@@ -1,0 +1,334 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+HUB_BIN="${HUB_BIN:-$ROOT_DIR/bin/orbit-hub}"
+CLI_BIN="${CLI_BIN:-$ROOT_DIR/bin/orbit}"
+RYUGI_BIN="${RYUGI_BIN:-$(command -v ryugi)}"
+
+if [ ! -x "$HUB_BIN" ] || [ ! -x "$CLI_BIN" ]; then
+  echo "error: build bin/orbit-hub and bin/orbit first (make build)" >&2
+  exit 1
+fi
+if [ -z "$RYUGI_BIN" ] || [ ! -x "$RYUGI_BIN" ]; then
+  echo "error: ryugi binary not found in PATH" >&2
+  exit 1
+fi
+
+TMP_ROOT="$(mktemp -d)"
+RYUGI_HOME="$TMP_ROOT/ryugi-home"
+mkdir -p "$RYUGI_HOME"
+HUB_PID=""
+
+cleanup() {
+  local rc=$?
+  if [ -n "$HUB_PID" ] && kill -0 "$HUB_PID" 2>/dev/null; then
+    kill "$HUB_PID" 2>/dev/null || true
+    wait "$HUB_PID" 2>/dev/null || true
+  fi
+  RYUGI_SERVER_HOME="$RYUGI_HOME" "$RYUGI_BIN" stop --format json >/dev/null 2>&1 || true
+  chmod -R u+w "$TMP_ROOT" 2>/dev/null || true
+  rm -rf "$TMP_ROOT"
+  exit "$rc"
+}
+trap cleanup EXIT
+
+# Allocate two free local TCP ports
+read -r HUB_PORT RYUGI_PORT < <(python3 -c '
+import socket
+def free_port():
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    p = s.getsockname()[1]
+    s.close()
+    return p
+print(free_port(), free_port())
+')
+
+CFG_DIR="$TMP_ROOT/config"
+DATA_DIR="$TMP_ROOT/data"
+WORK_REPO="$TMP_ROOT/work-repo"
+mkdir -p "$CFG_DIR" "$DATA_DIR" "$WORK_REPO"
+
+cat > "$CFG_DIR/machines.yaml" <<'YAML'
+schemaVersion: 1
+machines:
+  hub-node:
+    displayName: "hub-node"
+    transport: local_ws
+    tailscaleHost: "orbit.example.ts.net"
+    capabilities: [primary-dev, ryugi-host]
+YAML
+
+cat > "$CFG_DIR/projects.yaml" <<YAML
+schemaVersion: 1
+projects:
+  demo-app:
+    displayName: "demo-app"
+    repoIdentity: "github.com/example-org/demo-app"
+    defaultBranch: "main"
+    defaultCapability: "primary-dev"
+    defaultAdapter: "agy"
+    ideScheme: "cursor"
+    anchors:
+      primary-dev:
+        machine: "hub-node"
+        repoPath: "$WORK_REPO"
+YAML
+
+# 1. Initialize real git repo with initial commit + .ryugi/artifacts document
+export GIT_AUTHOR_NAME="Orbit Smoke"
+export GIT_AUTHOR_EMAIL="smoke@example.com"
+export GIT_COMMITTER_NAME="Orbit Smoke"
+export GIT_COMMITTER_EMAIL="smoke@example.com"
+
+git -C "$WORK_REPO" init -b main >/dev/null
+cat > "$WORK_REPO/app.go" <<'EOF'
+package main
+
+import "fmt"
+
+func main() {
+	fmt.Println("v0")
+}
+EOF
+mkdir -p "$WORK_REPO/.ryugi/artifacts/document/design-spec"
+cat > "$WORK_REPO/.ryugi/artifacts/document/design-spec/doc.xml" <<'EOF'
+<doc>
+  <h1 id="h1">Design Spec v0</h1>
+  <p id="p1">Initial paragraph.</p>
+</doc>
+EOF
+git -C "$WORK_REPO" add -A
+git -C "$WORK_REPO" commit -m "initial commit" >/dev/null
+INITIAL_BASE_SHA="$(git -C "$WORK_REPO" rev-parse HEAD)"
+
+# 2. Launch real orbit-hub with isolated RYUGI_SERVER_HOME
+HUB_URL="http://127.0.0.1:${HUB_PORT}"
+"$HUB_BIN" \
+  --config-dir "$CFG_DIR" \
+  --data-dir "$DATA_DIR" \
+  --listen "127.0.0.1:${HUB_PORT}" \
+  --hub-origin "$HUB_URL" \
+  --dev-open \
+  --ryugi-bin "$RYUGI_BIN" \
+  --ryugi-server-home "$RYUGI_HOME" \
+  --ryugi-port "$RYUGI_PORT" \
+  --ryugi-poll-seconds 0 \
+  >"$TMP_ROOT/hub.log" 2>&1 &
+HUB_PID=$!
+
+for _ in $(seq 1 40); do
+  if curl -sf "${HUB_URL}/api/health" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.25
+done
+curl -sf "${HUB_URL}/api/health" >/dev/null
+
+# Verify embedded SPA HTML is served
+curl -sf "${HUB_URL}/" | grep -q "hebi8-Orbit"
+
+# 3. Make dirty working tree edits + untracked file + external attachment
+cat > "$WORK_REPO/app.go" <<'EOF'
+package main
+
+import "fmt"
+
+func main() {
+	fmt.Println("v1 dirty")
+}
+EOF
+cat > "$WORK_REPO/helper.go" <<'EOF'
+package main
+
+func helper() string { return "ok" }
+EOF
+cat > "$WORK_REPO/.ryugi/artifacts/document/design-spec/doc.xml" <<'EOF'
+<doc>
+  <h1 id="h1">Design Spec v1</h1>
+  <p id="p1">Updated paragraph for review.</p>
+</doc>
+EOF
+printf 'fake-png-attachment' > "$TMP_ROOT/mockup.png"
+
+STATUS_BEFORE="$(git -C "$WORK_REPO" status --porcelain)"
+MIRROR_PATH="$DATA_DIR/git/demo-app.git"
+
+# 4. Delivery v1 (dirty workspace)
+V1_JSON="$("$CLI_BIN" deliver \
+  --project demo-app \
+  --repo "$WORK_REPO" \
+  --summary "v1 dirty checkpoint" \
+  --attach "$TMP_ROOT/mockup.png:assets/mockup.png" \
+  --hub "$HUB_URL" \
+  --mirror "$MIRROR_PATH" \
+  --json)"
+
+STATUS_AFTER="$(git -C "$WORK_REPO" status --porcelain)"
+if [ "$STATUS_BEFORE" != "$STATUS_AFTER" ]; then
+  echo "FAIL: repo git status was polluted by orbit deliver!" >&2
+  exit 1
+fi
+echo "[OK] v1 zero-pollution git status verified"
+
+read -r TASK_ID DLV_V1 ID_V1 URL_V1 SYNC_V1 < <(python3 -c '
+import json, sys
+d = json.loads(sys.argv[1])
+b = d["ryugiBindings"][0]
+print(d["task"]["taskId"], d["delivery"]["deliveryId"], b["derivedArtifactId"], b["openUrl"], d["delivery"]["ryugiSyncState"])
+' "$V1_JSON")
+
+if [ "$SYNC_V1" != "ready" ] || [ "${#ID_V1}" -ne 21 ]; then
+  echo "FAIL: unexpected v1 ryugi binding state=$SYNC_V1 id=$ID_V1" >&2
+  exit 1
+fi
+curl -sf "$URL_V1" | grep -q "data-ryugi-artifact-id"
+echo "[OK] v1 registered with real ryugi 1.105.8: delivery=$DLV_V1 artifactId=$ID_V1 url=$URL_V1"
+
+# Verify v1 frozen permissions (0444 file, 0555 dirs, 0755 .state)
+SNAP_V1="$DATA_DIR/deliveries/$DLV_V1"
+MODE_DOC="$(stat -c '%a' "$SNAP_V1/.ryugi/artifacts/document/design-spec/doc.xml")"
+MODE_DIR="$(stat -c '%a' "$SNAP_V1/.ryugi/artifacts/document/design-spec")"
+MODE_ROOT="$(stat -c '%a' "$SNAP_V1/.ryugi/artifacts")"
+MODE_STATE="$(stat -c '%a' "$SNAP_V1/.ryugi/artifacts/.state")"
+if [ "$MODE_DOC" != "444" ] || [ "$MODE_DIR" != "555" ] || [ "$MODE_ROOT" != "555" ] || [ "$MODE_STATE" != "755" ]; then
+  echo "FAIL: unexpected frozen permissions doc=$MODE_DOC dir=$MODE_DIR root=$MODE_ROOT state=$MODE_STATE" >&2
+  exit 1
+fi
+echo "[OK] v1 frozen snapshot permissions verified (doc=0444, dir=0555, root=0555, .state=0755)"
+
+# 5. Commit all changes cleanly, then deliver v2 with explicit --base INITIAL_BASE_SHA
+cat > "$WORK_REPO/.ryugi/artifacts/document/design-spec/doc.xml" <<'EOF'
+<doc>
+  <h1 id="h1">Design Spec v2</h1>
+  <p id="p1">Committed clean working tree revision.</p>
+</doc>
+EOF
+git -C "$WORK_REPO" add -A
+git -C "$WORK_REPO" commit -m "agent committed v2 changes" >/dev/null
+COMMITTED_HEAD="$(git -C "$WORK_REPO" rev-parse HEAD)"
+
+if [ -n "$(git -C "$WORK_REPO" status --porcelain)" ]; then
+  echo "FAIL: expected clean working tree before v2 deliver" >&2
+  exit 1
+fi
+
+V2_JSON="$("$CLI_BIN" deliver \
+  --project demo-app \
+  --repo "$WORK_REPO" \
+  --base "$INITIAL_BASE_SHA" \
+  --task "$TASK_ID" \
+  --summary "v2 committed clean tree" \
+  --hub "$HUB_URL" \
+  --mirror "$MIRROR_PATH" \
+  --json)"
+
+read -r DLV_V2 HEAD_V2 ID_V2 URL_V2 SYNC_V2 < <(python3 -c '
+import json, sys
+d = json.loads(sys.argv[1])
+b = d["ryugiBindings"][0]
+print(d["delivery"]["deliveryId"], d["delivery"]["headSha"], b["derivedArtifactId"], b["openUrl"], d["delivery"]["ryugiSyncState"])
+' "$V2_JSON")
+
+if [ "$HEAD_V2" != "$COMMITTED_HEAD" ]; then
+  echo "FAIL: clean working tree should reuse HEAD ($COMMITTED_HEAD), got $HEAD_V2" >&2
+  exit 1
+fi
+if [ "$SYNC_V2" != "ready" ] || [ "${#ID_V2}" -ne 21 ] || [ "$ID_V2" = "$ID_V1" ]; then
+  echo "FAIL: v2 artifact-id conflict or bad sync state: v1=$ID_V1 v2=$ID_V2 state=$SYNC_V2" >&2
+  exit 1
+fi
+curl -sf "$URL_V1" >/dev/null
+curl -sf "$URL_V2" | grep -q "data-ryugi-artifact-id"
+echo "[OK] v2 clean-tree reuse + distinct .artifact-id verified: v1=$ID_V1 v2=$ID_V2"
+
+# Verify v2 Diff against review base SHA is NON-EMPTY
+DIFF_V2="$(curl -sf "${HUB_URL}/api/deliveries/${DLV_V2}/diff")"
+python3 -c '
+import json, sys
+d = json.loads(sys.argv[1])
+files = d["files"]
+assert len(files) == 3, f"expected 3 changed files, got {len(files)}"
+assert "v1 dirty" in d["diffText"], "diffText missing expected app.go change"
+assert "helper()" in d["diffText"], "diffText missing expected helper.go change"
+' "$DIFF_V2"
+echo "[OK] v2 dual-baseline diff non-empty (3 changed files verified)"
+
+# 6. Submit Diff annotation TWICE with same Idempotency-Key -> verify idempotency
+ANN_BODY='{"source":"diff_drawer","anchor":{"path":"app.go","side":"new","startLine":6,"endLine":6},"body":"Add structured logging here"}'
+DIFF_ANN_1="$(curl -sf -X POST "${HUB_URL}/api/deliveries/${DLV_V2}/annotations" \
+  -H "Content-Type: application/json" \
+  -H "X-Orbit-Request: 1" \
+  -H "Idempotency-Key: smoke-diff-key-1" \
+  -d "$ANN_BODY")"
+DIFF_ANN_2="$(curl -sf -X POST "${HUB_URL}/api/deliveries/${DLV_V2}/annotations" \
+  -H "Content-Type: application/json" \
+  -H "X-Orbit-Request: 1" \
+  -H "Idempotency-Key: smoke-diff-key-1" \
+  -d "$ANN_BODY")"
+
+python3 -c '
+import json, sys
+a1, a2 = json.loads(sys.argv[1]), json.loads(sys.argv[2])
+assert a1["created"] is True and a2["created"] is False
+assert a1["annotation"]["annotationId"] == a2["annotation"]["annotationId"]
+assert a1["annotation"]["projectId"] == "demo-app"
+' "$DIFF_ANN_1" "$DIFF_ANN_2"
+echo "[OK] Diff annotation persisted & idempotency verified"
+
+# 7. Place a human thread in v2 Ryugi artifact comments.json (re-frozen 0444/0555) and trigger real Ryugi sync + receipt ack
+SNAP_V2_ART="$DATA_DIR/deliveries/$DLV_V2/.ryugi/artifacts/document/design-spec"
+chmod 0755 "$SNAP_V2_ART"
+cat > "$SNAP_V2_ART/comments.json" <<'EOF'
+{
+  "version": 1,
+  "threads": [
+    {
+      "id": "smoke_th_1",
+      "anchor": {
+        "blockId": "p1",
+        "quote": "Committed clean"
+      },
+      "status": "open",
+      "statusAt": "2026-11-23T20:00:00.000Z",
+      "statusBy": "human",
+      "messages": [
+        {
+          "id": "smoke_msg_1",
+          "author": "human",
+          "name": "Reviewer",
+          "text": "Please clarify rollback step in p1",
+          "at": "2026-11-23T20:00:00.000Z"
+        }
+      ]
+    }
+  ]
+}
+EOF
+chmod 0444 "$SNAP_V2_ART/comments.json"
+chmod 0555 "$SNAP_V2_ART"
+
+SYNC_1="$(curl -sf -X POST "${HUB_URL}/api/deliveries/${DLV_V2}/ryugi/sync" -H "X-Orbit-Request: 1")"
+SYNC_2="$(curl -sf -X POST "${HUB_URL}/api/deliveries/${DLV_V2}/ryugi/sync" -H "X-Orbit-Request: 1")"
+
+python3 -c '
+import json, sys
+s1, s2 = json.loads(sys.argv[1]), json.loads(sys.argv[2])
+assert s1["newAnnotations"] == 1 and s1["receiptsAcked"] == 1, f"unexpected sync #1: {s1}"
+assert s2["newAnnotations"] == 0 and s2["receiptsAcked"] == 0, f"unexpected sync #2 (receipt ack should clear unread): {s2}"
+' "$SYNC_1" "$SYNC_2"
+echo "[OK] Real Ryugi comment sync + SQLite commit-before-ack + idempotent re-sync verified"
+
+# 8. Verify both annotations exist on delivery detail and orbit status works
+DETAIL_V2="$(curl -sf "${HUB_URL}/api/deliveries/${DLV_V2}")"
+python3 -c '
+import json, sys
+d = json.loads(sys.argv[1])
+sources = sorted(a["source"] for a in d["annotations"])
+assert sources == ["diff_drawer", "ryugi"], f"expected both diff_drawer and ryugi annotations, got {sources}"
+' "$DETAIL_V2"
+
+"$CLI_BIN" status --hub "$HUB_URL" | grep -q "demo-app"
+echo "[OK] Both diff_drawer and ryugi annotations verified in SQLite + orbit status OK"
+echo "=== PHASE 0 E2E SMOKE PASSED ==="

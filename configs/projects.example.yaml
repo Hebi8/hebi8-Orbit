@@ -1,0 +1,58 @@
+# Example project registry for hebi8-Orbit.
+# Copy to ~/.config/hebi8-orbit/projects.yaml and replace placeholder values.
+schemaVersion: 1
+projects:
+  demo-app:
+    displayName: "demo-app"
+    repoIdentity: "github.com/example-org/demo-app"
+    defaultBranch: "main"
+    defaultCapability: "primary-dev"
+    defaultAdapter: "agy"
+    defaultModelConfig:
+      model: "gemini-4-neon"
+      thought_level: "high"
+      mode: "auto"
+    ideScheme: "cursor"
+    anchors:
+      primary-dev:
+        machine: "hub-node"
+        repoPath: "/home/orbit/dev/demo-app"
+        worktreeRoot: "/home/orbit/.local/share/hebi8-orbit/worktrees/demo-app"
+      macos-env:
+        machine: "mac-node"
+        repoPath: "/Users/orbit/code/demo-app"
+        worktreeRoot: "/Users/orbit/.local/share/hebi8-orbit/worktrees/demo-app"
+      deploy-node:
+        machine: "deploy-vps"
+        remoteDir: "/srv/demo-app"
+        remoteMirrorDir: "/srv/orbit-mirrors/demo-app.git"
+        deployStrategy:
+          kind: "ssh_push_and_switch"
+          targetEnv: "deploy-vps:prod"
+          verifyRunningVersionCmd: "curl -sf http://127.0.0.1:8080/api/version"
+          deployCmdTemplate: "/srv/demo-app/scripts/deploy-sha.sh --mirror /srv/orbit-mirrors/demo-app.git --sha {{headSha}} --expect {{expectedCurrentVersion}}"
+          healthCheckUrl: "http://127.0.0.1:8080/api/health"
+          requireHumanApproval: true
+    extraArtifactGlobs:
+      - "assets/mockups/*.png"
+
+  mobile-client:
+    displayName: "mobile-client"
+    repoIdentity: "github.com/example-org/mobile-client"
+    defaultBranch: "main"
+    defaultCapability: "macos-env"
+    defaultAdapter: "agy"
+    defaultModelConfig:
+      model: "gemini-4-neon"
+      thought_level: "high"
+      mode: "auto"
+    ideScheme: "cursor"
+    anchors:
+      primary-dev:
+        machine: "hub-node"
+        repoPath: "/home/orbit/dev/mobile-client"
+        worktreeRoot: "/home/orbit/.local/share/hebi8-orbit/worktrees/mobile-client"
+      macos-env:
+        machine: "mac-node"
+        repoPath: "/Users/orbit/code/mobile-client"
+        worktreeRoot: "/Users/orbit/.local/share/hebi8-orbit/worktrees/mobile-client"

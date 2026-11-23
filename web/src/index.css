@@ -1,0 +1,100 @@
+@import "tailwindcss";
+@import "react-diff-view/style/index.css";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+:root {
+  --orbit-bg: #f8fafc;
+  --orbit-surface: #ffffff;
+  --orbit-surface-2: #f1f5f9;
+  --orbit-border: #e2e8f0;
+  --orbit-text: #0f172a;
+  --orbit-text-muted: #64748b;
+
+  --diff-background-color: #ffffff;
+  --diff-text-color: #0f172a;
+  --diff-font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  --diff-selection-background-color: #bae6fd;
+  --diff-gutter-insert-background-color: #dcfce7;
+  --diff-gutter-delete-background-color: #fee2e2;
+  --diff-gutter-selected-background-color: #e0f2fe;
+  --diff-code-insert-background-color: #f0fdf4;
+  --diff-code-delete-background-color: #fef2f2;
+  --diff-code-insert-edit-background-color: #bbf7d0;
+  --diff-code-delete-edit-background-color: #fecaca;
+  --diff-code-selected-background-color: #e0f2fe;
+  --diff-omit-gutter-line-color: #94a3b8;
+}
+
+.dark {
+  --orbit-bg: #09090b;
+  --orbit-surface: #111114;
+  --orbit-surface-2: #18181c;
+  --orbit-border: #27272a;
+  --orbit-text: #f4f4f5;
+  --orbit-text-muted: #a1a1aa;
+
+  --diff-background-color: #0c0c0f;
+  --diff-text-color: #e4e4e7;
+  --diff-selection-background-color: #0369a1;
+  --diff-gutter-insert-background-color: rgba(22, 163, 74, 0.16);
+  --diff-gutter-delete-background-color: rgba(220, 38, 38, 0.16);
+  --diff-gutter-selected-background-color: rgba(14, 165, 233, 0.22);
+  --diff-code-insert-background-color: rgba(22, 163, 74, 0.1);
+  --diff-code-delete-background-color: rgba(220, 38, 38, 0.1);
+  --diff-code-insert-edit-background-color: rgba(34, 197, 94, 0.25);
+  --diff-code-delete-edit-background-color: rgba(239, 68, 68, 0.25);
+  --diff-code-selected-background-color: rgba(14, 165, 233, 0.16);
+  --diff-omit-gutter-line-color: #52525b;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  background-color: var(--orbit-bg);
+  color: var(--orbit-text);
+  font-family: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto, sans-serif;
+}
+
+/* Crisp compact diff styling */
+.orbit-diff table.diff {
+  font-size: 12px;
+  line-height: 1.55;
+  border-collapse: collapse;
+  width: 100%;
+}
+
+.orbit-diff .diff-gutter {
+  width: 44px;
+  padding: 0 8px;
+  text-align: right;
+  user-select: none;
+  cursor: pointer;
+  color: var(--orbit-text-muted);
+  border-right: 1px solid var(--orbit-border);
+}
+
+.orbit-diff .diff-gutter:hover {
+  color: #38bdf8;
+  background-color: rgba(56, 189, 248, 0.12);
+}
+
+.orbit-diff .diff-code {
+  padding: 0 10px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.orbit-diff .diff-hunk-header {
+  background-color: var(--orbit-surface-2);
+  color: var(--orbit-text-muted);
+  font-size: 11px;
+  border-top: 1px solid var(--orbit-border);
+  border-bottom: 1px solid var(--orbit-border);
+}
+
+.orbit-diff .diff-widget-content {
+  padding: 0;
+  background-color: var(--orbit-surface);
+}

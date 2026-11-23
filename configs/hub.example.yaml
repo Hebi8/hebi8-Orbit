@@ -1,0 +1,24 @@
+# Example hub configuration for hebi8-Orbit.
+# Copy to ~/.config/hebi8-orbit/hub.yaml and replace placeholder values.
+schemaVersion: 1
+listenAddr: "127.0.0.1:4310"
+dataDir: "~/.local/share/hebi8-orbit"
+configDir: "~/.config/hebi8-orbit"
+
+# Exact browser Origin served via tailscale serve (used for CSRF / CSWSH checks).
+hubOrigin: "https://orbit.example.ts.net"
+
+# Allowed Tailscale-User-Login identities (injected by tailscale serve).
+allowedTailscaleLogins:
+  - "user@example.com"
+
+# Ryugi sidecar settings (black-box CLI bridge).
+ryugiBin: "ryugi"
+ryugiServerHome: "~/.local/share/hebi8-orbit/ryugi-home"
+ryugiPort: 27319
+ryugiPublicOrigin: "https://orbit.example.ts.net:8443"
+ryugiPollIntervalSeconds: 6
+
+# Local development overrides (loopback only; keep false in production).
+devOpen: false
+devToken: ""

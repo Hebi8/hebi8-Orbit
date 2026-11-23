@@ -1,0 +1,922 @@
+package hub
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/Hebi8/hebi8-Orbit/internal/gitops"
+	"github.com/Hebi8/hebi8-Orbit/internal/protocol"
+	"github.com/Hebi8/hebi8-Orbit/internal/store"
+)
+
+// RyugiRunner executes ryugi CLI commands (replaceable in unit tests).
+type RyugiRunner interface {
+	Run(ctx context.Context, args ...string) ([]byte, error)
+}
+
+// ExecRyugiRunner runs the real ryugi binary with optional isolated RYUGI_SERVER_HOME.
+type ExecRyugiRunner struct {
+	Bin        string
+	ServerHome string
+}
+
+func (e ExecRyugiRunner) Run(ctx context.Context, args ...string) ([]byte, error) {
+	bin := e.Bin
+	if bin == "" {
+		bin = "ryugi"
+	}
+	cmd := exec.CommandContext(ctx, bin, args...)
+	env := os.Environ()
+	if e.ServerHome != "" {
+		env = setEnvVar(env, "RYUGI_SERVER_HOME", e.ServerHome)
+	}
+	cmd.Env = env
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	if err != nil {
+		// ryugi CLI prints structured JSON errors on stdout even on non-zero exit
+		if stdout.Len() > 0 && bytes.HasPrefix(bytes.TrimSpace(stdout.Bytes()), []byte("{")) {
+			return stdout.Bytes(), fmt.Errorf("ryugi %s failed: %w (stderr: %s)", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+		}
+		return nil, fmt.Errorf("ryugi %s failed: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+	}
+	return stdout.Bytes(), nil
+}
+
+func setEnvVar(env []string, key, val string) []string {
+	prefix := key + "="
+	out := make([]string, 0, len(env)+1)
+	replaced := false
+	for _, kv := range env {
+		if strings.HasPrefix(kv, prefix) {
+			out = append(out, prefix+val)
+			replaced = true
+		} else {
+			out = append(out, kv)
+		}
+	}
+	if !replaced {
+		out = append(out, prefix+val)
+	}
+	return out
+}
+
+// RyugiBridge manages frozen snapshot registration and single-flight annotation polling
+// with strict SQLite-commit-before-receipt-ack semantics.
+type RyugiBridge struct {
+	store        *store.Store
+	broker       *EventBroker
+	runner       RyugiRunner
+	dataDir      string
+	port         int
+	publicOrigin string
+	pollInterval time.Duration
+
+	mu       sync.Mutex
+	inFlight map[string]*singleFlightEntry
+}
+
+type singleFlightEntry struct {
+	mu      sync.Mutex
+	pending bool
+}
+
+// RyugiBridgeConfig configures a RyugiBridge instance.
+type RyugiBridgeConfig struct {
+	Store        *store.Store
+	Broker       *EventBroker
+	Runner       RyugiRunner
+	DataDir      string
+	Port         int
+	PublicOrigin string
+	PollInterval time.Duration
+}
+
+func NewRyugiBridge(cfg RyugiBridgeConfig) *RyugiBridge {
+	interval := cfg.PollInterval
+	if interval <= 0 {
+		interval = 6 * time.Second
+	}
+	return &RyugiBridge{
+		store:        cfg.Store,
+		broker:       cfg.Broker,
+		runner:       cfg.Runner,
+		dataDir:      cfg.DataDir,
+		port:         cfg.Port,
+		publicOrigin: cfg.PublicOrigin,
+		pollInterval: interval,
+		inFlight:     map[string]*singleFlightEntry{},
+	}
+}
+
+func (b *RyugiBridge) bindingGate(bindingID string) *singleFlightEntry {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	e, ok := b.inFlight[bindingID]
+	if !ok {
+		e = &singleFlightEntry{}
+		b.inFlight[bindingID] = e
+	}
+	return e
+}
+
+// RewriteRyugiURL preserves the full path, raw query (including ?key=...), and fragment
+// from rawURL while rewriting only the origin (scheme + host[:port]) when publicOrigin is set.
+func RewriteRyugiURL(rawURL, publicOrigin string) string {
+	rawURL = strings.TrimSpace(rawURL)
+	publicOrigin = strings.TrimSpace(publicOrigin)
+	if rawURL == "" || publicOrigin == "" {
+		return rawURL
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return rawURL
+	}
+	pub, err := url.Parse(publicOrigin)
+	if err != nil || pub.Scheme == "" || pub.Host == "" {
+		return rawURL
+	}
+	u.Scheme = pub.Scheme
+	u.Host = pub.Host
+	return u.String()
+}
+
+// ryugiCLIEnvelope parses the ryugi.cli/v1 JSON envelope.
+type ryugiCLIEnvelope struct {
+	Schema  string          `json:"schema"`
+	Command string          `json:"command"`
+	Outcome string          `json:"outcome"`
+	Data    json.RawMessage `json:"data"`
+	Error   *struct {
+		Code       string `json:"code"`
+		Message    string `json:"message"`
+		HTTPStatus int    `json:"httpStatus"`
+	} `json:"error"`
+}
+
+type ryugiStartData struct {
+	URL      string `json:"url"`
+	LocalURL string `json:"localUrl"`
+	Artifact string `json:"artifact"`
+	Status   string `json:"status"`
+}
+
+type ryugiPage struct {
+	Returned   int     `json:"returned"`
+	Total      int     `json:"total"`
+	HasMore    bool    `json:"hasMore"`
+	NextCursor *string `json:"nextCursor"`
+	Snapshot   string  `json:"snapshot"`
+}
+
+type ryugiThreadMessage struct {
+	ID     string `json:"id"`
+	Author string `json:"author"`
+	Name   string `json:"name"`
+	Text   string `json:"text"`
+	At     string `json:"at"`
+}
+
+type ryugiThreadItem struct {
+	ID        string               `json:"id"`
+	Anchor    map[string]any       `json:"anchor"`
+	Status    string               `json:"status"`
+	StatusBy  string               `json:"statusBy"`
+	WaitingOn string               `json:"waitingOn"`
+	Messages  []ryugiThreadMessage `json:"messages"`
+}
+
+type ryugiSection struct {
+	Items    []json.RawMessage `json:"items"`
+	Evidence string            `json:"evidence"`
+	Snapshot string            `json:"snapshot"`
+	Receipt  string            `json:"receipt"`
+	Page     ryugiPage         `json:"page"`
+}
+
+type ryugiCommentListData struct {
+	Artifact string                  `json:"artifact"`
+	Sections map[string]ryugiSection `json:"sections"`
+	// Single-section pagination may return items/page/receipt at top level or under sections
+	Items    []json.RawMessage `json:"items"`
+	Snapshot string            `json:"snapshot"`
+	Receipt  string            `json:"receipt"`
+	Page     *ryugiPage        `json:"page"`
+}
+
+type ryugiChangesData struct {
+	Artifact string            `json:"artifact"`
+	Snapshot string            `json:"snapshot"`
+	Receipt  string            `json:"receipt"`
+	Empty    bool              `json:"empty"`
+	Diff     string            `json:"diff"`
+	Blocks   []json.RawMessage `json:"blocks"`
+	Page     *ryugiPage        `json:"page"`
+}
+
+// RegisterDelivery exports a frozen snapshot for deliveryID and registers each
+// .ryugi/artifacts/<type>/<slug> with the Ryugi sidecar. This step is idempotent
+// and decoupled from code delivery persistence.
+func (b *RyugiBridge) RegisterDelivery(ctx context.Context, deliveryID string) ([]protocol.RyugiBindingView, error) {
+	dlv, _, _, proj, err := b.store.GetDeliveryDetail(ctx, deliveryID)
+	if err != nil {
+		return nil, err
+	}
+
+	locators := dlv.Manifest.RyugiArtifacts
+	if len(locators) == 0 {
+		discovered, err := gitops.DiscoverRyugiArtifactsInMirror(ctx, proj.MirrorBarePath, dlv.HeadSHA)
+		if err != nil {
+			return nil, err
+		}
+		locators = discovered
+	}
+	if len(locators) == 0 {
+		return nil, nil
+	}
+
+	frozenDir := filepath.Join(b.dataDir, "deliveries", deliveryID)
+	exported, err := gitops.ExportFrozenSnapshot(ctx, proj.MirrorBarePath, dlv.HeadSHA, deliveryID, frozenDir)
+	if err != nil {
+		_, _ = b.store.SaveRyugiBindings(ctx, deliveryID, frozenDir, protocol.RyugiSyncFailed, nil)
+		return nil, fmt.Errorf("export frozen snapshot: %w", err)
+	}
+	if len(exported) == 0 {
+		return nil, nil
+	}
+
+	var bindings []protocol.RyugiBindingView
+	var regErrors []string
+	for _, art := range exported {
+		args := []string{"start", "--background", "--no-open"}
+		if b.port > 0 {
+			args = append(args, "--port", strconv.Itoa(b.port))
+		}
+		args = append(args, "--project-dir", frozenDir, "--artifact", art.Locator, "--format", "json")
+
+		out, runErr := b.runner.Run(ctx, args...)
+		env, parseErr := parseRyugiEnvelope(out)
+		if parseErr != nil {
+			if runErr != nil {
+				regErrors = append(regErrors, fmt.Sprintf("%s: %v", art.Locator, runErr))
+			} else {
+				regErrors = append(regErrors, fmt.Sprintf("%s: %v", art.Locator, parseErr))
+			}
+			continue
+		}
+		if env.Outcome == "error" || (runErr != nil && env.Data == nil) {
+			msg := "ryugi start error"
+			if env.Error != nil {
+				msg = env.Error.Code + ": " + env.Error.Message
+			} else if runErr != nil {
+				msg = runErr.Error()
+			}
+			regErrors = append(regErrors, fmt.Sprintf("%s: %s", art.Locator, msg))
+			continue
+		}
+
+		var sd ryugiStartData
+		if err := json.Unmarshal(env.Data, &sd); err != nil {
+			regErrors = append(regErrors, fmt.Sprintf("%s: decode start data: %v", art.Locator, err))
+			continue
+		}
+		rawURL := sd.URL
+		if rawURL == "" {
+			rawURL = sd.LocalURL
+		}
+		openURL := RewriteRyugiURL(rawURL, b.publicOrigin)
+		bindings = append(bindings, protocol.RyugiBindingView{
+			DeliveryID:        deliveryID,
+			ProjectID:         dlv.ProjectID,
+			TaskID:            dlv.TaskID,
+			FrozenProjectDir:  frozenDir,
+			ArtifactLocator:   art.Locator,
+			DerivedArtifactID: art.DerivedArtifactID,
+			OpenURL:           openURL,
+			Active:            true,
+		})
+	}
+
+	if len(regErrors) > 0 && len(bindings) == 0 {
+		_, _ = b.store.SaveRyugiBindings(ctx, deliveryID, frozenDir, protocol.RyugiSyncFailed, nil)
+		return nil, fmt.Errorf("ryugi register failed: %s", strings.Join(regErrors, "; "))
+	}
+
+	syncState := protocol.RyugiSyncReady
+	if len(regErrors) > 0 {
+		syncState = protocol.RyugiSyncFailed
+	}
+	saved, err := b.store.SaveRyugiBindings(ctx, deliveryID, frozenDir, syncState, bindings)
+	if err != nil {
+		return nil, err
+	}
+	if len(regErrors) > 0 {
+		return saved, fmt.Errorf("partial ryugi registration errors: %s", strings.Join(regErrors, "; "))
+	}
+	return saved, nil
+}
+
+// BindingSyncResult summarizes a single binding sync pass.
+type BindingSyncResult struct {
+	NewAnnotations int
+	ReceiptsAcked  int
+}
+
+// SyncDelivery ensures registration (if pending/failed) and runs single-flight sync on all bindings of deliveryID.
+func (b *RyugiBridge) SyncDelivery(ctx context.Context, deliveryID string) (protocol.RyugiSyncResponse, error) {
+	dlv, _, _, _, err := b.store.GetDeliveryDetail(ctx, deliveryID)
+	if err != nil {
+		return protocol.RyugiSyncResponse{}, err
+	}
+
+	resp := protocol.RyugiSyncResponse{
+		DeliveryID:     deliveryID,
+		RyugiSyncState: dlv.RyugiSyncState,
+		RyugiBindings:  []protocol.RyugiBindingView{},
+	}
+
+	if dlv.RyugiSyncState == protocol.RyugiSyncPending || dlv.RyugiSyncState == protocol.RyugiSyncFailed {
+		if _, regErr := b.RegisterDelivery(ctx, deliveryID); regErr != nil {
+			resp.Errors = append(resp.Errors, regErr.Error())
+		}
+	}
+
+	records, err := b.store.ListRyugiBindings(ctx, deliveryID, false)
+	if err != nil {
+		return resp, err
+	}
+
+	for _, rec := range records {
+		res, syncErr := b.SyncBinding(ctx, rec.BindingID)
+		if syncErr != nil {
+			resp.Errors = append(resp.Errors, fmt.Sprintf("%s: %v", rec.ArtifactLocator, syncErr))
+			continue
+		}
+		resp.BindingsSynced++
+		resp.NewAnnotations += res.NewAnnotations
+		resp.ReceiptsAcked += res.ReceiptsAcked
+	}
+
+	updatedDlv, bindings, _, _, err := b.store.GetDeliveryDetail(ctx, deliveryID)
+	if err == nil {
+		resp.RyugiSyncState = updatedDlv.RyugiSyncState
+		resp.RyugiBindings = bindings
+	}
+	return resp, nil
+}
+
+// SyncBinding runs a single-flight sync for one binding_id.
+// Strictly commits to SQLite BEFORE acking any Ryugi receipt!
+func (b *RyugiBridge) SyncBinding(ctx context.Context, bindingID string) (BindingSyncResult, error) {
+	gate := b.bindingGate(bindingID)
+	gate.mu.Lock()
+	defer gate.mu.Unlock()
+
+	records, err := b.store.ListRyugiBindings(ctx, "", false)
+	if err != nil {
+		return BindingSyncResult{}, err
+	}
+	var rec *store.RyugiBindingRecord
+	for i := range records {
+		if records[i].BindingID == bindingID {
+			rec = &records[i]
+			break
+		}
+	}
+	if rec == nil {
+		return BindingSyncResult{}, store.ErrNotFound
+	}
+
+	// 1. Fetch comment list (--sections all --detail) + paginate any section with nextCursor
+	sections, err := b.fetchAllCommentSections(ctx, rec.FrozenProjectDir, rec.ArtifactLocator)
+	if err != nil {
+		return BindingSyncResult{}, err
+	}
+
+	var incoming []store.IncomingRyugiAnnotation
+	var threadsReceipt string
+	newHashes := make(map[string]string, len(rec.LastStateHashes))
+	for k, v := range rec.LastStateHashes {
+		newHashes[k] = v
+	}
+
+	// 1a. Threads (receipted)
+	if thSec, ok := sections["threads"]; ok {
+		threadsReceipt = thSec.Receipt
+		for _, rawItem := range thSec.Items {
+			var th ryugiThreadItem
+			if err := json.Unmarshal(rawItem, &th); err != nil {
+				continue
+			}
+			if th.Status == "withdrawn" || th.Status == "draft" {
+				continue
+			}
+			// Extract human messages in thread
+			for _, msg := range th.Messages {
+				if msg.Author != "human" {
+					continue
+				}
+				text := strings.TrimSpace(msg.Text)
+				if text == "" {
+					continue
+				}
+				anchor := protocol.AnnotationAnchor{
+					Artifact: rec.ArtifactLocator,
+					Section:  "threads",
+					ThreadID: th.ID,
+				}
+				if blockID, ok := th.Anchor["blockId"].(string); ok {
+					anchor.BlockID = blockID
+				}
+				if quote, ok := th.Anchor["quote"].(string); ok {
+					anchor.Quote = quote
+				}
+				if elemID, ok := th.Anchor["elementId"].(string); ok {
+					anchor.ElementID = elemID
+				} else if boardID, ok := th.Anchor["boardId"].(string); ok {
+					anchor.ElementID = boardID
+				}
+				if page, ok := th.Anchor["page"].(string); ok {
+					anchor.Page = page
+				}
+				incoming = append(incoming, store.IncomingRyugiAnnotation{
+					ExternalKey: fmt.Sprintf("ryugi:%s:threads:%s:%s", rec.BindingID, th.ID, msg.ID),
+					Anchor:      anchor,
+					Body:        text,
+				})
+			}
+		}
+	}
+
+	// 1b. Unreceipted state sections: asks / groups / rounds (content-hash dedup, latest submitted state only)
+	for _, secName := range []string{"asks", "groups", "rounds"} {
+		sec, ok := sections[secName]
+		if !ok {
+			continue
+		}
+		for _, rawItem := range sec.Items {
+			var obj map[string]any
+			if err := json.Unmarshal(rawItem, &obj); err != nil {
+				continue
+			}
+			stateStr, _ := obj["state"].(string)
+			statusStr, _ := obj["status"].(string)
+			effectiveState := stateStr
+			if effectiveState == "" {
+				effectiveState = statusStr
+			}
+			if !isSubmittedState(secName, effectiveState, obj) {
+				continue
+			}
+
+			itemID := firstStringField(obj, "id", "questionId", "groupId", "roundId")
+			if itemID == "" {
+				continue
+			}
+			contentHash := canonicalJSONHash(obj)
+			hashKey := secName + ":" + itemID
+			if newHashes[hashKey] == contentHash {
+				continue
+			}
+			newHashes[hashKey] = contentHash
+
+			body := formatStateSectionBody(secName, itemID, obj)
+			anchor := protocol.AnnotationAnchor{
+				Artifact: rec.ArtifactLocator,
+				Section:  secName,
+				Verdict:  effectiveState,
+			}
+			if blockID, ok := obj["blockId"].(string); ok {
+				anchor.BlockID = blockID
+			}
+			if elemID, ok := obj["boardId"].(string); ok {
+				anchor.ElementID = elemID
+			}
+			incoming = append(incoming, store.IncomingRyugiAnnotation{
+				ExternalKey: fmt.Sprintf("ryugi:%s:%s:%s:%s", rec.BindingID, secName, itemID, contentHash[:12]),
+				Anchor:      anchor,
+				Body:        body,
+			})
+		}
+	}
+
+	// 2. Document / slides changes (receipted)
+	var changesReceipt string
+	if isDocumentLikeArtifact(rec.ArtifactLocator) {
+		diffText, chReceipt, chErr := b.fetchDocumentChanges(ctx, rec.FrozenProjectDir, rec.ArtifactLocator)
+		if chErr != nil {
+			// On 0555 frozen dirs, ryugi 1.105.8 document changes may return EACCES trying to normalize doc.xml.
+			// Treat EACCES on frozen read-only snapshots as non-fatal no-edits.
+			if !strings.Contains(chErr.Error(), "EACCES") {
+				return BindingSyncResult{}, chErr
+			}
+		} else {
+			changesReceipt = chReceipt
+			if strings.TrimSpace(diffText) != "" {
+				diffHash := sha256Hex(diffText)
+				incoming = append(incoming, store.IncomingRyugiAnnotation{
+					ExternalKey: fmt.Sprintf("ryugi:%s:changes:%s", rec.BindingID, diffHash[:16]),
+					Anchor: protocol.AnnotationAnchor{
+						Artifact: rec.ArtifactLocator,
+						Section:  "changes",
+					},
+					Body: "Document edits:\n" + strings.TrimSpace(diffText),
+				})
+			}
+		}
+	}
+
+	// 3. COMMIT TO SQLITE FIRST (atomic BEGIN IMMEDIATE transaction)
+	inserted, emitted, err := b.store.ApplyRyugiSyncBatch(
+		ctx,
+		*rec,
+		incoming,
+		newHashes,
+		threadsReceipt,
+		changesReceipt,
+	)
+	if err != nil {
+		// NEVER ack any receipt if SQLite commit failed!
+		return BindingSyncResult{}, fmt.Errorf("commit ryugi sync batch: %w", err)
+	}
+
+	if b.broker != nil && len(emitted) > 0 {
+		b.broker.Broadcast(emitted...)
+	}
+
+	// 4. ONLY AFTER SQLITE COMMIT SUCCEEDS, ack receipts with Ryugi
+	acked := 0
+	if threadsReceipt != "" {
+		if err := b.ackReceipt(ctx, "comment", rec.FrozenProjectDir, rec.ArtifactLocator, threadsReceipt); err != nil {
+			return BindingSyncResult{NewAnnotations: inserted, ReceiptsAcked: acked}, err
+		}
+		acked++
+	}
+	if changesReceipt != "" {
+		if err := b.ackReceipt(ctx, "changes", rec.FrozenProjectDir, rec.ArtifactLocator, changesReceipt); err != nil {
+			return BindingSyncResult{NewAnnotations: inserted, ReceiptsAcked: acked}, err
+		}
+		acked++
+	}
+
+	return BindingSyncResult{
+		NewAnnotations: inserted,
+		ReceiptsAcked:  acked,
+	}, nil
+}
+
+func (b *RyugiBridge) fetchAllCommentSections(ctx context.Context, frozenDir, locator string) (map[string]ryugiSection, error) {
+	out, runErr := b.runner.Run(ctx,
+		"comment", "list",
+		"--sections", "all",
+		"--detail",
+		"--project-dir", frozenDir,
+		"--artifact", locator,
+		"--format", "json",
+	)
+	env, parseErr := parseRyugiEnvelope(out)
+	if parseErr != nil {
+		if runErr != nil {
+			return nil, runErr
+		}
+		return nil, parseErr
+	}
+	if env.Outcome == "error" {
+		if env.Error != nil {
+			return nil, fmt.Errorf("ryugi comment list: %s: %s", env.Error.Code, env.Error.Message)
+		}
+		return nil, fmt.Errorf("ryugi comment list error")
+	}
+
+	var data ryugiCommentListData
+	if err := json.Unmarshal(env.Data, &data); err != nil {
+		return nil, fmt.Errorf("decode comment list data: %w", err)
+	}
+	if data.Sections == nil {
+		data.Sections = map[string]ryugiSection{}
+	}
+
+	// Paginate any section with page.nextCursor using the same snapshot token
+	for secName, sec := range data.Sections {
+		cursor := ""
+		if sec.Page.NextCursor != nil {
+			cursor = strings.TrimSpace(*sec.Page.NextCursor)
+		}
+		snapshot := sec.Snapshot
+		if snapshot == "" {
+			snapshot = sec.Page.Snapshot
+		}
+		for cursor != "" {
+			args := []string{
+				"comment", "list",
+				"--section", secName,
+				"--detail",
+				"--project-dir", frozenDir,
+				"--artifact", locator,
+				"--cursor", cursor,
+				"--format", "json",
+			}
+			if snapshot != "" {
+				args = append(args, "--snapshot", snapshot)
+			}
+			pOut, pRunErr := b.runner.Run(ctx, args...)
+			pEnv, pParseErr := parseRyugiEnvelope(pOut)
+			if pParseErr != nil {
+				if pRunErr != nil {
+					return nil, pRunErr
+				}
+				return nil, pParseErr
+			}
+			if pEnv.Outcome == "error" {
+				if pEnv.Error != nil {
+					return nil, fmt.Errorf("ryugi comment list page (%s): %s: %s", secName, pEnv.Error.Code, pEnv.Error.Message)
+				}
+				return nil, fmt.Errorf("ryugi comment list page (%s) failed", secName)
+			}
+
+			var pageData ryugiCommentListData
+			if err := json.Unmarshal(pEnv.Data, &pageData); err != nil {
+				return nil, fmt.Errorf("decode comment list page (%s): %w", secName, err)
+			}
+
+			// Support both nested sections[secName] and top-level items/page/receipt shapes
+			var nextSec ryugiSection
+			if s2, ok := pageData.Sections[secName]; ok {
+				nextSec = s2
+			} else {
+				nextSec.Items = pageData.Items
+				nextSec.Receipt = pageData.Receipt
+				if pageData.Page != nil {
+					nextSec.Page = *pageData.Page
+				}
+			}
+			sec.Items = append(sec.Items, nextSec.Items...)
+			if nextSec.Receipt != "" {
+				sec.Receipt = nextSec.Receipt
+			}
+			if nextSec.Page.NextCursor != nil && strings.TrimSpace(*nextSec.Page.NextCursor) != "" && *nextSec.Page.NextCursor != cursor {
+				cursor = strings.TrimSpace(*nextSec.Page.NextCursor)
+			} else {
+				cursor = ""
+			}
+		}
+		data.Sections[secName] = sec
+	}
+	return data.Sections, nil
+}
+
+func (b *RyugiBridge) fetchDocumentChanges(ctx context.Context, frozenDir, locator string) (string, string, error) {
+	out, runErr := b.runner.Run(ctx,
+		"changes",
+		"--detail",
+		"--project-dir", frozenDir,
+		"--artifact", locator,
+		"--format", "json",
+	)
+	env, parseErr := parseRyugiEnvelope(out)
+	if parseErr != nil {
+		if runErr != nil {
+			return "", "", runErr
+		}
+		return "", "", parseErr
+	}
+	if env.Outcome == "error" {
+		if env.Error != nil {
+			return "", "", fmt.Errorf("ryugi changes: %s: %s", env.Error.Code, env.Error.Message)
+		}
+		return "", "", fmt.Errorf("ryugi changes failed")
+	}
+
+	var data ryugiChangesData
+	if err := json.Unmarshal(env.Data, &data); err != nil {
+		return "", "", fmt.Errorf("decode ryugi changes: %w", err)
+	}
+	if data.Empty {
+		return "", data.Receipt, nil
+	}
+
+	var diffBuf strings.Builder
+	diffBuf.WriteString(data.Diff)
+	receipt := data.Receipt
+
+	cursor := ""
+	snapshot := data.Snapshot
+	if data.Page != nil && data.Page.NextCursor != nil {
+		cursor = strings.TrimSpace(*data.Page.NextCursor)
+		if snapshot == "" {
+			snapshot = data.Page.Snapshot
+		}
+	}
+	for cursor != "" {
+		args := []string{
+			"changes",
+			"--detail",
+			"--project-dir", frozenDir,
+			"--artifact", locator,
+			"--cursor", cursor,
+			"--format", "json",
+		}
+		if snapshot != "" {
+			args = append(args, "--snapshot", snapshot)
+		}
+		pOut, pRunErr := b.runner.Run(ctx, args...)
+		pEnv, pParseErr := parseRyugiEnvelope(pOut)
+		if pParseErr != nil {
+			if pRunErr != nil {
+				return "", "", pRunErr
+			}
+			return "", "", pParseErr
+		}
+		if pEnv.Outcome == "error" {
+			return "", "", fmt.Errorf("ryugi changes page failed")
+		}
+		var pageData ryugiChangesData
+		if err := json.Unmarshal(pEnv.Data, &pageData); err != nil {
+			return "", "", err
+		}
+		if pageData.Diff != "" {
+			if diffBuf.Len() > 0 {
+				diffBuf.WriteString("\n")
+			}
+			diffBuf.WriteString(pageData.Diff)
+		}
+		if pageData.Receipt != "" {
+			receipt = pageData.Receipt
+		}
+		if pageData.Page != nil && pageData.Page.NextCursor != nil && strings.TrimSpace(*pageData.Page.NextCursor) != "" && *pageData.Page.NextCursor != cursor {
+			cursor = strings.TrimSpace(*pageData.Page.NextCursor)
+		} else {
+			cursor = ""
+		}
+	}
+	return diffBuf.String(), receipt, nil
+}
+
+func (b *RyugiBridge) ackReceipt(ctx context.Context, kind, frozenDir, locator, receipt string) error {
+	var args []string
+	if kind == "changes" {
+		args = []string{"changes", "ack", "--project-dir", frozenDir, "--artifact", locator, "--receipt", receipt, "--format", "json"}
+	} else {
+		args = []string{"comment", "ack", "--project-dir", frozenDir, "--artifact", locator, "--receipt", receipt, "--format", "json"}
+	}
+	out, runErr := b.runner.Run(ctx, args...)
+	env, parseErr := parseRyugiEnvelope(out)
+	if parseErr != nil {
+		if runErr != nil {
+			return fmt.Errorf("ryugi %s ack: %w", kind, runErr)
+		}
+		return fmt.Errorf("ryugi %s ack parse: %w", kind, parseErr)
+	}
+	if env.Outcome == "error" {
+		if env.Error != nil {
+			return fmt.Errorf("ryugi %s ack: %s: %s", kind, env.Error.Code, env.Error.Message)
+		}
+		return fmt.Errorf("ryugi %s ack failed", kind)
+	}
+	return nil
+}
+
+// StartPoller starts the periodic active=1 binding poller until ctx is canceled.
+func (b *RyugiBridge) StartPoller(ctx context.Context, wg *sync.WaitGroup) {
+	if b.pollInterval <= 0 {
+		return
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ticker := time.NewTicker(b.pollInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				records, err := b.store.ListRyugiBindings(ctx, "", true)
+				if err != nil {
+					continue
+				}
+				for _, rec := range records {
+					if ctx.Err() != nil {
+						return
+					}
+					_, _ = b.SyncBinding(ctx, rec.BindingID)
+				}
+			}
+		}
+	}()
+}
+
+func parseRyugiEnvelope(raw []byte) (ryugiCLIEnvelope, error) {
+	var env ryugiCLIEnvelope
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return env, fmt.Errorf("empty ryugi CLI output")
+	}
+	if err := json.Unmarshal(trimmed, &env); err != nil {
+		return env, fmt.Errorf("invalid ryugi CLI JSON: %w", err)
+	}
+	return env, nil
+}
+
+func isDocumentLikeArtifact(locator string) bool {
+	return strings.HasPrefix(locator, "document/") || strings.HasPrefix(locator, "slides/")
+}
+
+func isSubmittedState(section, state string, obj map[string]any) bool {
+	s := strings.ToLower(strings.TrimSpace(state))
+	if s == "" || s == "draft" || s == "withdrawn" || s == "open" || s == "empty" || s == "pending" || s == "unanswered" {
+		return false
+	}
+	switch section {
+	case "asks":
+		return s == "submitted" || s == "settled"
+	case "groups":
+		return s == "chosen" || s == "passed" || s == "rejected" || s == "submitted"
+	case "rounds":
+		return s == "submitted" || s == "completed"
+	default:
+		return false
+	}
+}
+
+func firstStringField(obj map[string]any, keys ...string) string {
+	for _, k := range keys {
+		if v, ok := obj[k].(string); ok && strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
+}
+
+func formatStateSectionBody(section, itemID string, obj map[string]any) string {
+	switch section {
+	case "asks":
+		choice, _ := obj["choice"].(string)
+		text, _ := obj["text"].(string)
+		state, _ := obj["state"].(string)
+		val := choice
+		if text != "" {
+			if val != "" {
+				val += " — " + text
+			} else {
+				val = text
+			}
+		}
+		if val == "" {
+			val = state
+		}
+		return fmt.Sprintf("[ask:%s] %s (%s)", itemID, val, state)
+	case "groups":
+		choice := firstStringField(obj, "choice", "boardId", "verdict", "state", "status")
+		note := firstStringField(obj, "text", "note")
+		if note != "" {
+			return fmt.Sprintf("[group:%s] %s — %s", itemID, choice, note)
+		}
+		return fmt.Sprintf("[group:%s] %s", itemID, choice)
+	case "rounds":
+		state := firstStringField(obj, "state", "status")
+		summary := firstStringField(obj, "summary", "text")
+		if summary != "" {
+			return fmt.Sprintf("[round:%s] %s — %s", itemID, state, summary)
+		}
+		return fmt.Sprintf("[round:%s] %s", itemID, state)
+	default:
+		return fmt.Sprintf("[%s:%s]", section, itemID)
+	}
+}
+
+func canonicalJSONHash(v any) string {
+	// Go's encoding/json deterministically sorts map keys lexicographically
+	b, _ := json.Marshal(v)
+	return sha256Hex(string(b))
+}
+
+func sha256Hex(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(sum[:])
+}
+
+// SortedKeys returns deterministic map keys (helper for tests/diagnostics).
+func SortedKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}

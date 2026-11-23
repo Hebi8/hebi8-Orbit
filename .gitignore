@@ -1,0 +1,28 @@
+# Build outputs
+bin/
+*.exe
+*.out
+coverage.out
+
+# Web dependencies & build output (keep .gitkeep so Go embed always compiles)
+web/node_modules/
+web/dist/*
+!web/dist/.gitkeep
+*.tsbuildinfo
+
+# Local runtime data & databases
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.db
+
+# Local private configs (only *.example.yaml belong in git)
+configs/*.yaml
+!configs/*.example.yaml
+
+# OS & editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

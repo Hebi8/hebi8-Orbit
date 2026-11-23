@@ -1,0 +1,69 @@
+# Example machine registry for hebi8-Orbit.
+# Copy to ~/.config/hebi8-orbit/machines.yaml and replace placeholder values.
+schemaVersion: 1
+machines:
+  hub-node:
+    displayName: "hub-node (Primary Hub & Dev)"
+    transport: local_ws
+    tailscaleHost: "orbit.example.ts.net"
+    capabilities: [primary-dev, linux-x64, docker-local, ryugi-host, pa-host]
+    adapters:
+      agy:
+        bin: "/home/orbit/.local/bin/agy"
+        defaultArgs: ["acp", "--stdio", "--process-per-session"]
+        maxLiveWorkers: 8
+        idleCloseSeconds: 1200
+      claude:
+        bin: "claude-agent-acp"
+        maxLiveWorkers: 4
+        idleCloseSeconds: 900
+      codex:
+        bin: "codex-acp"
+        maxLiveWorkers: 4
+        idleCloseSeconds: 900
+    exclusiveResources: {}
+
+  mac-node:
+    displayName: "mac-node (macOS / Xcode / Browser)"
+    transport: remote_ws
+    tailscaleHost: "mac-node.example.ts.net"
+    tokenHash: "sha256:replace-with-sha256-of-runner-token"
+    capabilities: [macos-env, xcode, ios-sim, logged-in-browser]
+    adapters:
+      agy:
+        bin: "/Users/orbit/.local/bin/agy"
+        defaultArgs: ["acp", "--stdio", "--process-per-session"]
+        maxLiveWorkers: 6
+        idleCloseSeconds: 900
+    exclusiveResources:
+      macos_gui:
+        probe: "macos_screen_unlocked"
+        description: "macOS desktop unlocked"
+      chrome_logged_in:
+        probe: "opencli_chrome_ready"
+        description: "Logged-in browser available"
+      xcode_sim:
+        probe: "xcode_sim_available"
+        description: "Exclusive iOS simulator slot"
+
+  aux-node:
+    displayName: "aux-node (Auxiliary Linux)"
+    transport: remote_ws
+    tailscaleHost: "aux-node.example.ts.net"
+    tokenHash: "sha256:replace-with-sha256-of-runner-token"
+    capabilities: [aux-linux]
+    adapters:
+      agy:
+        bin: "/home/orbit/.local/bin/agy"
+        defaultArgs: ["acp", "--stdio", "--process-per-session"]
+        maxLiveWorkers: 3
+        idleCloseSeconds: 600
+    exclusiveResources: {}
+
+  deploy-vps:
+    displayName: "deploy-vps (Outbound SSH Target)"
+    transport: ssh_outbound
+    sshAlias: "deploy-vps"
+    capabilities: [deploy-node]
+    adapters: {}
+    exclusiveResources: {}
