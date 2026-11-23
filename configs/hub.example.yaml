@@ -13,8 +13,13 @@ allowedTailscaleLogins:
   - "user@example.com"
 
 # Ryugi sidecar settings (black-box CLI bridge).
+# When proxying via tailscale serve on a Tailnet host, set ryugiHost to the
+# node's Tailscale IP and ryugiUrlHost to the MagicDNS host so Ryugi enables
+# key-authenticated access and accepts the proxied Host header.
 ryugiBin: "ryugi"
 ryugiServerHome: "~/.local/share/hebi8-orbit/ryugi-home"
+ryugiHost: "127.0.0.1"
+ryugiUrlHost: ""
 ryugiPort: 27319
 ryugiPublicOrigin: "https://orbit.example.ts.net:8443"
 ryugiPollIntervalSeconds: 6

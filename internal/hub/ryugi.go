@@ -86,6 +86,8 @@ type RyugiBridge struct {
 	broker       *EventBroker
 	runner       RyugiRunner
 	dataDir      string
+	host         string
+	urlHost      string
 	port         int
 	publicOrigin string
 	pollInterval time.Duration
@@ -106,6 +108,8 @@ type RyugiBridgeConfig struct {
 	Broker       *EventBroker
 	Runner       RyugiRunner
 	DataDir      string
+	Host         string
+	URLHost      string
 	Port         int
 	PublicOrigin string
 	PollInterval time.Duration
@@ -122,6 +126,8 @@ func NewRyugiBridge(cfg RyugiBridgeConfig) *RyugiBridge {
 		broker:       cfg.Broker,
 		runner:       cfg.Runner,
 		dataDir:      cfg.DataDir,
+		host:         strings.TrimSpace(cfg.Host),
+		urlHost:      strings.TrimSpace(cfg.URLHost),
 		port:         cfg.Port,
 		publicOrigin: cfg.PublicOrigin,
 		pollInterval: interval,
@@ -309,6 +315,12 @@ func (b *RyugiBridge) RegisterDelivery(ctx context.Context, deliveryID string) (
 	var regErrors []string
 	for _, art := range exported {
 		args := []string{"start", "--background", "--no-open"}
+		if b.host != "" {
+			args = append(args, "--host", b.host)
+		}
+		if b.urlHost != "" {
+			args = append(args, "--url-host", b.urlHost)
+		}
 		if b.port > 0 {
 			args = append(args, "--port", strconv.Itoa(b.port))
 		}

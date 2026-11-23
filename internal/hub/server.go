@@ -99,6 +99,8 @@ func NewServer(ctx context.Context, opts ServerOptions) (*Server, error) {
 		Broker:       broker,
 		Runner:       runner,
 		DataDir:      cfg.DataDir,
+		Host:         cfg.RyugiHost,
+		URLHost:      cfg.RyugiURLHost,
 		Port:         cfg.RyugiPort,
 		PublicOrigin: cfg.RyugiPublicOrigin,
 		PollInterval: time.Duration(cfg.RyugiPollIntervalSeconds) * time.Second,

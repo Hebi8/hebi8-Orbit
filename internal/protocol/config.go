@@ -20,6 +20,8 @@ type HubConfig struct {
 	AllowedTailscaleLogins   []string `yaml:"allowedTailscaleLogins" json:"allowedTailscaleLogins"`
 	RyugiBin                 string   `yaml:"ryugiBin" json:"ryugiBin"`
 	RyugiServerHome          string   `yaml:"ryugiServerHome" json:"ryugiServerHome"`
+	RyugiHost                string   `yaml:"ryugiHost,omitempty" json:"ryugiHost,omitempty"`
+	RyugiURLHost             string   `yaml:"ryugiUrlHost,omitempty" json:"ryugiUrlHost,omitempty"`
 	RyugiPort                int      `yaml:"ryugiPort" json:"ryugiPort"`
 	RyugiPublicOrigin        string   `yaml:"ryugiPublicOrigin" json:"ryugiPublicOrigin"`
 	RyugiPollIntervalSeconds int      `yaml:"ryugiPollIntervalSeconds" json:"ryugiPollIntervalSeconds"`
