@@ -27,15 +27,19 @@ func runCmd(t *testing.T, dir string, env []string, name string, args ...string)
 	return strings.TrimSpace(string(out))
 }
 
-func initTestRepo(t *testing.T) (string, string) {
-	t.Helper()
-	repo := t.TempDir()
-	env := append(os.Environ(),
+func testGitEnv() []string {
+	return append(os.Environ(),
 		"GIT_AUTHOR_NAME=Tester",
 		"GIT_AUTHOR_EMAIL=tester@example.com",
 		"GIT_COMMITTER_NAME=Tester",
 		"GIT_COMMITTER_EMAIL=tester@example.com",
 	)
+}
+
+func initTestRepo(t *testing.T) (string, string) {
+	t.Helper()
+	repo := t.TempDir()
+	env := testGitEnv()
 	runCmd(t, repo, env, "git", "init", "-b", "main")
 	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# Demo\nline 1\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -54,7 +58,6 @@ func TestPackageCheckpoint_ZeroPollutionAndDualBaseline(t *testing.T) {
 	repo, baseSHA := initTestRepo(t)
 	mirror := filepath.Join(t.TempDir(), "demo.git")
 
-	// Create staged edit, unstaged edit, untracked file, and ignored file
 	if err := os.WriteFile(filepath.Join(repo, "staged.txt"), []byte("staged content\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -92,10 +95,9 @@ func TestPackageCheckpoint_ZeroPollutionAndDualBaseline(t *testing.T) {
 		t.Fatalf("unexpected baselines: review=%s parent=%s expected=%s", pkg.ReviewBaseSHA, pkg.CommitParentSHA, baseSHA)
 	}
 	if pkg.Manifest.FilesChanged != 3 {
-		t.Fatalf("expected 3 changed files (staged, README, untracked; excluding ignored.log), got %d", pkg.Manifest.FilesChanged)
+		t.Fatalf("expected 3 changed files, got %d", pkg.Manifest.FilesChanged)
 	}
 
-	// Push to bare mirror and check diff
 	if err := gitops.PushDeliveryRef(ctx, repo, mirror, pkg.DeliveryID, pkg.HeadSHA); err != nil {
 		t.Fatalf("PushDeliveryRef failed: %v", err)
 	}
@@ -107,14 +109,8 @@ func TestPackageCheckpoint_ZeroPollutionAndDualBaseline(t *testing.T) {
 		t.Fatalf("unexpected diff result: files=%+v diff=%s", files, diffText)
 	}
 
-	// Now commit all changes normally in repo -> working tree is CLEAN.
-	// Passing ReviewBaseSHA = baseSHA MUST reuse HEAD (no empty commit) AND still yield NON-EMPTY diff!
-	env := append(os.Environ(),
-		"GIT_AUTHOR_NAME=Tester",
-		"GIT_AUTHOR_EMAIL=tester@example.com",
-		"GIT_COMMITTER_NAME=Tester",
-		"GIT_COMMITTER_EMAIL=tester@example.com",
-	)
+	// Commit normally -> working tree clean -> passing ReviewBaseSHA reuses HEAD AND yields non-empty diff
+	env := testGitEnv()
 	runCmd(t, repo, env, "git", "add", "-A")
 	runCmd(t, repo, env, "git", "commit", "-m", "agent committed changes")
 	committedHead := runCmd(t, repo, env, "git", "rev-parse", "HEAD")
@@ -146,11 +142,80 @@ func TestPackageCheckpoint_ZeroPollutionAndDualBaseline(t *testing.T) {
 	}
 }
 
+func TestPackageCheckpoint_UnicodePathsAndSubdirectoryInvocation(t *testing.T) {
+	ctx := context.Background()
+	repo, _ := initTestRepo(t)
+	mirror := filepath.Join(t.TempDir(), "mirror.git")
+	env := testGitEnv()
+
+	// Create Chinese/non-ASCII path with spaces and glob metacharacters, plus a subdirectory
+	subDir := filepath.Join(repo, "设计稿", "子目录")
+	if err := os.MkdirAll(subDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	origFile := filepath.Join(subDir, "首页 方案[v1].md")
+	if err := os.WriteFile(origFile, []byte("line one\nline two\nline three\nline four\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, repo, env, "git", "add", "-A")
+	runCmd(t, repo, env, "git", "commit", "-m", "add unicode file")
+	baseSHA := runCmd(t, repo, env, "git", "rev-parse", "HEAD")
+
+	// Rename unicode file and edit a line, plus add a root-level dirty file
+	renamedFile := filepath.Join(subDir, "首页 方案[v2].md")
+	if err := os.Rename(origFile, renamedFile); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(renamedFile, []byte("line one\nline two updated\nline three\nline four\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "根目录变更.txt"), []byte("from root\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Invoke PackageCheckpoint from nested subdirectory -> must package whole repo cleanly!
+	pkg, err := gitops.PackageCheckpoint(ctx, gitops.PackageOptions{
+		RepoDir:       subDir,
+		DeliveryID:    "dlv_01UNICODE000000000001",
+		ReviewBaseSHA: baseSHA,
+	})
+	if err != nil {
+		t.Fatalf("PackageCheckpoint from subdir failed: %v", err)
+	}
+	if pkg.RepoRoot != repo {
+		t.Fatalf("expected RepoRoot=%s, got %s", repo, pkg.RepoRoot)
+	}
+	if pkg.Manifest.FilesChanged != 2 {
+		t.Fatalf("expected 2 changed files (renamed unicode + root file), got %d", pkg.Manifest.FilesChanged)
+	}
+
+	if err := gitops.PushDeliveryRef(ctx, subDir, mirror, pkg.DeliveryID, pkg.HeadSHA); err != nil {
+		t.Fatalf("PushDeliveryRef from subdir failed: %v", err)
+	}
+
+	targetRel := "设计稿/子目录/首页 方案[v2].md"
+	files, diffText, err := gitops.ComputeMirrorDiff(ctx, mirror, baseSHA, pkg.HeadSHA, targetRel)
+	if err != nil {
+		t.Fatalf("ComputeMirrorDiff literal unicode path failed: %v", err)
+	}
+	foundRename := false
+	for _, f := range files {
+		if f.Path == targetRel && f.Status == "renamed" && f.OldPath == "设计稿/子目录/首页 方案[v1].md" {
+			foundRename = true
+		}
+	}
+	if !foundRename {
+		t.Fatalf("expected renamed unicode file stat, got %+v", files)
+	}
+	if !strings.Contains(diffText, "line two updated") || strings.Contains(diffText, "from root") {
+		t.Fatalf("literal single-file unicode diff unexpected:\n%s", diffText)
+	}
+}
+
 func TestPackageCheckpoint_AttachmentCollision(t *testing.T) {
 	ctx := context.Background()
 	repo, _ := initTestRepo(t)
 
-	// Colliding with README.md in git tree MUST fail
 	_, err := gitops.PackageCheckpoint(ctx, gitops.PackageOptions{
 		RepoDir:    repo,
 		DeliveryID: "dlv_01ATTACHCONFLICT000001",
@@ -162,7 +227,6 @@ func TestPackageCheckpoint_AttachmentCollision(t *testing.T) {
 		t.Fatalf("expected ErrAttachmentConflict, got %v", err)
 	}
 
-	// External non-colliding file MUST succeed with sha256
 	extFile := filepath.Join(t.TempDir(), "mockup.png")
 	if err := os.WriteFile(extFile, []byte("fake-png-bytes"), 0o644); err != nil {
 		t.Fatal(err)
@@ -186,14 +250,8 @@ func TestBareMirror_PreReceiveIdempotencyAndImmutability(t *testing.T) {
 	ctx := context.Background()
 	repo, sha1 := initTestRepo(t)
 	mirror := filepath.Join(t.TempDir(), "mirror.git")
+	env := testGitEnv()
 
-	// Create a second commit sha2
-	env := append(os.Environ(),
-		"GIT_AUTHOR_NAME=Tester",
-		"GIT_AUTHOR_EMAIL=tester@example.com",
-		"GIT_COMMITTER_NAME=Tester",
-		"GIT_COMMITTER_EMAIL=tester@example.com",
-	)
 	if err := os.WriteFile(filepath.Join(repo, "second.txt"), []byte("v2\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -203,30 +261,21 @@ func TestBareMirror_PreReceiveIdempotencyAndImmutability(t *testing.T) {
 
 	dlvID := "dlv_01PRERECEIVE0000000001"
 
-	// 1. First push -> succeeds
 	if err := gitops.PushDeliveryRef(ctx, repo, mirror, dlvID, sha1); err != nil {
 		t.Fatalf("first push failed: %v", err)
 	}
-
-	// 2. Same SHA retry -> idempotent success
 	if err := gitops.PushDeliveryRef(ctx, repo, mirror, dlvID, sha1); err != nil {
 		t.Fatalf("idempotent same-SHA push failed: %v", err)
 	}
-
-	// 3. Different SHA to same delivery ref -> rejected with ErrDeliveryRefConflict
 	err := gitops.PushDeliveryRef(ctx, repo, mirror, dlvID, sha2)
 	if !errors.Is(err, gitops.ErrDeliveryRefConflict) {
 		t.Fatalf("expected ErrDeliveryRefConflict on different SHA overwrite, got %v", err)
 	}
-
-	// 4. Deleting the delivery ref -> rejected by pre-receive
 	delCmd := exec.Command("git", "push", mirror, ":refs/orbit/deliveries/"+dlvID)
 	delCmd.Dir = repo
 	if out, err := delCmd.CombinedOutput(); err == nil {
 		t.Fatalf("expected delete of delivery ref to be rejected, succeeded: %s", string(out))
 	}
-
-	// 5. Pushing to non-delivery ref (refs/heads/main) -> rejected by pre-receive
 	branchCmd := exec.Command("git", "push", mirror, "HEAD:refs/heads/main")
 	branchCmd.Dir = repo
 	if out, err := branchCmd.CombinedOutput(); err == nil {
@@ -234,17 +283,19 @@ func TestBareMirror_PreReceiveIdempotencyAndImmutability(t *testing.T) {
 	}
 }
 
-func TestExportFrozenSnapshot_DeterministicIDAndPermissions(t *testing.T) {
+func TestExportFrozenSnapshot_DeterministicIDPermissionsAndRecalibration(t *testing.T) {
 	ctx := context.Background()
 	repo, _ := initTestRepo(t)
 	mirror := filepath.Join(t.TempDir(), "mirror.git")
 
-	// Add a Ryugi document artifact to the repo
 	artDir := filepath.Join(repo, ".ryugi", "artifacts", "document", "v1-spec")
-	if err := os.MkdirAll(artDir, 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Join(artDir, "assets"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(artDir, "doc.xml"), []byte("<doc><h1 id=\"h1\">Spec</h1></doc>\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(artDir, "assets", "pic.txt"), []byte("asset"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -298,75 +349,100 @@ func TestExportFrozenSnapshot_DeterministicIDAndPermissions(t *testing.T) {
 		t.Fatalf("two distinct deliveries MUST NOT share the same .artifact-id: %s", exp1[0].DerivedArtifactID)
 	}
 
-	// Verify file permissions: source file 0444, artifact dir 0555, .ryugi/artifacts 0555, .state 0755
-	docStat, err := os.Stat(filepath.Join(snap1, ".ryugi", "artifacts", "document", "v1-spec", "doc.xml"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if docStat.Mode().Perm() != 0o444 {
-		t.Fatalf("expected doc.xml mode 0444, got %04o", docStat.Mode().Perm())
-	}
-	artDirStat, err := os.Stat(filepath.Join(snap1, ".ryugi", "artifacts", "document", "v1-spec"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if artDirStat.Mode().Perm() != 0o555 {
-		t.Fatalf("expected artifact dir mode 0555, got %04o", artDirStat.Mode().Perm())
-	}
-	rootArtStat, err := os.Stat(filepath.Join(snap1, ".ryugi", "artifacts"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if rootArtStat.Mode().Perm() != 0o555 {
-		t.Fatalf("expected .ryugi/artifacts mode 0555, got %04o", rootArtStat.Mode().Perm())
-	}
-	stateStat, err := os.Stat(filepath.Join(snap1, ".ryugi", "artifacts", ".state"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if stateStat.Mode().Perm() != 0o755 {
-		t.Fatalf("expected .ryugi/artifacts/.state mode 0755, got %04o", stateStat.Mode().Perm())
-	}
-
-	// Verify writing inside .state succeeds while replacing doc.xml fails (non-root)
-	if os.Geteuid() != 0 {
-		if err := os.WriteFile(filepath.Join(snap1, ".ryugi", "artifacts", "document", "v1-spec", "tamper.txt"), []byte("no"), 0o644); err == nil {
-			t.Fatalf("expected writing into frozen 0555 artifact dir to fail")
+	// Verify model: source files 0444, <artifactDir> 0755, nested subdirs 0555, <type> 0555, .ryugi/artifacts 0555, .state 0755
+	checkPerm := func(p string, want os.FileMode) {
+		t.Helper()
+		st, err := os.Stat(p)
+		if err != nil {
+			t.Fatalf("stat %s: %v", p, err)
+		}
+		if st.Mode().Perm() != want {
+			t.Fatalf("%s perm=%04o want=%04o", p, st.Mode().Perm(), want)
 		}
 	}
-	if err := os.WriteFile(filepath.Join(snap1, ".ryugi", "artifacts", ".state", "probe.json"), []byte("{}"), 0o644); err != nil {
-		t.Fatalf("expected writing into 0755 .state dir to succeed: %v", err)
+	specDir := filepath.Join(snap1, ".ryugi", "artifacts", "document", "v1-spec")
+	checkPerm(filepath.Join(specDir, "doc.xml"), 0o444)
+	checkPerm(filepath.Join(specDir, ".artifact-id"), 0o444)
+	checkPerm(filepath.Join(specDir, "assets"), 0o555)
+	checkPerm(filepath.Join(specDir, "assets", "pic.txt"), 0o444)
+	checkPerm(specDir, 0o755)
+	checkPerm(filepath.Join(snap1, ".ryugi", "artifacts", "document"), 0o555)
+	checkPerm(filepath.Join(snap1, ".ryugi", "artifacts"), 0o555)
+	checkPerm(filepath.Join(snap1, ".ryugi", "artifacts", ".state"), 0o755)
+
+	// Simulate an older snapshot with 0555 <artifactDir> and verify fast-path ExportFrozenSnapshot recalibrates it to 0755
+	if err := os.Chmod(specDir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gitops.ExportFrozenSnapshot(ctx, mirror, pkg1.HeadSHA, pkg1.DeliveryID, snap1); err != nil {
+		t.Fatalf("fast-path recalibration failed: %v", err)
+	}
+	checkPerm(specDir, 0o755)
+	if err := os.WriteFile(filepath.Join(specDir, "comments.json"), []byte(`{"version":1,"threads":[]}`), 0o644); err != nil {
+		t.Fatalf("expected writing comments.json inside 0755 artifactDir to succeed: %v", err)
 	}
 }
 
-func TestPackageCheckpoint_DirtySubmoduleRejected(t *testing.T) {
+func TestPackageCheckpoint_DirtySubmoduleHeadAdvanceAndWorkingTreeEdit(t *testing.T) {
 	ctx := context.Background()
 	subRepo, _ := initTestRepo(t)
 	mainRepo, _ := initTestRepo(t)
+	env := testGitEnv()
 
-	env := append(os.Environ(),
-		"GIT_AUTHOR_NAME=Tester",
-		"GIT_AUTHOR_EMAIL=tester@example.com",
-		"GIT_COMMITTER_NAME=Tester",
-		"GIT_COMMITTER_EMAIL=tester@example.com",
-	)
 	runCmd(t, mainRepo, env, "git", "-c", "protocol.file.allow=always", "submodule", "add", subRepo, "deps/sub")
 	runCmd(t, mainRepo, env, "git", "commit", "-m", "add submodule")
 
-	// Advance commit inside submodule so mainRepo sees '+' dirty submodule
-	subDir := filepath.Join(mainRepo, "deps", "sub")
-	if err := os.WriteFile(filepath.Join(subDir, "extra.txt"), []byte("dirty\n"), 0o644); err != nil {
+	subDir := filepath.Join(mainRepo, "deps/sub")
+
+	// Case 1: Submodule HEAD unchanged, but working tree has uncommitted modification -> MUST be rejected!
+	if err := os.WriteFile(filepath.Join(subDir, "README.md"), []byte("dirty working tree in submodule\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	runCmd(t, subDir, env, "git", "add", "extra.txt")
-	runCmd(t, subDir, env, "git", "commit", "-m", "advance sub")
-
 	_, err := gitops.PackageCheckpoint(ctx, gitops.PackageOptions{
 		RepoDir:    mainRepo,
-		DeliveryID: "dlv_01SUBMODULE00000000001",
+		DeliveryID: "dlv_01SUBDIRTYWT00000001",
 	})
 	if !errors.Is(err, gitops.ErrDirtySubmodule) {
-		t.Fatalf("expected ErrDirtySubmodule, got %v", err)
+		t.Fatalf("expected ErrDirtySubmodule for uncommitted submodule working tree edit, got %v", err)
+	}
+
+	// Case 2: Commit inside submodule so HEAD advances ('+' flag) -> MUST also be rejected!
+	runCmd(t, subDir, env, "git", "add", "-A")
+	runCmd(t, subDir, env, "git", "commit", "-m", "advance sub head")
+	_, err = gitops.PackageCheckpoint(ctx, gitops.PackageOptions{
+		RepoDir:    mainRepo,
+		DeliveryID: "dlv_01SUBHEADADV00000001",
+	})
+	if !errors.Is(err, gitops.ErrDirtySubmodule) {
+		t.Fatalf("expected ErrDirtySubmodule for advanced submodule HEAD, got %v", err)
 	}
 }
 
+func TestPackageCheckpoint_UnregisteredNestedGitRepoRejected(t *testing.T) {
+	ctx := context.Background()
+	mainRepo, _ := initTestRepo(t)
+	env := testGitEnv()
+
+	// Create an unregistered nested git repository inside mainRepo (no .gitmodules entry)
+	nestedDir := filepath.Join(mainRepo, "vendor", "nested-lib")
+	if err := os.MkdirAll(nestedDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, nestedDir, env, "git", "init", "-b", "main")
+	if err := os.WriteFile(filepath.Join(nestedDir, "lib.go"), []byte("package lib\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, nestedDir, env, "git", "add", ".")
+	runCmd(t, nestedDir, env, "git", "commit", "-m", "nested init")
+
+	_, err := gitops.PackageCheckpoint(ctx, gitops.PackageOptions{
+		RepoDir:    mainRepo,
+		DeliveryID: "dlv_01NESTEDGIT000000001",
+	})
+	if !errors.Is(err, gitops.ErrUnregisteredSubmodule) {
+		t.Fatalf("expected ErrUnregisteredSubmodule for unregistered nested .git dir, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "vendor/nested-lib") {
+		t.Fatalf("expected error to name offending path vendor/nested-lib, got: %v", err)
+	}
+}

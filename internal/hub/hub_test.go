@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -221,6 +223,55 @@ func TestAuthAndCrossOriginDefense(t *testing.T) {
 	if err == nil || wsResp == nil || wsResp.StatusCode != http.StatusForbidden {
 		t.Fatalf("expected WS 403 for :8443 origin, got err=%v resp=%v", err, wsResp)
 	}
+
+	// 9. Tailscale-authenticated write WITHOUT Origin header -> 403 (Blocking #6)
+	req, _ = http.NewRequest(http.MethodPost, ts.URL+"/api/admin/gc-pause", strings.NewReader(`{"paused":false}`))
+	req.Header.Set("Tailscale-User-Login", "user@example.com")
+	req.Header.Set("X-Orbit-Request", "1")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 for Tailscale write without Origin header, got %d", resp.StatusCode)
+	}
+
+	// 10. ValidateListenAddr rejects non-loopback in production mode (!DevOpen)
+	for _, badAddr := range []string{"0.0.0.0:4310", ":4310", "[::]:4310", "192.168.1.10:4310"} {
+		badCfg := protocol.DefaultHubConfig()
+		badCfg.DevOpen = false
+		badCfg.ListenAddr = badAddr
+		if err := hub.ValidateListenAddr(badCfg); err == nil {
+			t.Fatalf("expected ValidateListenAddr to reject non-loopback %q", badAddr)
+		}
+	}
+	for _, okAddr := range []string{"127.0.0.1:4310", "[::1]:4310", "localhost:4310"} {
+		okCfg := protocol.DefaultHubConfig()
+		okCfg.DevOpen = false
+		okCfg.ListenAddr = okAddr
+		if err := hub.ValidateListenAddr(okCfg); err != nil {
+			t.Fatalf("expected ValidateListenAddr to allow loopback %q, got %v", okAddr, err)
+		}
+	}
+
+	// 11. Local CLI write via X-Orbit-Dev-Token WITHOUT Origin succeeds on loopback
+	srvTok, _, _, _ := setupTestHub(t, func(c *protocol.HubConfig) {
+		c.DevToken = "secret-cli-tok"
+	}, &fakeRyugiRunner{})
+	tsTok := httptest.NewServer(srvTok.Handler())
+	defer tsTok.Close()
+	req, _ = http.NewRequest(http.MethodPost, tsTok.URL+"/api/admin/gc-pause", strings.NewReader(`{"paused":true}`))
+	req.Header.Set("X-Orbit-Dev-Token", "secret-cli-tok")
+	req.Header.Set("X-Orbit-Request", "1")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 for loopback CLI dev-token write without Origin, got %d", resp.StatusCode)
+	}
 }
 
 func TestBlobsStreamingSHA256AndAnnotationsIdempotency(t *testing.T) {
@@ -246,7 +297,34 @@ func TestBlobsStreamingSHA256AndAnnotationsIdempotency(t *testing.T) {
 		t.Fatalf("expected 400 for sha256 mismatch, got %d", resp.StatusCode)
 	}
 
-	// 2. Blob PUT valid -> 200, HEAD -> 200, GET -> exact bytes
+	// 2. HTML Blob PUT valid -> 200, HEAD -> 200, GET -> exact bytes with safe octet-stream + attachment headers (Blocking #5)
+	htmlPayload := []byte("<!doctype html><html><body><script>alert(1)</script></body></html>")
+	htmlSum := sha256.Sum256(htmlPayload)
+	htmlHex := hex.EncodeToString(htmlSum[:])
+	req, _ = http.NewRequest(http.MethodPut, ts.URL+"/api/blobs/"+htmlHex, bytes.NewReader(htmlPayload))
+	req.Header.Set("X-Orbit-Request", "1")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 for HTML blob PUT, got %d", resp.StatusCode)
+	}
+	htmlGet, err := http.Get(ts.URL + "/api/blobs/" + htmlHex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	htmlGet.Body.Close()
+	if htmlGet.Header.Get("Content-Type") != "application/octet-stream" ||
+		!strings.Contains(htmlGet.Header.Get("Content-Disposition"), "attachment;") ||
+		htmlGet.Header.Get("X-Content-Type-Options") != "nosniff" {
+		t.Fatalf("unsafe blob response headers: ct=%q cd=%q nosniff=%q",
+			htmlGet.Header.Get("Content-Type"),
+			htmlGet.Header.Get("Content-Disposition"),
+			htmlGet.Header.Get("X-Content-Type-Options"))
+	}
+
 	req, _ = http.NewRequest(http.MethodPut, ts.URL+"/api/blobs/"+goodHex, bytes.NewReader(payload))
 	req.Header.Set("X-Orbit-Request", "1")
 	resp, err = http.DefaultClient.Do(req)
@@ -356,8 +434,56 @@ func TestBlobsStreamingSHA256AndAnnotationsIdempotency(t *testing.T) {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusCreated || importResp.Delivery.DeliveryID != dlvID {
-		t.Fatalf("expected 201 manual-import, got %d %+v", resp.StatusCode, importResp)
+	if resp.StatusCode != http.StatusCreated || !importResp.Created || importResp.Delivery.DeliveryID != dlvID {
+		t.Fatalf("expected 201 created manual-import, got %d %+v", resp.StatusCode, importResp)
+	}
+
+	// Idempotent replay with identical fields -> 200 OK, created=false
+	req, _ = http.NewRequest(http.MethodPost, ts.URL+"/api/deliveries/manual-import", bytes.NewReader(importBody))
+	req.Header.Set("X-Orbit-Request", "1")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var replayResp protocol.ManualImportResponse
+	_ = json.NewDecoder(resp.Body).Decode(&replayResp)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || replayResp.Created {
+		t.Fatalf("expected 200 idempotent manual-import replay with created=false, got %d %+v", resp.StatusCode, replayResp)
+	}
+
+	// Conflicting manual-import reusing same deliveryId with different baseSha -> 409 Conflict (Blocking #3)
+	conflictBody, _ := json.Marshal(protocol.ManualImportRequest{
+		DeliveryID: dlvID,
+		ProjectID:  "demo-app",
+		Summary:    "conflict",
+		BaseSHA:    pkg.HeadSHA, // different baseSha!
+		HeadSHA:    pkg.HeadSHA,
+		GitRef:     "refs/orbit/deliveries/" + dlvID,
+	})
+	req, _ = http.NewRequest(http.MethodPost, ts.URL+"/api/deliveries/manual-import", bytes.NewReader(conflictBody))
+	req.Header.Set("X-Orbit-Request", "1")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict for mismatched existing deliveryId, got %d", resp.StatusCode)
+	}
+
+	// Complete review endpoint resolves inbox item
+	req, _ = http.NewRequest(http.MethodPost, ts.URL+"/api/deliveries/"+dlvID+"/complete-review", nil)
+	req.Header.Set("X-Orbit-Request", "1")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var crResp protocol.CompleteReviewResponse
+	_ = json.NewDecoder(resp.Body).Decode(&crResp)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || crResp.InboxState != protocol.InboxResolved {
+		t.Fatalf("expected 200 resolved complete-review, got %d %+v", resp.StatusCode, crResp)
 	}
 
 	// Verify WS receives live events (task.created + delivery.published)
@@ -665,5 +791,286 @@ func TestRyugiBridge_NoAckWhenSQLiteCommitFails(t *testing.T) {
 	}
 	if ackCalled {
 		t.Fatalf("CRITICAL VIOLATION: ryugi ack was called even though SQLite COMMIT failed!")
+	}
+}
+
+// Blocking #10 & #11 & #1:
+// - Two paginated comment pages with DIFFERENT receipts -> BOTH receipts acked
+// - Malformed thread JSON -> returns error and invokes ZERO acks
+// - Document changes error surfaced verbatim in Errors[] (never silently swallowed)
+// - A -> B -> A ask transition emits 3 distinct annotations (v1, v2, v3)
+// - GC pause blocks manual Ryugi sync with ErrSyncPaused (409)
+func TestRyugiBridge_MultiPageReceiptsMalformedNoAckChangesErrorAndABATransition(t *testing.T) {
+	var mu sync.Mutex
+	ackedReceipts := []string{}
+	mode := "two_pages_aba"
+	askChoice := "A"
+
+	fake := &fakeRyugiRunner{
+		handler: func(args []string) ([]byte, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			joined := strings.Join(args, " ")
+			switch {
+			case strings.HasPrefix(joined, "start "):
+				return []byte(`{"schema":"ryugi.cli/v1","command":"start","outcome":"success","data":{"url":"http://localhost:27319/document/MultiRcpt123456789012"}}`), nil
+
+			case strings.HasPrefix(joined, "comment list --sections all"):
+				if mode == "malformed" {
+					return []byte(`{"schema":"ryugi.cli/v1","command":"comment.list","outcome":"success","data":{"artifact":"document/spec","sections":{"threads":{"items":["not-an-object"],"receipt":"rcpt-bad-must-not-ack","page":{"hasMore":false,"nextCursor":null}}}}}`), nil
+				}
+				if mode == "two_pages_aba" {
+					return []byte(`{"schema":"ryugi.cli/v1","command":"comment.list","outcome":"success","data":{"artifact":"document/spec","sections":{"threads":{"items":[{"id":"t1","anchor":{"blockId":"p1"},"status":"open","messages":[{"id":"m1","author":"human","text":"Page 1 note"}]}],"snapshot":"s1","receipt":"rcpt-page-1","page":{"hasMore":true,"nextCursor":"cur-p2","snapshot":"s1"}},"asks":{"items":[{"id":"q1","state":"submitted","choice":"` + askChoice + `"}],"page":{"hasMore":false,"nextCursor":null}}}}}`), nil
+				}
+				return []byte(`{"schema":"ryugi.cli/v1","command":"comment.list","outcome":"success","data":{"artifact":"document/spec","sections":{"threads":{"items":[],"page":{"hasMore":false,"nextCursor":null}},"asks":{"items":[{"id":"q1","state":"submitted","choice":"` + askChoice + `"}],"page":{"hasMore":false,"nextCursor":null}}}}}`), nil
+
+			case strings.HasPrefix(joined, "comment list --section threads") && strings.Contains(joined, "--cursor cur-p2"):
+				return []byte(`{"schema":"ryugi.cli/v1","command":"comment.list","outcome":"success","data":{"artifact":"document/spec","sections":{"threads":{"items":[{"id":"t2","anchor":{"blockId":"p2"},"status":"open","messages":[{"id":"m2","author":"human","text":"Page 2 note"}]}],"snapshot":"s1","receipt":"rcpt-page-2","page":{"hasMore":false,"nextCursor":null,"snapshot":"s1"}}}}}`), nil
+
+			case strings.HasPrefix(joined, "changes --detail"):
+				if mode == "changes_error" {
+					return []byte(`{"schema":"ryugi.cli/v1","command":"changes","outcome":"error","error":{"code":"E_REVIEW_FAILED","message":"EACCES: cannot read doc.xml"}}`), nil
+				}
+				return []byte(`{"schema":"ryugi.cli/v1","command":"changes","outcome":"success","data":{"artifact":"document/spec","empty":true,"diff":""}}`), nil
+
+			case strings.HasPrefix(joined, "comment ack"):
+				for i := 0; i < len(args)-1; i++ {
+					if args[i] == "--receipt" {
+						ackedReceipts = append(ackedReceipts, args[i+1])
+					}
+				}
+				return []byte(`{"schema":"ryugi.cli/v1","command":"comment.ack","outcome":"success","data":{"status":"acknowledged"}}`), nil
+			}
+			return []byte(`{"schema":"ryugi.cli/v1","outcome":"success","data":{}}`), nil
+		},
+	}
+
+	srv, st, _, dataDir := setupTestHub(t, func(c *protocol.HubConfig) { c.DevOpen = true }, fake)
+	ctx := context.Background()
+
+	repo := t.TempDir()
+	gitEnv := append(os.Environ(),
+		"GIT_AUTHOR_NAME=Tester", "GIT_AUTHOR_EMAIL=tester@example.com",
+		"GIT_COMMITTER_NAME=Tester", "GIT_COMMITTER_EMAIL=tester@example.com",
+	)
+	runG := func(args ...string) {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repo
+		cmd.Env = gitEnv
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, string(out))
+		}
+	}
+	runG("init", "-b", "main")
+	artDir := filepath.Join(repo, ".ryugi", "artifacts", "document", "spec")
+	_ = os.MkdirAll(artDir, 0o755)
+	_ = os.WriteFile(filepath.Join(artDir, "doc.xml"), []byte("<doc><p id=\"p1\">Hello</p></doc>\n"), 0o644)
+	runG("add", ".")
+	runG("commit", "-m", "add doc")
+
+	dlvID := "dlv_01MULTIRCPT000000001"
+	pkg, err := gitops.PackageCheckpoint(ctx, gitops.PackageOptions{RepoDir: repo, DeliveryID: dlvID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gitops.PushDeliveryRef(ctx, repo, filepath.Join(dataDir, "git", "demo-app.git"), dlvID, pkg.HeadSHA); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = gitops.RemoveFrozenDir(filepath.Join(dataDir, "deliveries", dlvID)) })
+
+	_, err = st.CreateManualImportDelivery(ctx, store.ManualImportParams{
+		DeliveryID:   dlvID,
+		ProjectID:    "demo-app",
+		Title:        "Multi-Receipt Test",
+		Summary:      "Test multi-page receipts & A->B->A",
+		RepoIdentity: "github.com/example-org/demo-app",
+		BaseSHA:      pkg.ReviewBaseSHA,
+		HeadSHA:      pkg.HeadSHA,
+		GitRef:       "refs/orbit/deliveries/" + dlvID,
+		Manifest:     pkg.Manifest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bindings, err := srv.RyugiBridge().RegisterDelivery(ctx, dlvID)
+	if err != nil || len(bindings) != 1 {
+		t.Fatalf("RegisterDelivery failed: %v", err)
+	}
+
+	// 1. Two pages with DIFFERENT receipts + initial ask = A -> BOTH rcpt-page-1 & rcpt-page-2 MUST be acked!
+	r1, err := srv.RyugiBridge().SyncDelivery(ctx, dlvID)
+	if err != nil || r1.NewAnnotations != 3 || r1.ReceiptsAcked != 2 {
+		t.Fatalf("expected 3 new annotations (2 threads + ask A) and 2 acks, got %+v err=%v", r1, err)
+	}
+	if len(ackedReceipts) != 2 || ackedReceipts[0] != "rcpt-page-1" || ackedReceipts[1] != "rcpt-page-2" {
+		t.Fatalf("expected both page receipts acked in order, got %v", ackedReceipts)
+	}
+
+	// 2. A -> B -> A state transition: B emits v2, returning to A emits v3!
+	mu.Lock()
+	mode = "aba_only"
+	askChoice = "B"
+	mu.Unlock()
+	rB, err := srv.RyugiBridge().SyncDelivery(ctx, dlvID)
+	if err != nil || rB.NewAnnotations != 1 {
+		t.Fatalf("expected 1 new annotation for A->B, got %+v err=%v", rB, err)
+	}
+	mu.Lock()
+	askChoice = "A"
+	mu.Unlock()
+	rA2, err := srv.RyugiBridge().SyncDelivery(ctx, dlvID)
+	if err != nil || rA2.NewAnnotations != 1 {
+		t.Fatalf("expected 1 new annotation for B->A reversion, got %+v err=%v", rA2, err)
+	}
+	// Repeating A again without change -> 0 new annotations
+	rA3, err := srv.RyugiBridge().SyncDelivery(ctx, dlvID)
+	if err != nil || rA3.NewAnnotations != 0 {
+		t.Fatalf("expected 0 new annotations for unchanged A, got %+v err=%v", rA3, err)
+	}
+
+	// 3. Document changes error MUST be surfaced verbatim in Errors[] (not swallowed)
+	mu.Lock()
+	mode = "changes_error"
+	mu.Unlock()
+	rErr, err := srv.RyugiBridge().SyncDelivery(ctx, dlvID)
+	if err != nil || len(rErr.Errors) == 0 || !strings.Contains(rErr.Errors[0], "EACCES") {
+		t.Fatalf("expected document changes EACCES surfaced in Errors[], got %+v err=%v", rErr, err)
+	}
+
+	// 4. Malformed thread item -> SyncBinding returns error and ackedReceipts count stays 2!
+	mu.Lock()
+	mode = "malformed"
+	mu.Unlock()
+	if _, err := srv.RyugiBridge().SyncBinding(ctx, bindings[0].BindingID); err == nil {
+		t.Fatalf("expected SyncBinding to fail on malformed thread JSON")
+	}
+	if len(ackedReceipts) != 2 {
+		t.Fatalf("expected zero additional acks on malformed thread, got %v", ackedReceipts)
+	}
+
+	// 5. GC pause pauses Ryugi sync with 409 Conflict
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/admin/gc-pause", strings.NewReader(`{"paused":true,"reason":"backup"}`))
+	req.Header.Set("X-Orbit-Request", "1")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	req, _ = http.NewRequest(http.MethodPost, ts.URL+"/api/deliveries/"+dlvID+"/ryugi/sync", nil)
+	req.Header.Set("X-Orbit-Request", "1")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict while GC pause is active, got %d", resp.StatusCode)
+	}
+}
+
+// Blocking #4: Verify >1000 event paginated WS replay AND burst live tailing with ZERO dropped/skipped events
+func TestWebSocket_PaginatedReplayOver1000AndLiveBurstNoDrops(t *testing.T) {
+	srv, st, _, _ := setupTestHub(t, func(c *protocol.HubConfig) { c.DevOpen = true }, &fakeRyugiRunner{})
+	ctx := context.Background()
+	now := time.Now().UnixMilli()
+
+	// Seed 1,250 timeline events BEFORE WS connects (exceeds old 1000 cap & multi-pages 200-row chunks)
+	const initialCount = 1250
+	err := st.WithWriteTx(ctx, func(tx *sql.Tx) error {
+		for i := 1; i <= initialCount; i++ {
+			_, err := tx.Exec(`
+				INSERT INTO events (event_id, stream_id, project_id, actor_kind, actor_id, kind, visibility, payload_json, created_at)
+				VALUES (?, 'project:demo-app', 'demo-app', 'system', 'sys', 'task.state_changed', 'timeline', '{}', ?)
+			`, fmt.Sprintf("evt_ws_init_%04d", i), now+int64(i))
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("seed 1250 events failed: %v", err)
+	}
+
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/ws/client?sinceSeq=0"
+	conn, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
+		HTTPHeader: http.Header{"Origin": []string{ts.URL}},
+	})
+	if err != nil {
+		t.Fatalf("ws dial failed: %v", err)
+	}
+	defer conn.CloseNow()
+	conn.SetReadLimit(1 << 20)
+
+	// Read all replay frames until replay_end
+	var replayed []int64
+	for {
+		rctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		_, data, err := conn.Read(rctx)
+		cancel()
+		if err != nil {
+			t.Fatalf("read replay frame failed: %v", err)
+		}
+		var msg protocol.WSServerMessage
+		if err := json.Unmarshal(data, &msg); err != nil {
+			t.Fatal(err)
+		}
+		if msg.Type == protocol.WSMessageReplay {
+			for _, ev := range msg.Events {
+				replayed = append(replayed, ev.Seq)
+			}
+		} else if msg.Type == protocol.WSMessageReplayEnd {
+			break
+		}
+	}
+	if len(replayed) != initialCount {
+		t.Fatalf("expected all %d replayed events without truncation, got %d", initialCount, len(replayed))
+	}
+	for i := 1; i < len(replayed); i++ {
+		if replayed[i] <= replayed[i-1] {
+			t.Fatalf("replayed seq not strictly ascending at %d: %d <= %d", i, replayed[i], replayed[i-1])
+		}
+	}
+
+	// Burst-insert 320 live events (exceeds old 256-slot channel buffer!) and notify broker
+	const burstCount = 320
+	go func() {
+		for i := 1; i <= burstCount; i++ {
+			_ = st.WithWriteTx(context.Background(), func(tx *sql.Tx) error {
+				_, err := tx.Exec(`
+					INSERT INTO events (event_id, stream_id, project_id, actor_kind, actor_id, kind, visibility, payload_json, created_at)
+					VALUES (?, 'project:demo-app', 'demo-app', 'system', 'sys', 'task.state_changed', 'timeline', '{}', ?)
+				`, fmt.Sprintf("evt_ws_live_%04d", i), now+int64(initialCount+i))
+				return err
+			})
+			srv.EventBroker().Notify()
+		}
+	}()
+
+	lastSeq := replayed[len(replayed)-1]
+	liveReceived := 0
+	for liveReceived < burstCount {
+		rctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		_, data, err := conn.Read(rctx)
+		cancel()
+		if err != nil {
+			t.Fatalf("read live event #%d failed: %v", liveReceived, err)
+		}
+		var msg protocol.WSServerMessage
+		if err := json.Unmarshal(data, &msg); err != nil {
+			t.Fatal(err)
+		}
+		if msg.Type == protocol.WSMessageEvent && msg.Event != nil {
+			if msg.Event.Seq != lastSeq+1 {
+				t.Fatalf("expected contiguous live seq %d, got %d", lastSeq+1, msg.Event.Seq)
+			}
+			lastSeq = msg.Event.Seq
+			liveReceived++
+		}
 	}
 }

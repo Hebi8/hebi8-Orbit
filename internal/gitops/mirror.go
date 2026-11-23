@@ -97,7 +97,7 @@ func PushDeliveryRef(ctx context.Context, repoDir, mirrorPath, deliveryID, headS
 	if err := EnsureBareMirror(ctx, mirrorPath); err != nil {
 		return err
 	}
-	absRepo, err := filepath.Abs(repoDir)
+	repoRoot, err := ResolveRepoRoot(ctx, repoDir)
 	if err != nil {
 		return err
 	}
@@ -107,16 +107,13 @@ func PushDeliveryRef(ctx context.Context, repoDir, mirrorPath, deliveryID, headS
 	}
 	targetRef := "refs/orbit/deliveries/" + deliveryID
 
-	// Also push with explicit authorization env vars consumed by pre-receive.
 	env := append(os.Environ(),
 		"ORBIT_ALLOWED_REF="+targetRef,
 		"ORBIT_EXPECTED_SHA="+headSHA,
 	)
 
-	// Force-spec (+) ensures Git actually invokes pre-receive even for non-fast-forward updates,
-	// allowing pre-receive to reliably distinguish idempotent same-SHA vs ERR_DELIVERY_REF_CONFLICT.
 	spec := fmt.Sprintf("+%s:%s", headSHA, targetRef)
-	if _, err := runGit(ctx, absRepo, env, "push", "--no-verify", absMirror, spec); err != nil {
+	if _, err := runGit(ctx, repoRoot, env, "push", "--no-verify", absMirror, spec); err != nil {
 		if strings.Contains(err.Error(), "ERR_DELIVERY_REF_CONFLICT") {
 			return fmt.Errorf("%w: %v", ErrDeliveryRefConflict, err)
 		}
@@ -148,22 +145,16 @@ func VerifyMirrorDelivery(ctx context.Context, mirrorPath, deliveryID, expectedB
 	return nil
 }
 
-// DiscoverRyugiArtifactsInMirror lists all .ryugi/artifacts/<type>/<slug> locators at headSHA.
+// DiscoverRyugiArtifactsInMirror lists all .ryugi/artifacts/<type>/<slug> locators at headSHA
+// using -z and core.quotePath=false for full Unicode/space path safety.
 func DiscoverRyugiArtifactsInMirror(ctx context.Context, mirrorPath, headSHA string) ([]string, error) {
 	absMirror, err := filepath.Abs(mirrorPath)
 	if err != nil {
 		return nil, err
 	}
-	out, err := runGit(ctx, "", nil, "--git-dir", absMirror, "ls-tree", "-r", "--name-only", headSHA)
+	out, err := runGit(ctx, "", nil, "-c", "core.quotePath=false", "--git-dir", absMirror, "ls-tree", "-r", "-z", "--name-only", headSHA)
 	if err != nil {
 		return nil, fmt.Errorf("ls-tree mirror %s: %w", headSHA, err)
 	}
-	var paths []string
-	for _, line := range strings.Split(out, "\n") {
-		p := strings.TrimSpace(line)
-		if p != "" {
-			paths = append(paths, p)
-		}
-	}
-	return extractRyugiArtifactLocators(paths), nil
+	return extractRyugiArtifactLocators(splitNUL(out)), nil
 }

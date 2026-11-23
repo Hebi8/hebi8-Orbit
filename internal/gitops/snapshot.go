@@ -32,7 +32,6 @@ func DeriveArtifactID(deliveryID, locator string) string {
 		n.QuoRem(n, base, rem)
 		chars = append(chars, base62Alphabet[rem.Int64()])
 	}
-	// Reverse to big-endian representation
 	for i, j := 0, len(chars)-1; i < j; i, j = i+1, j-1 {
 		chars[i], chars[j] = chars[j], chars[i]
 	}
@@ -49,10 +48,15 @@ type ExportedArtifact struct {
 	ArtifactDir       string
 }
 
-// ExportFrozenSnapshot exports headSHA from mirrorPath into targetDir, writes deterministic
-// 21-char .artifact-id files for every .ryugi/artifacts/<type>/<slug>, creates writable
-// .ryugi/artifacts/.state (0755), and freezes artifact files (0444) plus artifact source
-// directories and .ryugi/artifacts/ (0555) to prevent unlink/replace tampering.
+// ExportFrozenSnapshot exports headSHA from mirrorPath into targetDir for Ryugi runtime serving.
+// The immutable source of truth always remains bare mirror refs/orbit/deliveries/<deliveryID>.
+// In the exported working copy for Ryugi 1.105.8:
+//   - .ryugi/artifacts/ and each <type>/ dir are 0555
+//   - each <artifactDir> (.ryugi/artifacts/<type>/<slug>) is 0755 so Ryugi can atomically write comments.json
+//   - artifact source files (doc.xml, canvas.json, .artifact-id, assets/*) are 0444 (nested subdirs 0555)
+//   - .ryugi/artifacts/.state/ is 0755
+//
+// If targetDir already exists, permissions and .artifact-id are calibrated idempotently.
 func ExportFrozenSnapshot(ctx context.Context, mirrorPath, headSHA, deliveryID, targetDir string) ([]ExportedArtifact, error) {
 	absMirror, err := filepath.Abs(mirrorPath)
 	if err != nil {
@@ -63,9 +67,9 @@ func ExportFrozenSnapshot(ctx context.Context, mirrorPath, headSHA, deliveryID, 
 		return nil, err
 	}
 
-	// Idempotent fast-path: if targetDir already exists, inspect existing artifacts and return them.
+	// Existing snapshot fast-path: recalibrate permissions & ensure .artifact-id / .state match current model.
 	if info, err := os.Stat(absTarget); err == nil && info.IsDir() {
-		return collectExistingFrozenArtifacts(absTarget, deliveryID)
+		return calibrateExistingFrozenSnapshot(absTarget, deliveryID)
 	}
 
 	if err := os.MkdirAll(filepath.Dir(absTarget), 0o755); err != nil {
@@ -83,7 +87,6 @@ func ExportFrozenSnapshot(ctx context.Context, mirrorPath, headSHA, deliveryID, 
 		}
 	}()
 
-	// Stream git archive tar directly into stagingDir
 	cmd := exec.CommandContext(ctx, "git", "--git-dir", absMirror, "archive", "--format=tar", headSHA)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -103,7 +106,6 @@ func ExportFrozenSnapshot(ctx context.Context, mirrorPath, headSHA, deliveryID, 
 		return nil, fmt.Errorf("git archive %s: %w: %s", headSHA, err, strings.TrimSpace(stderr.String()))
 	}
 
-	// Discover .ryugi/artifacts/<type>/<slug>
 	artifactsRoot := filepath.Join(stagingDir, ".ryugi", "artifacts")
 	exported, err := freezeRyugiArtifactsDir(artifactsRoot, absTarget, deliveryID)
 	if err != nil {
@@ -111,9 +113,8 @@ func ExportFrozenSnapshot(ctx context.Context, mirrorPath, headSHA, deliveryID, 
 	}
 
 	if err := os.Rename(stagingDir, absTarget); err != nil {
-		// Handle concurrent race where another worker exported the exact same immutable delivery
 		if info, statErr := os.Stat(absTarget); statErr == nil && info.IsDir() {
-			return collectExistingFrozenArtifacts(absTarget, deliveryID)
+			return calibrateExistingFrozenSnapshot(absTarget, deliveryID)
 		}
 		return nil, fmt.Errorf("finalize frozen snapshot dir: %w", err)
 	}
@@ -175,7 +176,6 @@ func extractTarSafe(r io.Reader, dstDir string) error {
 				return err
 			}
 		case tar.TypeSymlink:
-			// Only allow relative symlinks that stay inside cleanDst
 			if filepath.IsAbs(hdr.Linkname) {
 				continue
 			}
@@ -195,8 +195,8 @@ func extractTarSafe(r io.Reader, dstDir string) error {
 	return nil
 }
 
-func freezeRyugiArtifactsDir(stagingArtifactsRoot, finalTargetRoot, deliveryID string) ([]ExportedArtifact, error) {
-	info, err := os.Stat(stagingArtifactsRoot)
+func freezeRyugiArtifactsDir(artifactsRoot, finalTargetRoot, deliveryID string) ([]ExportedArtifact, error) {
+	info, err := os.Stat(artifactsRoot)
 	if os.IsNotExist(err) || (err == nil && !info.IsDir()) {
 		return nil, nil
 	}
@@ -204,8 +204,12 @@ func freezeRyugiArtifactsDir(stagingArtifactsRoot, finalTargetRoot, deliveryID s
 		return nil, err
 	}
 
-	// Ensure writable .state directory exists before freezing parent
-	stateDir := filepath.Join(stagingArtifactsRoot, ".state")
+	// Ensure artifactsRoot is temporarily writable while setting up .state and calibrating children
+	if err := os.Chmod(artifactsRoot, 0o755); err != nil {
+		return nil, fmt.Errorf("prepare .ryugi/artifacts: %w", err)
+	}
+
+	stateDir := filepath.Join(artifactsRoot, ".state")
 	if err := os.MkdirAll(stateDir, 0o755); err != nil {
 		return nil, fmt.Errorf("mkdir ryugi .state: %w", err)
 	}
@@ -213,7 +217,7 @@ func freezeRyugiArtifactsDir(stagingArtifactsRoot, finalTargetRoot, deliveryID s
 		return nil, fmt.Errorf("chmod ryugi .state: %w", err)
 	}
 
-	typeEntries, err := os.ReadDir(stagingArtifactsRoot)
+	typeEntries, err := os.ReadDir(artifactsRoot)
 	if err != nil {
 		return nil, err
 	}
@@ -226,7 +230,11 @@ func freezeRyugiArtifactsDir(stagingArtifactsRoot, finalTargetRoot, deliveryID s
 			continue
 		}
 		artType := te.Name()
-		typePath := filepath.Join(stagingArtifactsRoot, artType)
+		typePath := filepath.Join(artifactsRoot, artType)
+		if err := os.Chmod(typePath, 0o755); err != nil {
+			return nil, fmt.Errorf("prepare type dir %s: %w", typePath, err)
+		}
+
 		slugEntries, err := os.ReadDir(typePath)
 		if err != nil {
 			return nil, err
@@ -240,14 +248,24 @@ func freezeRyugiArtifactsDir(stagingArtifactsRoot, finalTargetRoot, deliveryID s
 			derivedID := DeriveArtifactID(deliveryID, locator)
 			artDir := filepath.Join(typePath, slug)
 
-			// Write deterministic 21-char .artifact-id
-			idFile := filepath.Join(artDir, ".artifact-id")
-			if err := os.WriteFile(idFile, []byte(derivedID), 0o644); err != nil {
-				return nil, fmt.Errorf("write .artifact-id for %s: %w", locator, err)
+			// Ensure <artifactDir> is 0755 so Ryugi 1.105.8 can atomically write comments.json.<pid>.tmp
+			if err := os.Chmod(artDir, 0o755); err != nil {
+				return nil, fmt.Errorf("chmod artifact dir %s: %w", locator, err)
 			}
 
-			// Freeze all source files to 0444 and subdirs to 0555 bottom-up
-			if err := freezeSubtree(artDir); err != nil {
+			// Write or verify deterministic 21-char .artifact-id
+			idFile := filepath.Join(artDir, ".artifact-id")
+			existingID, readErr := os.ReadFile(idFile)
+			if readErr != nil || strings.TrimSpace(string(existingID)) != derivedID {
+				_ = os.Chmod(idFile, 0o644)
+				if err := os.WriteFile(idFile, []byte(derivedID), 0o644); err != nil {
+					return nil, fmt.Errorf("write .artifact-id for %s: %w", locator, err)
+				}
+			}
+
+			// Freeze source files to 0444 (preserving comments.json writable) and nested subdirs to 0555,
+			// while keeping <artifactDir> itself 0755 for Ryugi atomic comments.json writes.
+			if err := freezeArtifactContents(artDir); err != nil {
 				return nil, fmt.Errorf("freeze artifact %s: %w", locator, err)
 			}
 
@@ -272,23 +290,32 @@ func freezeRyugiArtifactsDir(stagingArtifactsRoot, finalTargetRoot, deliveryID s
 	}
 
 	// Freeze .ryugi/artifacts itself to 0555 while keeping .state 0755
-	if err := os.Chmod(stagingArtifactsRoot, 0o555); err != nil {
+	if err := os.Chmod(artifactsRoot, 0o555); err != nil {
 		return nil, fmt.Errorf("chmod .ryugi/artifacts: %w", err)
 	}
 	return exported, nil
 }
 
-func freezeSubtree(root string) error {
-	var dirs []string
-	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+func freezeArtifactContents(artDir string) error {
+	var subdirs []string
+	err := filepath.WalkDir(artDir, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
+		if path == artDir {
+			return nil
+		}
 		if d.IsDir() {
-			dirs = append(dirs, path)
+			// Temporarily allow traversal/chmod if recalibrating an existing frozen subdir
+			_ = os.Chmod(path, 0o755)
+			subdirs = append(subdirs, path)
 			return nil
 		}
 		if d.Type()&os.ModeSymlink != 0 {
+			return nil
+		}
+		// Keep Ryugi's own comments.json writable when recalibrating existing snapshots
+		if filepath.Dir(path) == artDir && d.Name() == "comments.json" {
 			return nil
 		}
 		return os.Chmod(path, 0o444)
@@ -296,64 +323,20 @@ func freezeSubtree(root string) error {
 	if err != nil {
 		return err
 	}
-	// Chmod directories deepest-first so children are updated before parents become read-only
-	sort.Slice(dirs, func(i, j int) bool {
-		return len(dirs[i]) > len(dirs[j])
+	sort.Slice(subdirs, func(i, j int) bool {
+		return len(subdirs[i]) > len(subdirs[j])
 	})
-	for _, d := range dirs {
+	for _, d := range subdirs {
 		if err := os.Chmod(d, 0o555); err != nil {
 			return err
 		}
 	}
-	return nil
+	return os.Chmod(artDir, 0o755)
 }
 
-func collectExistingFrozenArtifacts(targetRoot, deliveryID string) ([]ExportedArtifact, error) {
+func calibrateExistingFrozenSnapshot(targetRoot, deliveryID string) ([]ExportedArtifact, error) {
 	artifactsRoot := filepath.Join(targetRoot, ".ryugi", "artifacts")
-	info, err := os.Stat(artifactsRoot)
-	if os.IsNotExist(err) || (err == nil && !info.IsDir()) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	typeEntries, err := os.ReadDir(artifactsRoot)
-	if err != nil {
-		return nil, err
-	}
-	var exported []ExportedArtifact
-	for _, te := range typeEntries {
-		if !te.IsDir() || strings.HasPrefix(te.Name(), ".") {
-			continue
-		}
-		typePath := filepath.Join(artifactsRoot, te.Name())
-		slugEntries, err := os.ReadDir(typePath)
-		if err != nil {
-			return nil, err
-		}
-		for _, se := range slugEntries {
-			if !se.IsDir() || strings.HasPrefix(se.Name(), ".") {
-				continue
-			}
-			locator := te.Name() + "/" + se.Name()
-			artDir := filepath.Join(typePath, se.Name())
-			derivedID := DeriveArtifactID(deliveryID, locator)
-			if raw, err := os.ReadFile(filepath.Join(artDir, ".artifact-id")); err == nil {
-				if trimmed := strings.TrimSpace(string(raw)); len(trimmed) == 21 {
-					derivedID = trimmed
-				}
-			}
-			exported = append(exported, ExportedArtifact{
-				Locator:           locator,
-				DerivedArtifactID: derivedID,
-				ArtifactDir:       artDir,
-			})
-		}
-	}
-	sort.Slice(exported, func(i, j int) bool {
-		return exported[i].Locator < exported[j].Locator
-	})
-	return exported, nil
+	return freezeRyugiArtifactsDir(artifactsRoot, targetRoot, deliveryID)
 }
 
 // RemoveFrozenDir safely removes a frozen snapshot directory by restoring write permissions first.

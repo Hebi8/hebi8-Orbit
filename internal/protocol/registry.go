@@ -77,6 +77,7 @@ func ExportedDTOTypes() []reflect.Type {
 		reflect.TypeOf(DeliveryDiffResponse{}),
 		reflect.TypeOf(ManualImportRequest{}),
 		reflect.TypeOf(ManualImportResponse{}),
+		reflect.TypeOf(CompleteReviewResponse{}),
 		reflect.TypeOf(CreateAnnotationRequest{}),
 		reflect.TypeOf(CreateAnnotationResponse{}),
 		reflect.TypeOf(RyugiSyncResponse{}),

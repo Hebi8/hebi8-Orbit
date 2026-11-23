@@ -12,6 +12,7 @@ import (
 
 // ComputeMirrorDiff reads file stats and unified diff text between baseSHA and headSHA
 // directly from the bare mirror repository without checking out a worktree.
+// Supports non-ASCII/Unicode/space filenames and literal pathspecs.
 func ComputeMirrorDiff(ctx context.Context, mirrorPath, baseSHA, headSHA, filePath string) ([]protocol.DiffFileStat, string, error) {
 	if err := validateCommitArg(baseSHA); err != nil {
 		return nil, "", fmt.Errorf("invalid baseSha: %w", err)
@@ -20,7 +21,7 @@ func ComputeMirrorDiff(ctx context.Context, mirrorPath, baseSHA, headSHA, filePa
 		return nil, "", fmt.Errorf("invalid headSha: %w", err)
 	}
 	cleanFile := ""
-	if strings.TrimSpace(filePath) != "" {
+	if filePath != "" {
 		var err error
 		cleanFile, err = validateRelativeFile(filePath)
 		if err != nil {
@@ -42,9 +43,9 @@ func ComputeMirrorDiff(ctx context.Context, mirrorPath, baseSHA, headSHA, filePa
 		return nil, "", err
 	}
 
-	args := []string{"--git-dir", absMirror, "diff", "-U3", "--no-color", "-M", baseSHA, headSHA}
+	args := []string{"-c", "core.quotePath=false", "--git-dir", absMirror, "diff", "-U3", "--no-color", "-M", baseSHA, headSHA}
 	if cleanFile != "" {
-		args = append(args, "--", cleanFile)
+		args = append(args, "--", ":(literal)"+cleanFile)
 	}
 	diffText, err := runGit(ctx, "", nil, args...)
 	if err != nil {
@@ -77,18 +78,21 @@ func computeDiffStats(ctx context.Context, repoOrMirror string, isBare bool, bas
 	}
 
 	baseArgs := func(rest ...string) (string, error) {
+		prefix := []string{"-c", "core.quotePath=false"}
 		if isBare {
-			args := append([]string{"--git-dir", repoOrMirror}, rest...)
+			args := append(prefix, "--git-dir", repoOrMirror)
+			args = append(args, rest...)
 			return runGit(ctx, "", nil, args...)
 		}
-		return runGit(ctx, repoOrMirror, nil, rest...)
+		args := append(prefix, rest...)
+		return runGit(ctx, repoOrMirror, nil, args...)
 	}
 
-	statusOut, err := baseArgs("diff", "--name-status", "-M", baseSHA, headSHA)
+	statusOut, err := baseArgs("diff", "--name-status", "-M", "-z", baseSHA, headSHA)
 	if err != nil {
 		return nil, err
 	}
-	numOut, err := baseArgs("diff", "--numstat", "-M", baseSHA, headSHA)
+	numOut, err := baseArgs("diff", "--numstat", "-M", "-z", baseSHA, headSHA)
 	if err != nil {
 		return nil, err
 	}
@@ -96,66 +100,88 @@ func computeDiffStats(ctx context.Context, repoOrMirror string, isBare bool, bas
 	byPath := map[string]*protocol.DiffFileStat{}
 	order := []string{}
 
-	for _, line := range strings.Split(statusOut, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
+	// Parse NUL-delimited --name-status -M -z:
+	// - Rnnn\0oldPath\0newPath\0 or Cnnn\0oldPath\0newPath\0
+	// - A/M/D/T/U\0path\0
+	statusTokens := strings.Split(statusOut, "\x00")
+	for i := 0; i < len(statusTokens); {
+		code := statusTokens[i]
+		if code == "" {
+			i++
 			continue
 		}
-		parts := strings.Split(line, "\t")
-		if len(parts) < 2 {
-			continue
-		}
-		code := parts[0]
 		var stat protocol.DiffFileStat
-		switch {
-		case strings.HasPrefix(code, "A"):
-			stat.Status = "added"
-			stat.Path = parts[1]
-		case strings.HasPrefix(code, "D"):
-			stat.Status = "deleted"
-			stat.Path = parts[1]
-		case strings.HasPrefix(code, "R") && len(parts) >= 3:
-			stat.Status = "renamed"
-			stat.OldPath = parts[1]
-			stat.Path = parts[2]
-		case strings.HasPrefix(code, "C") && len(parts) >= 3:
-			stat.Status = "copied"
-			stat.OldPath = parts[1]
-			stat.Path = parts[2]
-		default:
-			stat.Status = "modified"
-			stat.Path = parts[1]
+		if (strings.HasPrefix(code, "R") || strings.HasPrefix(code, "C")) && i+2 < len(statusTokens) {
+			if strings.HasPrefix(code, "R") {
+				stat.Status = "renamed"
+			} else {
+				stat.Status = "copied"
+			}
+			stat.OldPath = statusTokens[i+1]
+			stat.Path = statusTokens[i+2]
+			i += 3
+		} else if i+1 < len(statusTokens) {
+			switch {
+			case strings.HasPrefix(code, "A"):
+				stat.Status = "added"
+			case strings.HasPrefix(code, "D"):
+				stat.Status = "deleted"
+			default:
+				stat.Status = "modified"
+			}
+			stat.Path = statusTokens[i+1]
+			i += 2
+		} else {
+			break
 		}
-		byPath[stat.Path] = &stat
-		order = append(order, stat.Path)
+		if stat.Path != "" {
+			byPath[stat.Path] = &stat
+			order = append(order, stat.Path)
+		}
 	}
 
-	for _, line := range strings.Split(numOut, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
+	// Parse NUL-delimited --numstat -M -z:
+	// - Non-rename: "<ins>\t<del>\t<path>\0"
+	// - Rename/copy: "<ins>\t<del>\t\0<oldPath>\0<newPath>\0"
+	numTokens := strings.Split(numOut, "\x00")
+	for i := 0; i < len(numTokens); {
+		tok := numTokens[i]
+		if tok == "" {
+			i++
 			continue
 		}
-		parts := strings.Split(line, "\t")
+		parts := strings.SplitN(tok, "\t", 3)
 		if len(parts) < 3 {
+			i++
 			continue
 		}
-		rawPath := parts[2]
-		// Normalize rename numstat syntax "a/{old => new}/b" or "old => new" when looking up
-		lookupPath := normalizeNumstatPath(rawPath)
-		st, ok := byPath[lookupPath]
-		if !ok {
-			st = &protocol.DiffFileStat{Path: lookupPath, Status: "modified"}
-			byPath[lookupPath] = st
-			order = append(order, lookupPath)
+		insStr, delStr, pathPart := parts[0], parts[1], parts[2]
+		var targetPath string
+		if pathPart == "" && i+2 < len(numTokens) {
+			// Rename/copy entry: next two NUL tokens are oldPath, newPath
+			targetPath = numTokens[i+2]
+			i += 3
+		} else {
+			targetPath = pathPart
+			i++
 		}
-		if parts[0] == "-" || parts[1] == "-" {
+		if targetPath == "" {
+			continue
+		}
+		st, ok := byPath[targetPath]
+		if !ok {
+			st = &protocol.DiffFileStat{Path: targetPath, Status: "modified"}
+			byPath[targetPath] = st
+			order = append(order, targetPath)
+		}
+		if insStr == "-" || delStr == "-" {
 			st.Binary = true
 			continue
 		}
-		if ins, err := strconv.Atoi(parts[0]); err == nil {
+		if ins, err := strconv.Atoi(insStr); err == nil {
 			st.Insertions = ins
 		}
-		if del, err := strconv.Atoi(parts[1]); err == nil {
+		if del, err := strconv.Atoi(delStr); err == nil {
 			st.Deletions = del
 		}
 	}
@@ -169,24 +195,6 @@ func computeDiffStats(ctx context.Context, repoOrMirror string, isBare bool, bas
 	return out, nil
 }
 
-func normalizeNumstatPath(raw string) string {
-	if !strings.Contains(raw, " => ") {
-		return raw
-	}
-	if start := strings.Index(raw, "{"); start != -1 {
-		if end := strings.Index(raw[start:], "}"); end != -1 {
-			inner := raw[start+1 : start+end]
-			if arrow := strings.Index(inner, " => "); arrow != -1 {
-				replacement := inner[arrow+4:]
-				combined := raw[:start] + replacement + raw[start+end+1:]
-				return strings.ReplaceAll(combined, "//", "/")
-			}
-		}
-	}
-	parts := strings.SplitN(raw, " => ", 2)
-	return parts[1]
-}
-
 func validateCommitArg(sha string) error {
 	sha = strings.TrimSpace(sha)
 	if sha == "" || strings.HasPrefix(sha, "-") {
@@ -196,8 +204,11 @@ func validateCommitArg(sha string) error {
 }
 
 func validateRelativeFile(p string) (string, error) {
+	if p == "" || strings.ContainsRune(p, '\x00') {
+		return "", fmt.Errorf("%w: %s", ErrInvalidPath, p)
+	}
 	cleaned := filepath.ToSlash(filepath.Clean(p))
-	if cleaned == "." || cleaned == "" || strings.HasPrefix(cleaned, "/") || strings.HasPrefix(cleaned, "../") || cleaned == ".." || strings.HasPrefix(cleaned, "-") {
+	if cleaned == "." || cleaned == "" || strings.HasPrefix(cleaned, "/") || strings.HasPrefix(cleaned, "../") || cleaned == ".." {
 		return "", fmt.Errorf("%w: %s", ErrInvalidPath, p)
 	}
 	return cleaned, nil

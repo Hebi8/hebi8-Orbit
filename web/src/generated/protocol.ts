@@ -78,7 +78,7 @@ export type InboxCategory = (typeof InboxCategoryValues)[number];
 export const InboxStateValues = ["open", "resolved", "dismissed"] as const;
 export type InboxState = (typeof InboxStateValues)[number];
 
-export const EventKindValues = ["task.created", "task.state_changed", "task.cancelled", "attempt.started", "attempt.state_changed", "attempt.finished", "resource.waiting", "resource.acquired", "delivery.published", "delivery.verified", "annotation.created", "annotation.addressed", "approval.requested", "approval.decided", "approval.expired", "approval.consumed", "deploy.started", "deploy.verified", "deploy.failed", "acp.message_batch", "acp.thought_batch", "acp.tool_call", "acp.unsolicited_update", "acp.usage", "pa.turn", "pa.action_executed"] as const;
+export const EventKindValues = ["task.created", "task.state_changed", "task.cancelled", "attempt.started", "attempt.state_changed", "attempt.finished", "resource.waiting", "resource.acquired", "delivery.published", "delivery.verified", "delivery.ryugi_updated", "delivery.review_completed", "annotation.created", "annotation.addressed", "approval.requested", "approval.decided", "approval.expired", "approval.consumed", "deploy.started", "deploy.verified", "deploy.failed", "acp.message_batch", "acp.thought_batch", "acp.tool_call", "acp.unsolicited_update", "acp.usage", "pa.turn", "pa.action_executed"] as const;
 export type EventKind = (typeof EventKindValues)[number];
 
 export const IDESchemeValues = ["cursor", "vscode", "zed", "antigravity"] as const;
@@ -369,7 +369,15 @@ export interface ManualImportResponse {
   delivery: DeliveryView;
   ryugiBindings: RyugiBindingView[];
   inboxItem: InboxItemView;
+  created: boolean;
   ryugiError?: string;
+}
+
+export interface CompleteReviewResponse {
+  deliveryId: string;
+  inboxId: string;
+  inboxState: InboxState;
+  resolvedAt: number;
 }
 
 export interface CreateAnnotationRequest {

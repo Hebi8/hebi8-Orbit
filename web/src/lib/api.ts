@@ -1,5 +1,6 @@
 import type {
   BootstrapResponse,
+  CompleteReviewResponse,
   CreateAnnotationRequest,
   CreateAnnotationResponse,
   DeliveryDetailResponse,
@@ -113,6 +114,13 @@ export const api = {
   syncDeliveryRyugi(deliveryId: string): Promise<RyugiSyncResponse> {
     return apiFetch<RyugiSyncResponse>(
       `/api/deliveries/${encodeURIComponent(deliveryId)}/ryugi/sync`,
+      { method: 'POST' },
+    );
+  },
+
+  completeDeliveryReview(deliveryId: string): Promise<CompleteReviewResponse> {
+    return apiFetch<CompleteReviewResponse>(
+      `/api/deliveries/${encodeURIComponent(deliveryId)}/complete-review`,
       { method: 'POST' },
     );
   },

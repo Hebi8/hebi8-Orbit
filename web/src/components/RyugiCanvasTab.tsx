@@ -1,12 +1,14 @@
 import { useState } from 'react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import {
+  AlertTriangle,
   CheckCircle2,
   ExternalLink,
   Eye,
   Layers,
   Lock,
   RefreshCw,
+  XCircle,
 } from 'lucide-react';
 import type { DeliveryDetailResponse, RyugiSyncResponse } from '../generated/protocol';
 import { api } from '../lib/api';
@@ -33,6 +35,14 @@ export function RyugiCanvasTab({ detail }: RyugiCanvasTabProps) {
 
   const bindings = detail.ryugiBindings;
   const ryugiAnnotations = detail.annotations.filter((a) => a.source === 'ryugi');
+  const syncErrors = syncResult?.errors ?? [];
+  const syncTone: 'none' | 'success' | 'partial' | 'error' = !syncResult
+    ? 'none'
+    : syncErrors.length === 0
+      ? 'success'
+      : syncResult.bindingsSynced > 0 || syncResult.newAnnotations > 0
+        ? 'partial'
+        : 'error';
 
   return (
     <div className="flex flex-1 flex-col overflow-y-auto p-4 space-y-4">
@@ -62,21 +72,53 @@ export function RyugiCanvasTab({ detail }: RyugiCanvasTabProps) {
         </button>
       </div>
 
-      {syncResult && (
-        <div className="flex items-center justify-between rounded-md border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-700 dark:text-emerald-300">
-          <div className="flex items-center gap-1.5">
-            <CheckCircle2 className="h-3.5 w-3.5" />
+      {/* Distinct Sync Feedback: Success (Green) / Partial (Amber) / Failure (Red) */}
+      {syncResult && syncTone === 'success' && (
+        <div className="flex items-center gap-1.5 rounded-md border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-700 dark:text-emerald-300">
+          <CheckCircle2 className="h-3.5 w-3.5 shrink-0" />
+          <span>
+            同步完成：扫描 {syncResult.bindingsSynced} 个绑定，新增 {syncResult.newAnnotations}{' '}
+            条批注，已 ack {syncResult.receiptsAcked} 个回执
+          </span>
+        </div>
+      )}
+
+      {syncResult && syncTone === 'partial' && (
+        <div className="space-y-1.5 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-800 dark:text-amber-300">
+          <div className="flex items-center gap-1.5 font-medium">
+            <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
             <span>
-              同步完成：扫描 {syncResult.bindingsSynced} 个绑定，新增 {syncResult.newAnnotations}{' '}
-              条批注，已 ack {syncResult.receiptsAcked} 个回执
+              部分同步完成：扫描 {syncResult.bindingsSynced} 个绑定，新增{' '}
+              {syncResult.newAnnotations} 条批注，已 ack {syncResult.receiptsAcked}{' '}
+              个回执，但存在 {syncErrors.length} 项错误
             </span>
           </div>
+          <ul className="list-disc space-y-0.5 pl-5 font-mono text-[11px]">
+            {syncErrors.map((errMsg, i) => (
+              <li key={i}>{errMsg}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {syncResult && syncTone === 'error' && (
+        <div className="space-y-1.5 rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-xs text-rose-700 dark:text-rose-300">
+          <div className="flex items-center gap-1.5 font-medium">
+            <XCircle className="h-3.5 w-3.5 shrink-0" />
+            <span>同步失败（{syncErrors.length} 项错误）</span>
+          </div>
+          <ul className="list-disc space-y-0.5 pl-5 font-mono text-[11px]">
+            {syncErrors.map((errMsg, i) => (
+              <li key={i}>{errMsg}</li>
+            ))}
+          </ul>
         </div>
       )}
 
       {syncMutation.isError && (
-        <div className="rounded-md border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-xs text-rose-600 dark:text-rose-400">
-          同步失败：{(syncMutation.error as Error).message}
+        <div className="flex items-center gap-1.5 rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-xs text-rose-600 dark:text-rose-400">
+          <XCircle className="h-3.5 w-3.5 shrink-0" />
+          <span>同步请求失败：{(syncMutation.error as Error).message}</span>
         </div>
       )}
 
@@ -137,7 +179,7 @@ export function RyugiCanvasTab({ detail }: RyugiCanvasTabProps) {
         </div>
       )}
 
-      {/* Experimental iframe preview toggle (OFF by default, safely collapsed) */}
+      {/* Experimental iframe preview toggle (OFF by default) */}
       {bindings.length > 0 && (
         <div className="rounded-md border border-zinc-200/80 bg-zinc-50/50 p-3 dark:border-zinc-800/80 dark:bg-zinc-900/30">
           <label className="flex cursor-pointer items-center justify-between gap-2 text-xs text-zinc-600 dark:text-zinc-400">

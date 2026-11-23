@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -483,5 +484,145 @@ func TestBackupTo_HotBackupIntegrity(t *testing.T) {
 	}
 	if dlv.HeadSHA != "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" {
 		t.Fatalf("unexpected headSha in restored backup: %s", dlv.HeadSHA)
+	}
+}
+
+func TestManualImport_ConflictIdempotencyBlobRefCountAndReviewComplete(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	sha := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	// Repeated PutBlobRecord must keep ref_count = 0
+	if err := s.PutBlobRecord(ctx, sha, 42, "/tmp/blob-a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutBlobRecord(ctx, sha, 42, "/tmp/blob-a"); err != nil {
+		t.Fatal(err)
+	}
+	rec, err := s.GetBlobRecord(ctx, sha)
+	if err != nil || rec.RefCount != 0 {
+		t.Fatalf("expected ref_count=0 after PUTs, got %+v err=%v", rec, err)
+	}
+
+	// Wrong manifest blob size MUST fail with ErrBlobMismatch
+	_, err = s.CreateManualImportDelivery(ctx, store.ManualImportParams{
+		DeliveryID:      "dlv_01BADSIZE000000000001",
+		ProjectID:       "proj-a",
+		Summary:         "bad size",
+		SourceMachineID: "hub-node",
+		RepoIdentity:    "repo",
+		BaseSHA:         "1111111111111111111111111111111111111111",
+		HeadSHA:         "2222222222222222222222222222222222222222",
+		GitRef:          "refs/orbit/deliveries/dlv_01BADSIZE000000000001",
+		Manifest: protocol.DeliveryManifest{
+			Blobs: []protocol.BlobManifestItem{{Path: "a.bin", SHA256: sha, Size: 999}},
+		},
+	})
+	if !errors.Is(err, store.ErrBlobMismatch) {
+		t.Fatalf("expected ErrBlobMismatch for mismatched manifest blob size, got %v", err)
+	}
+
+	// New delivery referencing same blob twice under two paths -> ref_count increments ONCE (+1)
+	baseParams := store.ManualImportParams{
+		DeliveryID:      "dlv_01IDEMP0000000000001",
+		ProjectID:       "proj-a",
+		Summary:         "ok",
+		SourceMachineID: "hub-node",
+		RepoIdentity:    "repo",
+		BaseSHA:         "1111111111111111111111111111111111111111",
+		HeadSHA:         "2222222222222222222222222222222222222222",
+		GitRef:          "refs/orbit/deliveries/dlv_01IDEMP0000000000001",
+		Manifest: protocol.DeliveryManifest{
+			Blobs: []protocol.BlobManifestItem{
+				{Path: "a.bin", SHA256: sha, Size: 42},
+				{Path: "copy.bin", SHA256: sha, Size: 42},
+			},
+		},
+	}
+	res1, err := s.CreateManualImportDelivery(ctx, baseParams)
+	if err != nil || !res1.Created {
+		t.Fatalf("first import failed: err=%v created=%v", err, res1.Created)
+	}
+	rec, _ = s.GetBlobRecord(ctx, sha)
+	if rec.RefCount != 1 {
+		t.Fatalf("expected ref_count=1 (deduped per delivery), got %d", rec.RefCount)
+	}
+
+	// Exact idempotent replay -> Created=false, ref_count stays 1
+	res2, err := s.CreateManualImportDelivery(ctx, baseParams)
+	if err != nil || res2.Created || res2.Delivery.DeliveryID != res1.Delivery.DeliveryID {
+		t.Fatalf("expected idempotent replay Created=false, got err=%v created=%v", err, res2.Created)
+	}
+	rec, _ = s.GetBlobRecord(ctx, sha)
+	if rec.RefCount != 1 {
+		t.Fatalf("expected ref_count to remain 1 on replay, got %d", rec.RefCount)
+	}
+
+	// Same deliveryId with different headSha -> ErrConflict!
+	conflictParams := baseParams
+	conflictParams.HeadSHA = "3333333333333333333333333333333333333333"
+	if _, err := s.CreateManualImportDelivery(ctx, conflictParams); !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("expected ErrConflict for mismatched headSha on existing deliveryId, got %v", err)
+	}
+
+	// Same deliveryId with different projectId -> ErrConflict!
+	conflictProj := baseParams
+	conflictProj.ProjectID = "proj-b"
+	if _, err := s.CreateManualImportDelivery(ctx, conflictProj); !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("expected ErrConflict for mismatched projectId on existing deliveryId, got %v", err)
+	}
+
+	// CompleteDeliveryReview resolves inbox item and emits event
+	cr, ev, err := s.CompleteDeliveryReview(ctx, baseParams.DeliveryID, "human")
+	if err != nil || cr.InboxState != protocol.InboxResolved || ev == nil || ev.Kind != protocol.EventDeliveryReviewCompleted {
+		t.Fatalf("unexpected CompleteDeliveryReview result: cr=%+v ev=%+v err=%v", cr, ev, err)
+	}
+	boot, err := s.Bootstrap(ctx, nil)
+	if err != nil || len(boot.OpenInboxItems) != 0 {
+		t.Fatalf("expected 0 open inbox items after CompleteDeliveryReview, got %d err=%v", len(boot.OpenInboxItems), err)
+	}
+}
+
+func TestGetTaskTimeline_ReturnsLatestPageAscending(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	seedTask(t, s, "tsk_many", "proj-a")
+	now := time.Now().UnixMilli()
+
+	// Insert 520 timeline events
+	err := s.WithWriteTx(ctx, func(tx *sql.Tx) error {
+		for i := 1; i <= 520; i++ {
+			_, err := tx.Exec(`
+				INSERT INTO events (event_id, stream_id, project_id, task_id, actor_kind, actor_id, kind, visibility, payload_json, created_at)
+				VALUES (?, 'task:tsk_many', 'proj-a', 'tsk_many', 'system', 'sys', 'task.state_changed', 'timeline', '{}', ?)
+			`, fmt.Sprintf("evt_many_%04d", i), now+int64(i))
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("seed 520 events failed: %v", err)
+	}
+
+	tl, err := s.GetTaskTimeline(ctx, "tsk_many", 0, false)
+	if err != nil {
+		t.Fatalf("GetTaskTimeline failed: %v", err)
+	}
+	if len(tl.Events) != 500 {
+		t.Fatalf("expected latest 500 events, got %d", len(tl.Events))
+	}
+	if tl.Events[0].EventID != "evt_many_0021" || tl.Events[499].EventID != "evt_many_0520" {
+		t.Fatalf("expected ascending latest page 21..520, got %s..%s", tl.Events[0].EventID, tl.Events[499].EventID)
+	}
+
+	// Paginate backwards using beforeSeq = tl.Events[0].Seq -> must return 1..20 ascending
+	older, err := s.GetTaskTimeline(ctx, "tsk_many", tl.Events[0].Seq, false)
+	if err != nil {
+		t.Fatalf("GetTaskTimeline beforeSeq failed: %v", err)
+	}
+	if len(older.Events) != 20 || older.Events[0].EventID != "evt_many_0001" || older.Events[19].EventID != "evt_many_0020" {
+		t.Fatalf("expected older page 1..20, got len=%d", len(older.Events))
 	}
 }

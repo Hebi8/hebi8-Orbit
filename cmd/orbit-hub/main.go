@@ -81,6 +81,11 @@ func main() {
 	cfg.DataDir = protocol.ExpandPath(cfg.DataDir)
 	cfg.RyugiServerHome = protocol.ExpandPath(cfg.RyugiServerHome)
 
+	// Enforce loopback-only listenAddr whenever Tailscale-User-Login auth is active (!DevOpen)
+	if err := hub.ValidateListenAddr(cfg); err != nil {
+		log.Fatalf("invalid hub listen configuration: %v", err)
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 

@@ -482,7 +482,7 @@ func (s *Store) GetTaskTimeline(ctx context.Context, taskID string, beforeSeq in
 			return err
 		}
 
-		// Events
+		// Events: fetch newest page via ORDER BY seq DESC LIMIT 500, then reverse to ascending order
 		var evQuery string
 		args := []any{taskID}
 		if includeRaw {
@@ -498,7 +498,7 @@ func (s *Store) GetTaskTimeline(ctx context.Context, taskID string, beforeSeq in
 			evQuery += ` AND seq < ?`
 			args = append(args, beforeSeq)
 		}
-		evQuery += ` ORDER BY seq ASC LIMIT 500`
+		evQuery += ` ORDER BY seq DESC LIMIT 500`
 
 		eRows, err := tx.QueryContext(ctx, evQuery, args...)
 		if err != nil {
@@ -512,7 +512,14 @@ func (s *Store) GetTaskTimeline(ctx context.Context, taskID string, beforeSeq in
 			}
 			resp.Events = append(resp.Events, ev)
 		}
-		return eRows.Err()
+		if err := eRows.Err(); err != nil {
+			return err
+		}
+		// Reverse descending page back into ascending chronological order
+		for i, j := 0, len(resp.Events)-1; i < j; i, j = i+1, j-1 {
+			resp.Events[i], resp.Events[j] = resp.Events[j], resp.Events[i]
+		}
+		return nil
 	})
 	return resp, err
 }
@@ -689,26 +696,62 @@ type ManualImportResult struct {
 	Attempt   protocol.AttemptView
 	Delivery  protocol.DeliveryView
 	InboxItem protocol.InboxItemView
+	Created   bool
 	Events    []protocol.EventRecord
 }
 
 // CreateManualImportDelivery atomically creates/updates a manual Task, a manual Attempt,
 // an immutable Delivery, unified timeline/inbox events, and a delivery_review inbox card.
+// Re-submitting the same deliveryId with identical immutable fields is idempotent (Created=false);
+// any mismatch in projectId/taskId/baseSha/headSha/gitRef returns ErrConflict.
 func (s *Store) CreateManualImportDelivery(ctx context.Context, p ManualImportParams) (ManualImportResult, error) {
 	var res ManualImportResult
 	now := time.Now().UnixMilli()
 
 	err := s.WithWriteTx(ctx, func(tx *sql.Tx) error {
-		// Check if delivery already exists (idempotent retry by deliveryId)
-		var existingTaskID, existingAttemptID string
+		// Check if delivery already exists (strict conflict validation vs idempotent replay)
+		var existingProjectID, existingTaskID, existingAttemptID, existingBaseSHA, existingHeadSHA, existingGitRef string
 		err := tx.QueryRowContext(ctx, `
-			SELECT task_id, attempt_id FROM deliveries WHERE delivery_id = ?
-		`, p.DeliveryID).Scan(&existingTaskID, &existingAttemptID)
+			SELECT project_id, task_id, attempt_id, base_sha, head_sha, git_ref
+			FROM deliveries WHERE delivery_id = ?
+		`, p.DeliveryID).Scan(&existingProjectID, &existingTaskID, &existingAttemptID, &existingBaseSHA, &existingHeadSHA, &existingGitRef)
 		if err == nil {
-			// Load existing entities and return idempotently
+			if existingProjectID != p.ProjectID ||
+				(p.TaskID != "" && existingTaskID != p.TaskID) ||
+				existingBaseSHA != p.BaseSHA ||
+				existingHeadSHA != p.HeadSHA ||
+				existingGitRef != p.GitRef {
+				return fmt.Errorf("%w: delivery %s already exists with different immutable metadata", ErrConflict, p.DeliveryID)
+			}
+			res.Created = false
 			return loadManualImportExisting(ctx, tx, existingTaskID, existingAttemptID, p.DeliveryID, &res)
 		} else if !errors.Is(err, sql.ErrNoRows) {
 			return err
+		}
+
+		// Verify and increment ref_count once per distinct blob sha256 referenced by this new delivery
+		distinctBlobs := map[string]int64{}
+		for _, b := range p.Manifest.Blobs {
+			if prevSize, dup := distinctBlobs[b.SHA256]; dup && prevSize != b.Size {
+				return fmt.Errorf("%w: conflicting sizes for blob %s", ErrBlobMismatch, b.SHA256)
+			}
+			distinctBlobs[b.SHA256] = b.Size
+		}
+		for sha, expectedSize := range distinctBlobs {
+			var actualSize int64
+			err := tx.QueryRowContext(ctx, `SELECT size_bytes FROM delivery_blobs WHERE sha256 = ?`, sha).Scan(&actualSize)
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("%w: blob %s not uploaded", ErrBlobMismatch, sha)
+			}
+			if err != nil {
+				return err
+			}
+			if actualSize != expectedSize {
+				return fmt.Errorf("%w: blob %s size mismatch (stored=%d manifest=%d)", ErrBlobMismatch, sha, actualSize, expectedSize)
+			}
+			if _, err := tx.ExecContext(ctx, `UPDATE delivery_blobs SET ref_count = ref_count + 1 WHERE sha256 = ?`, sha); err != nil {
+				return err
+			}
 		}
 
 		// Ensure source machine exists; if omitted, pick first local_ws machine or any machine.
@@ -941,6 +984,7 @@ func (s *Store) CreateManualImportDelivery(ctx context.Context, p ManualImportPa
 			return fmt.Errorf("upsert inbox_items: %w", err)
 		}
 
+		res.Created = true
 		return loadManualImportExisting(ctx, tx, taskID, attemptID, p.DeliveryID, &res)
 	})
 	return res, err
@@ -1243,16 +1287,42 @@ func (s *Store) CreateAnnotation(ctx context.Context, p CreateAnnotationParams) 
 	return out, created, emitted, err
 }
 
+// StateHashEntry tracks both the latest content hash and monotonic revision number
+// for unreceipted Ryugi state items (asks/groups/rounds) so A -> B -> A transitions
+// emit distinct annotations with external_key suffix :v<rev>.
+type StateHashEntry struct {
+	Hash string `json:"hash"`
+	Rev  int    `json:"rev"`
+}
+
+func (e *StateHashEntry) UnmarshalJSON(data []byte) error {
+	var legacy string
+	if err := json.Unmarshal(data, &legacy); err == nil {
+		e.Hash = legacy
+		e.Rev = 1
+		return nil
+	}
+	type alias StateHashEntry
+	var a alias
+	if err := json.Unmarshal(data, &a); err != nil {
+		return err
+	}
+	*e = StateHashEntry(a)
+	return nil
+}
+
 // RyugiBindingRecord extends RyugiBindingView with last_state_hashes for internal bridge syncing.
 type RyugiBindingRecord struct {
 	protocol.RyugiBindingView
-	LastStateHashes map[string]string
+	LastStateHashes map[string]StateHashEntry
 }
 
-// SaveRyugiBindings updates frozen_snapshot_dir, ryugi_sync_state, and upserts ryugi_bindings.
-func (s *Store) SaveRyugiBindings(ctx context.Context, deliveryID, frozenDir string, syncState protocol.RyugiSyncState, bindings []protocol.RyugiBindingView) ([]protocol.RyugiBindingView, error) {
+// SaveRyugiBindings updates frozen_snapshot_dir, ryugi_sync_state, upserts ryugi_bindings,
+// and atomically emits a delivery.ryugi_updated event in the same write transaction.
+func (s *Store) SaveRyugiBindings(ctx context.Context, deliveryID, frozenDir string, syncState protocol.RyugiSyncState, bindings []protocol.RyugiBindingView) ([]protocol.RyugiBindingView, *protocol.EventRecord, error) {
 	now := time.Now().UnixMilli()
 	var saved []protocol.RyugiBindingView
+	var emitted *protocol.EventRecord
 
 	err := s.WithWriteTx(ctx, func(tx *sql.Tx) error {
 		var projectID, taskID string
@@ -1318,9 +1388,32 @@ func (s *Store) SaveRyugiBindings(ctx context.Context, deliveryID, frozenDir str
 			}
 			saved = append(saved, rb)
 		}
-		return rows.Err()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+
+		ev, err := insertEventTx(ctx, tx, eventInsert{
+			StreamID:   "task:" + taskID,
+			ProjectID:  projectID,
+			TaskID:     taskID,
+			ActorKind:  protocol.ActorRyugi,
+			ActorID:    "ryugi-bridge",
+			Kind:       protocol.EventDeliveryRyugiUpdated,
+			Visibility: protocol.VisibilityTimeline,
+			Payload: map[string]any{
+				"deliveryId":     deliveryID,
+				"ryugiSyncState": syncState,
+				"bindingCount":   len(saved),
+			},
+			CreatedAt: now,
+		})
+		if err != nil {
+			return err
+		}
+		emitted = &ev
+		return nil
 	})
-	return saved, err
+	return saved, emitted, err
 }
 
 // ListRyugiBindings lists either all active bindings (deliveryID == "") or bindings for one delivery.
@@ -1373,7 +1466,7 @@ func (s *Store) ListRyugiBindings(ctx context.Context, deliveryID string, active
 			rec.LastChangesReceipt = lastChanges.String
 		}
 		rec.Active = active != 0
-		rec.LastStateHashes = map[string]string{}
+		rec.LastStateHashes = map[string]StateHashEntry{}
 		_ = json.Unmarshal([]byte(hashesJSON), &rec.LastStateHashes)
 		out = append(out, rec)
 	}
@@ -1394,7 +1487,7 @@ func (s *Store) ApplyRyugiSyncBatch(
 	ctx context.Context,
 	binding RyugiBindingRecord,
 	incoming []IncomingRyugiAnnotation,
-	newStateHashes map[string]string,
+	newStateHashes map[string]StateHashEntry,
 	threadReceipt string,
 	changesReceipt string,
 ) (int, []protocol.EventRecord, error) {
@@ -1446,12 +1539,11 @@ func (s *Store) ApplyRyugiSyncBatch(
 			}
 		}
 
-		// Canonicalize state hashes JSON deterministically
 		if newStateHashes == nil {
 			newStateHashes = binding.LastStateHashes
 		}
 		if newStateHashes == nil {
-			newStateHashes = map[string]string{}
+			newStateHashes = map[string]StateHashEntry{}
 		}
 		keys := make([]string, 0, len(newStateHashes))
 		for k := range newStateHashes {
@@ -1489,15 +1581,78 @@ func (s *Store) ApplyRyugiSyncBatch(
 	return insertedCount, emitted, err
 }
 
-// PutBlobRecord records a content-addressed blob in delivery_blobs.
+// CompleteDeliveryReview atomically resolves the delivery_review inbox card for deliveryID
+// and emits a delivery.review_completed inbox event so connected clients clear badges immediately.
+func (s *Store) CompleteDeliveryReview(ctx context.Context, deliveryID, actorID string) (protocol.CompleteReviewResponse, *protocol.EventRecord, error) {
+	var resp protocol.CompleteReviewResponse
+	var emitted *protocol.EventRecord
+	now := time.Now().UnixMilli()
+
+	err := s.WithWriteTx(ctx, func(tx *sql.Tx) error {
+		var projectID, taskID string
+		err := tx.QueryRowContext(ctx, `SELECT project_id, task_id FROM deliveries WHERE delivery_id = ?`, deliveryID).Scan(&projectID, &taskID)
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+
+		inboxID := "inb:dlv:" + deliveryID
+		res, err := tx.ExecContext(ctx, `
+			UPDATE inbox_items
+			SET state = 'resolved', resolved_at = ?, updated_at = ?
+			WHERE inbox_id = ? AND state = 'open'
+		`, now, now, inboxID)
+		if err != nil {
+			return err
+		}
+		changed, _ := res.RowsAffected()
+
+		if changed > 0 {
+			if actorID == "" {
+				actorID = "human"
+			}
+			ev, err := insertEventTx(ctx, tx, eventInsert{
+				StreamID:   "task:" + taskID,
+				ProjectID:  projectID,
+				TaskID:     taskID,
+				ActorKind:  protocol.ActorHuman,
+				ActorID:    actorID,
+				Kind:       protocol.EventDeliveryReviewCompleted,
+				Visibility: protocol.VisibilityInbox,
+				Payload: map[string]any{
+					"deliveryId": deliveryID,
+					"inboxId":    inboxID,
+				},
+				CreatedAt: now,
+			})
+			if err != nil {
+				return err
+			}
+			emitted = &ev
+		}
+
+		resp = protocol.CompleteReviewResponse{
+			DeliveryID: deliveryID,
+			InboxID:    inboxID,
+			InboxState: protocol.InboxResolved,
+			ResolvedAt: now,
+		}
+		return nil
+	})
+	return resp, emitted, err
+}
+
+// PutBlobRecord registers a content-addressed blob in delivery_blobs with ref_count = 0.
+// Delivery references increment ref_count once per distinct delivery sha256 inside CreateManualImportDelivery.
 func (s *Store) PutBlobRecord(ctx context.Context, sha256Hex string, sizeBytes int64, storagePath string) error {
 	now := time.Now().UnixMilli()
 	return s.WithWriteTx(ctx, func(tx *sql.Tx) error {
 		_, err := tx.ExecContext(ctx, `
 			INSERT INTO delivery_blobs (sha256, size_bytes, storage_path, ref_count, created_at)
-			VALUES (?, ?, ?, 1, ?)
-			ON CONFLICT(sha256) DO UPDATE SET
-				ref_count = ref_count + 1
+			VALUES (?, ?, ?, 0, ?)
+			ON CONFLICT(sha256) DO NOTHING
 		`, sha256Hex, sizeBytes, storagePath, now)
 		return err
 	})
@@ -1525,40 +1680,56 @@ func (s *Store) GetBlobRecord(ctx context.Context, sha256Hex string) (BlobRecord
 	return b, err
 }
 
-// ListEventsAfter returns non-raw events strictly after sinceSeq up to replayHead (snapshot consistency).
-func (s *Store) ListEventsAfter(ctx context.Context, sinceSeq int64, limit int) ([]protocol.EventRecord, int64, error) {
-	if limit <= 0 || limit > 2000 {
-		limit = 500
-	}
-	var events []protocol.EventRecord
-	var replayHead int64
+// MaxEventSeq returns the current highest committed sequence number in events.
+func (s *Store) MaxEventSeq(ctx context.Context) (int64, error) {
+	var maxSeq int64
+	err := s.ro.QueryRowContext(ctx, `SELECT COALESCE(MAX(seq), 0) FROM events`).Scan(&maxSeq)
+	return maxSeq, err
+}
 
-	err := s.WithReadTx(ctx, func(tx *sql.Tx) error {
-		if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(seq), 0) FROM events`).Scan(&replayHead); err != nil {
-			return err
-		}
-		rows, err := tx.QueryContext(ctx, `
+// ListEventsPage returns one ascending page of committed non-raw events with seq > afterSeq
+// (and seq <= upToSeq when upToSeq > 0), enabling unbounded gapless WebSocket replay & tailing.
+func (s *Store) ListEventsPage(ctx context.Context, afterSeq, upToSeq int64, limit int) ([]protocol.EventRecord, error) {
+	if limit <= 0 || limit > 1000 {
+		limit = 200
+	}
+	var (
+		rows *sql.Rows
+		err  error
+	)
+	if upToSeq > 0 {
+		rows, err = s.ro.QueryContext(ctx, `
 			SELECT seq, event_id, stream_id, project_id, task_id, attempt_id,
 			       actor_kind, actor_id, kind, visibility, payload_json, created_at
 			FROM events
 			WHERE seq > ? AND seq <= ? AND visibility != 'raw_acp'
 			ORDER BY seq ASC
 			LIMIT ?
-		`, sinceSeq, replayHead, limit)
+		`, afterSeq, upToSeq, limit)
+	} else {
+		rows, err = s.ro.QueryContext(ctx, `
+			SELECT seq, event_id, stream_id, project_id, task_id, attempt_id,
+			       actor_kind, actor_id, kind, visibility, payload_json, created_at
+			FROM events
+			WHERE seq > ? AND visibility != 'raw_acp'
+			ORDER BY seq ASC
+			LIMIT ?
+		`, afterSeq, limit)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var events []protocol.EventRecord
+	for rows.Next() {
+		ev, err := scanEventRecord(rows)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		defer rows.Close()
-		for rows.Next() {
-			ev, err := scanEventRecord(rows)
-			if err != nil {
-				return err
-			}
-			events = append(events, ev)
-		}
-		return rows.Err()
-	})
-	return events, replayHead, err
+		events = append(events, ev)
+	}
+	return events, rows.Err()
 }
 
 type eventInsert struct {

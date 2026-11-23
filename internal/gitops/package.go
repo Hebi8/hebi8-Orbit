@@ -18,11 +18,12 @@ import (
 )
 
 var (
-	ErrNoHeadCommit        = errors.New("repository has no HEAD commit; create an initial commit first")
-	ErrDirtySubmodule      = errors.New("ERR_DIRTY_SUBMODULE: dirty or uninitialized submodule detected")
-	ErrAttachmentConflict  = errors.New("ERR_ATTACHMENT_CONFLICT: attachment path collides with tracked/packaged git file")
-	ErrDeliveryRefConflict = errors.New("ERR_DELIVERY_REF_CONFLICT: delivery ref already exists with a different SHA")
-	ErrInvalidPath         = errors.New("invalid relative file path")
+	ErrNoHeadCommit          = errors.New("repository has no HEAD commit; create an initial commit first")
+	ErrDirtySubmodule        = errors.New("ERR_DIRTY_SUBMODULE: dirty or uninitialized submodule detected")
+	ErrUnregisteredSubmodule = fmt.Errorf("%w (unregistered nested git repository)", ErrDirtySubmodule)
+	ErrAttachmentConflict    = errors.New("ERR_ATTACHMENT_CONFLICT: attachment path collides with tracked/packaged git file")
+	ErrDeliveryRefConflict   = errors.New("ERR_DELIVERY_REF_CONFLICT: delivery ref already exists with a different SHA")
+	ErrInvalidPath           = errors.New("invalid relative file path")
 )
 
 // AttachmentInput specifies a file to attach as a content-addressed blob.
@@ -43,19 +44,33 @@ type PackageOptions struct {
 
 // PackagedBlob describes an attachment file ready for upload.
 type PackagedBlob struct {
-	LocalPath string
-	Item      protocol.BlobManifestItem
+	LocalPath string                    `json:"localPath"`
+	Item      protocol.BlobManifestItem `json:"item"`
 }
 
 // PackageResult holds immutable refs, baselines, and manifest data produced by packaging.
 type PackageResult struct {
 	DeliveryID      string
+	RepoRoot        string
 	ReviewBaseSHA   string
 	CommitParentSHA string
 	HeadSHA         string
 	ReusedHead      bool
 	Manifest        protocol.DeliveryManifest
 	Blobs           []PackagedBlob
+}
+
+// ResolveRepoRoot resolves the top-level git repository root for any path inside a repo.
+func ResolveRepoRoot(ctx context.Context, dir string) (string, error) {
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		return "", fmt.Errorf("resolve repo dir: %w", err)
+	}
+	top, err := runGitTrim(ctx, absDir, nil, "rev-parse", "--show-toplevel")
+	if err != nil {
+		return "", fmt.Errorf("resolve git toplevel for %s: %w", absDir, err)
+	}
+	return top, nil
 }
 
 // PackageCheckpoint packages the repository working tree (including unstaged/untracked changes)
@@ -70,34 +85,30 @@ func PackageCheckpoint(ctx context.Context, opts PackageOptions) (PackageResult,
 		return res, fmt.Errorf("delivery id is required")
 	}
 
-	absRepo, err := filepath.Abs(opts.RepoDir)
+	// Resolve git repository root so invoking from any subdirectory works cleanly
+	repoRoot, err := ResolveRepoRoot(ctx, opts.RepoDir)
 	if err != nil {
-		return res, fmt.Errorf("resolve repo dir: %w", err)
+		return res, err
 	}
 
 	// 0. Verify HEAD exists -> commitParentSHA
-	commitParentSHA, err := runGitTrim(ctx, absRepo, nil, "rev-parse", "--verify", "HEAD^{commit}")
+	commitParentSHA, err := runGitTrim(ctx, repoRoot, nil, "rev-parse", "--verify", "HEAD^{commit}")
 	if err != nil {
 		return res, fmt.Errorf("%w: %v", ErrNoHeadCommit, err)
 	}
 
 	reviewBaseSHA := commitParentSHA
 	if strings.TrimSpace(opts.ReviewBaseSHA) != "" {
-		resolvedBase, err := runGitTrim(ctx, absRepo, nil, "rev-parse", "--verify", opts.ReviewBaseSHA+"^{commit}")
+		resolvedBase, err := runGitTrim(ctx, repoRoot, nil, "rev-parse", "--verify", opts.ReviewBaseSHA+"^{commit}")
 		if err != nil {
 			return res, fmt.Errorf("invalid base sha %q: %w", opts.ReviewBaseSHA, err)
 		}
 		reviewBaseSHA = resolvedBase
 	}
 
-	// 1. Detect dirty submodules
-	subOut, err := runGit(ctx, absRepo, nil, "submodule", "status", "--recursive")
-	if err == nil {
-		for _, line := range strings.Split(subOut, "\n") {
-			if len(line) > 0 && (line[0] == '+' || line[0] == '-' || line[0] == 'U') {
-				return res, fmt.Errorf("%w: %s", ErrDirtySubmodule, strings.TrimSpace(line))
-			}
-		}
+	// 1. Check registered submodules (status flags + recursive uncommitted/untracked working tree status)
+	if err := checkRegisteredSubmodules(ctx, repoRoot); err != nil {
+		return res, err
 	}
 
 	// 2. Create a fresh temp directory and point GIT_INDEX_FILE to a non-existent file inside it
@@ -109,21 +120,26 @@ func PackageCheckpoint(ctx context.Context, opts PackageOptions) (PackageResult,
 
 	indexEnv := append(os.Environ(), "GIT_INDEX_FILE="+filepath.Join(tmpDir, "index"))
 
-	if _, err := runGit(ctx, absRepo, indexEnv, "read-tree", commitParentSHA); err != nil {
+	if _, err := runGit(ctx, repoRoot, indexEnv, "read-tree", commitParentSHA); err != nil {
 		return res, fmt.Errorf("git read-tree: %w", err)
 	}
 
-	// 3. Add all changes respecting .gitignore into the isolated temp index
-	if _, err := runGit(ctx, absRepo, indexEnv, "add", "-A"); err != nil {
+	// 3. Add all changes across repoRoot respecting .gitignore into the isolated temp index
+	if _, err := runGit(ctx, repoRoot, indexEnv, "add", "-A"); err != nil {
 		return res, fmt.Errorf("git add -A: %w", err)
 	}
 
+	// 3b. Inspect temp index for mode 160000 (gitlink) entries to catch unregistered nested git repos
+	if err := checkIndexGitlinks(ctx, repoRoot, indexEnv); err != nil {
+		return res, err
+	}
+
 	// 4. Write tree and compare against HEAD^{tree}; reuse HEAD directly if working tree is clean
-	treeSHA, err := runGitTrim(ctx, absRepo, indexEnv, "write-tree")
+	treeSHA, err := runGitTrim(ctx, repoRoot, indexEnv, "write-tree")
 	if err != nil {
 		return res, fmt.Errorf("git write-tree: %w", err)
 	}
-	headTreeSHA, err := runGitTrim(ctx, absRepo, nil, "rev-parse", commitParentSHA+"^{tree}")
+	headTreeSHA, err := runGitTrim(ctx, repoRoot, nil, "rev-parse", commitParentSHA+"^{tree}")
 	if err != nil {
 		return res, fmt.Errorf("git rev-parse HEAD^{tree}: %w", err)
 	}
@@ -136,25 +152,22 @@ func PackageCheckpoint(ctx context.Context, opts PackageOptions) (PackageResult,
 	} else {
 		msg := fmt.Sprintf("orbit checkpoint: delivery=%s task=%s attempt=%s", opts.DeliveryID, opts.TaskID, opts.AttemptID)
 		commitEnv := withFallbackGitIdentity(os.Environ())
-		headSHA, err = runGitTrim(ctx, absRepo, commitEnv, "commit-tree", treeSHA, "-p", commitParentSHA, "-m", msg)
+		headSHA, err = runGitTrim(ctx, repoRoot, commitEnv, "commit-tree", treeSHA, "-p", commitParentSHA, "-m", msg)
 		if err != nil {
 			return res, fmt.Errorf("git commit-tree: %w", err)
 		}
 	}
 
-	// 5. Inspect packaged tree files for attachment collision & .ryugi/artifacts discovery
-	treeListOut, err := runGit(ctx, absRepo, nil, "ls-tree", "-r", "--name-only", treeSHA)
+	// 5. Inspect packaged tree files using -z + core.quotePath=false for full Unicode/space support
+	treeListOut, err := runGit(ctx, repoRoot, nil, "-c", "core.quotePath=false", "ls-tree", "-r", "-z", "--name-only", treeSHA)
 	if err != nil {
 		return res, fmt.Errorf("git ls-tree: %w", err)
 	}
 	treeFiles := map[string]struct{}{}
 	var treeFileSlice []string
-	for _, line := range strings.Split(treeListOut, "\n") {
-		p := strings.TrimSpace(line)
-		if p != "" {
-			treeFiles[p] = struct{}{}
-			treeFileSlice = append(treeFileSlice, p)
-		}
+	for _, p := range splitNUL(treeListOut) {
+		treeFiles[p] = struct{}{}
+		treeFileSlice = append(treeFileSlice, p)
 	}
 
 	ryugiArtifacts := extractRyugiArtifactLocators(treeFileSlice)
@@ -170,7 +183,7 @@ func PackageCheckpoint(ctx context.Context, opts PackageOptions) (PackageResult,
 		}
 		target := att.TargetPath
 		if target == "" {
-			if rel, err := filepath.Rel(absRepo, localAbs); err == nil && !strings.HasPrefix(rel, "..") {
+			if rel, err := filepath.Rel(repoRoot, localAbs); err == nil && !strings.HasPrefix(rel, "..") {
 				target = filepath.ToSlash(rel)
 			} else {
 				target = filepath.Base(localAbs)
@@ -202,7 +215,7 @@ func PackageCheckpoint(ctx context.Context, opts PackageOptions) (PackageResult,
 	}
 
 	// 6. Compute diff summary against reviewBaseSHA (NOT commitParentSHA!)
-	diffStats, err := computeDiffStats(ctx, absRepo, false, reviewBaseSHA, headSHA)
+	diffStats, err := computeDiffStats(ctx, repoRoot, false, reviewBaseSHA, headSHA)
 	if err != nil {
 		return res, fmt.Errorf("compute review diff stats: %w", err)
 	}
@@ -214,12 +227,13 @@ func PackageCheckpoint(ctx context.Context, opts PackageOptions) (PackageResult,
 
 	// 7. Persist local keep-alive ref so network retries reuse the exact same HEAD_SHA
 	localRef := "refs/orbit/local/" + opts.DeliveryID
-	if _, err := runGit(ctx, absRepo, nil, "update-ref", localRef, headSHA); err != nil {
+	if _, err := runGit(ctx, repoRoot, nil, "update-ref", localRef, headSHA); err != nil {
 		return res, fmt.Errorf("update local keep-alive ref: %w", err)
 	}
 
 	res = PackageResult{
 		DeliveryID:      opts.DeliveryID,
+		RepoRoot:        repoRoot,
 		ReviewBaseSHA:   reviewBaseSHA,
 		CommitParentSHA: commitParentSHA,
 		HeadSHA:         headSHA,
@@ -230,11 +244,137 @@ func PackageCheckpoint(ctx context.Context, opts PackageOptions) (PackageResult,
 			Deletions:      del,
 			Blobs:          manifestBlobs,
 			RyugiArtifacts: ryugiArtifacts,
-			WorktreePath:   absRepo,
+			WorktreePath:   repoRoot,
 		},
 		Blobs: packagedBlobs,
 	}
 	return res, nil
+}
+
+func checkRegisteredSubmodules(ctx context.Context, repoRoot string) error {
+	subOut, err := runGit(ctx, repoRoot, nil, "-c", "core.quotePath=false", "submodule", "status", "--recursive")
+	if err != nil {
+		return fmt.Errorf("%w: failed to inspect submodules: %v", ErrDirtySubmodule, err)
+	}
+	if strings.TrimSpace(subOut) == "" {
+		return nil
+	}
+
+	for _, line := range strings.Split(subOut, "\n") {
+		if line == "" {
+			continue
+		}
+		if line[0] == '+' || line[0] == '-' || line[0] == 'U' {
+			return fmt.Errorf("%w: %s", ErrDirtySubmodule, strings.TrimSpace(line))
+		}
+	}
+
+	// Enumerate initialized recursive submodule paths safely via NUL-delimited foreach
+	pathsOut, err := runGit(ctx, repoRoot, nil, "submodule", "foreach", "--quiet", "--recursive", `printf '%s\0' "$displaypath"`)
+	if err != nil {
+		return fmt.Errorf("%w: failed to enumerate submodules: %v", ErrDirtySubmodule, err)
+	}
+	for _, subRel := range splitNUL(pathsOut) {
+		subAbs := filepath.Join(repoRoot, filepath.FromSlash(subRel))
+		porcelain, err := runGit(ctx, subAbs, nil, "-c", "core.quotePath=false", "status", "--porcelain")
+		if err != nil {
+			return fmt.Errorf("%w: inspect submodule %s: %v", ErrDirtySubmodule, subRel, err)
+		}
+		if strings.TrimSpace(porcelain) != "" {
+			return fmt.Errorf("%w: uncommitted changes in submodule %s", ErrDirtySubmodule, subRel)
+		}
+	}
+	return nil
+}
+
+func checkIndexGitlinks(ctx context.Context, repoRoot string, indexEnv []string) error {
+	stageOut, err := runGit(ctx, repoRoot, indexEnv, "-c", "core.quotePath=false", "ls-files", "--stage", "-z")
+	if err != nil {
+		return fmt.Errorf("inspect temp index gitlinks: %w", err)
+	}
+	var gitlinks []string
+	for _, entry := range splitNUL(stageOut) {
+		// Format: "<mode> <sha> <stage>\t<path>"
+		tabIdx := strings.IndexByte(entry, '\t')
+		if tabIdx <= 0 {
+			continue
+		}
+		meta := entry[:tabIdx]
+		path := entry[tabIdx+1:]
+		if strings.HasPrefix(meta, "160000 ") {
+			gitlinks = append(gitlinks, path)
+		}
+	}
+	if len(gitlinks) == 0 {
+		return nil
+	}
+
+	registered, err := loadRegisteredSubmodulePaths(ctx, repoRoot)
+	if err != nil {
+		return fmt.Errorf("%w: load .gitmodules: %v", ErrDirtySubmodule, err)
+	}
+
+	for _, gl := range gitlinks {
+		norm := filepath.ToSlash(filepath.Clean(gl))
+		if _, ok := registered[norm]; !ok {
+			return fmt.Errorf("%w: %s", ErrUnregisteredSubmodule, norm)
+		}
+		// Double-check working tree cleanliness for every gitlink
+		subAbs := filepath.Join(repoRoot, filepath.FromSlash(norm))
+		porcelain, err := runGit(ctx, subAbs, nil, "-c", "core.quotePath=false", "status", "--porcelain")
+		if err != nil {
+			return fmt.Errorf("%w: inspect gitlink %s: %v", ErrDirtySubmodule, norm, err)
+		}
+		if strings.TrimSpace(porcelain) != "" {
+			return fmt.Errorf("%w: uncommitted changes in submodule %s", ErrDirtySubmodule, norm)
+		}
+	}
+	return nil
+}
+
+func loadRegisteredSubmodulePaths(ctx context.Context, repoRoot string) (map[string]struct{}, error) {
+	registered := map[string]struct{}{}
+	gmPath := filepath.Join(repoRoot, ".gitmodules")
+	if _, err := os.Stat(gmPath); os.IsNotExist(err) {
+		return registered, nil
+	} else if err != nil {
+		return nil, err
+	}
+
+	out, err := runGit(ctx, repoRoot, nil, "config", "--file", gmPath, "--null", "--get-regexp", `^submodule\..*\.path$`)
+	if err != nil {
+		// Exit code 1 simply means no matching keys in .gitmodules
+		if strings.Contains(err.Error(), "exit status 1") {
+			return registered, nil
+		}
+		return nil, err
+	}
+	for _, rec := range splitNUL(out) {
+		// --null --get-regexp format: "key\nvalue"
+		nlIdx := strings.IndexByte(rec, '\n')
+		if nlIdx < 0 {
+			continue
+		}
+		p := filepath.ToSlash(filepath.Clean(rec[nlIdx+1:]))
+		if p != "" && p != "." {
+			registered[p] = struct{}{}
+		}
+	}
+	return registered, nil
+}
+
+func splitNUL(s string) []string {
+	if s == "" {
+		return nil
+	}
+	raw := strings.Split(s, "\x00")
+	out := make([]string, 0, len(raw))
+	for _, item := range raw {
+		if item != "" {
+			out = append(out, item)
+		}
+	}
+	return out
 }
 
 func extractRyugiArtifactLocators(paths []string) []string {

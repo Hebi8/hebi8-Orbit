@@ -33,7 +33,6 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Allocate two free local TCP ports
 read -r HUB_PORT RYUGI_PORT < <(python3 -c '
 import socket
 def free_port():
@@ -96,7 +95,7 @@ mkdir -p "$WORK_REPO/.ryugi/artifacts/document/design-spec"
 cat > "$WORK_REPO/.ryugi/artifacts/document/design-spec/doc.xml" <<'EOF'
 <doc>
   <h1 id="h1">Design Spec v0</h1>
-  <p id="p1">Initial paragraph.</p>
+  <p id="p1">Initial paragraph. Pick: <ask id="q1" recommend="a"><option value="a">Option A</option><option value="b">Option B</option></ask></p>
 </doc>
 EOF
 git -C "$WORK_REPO" add -A
@@ -125,8 +124,6 @@ for _ in $(seq 1 40); do
   sleep 0.25
 done
 curl -sf "${HUB_URL}/api/health" >/dev/null
-
-# Verify embedded SPA HTML is served
 curl -sf "${HUB_URL}/" | grep -q "hebi8-Orbit"
 
 # 3. Make dirty working tree edits + untracked file + external attachment
@@ -147,7 +144,7 @@ EOF
 cat > "$WORK_REPO/.ryugi/artifacts/document/design-spec/doc.xml" <<'EOF'
 <doc>
   <h1 id="h1">Design Spec v1</h1>
-  <p id="p1">Updated paragraph for review.</p>
+  <p id="p1">Updated paragraph for review. Pick: <ask id="q1" recommend="a"><option value="a">Option A</option><option value="b">Option B</option></ask></p>
 </doc>
 EOF
 printf 'fake-png-attachment' > "$TMP_ROOT/mockup.png"
@@ -162,6 +159,7 @@ V1_JSON="$("$CLI_BIN" deliver \
   --summary "v1 dirty checkpoint" \
   --attach "$TMP_ROOT/mockup.png:assets/mockup.png" \
   --hub "$HUB_URL" \
+  --data-dir "$DATA_DIR" \
   --mirror "$MIRROR_PATH" \
   --json)"
 
@@ -186,23 +184,24 @@ fi
 curl -sf "$URL_V1" | grep -q "data-ryugi-artifact-id"
 echo "[OK] v1 registered with real ryugi 1.105.8: delivery=$DLV_V1 artifactId=$ID_V1 url=$URL_V1"
 
-# Verify v1 frozen permissions (0444 file, 0555 dirs, 0755 .state)
+# Verify v1 frozen permissions: doc=0444, artifactDir=0755, typeDir=0555, artifacts=0555, .state=0755
 SNAP_V1="$DATA_DIR/deliveries/$DLV_V1"
 MODE_DOC="$(stat -c '%a' "$SNAP_V1/.ryugi/artifacts/document/design-spec/doc.xml")"
-MODE_DIR="$(stat -c '%a' "$SNAP_V1/.ryugi/artifacts/document/design-spec")"
+MODE_ARTDIR="$(stat -c '%a' "$SNAP_V1/.ryugi/artifacts/document/design-spec")"
+MODE_TYPEDIR="$(stat -c '%a' "$SNAP_V1/.ryugi/artifacts/document")"
 MODE_ROOT="$(stat -c '%a' "$SNAP_V1/.ryugi/artifacts")"
 MODE_STATE="$(stat -c '%a' "$SNAP_V1/.ryugi/artifacts/.state")"
-if [ "$MODE_DOC" != "444" ] || [ "$MODE_DIR" != "555" ] || [ "$MODE_ROOT" != "555" ] || [ "$MODE_STATE" != "755" ]; then
-  echo "FAIL: unexpected frozen permissions doc=$MODE_DOC dir=$MODE_DIR root=$MODE_ROOT state=$MODE_STATE" >&2
+if [ "$MODE_DOC" != "444" ] || [ "$MODE_ARTDIR" != "755" ] || [ "$MODE_TYPEDIR" != "555" ] || [ "$MODE_ROOT" != "555" ] || [ "$MODE_STATE" != "755" ]; then
+  echo "FAIL: unexpected frozen permissions doc=$MODE_DOC artDir=$MODE_ARTDIR typeDir=$MODE_TYPEDIR root=$MODE_ROOT state=$MODE_STATE" >&2
   exit 1
 fi
-echo "[OK] v1 frozen snapshot permissions verified (doc=0444, dir=0555, root=0555, .state=0755)"
+echo "[OK] v1 frozen snapshot permissions verified (doc=0444, artDir=0755, typeDir=0555, root=0555, .state=0755)"
 
 # 5. Commit all changes cleanly, then deliver v2 with explicit --base INITIAL_BASE_SHA
 cat > "$WORK_REPO/.ryugi/artifacts/document/design-spec/doc.xml" <<'EOF'
 <doc>
   <h1 id="h1">Design Spec v2</h1>
-  <p id="p1">Committed clean working tree revision.</p>
+  <p id="p1">Committed clean working tree revision. Pick: <ask id="q1" recommend="a"><option value="a">Option A</option><option value="b">Option B</option></ask></p>
 </doc>
 EOF
 git -C "$WORK_REPO" add -A
@@ -221,6 +220,7 @@ V2_JSON="$("$CLI_BIN" deliver \
   --task "$TASK_ID" \
   --summary "v2 committed clean tree" \
   --hub "$HUB_URL" \
+  --data-dir "$DATA_DIR" \
   --mirror "$MIRROR_PATH" \
   --json)"
 
@@ -277,10 +277,42 @@ assert a1["annotation"]["projectId"] == "demo-app"
 ' "$DIFF_ANN_1" "$DIFF_ANN_2"
 echo "[OK] Diff annotation persisted & idempotency verified"
 
-# 7. Place a human thread in v2 Ryugi artifact comments.json (re-frozen 0444/0555) and trigger real Ryugi sync + receipt ack
-SNAP_V2_ART="$DATA_DIR/deliveries/$DLV_V2/.ryugi/artifacts/document/design-spec"
-chmod 0755 "$SNAP_V2_ART"
-cat > "$SNAP_V2_ART/comments.json" <<'EOF'
+# 7. Real Ryugi writes & sync directly on frozen snapshots WITHOUT ANY chmod!
+# 7a. On v1 frozen snapshot: prove real ryugi 1.105.8 server atomically writes comments.json & asks without chmod
+RYUGI_SERVER_HOME="$RYUGI_HOME" "$RYUGI_BIN" comment add \
+  --project-dir "$SNAP_V1" \
+  --artifact document/design-spec \
+  --block p1 \
+  --text "Verified real ryugi server atomic comments.json write" \
+  --format json | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["outcome"]=="success", d'
+
+RYUGI_SERVER_HOME="$RYUGI_HOME" "$RYUGI_BIN" comment answer \
+  --project-dir "$SNAP_V1" \
+  --artifact document/design-spec \
+  --ask q1 \
+  --choice b \
+  --format json | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["outcome"]=="success", d'
+RYUGI_SERVER_HOME="$RYUGI_HOME" "$RYUGI_BIN" comment submit \
+  --project-dir "$SNAP_V1" \
+  --artifact document/design-spec \
+  --format json | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["outcome"]=="success", d'
+
+SYNC_V1_1="$(curl -sf -X POST "${HUB_URL}/api/deliveries/${DLV_V1}/ryugi/sync" -H "X-Orbit-Request: 1")"
+SYNC_V1_2="$(curl -sf -X POST "${HUB_URL}/api/deliveries/${DLV_V1}/ryugi/sync" -H "X-Orbit-Request: 1")"
+python3 -c '
+import json, sys
+s1, s2 = json.loads(sys.argv[1]), json.loads(sys.argv[2])
+assert not s1.get("errors"), f"unexpected v1 sync #1 errors: {s1}"
+assert not s2.get("errors"), f"unexpected v1 sync #2 errors: {s2}"
+assert s1["newAnnotations"] == 1, f"expected 1 synced ask on v1, got {s1}"
+assert s2["newAnnotations"] == 0, f"expected 0 on v1 re-sync, got {s2}"
+' "$SYNC_V1_1" "$SYNC_V1_2"
+echo "[OK] v1 real ryugi CLI writes (comment add + answer + submit, ZERO chmod) + Hub sync verified"
+
+# 7b. On v2 frozen snapshot: create a human thread as normal user (ZERO chmod!) and verify threads receipt + real comment ack
+SNAP_V2="$DATA_DIR/deliveries/$DLV_V2"
+SNAP_V2_COMMENTS="$SNAP_V2/.ryugi/artifacts/document/design-spec/comments.json"
+cat > "$SNAP_V2_COMMENTS" <<'EOF'
 {
   "version": 1,
   "threads": [
@@ -306,8 +338,6 @@ cat > "$SNAP_V2_ART/comments.json" <<'EOF'
   ]
 }
 EOF
-chmod 0444 "$SNAP_V2_ART/comments.json"
-chmod 0555 "$SNAP_V2_ART"
 
 SYNC_1="$(curl -sf -X POST "${HUB_URL}/api/deliveries/${DLV_V2}/ryugi/sync" -H "X-Orbit-Request: 1")"
 SYNC_2="$(curl -sf -X POST "${HUB_URL}/api/deliveries/${DLV_V2}/ryugi/sync" -H "X-Orbit-Request: 1")"
@@ -315,20 +345,25 @@ SYNC_2="$(curl -sf -X POST "${HUB_URL}/api/deliveries/${DLV_V2}/ryugi/sync" -H "
 python3 -c '
 import json, sys
 s1, s2 = json.loads(sys.argv[1]), json.loads(sys.argv[2])
-assert s1["newAnnotations"] == 1 and s1["receiptsAcked"] == 1, f"unexpected sync #1: {s1}"
-assert s2["newAnnotations"] == 0 and s2["receiptsAcked"] == 0, f"unexpected sync #2 (receipt ack should clear unread): {s2}"
+assert not s1.get("errors"), f"unexpected v2 sync #1 errors: {s1}"
+assert not s2.get("errors"), f"unexpected v2 sync #2 errors: {s2}"
+assert s1["newAnnotations"] == 1 and s1["receiptsAcked"] == 1, f"unexpected v2 sync #1: {s1}"
+assert s2["newAnnotations"] == 0 and s2["receiptsAcked"] == 0, f"unexpected v2 sync #2: {s2}"
 ' "$SYNC_1" "$SYNC_2"
-echo "[OK] Real Ryugi comment sync + SQLite commit-before-ack + idempotent re-sync verified"
+echo "[OK] v2 human thread sync + SQLite commit-before-ack + real ryugi comment ack (ZERO chmod) verified"
 
-# 8. Verify both annotations exist on delivery detail and orbit status works
+# 8. Verify complete-review endpoint resolves inbox item and both annotation sources exist
 DETAIL_V2="$(curl -sf "${HUB_URL}/api/deliveries/${DLV_V2}")"
 python3 -c '
 import json, sys
 d = json.loads(sys.argv[1])
-sources = sorted(a["source"] for a in d["annotations"])
-assert sources == ["diff_drawer", "ryugi"], f"expected both diff_drawer and ryugi annotations, got {sources}"
+sources = sorted(set(a["source"] for a in d["annotations"]))
+assert sources == ["diff_drawer", "ryugi"], f"expected diff_drawer & ryugi annotations, got {sources}"
 ' "$DETAIL_V2"
 
+curl -sf -X POST "${HUB_URL}/api/deliveries/${DLV_V2}/complete-review" -H "X-Orbit-Request: 1" | \
+  python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["inboxState"]=="resolved", d'
+
 "$CLI_BIN" status --hub "$HUB_URL" | grep -q "demo-app"
-echo "[OK] Both diff_drawer and ryugi annotations verified in SQLite + orbit status OK"
+echo "[OK] Both diff_drawer and ryugi annotations + complete-review + orbit status verified"
 echo "=== PHASE 0 E2E SMOKE PASSED ==="

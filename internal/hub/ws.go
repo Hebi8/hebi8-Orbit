@@ -13,20 +13,25 @@ import (
 	"github.com/Hebi8/hebi8-Orbit/internal/protocol"
 )
 
-// EventBroker fans out newly committed non-raw events to connected /ws/client sockets.
+const wsPageSize = 50
+
+// EventBroker is a pure signal-wake fan-out hub backed by SQLite's monotonic events table.
+// Each subscriber receives a coalescing capacity-1 wakeup signal; actual events are always
+// read sequentially from SQLite in strict ascending seq order, eliminating dropped frames,
+// out-of-order concurrent commit skips, and page truncation.
 type EventBroker struct {
 	mu   sync.RWMutex
-	subs map[chan protocol.EventRecord]struct{}
+	subs map[chan struct{}]struct{}
 }
 
 func NewEventBroker() *EventBroker {
 	return &EventBroker{
-		subs: map[chan protocol.EventRecord]struct{}{},
+		subs: map[chan struct{}]struct{}{},
 	}
 }
 
-func (b *EventBroker) Subscribe() (chan protocol.EventRecord, func()) {
-	ch := make(chan protocol.EventRecord, 256)
+func (b *EventBroker) Subscribe() (<-chan struct{}, func()) {
+	ch := make(chan struct{}, 1)
 	b.mu.Lock()
 	b.subs[ch] = struct{}{}
 	b.mu.Unlock()
@@ -42,22 +47,25 @@ func (b *EventBroker) Subscribe() (chan protocol.EventRecord, func()) {
 	return ch, unsub
 }
 
-func (b *EventBroker) Broadcast(events ...protocol.EventRecord) {
-	if len(events) == 0 {
-		return
-	}
+// Notify wakes all connected WebSocket clients to read newly committed SQLite events.
+func (b *EventBroker) Notify() {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
-	for _, ev := range events {
-		if ev.Visibility == protocol.VisibilityRawACP {
-			continue
+	for ch := range b.subs {
+		select {
+		case ch <- struct{}{}:
+		default:
+			// Signal already pending; coalesced cleanly without losing any DB event
 		}
-		for ch := range b.subs {
-			select {
-			case ch <- ev:
-			default:
-				// Slow consumer drops frame and will resync on reconnect via sinceSeq
-			}
+	}
+}
+
+// Broadcast notifies connected subscribers when any non-raw event was committed.
+func (b *EventBroker) Broadcast(events ...protocol.EventRecord) {
+	for _, ev := range events {
+		if ev.Visibility != protocol.VisibilityRawACP {
+			b.Notify()
+			return
 		}
 	}
 }
@@ -83,8 +91,6 @@ func (s *Server) handleClientWS(w http.ResponseWriter, r *http.Request) {
 		sinceSeq = parsed
 	}
 
-	// Origin has already been strictly validated above; skip coder/websocket's built-in host check
-	// so reverse-proxied Tailscale HTTPS origins work cleanly against 127.0.0.1 listen addresses.
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 		InsecureSkipVerify: true,
 	})
@@ -96,8 +102,8 @@ func (s *Server) handleClientWS(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 
-	// Subscribe BEFORE querying replay snapshot so live events produced during replay are buffered.
-	subCh, unsub := s.broker.Subscribe()
+	// Subscribe BEFORE locking replayHead so any commit happening during replay triggers a wakeup.
+	wakeCh, unsub := s.broker.Subscribe()
 	defer unsub()
 
 	// Drain client frames to process pings/closes promptly.
@@ -110,21 +116,35 @@ func (s *Server) handleClientWS(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	replayEvents, replayHead, err := s.store.ListEventsAfter(ctx, sinceSeq, 1000)
+	// Phase 1: Paginated replay of ALL committed events in (sinceSeq, replayHead]
+	replayHead, err := s.store.MaxEventSeq(ctx)
 	if err != nil {
-		_ = conn.Close(websocket.StatusInternalError, "replay query failed")
+		_ = conn.Close(websocket.StatusInternalError, "replay head query failed")
 		return
 	}
 
-	if len(replayEvents) > 0 {
+	lastSentSeq := sinceSeq
+	for lastSentSeq < replayHead {
+		batch, err := s.store.ListEventsPage(ctx, lastSentSeq, replayHead, wsPageSize)
+		if err != nil {
+			_ = conn.Close(websocket.StatusInternalError, "replay page query failed")
+			return
+		}
+		if len(batch) == 0 {
+			break
+		}
 		if err := writeWSJSON(ctx, conn, protocol.WSServerMessage{
 			Type:          protocol.WSMessageReplay,
-			Events:        replayEvents,
+			Events:        batch,
 			ReplayHeadSeq: replayHead,
 			ServerTime:    time.Now().UnixMilli(),
 		}); err != nil {
 			return
 		}
+		lastSentSeq = batch[len(batch)-1].Seq
+	}
+	if replayHead > lastSentSeq {
+		lastSentSeq = replayHead
 	}
 
 	if err := writeWSJSON(ctx, conn, protocol.WSServerMessage{
@@ -135,31 +155,54 @@ func (s *Server) handleClientWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	lastSentSeq := replayHead
+	// Helper: drain all newly committed SQLite events with seq > lastSentSeq in paginated ascending order
+	drainLive := func() error {
+		for {
+			batch, err := s.store.ListEventsPage(ctx, lastSentSeq, 0, wsPageSize)
+			if err != nil {
+				return err
+			}
+			if len(batch) == 0 {
+				return nil
+			}
+			for i := range batch {
+				ev := batch[i]
+				if err := writeWSJSON(ctx, conn, protocol.WSServerMessage{
+					Type:       protocol.WSMessageEvent,
+					Event:      &ev,
+					ServerTime: time.Now().UnixMilli(),
+				}); err != nil {
+					return err
+				}
+				lastSentSeq = ev.Seq
+			}
+			if len(batch) < wsPageSize {
+				return nil
+			}
+		}
+	}
+
+	// Catch up anything committed while replay pages were streaming
+	if err := drainLive(); err != nil {
+		return
+	}
+
 	ticker := time.NewTicker(25 * time.Second)
 	defer ticker.Stop()
 
+	// Phase 2: Signal-driven SQLite tailing
 	for {
 		select {
 		case <-ctx.Done():
 			_ = conn.Close(websocket.StatusNormalClosure, "closing")
 			return
-		case ev, ok := <-subCh:
+		case _, ok := <-wakeCh:
 			if !ok {
 				return
 			}
-			if ev.Seq <= lastSentSeq {
-				continue
-			}
-			evCopy := ev
-			if err := writeWSJSON(ctx, conn, protocol.WSServerMessage{
-				Type:       protocol.WSMessageEvent,
-				Event:      &evCopy,
-				ServerTime: time.Now().UnixMilli(),
-			}); err != nil {
+			if err := drainLive(); err != nil {
 				return
 			}
-			lastSentSeq = ev.Seq
 		case <-ticker.C:
 			if err := writeWSJSON(ctx, conn, protocol.WSServerMessage{
 				Type:       protocol.WSMessagePing,

@@ -1,5 +1,7 @@
 import { useState } from 'react';
+import { useMutation, useQueryClient } from '@tanstack/react-query';
 import {
+  Check,
   ChevronDown,
   ChevronRight,
   Code2,
@@ -14,11 +16,13 @@ import type {
   AnnotationView,
   AttemptView,
   DeliveryView,
+  InboxItemView,
   MachineView,
   ProjectView,
   TaskSummary,
   TaskTimelineResponse,
 } from '../generated/protocol';
+import { api } from '../lib/api';
 import { buildIDEJump } from '../lib/ide';
 import { useWorkbenchStore } from '../store/useWorkbenchStore';
 
@@ -26,6 +30,7 @@ interface TaskTimelinePaneProps {
   project?: ProjectView;
   machines: MachineView[];
   tasks: TaskSummary[];
+  inboxItems: InboxItemView[];
   timeline?: TaskTimelineResponse;
   isLoadingTimeline: boolean;
 }
@@ -34,6 +39,7 @@ export function TaskTimelinePane({
   project,
   machines,
   tasks,
+  inboxItems,
   timeline,
   isLoadingTimeline,
 }: TaskTimelinePaneProps) {
@@ -162,6 +168,12 @@ export function TaskTimelinePane({
                         delivery={delivery}
                         annotations={deliveryAnns}
                         selected={selectedDeliveryId === delivery.deliveryId}
+                        hasOpenReviewInbox={inboxItems.some(
+                          (it) =>
+                            it.category === 'delivery_review' &&
+                            it.refId === delivery.deliveryId &&
+                            it.state === 'open',
+                        )}
                         project={project}
                         machines={machines}
                         localMachineId={localMachineId}
@@ -273,6 +285,7 @@ function DeliveryCard({
   delivery,
   annotations,
   selected,
+  hasOpenReviewInbox,
   project,
   machines,
   localMachineId,
@@ -284,6 +297,7 @@ function DeliveryCard({
   delivery: DeliveryView;
   annotations: AnnotationView[];
   selected: boolean;
+  hasOpenReviewInbox: boolean;
   project: ProjectView;
   machines: MachineView[];
   localMachineId: string;
@@ -291,6 +305,15 @@ function DeliveryCard({
   onOpenRyugi: () => void;
   onOpenDiff: () => void;
 }) {
+  const queryClient = useQueryClient();
+  const completeReviewMutation = useMutation({
+    mutationFn: () => api.completeDeliveryReview(delivery.deliveryId),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['bootstrap'] });
+      void queryClient.invalidateQueries({ queryKey: ['task-timeline', delivery.taskId] });
+    },
+  });
+
   const shortHead = delivery.headSha.slice(0, 7);
   const shortBase = delivery.baseSha.slice(0, 7);
   const openAnns = annotations.filter((a) => a.status === 'open');
@@ -366,6 +389,18 @@ function DeliveryCard({
             <span>在 IDE 打开</span>
             <ExternalLink className="h-3 w-3 opacity-60" />
           </a>
+        )}
+
+        {hasOpenReviewInbox && (
+          <button
+            type="button"
+            disabled={completeReviewMutation.isPending}
+            onClick={() => completeReviewMutation.mutate()}
+            className="ml-auto flex items-center gap-1 rounded-md border border-emerald-500/40 bg-emerald-500/10 px-2.5 py-1 text-xs font-medium text-emerald-700 transition hover:bg-emerald-500/20 disabled:opacity-50 dark:text-emerald-300"
+          >
+            <Check className="h-3.5 w-3.5" />
+            <span>{completeReviewMutation.isPending ? '处理中...' : '完成审阅'}</span>
+          </button>
         )}
       </div>
 

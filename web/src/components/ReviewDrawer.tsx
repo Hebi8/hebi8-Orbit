@@ -37,6 +37,7 @@ export function ReviewDrawer({
   } = useWorkbenchStore();
 
   const [selectedFile, setSelectedFile] = useState('');
+  const [selectedLine, setSelectedLine] = useState<number | undefined>(undefined);
   const draggingRef = useRef(false);
 
   if (!selectedDeliveryId) {
@@ -60,6 +61,11 @@ export function ReviewDrawer({
     window.addEventListener('mouseup', onUp);
   };
 
+  const activeDiffFile =
+    detail && selectedFile && detail.diffFiles.some((f) => f.path === selectedFile)
+      ? selectedFile
+      : detail?.diffFiles[0]?.path;
+
   const ideJump = detail
     ? buildIDEJump({
         scheme: preferredIDE || detail.project.ideScheme,
@@ -67,7 +73,8 @@ export function ReviewDrawer({
         delivery: detail.delivery,
         project: detail.project,
         machines,
-        file: drawerTab === 'diff' ? selectedFile || detail.diffFiles[0]?.path : undefined,
+        file: drawerTab === 'diff' ? activeDiffFile : undefined,
+        line: drawerTab === 'diff' ? selectedLine : undefined,
       })
     : null;
 
@@ -90,6 +97,7 @@ export function ReviewDrawer({
             value={selectedDeliveryId}
             onChange={(e) => {
               setSelectedFile('');
+              setSelectedLine(undefined);
               setSelectedDelivery(e.target.value);
             }}
             className="max-w-[190px] rounded-md border border-zinc-200 bg-zinc-50 px-2 py-1 font-mono text-xs text-zinc-800 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200"
@@ -104,11 +112,14 @@ export function ReviewDrawer({
           {ideJump && (
             <a
               href={ideJump.uri}
-              title={`${ideJump.mode === 'ssh' ? 'SSH Remote' : '本机直开'} (${ideJump.targetLabel})`}
+              title={`${ideJump.mode === 'ssh' ? 'SSH Remote' : '本机直开'} (${ideJump.targetLabel}): ${ideJump.resolvedPath}${ideJump.line ? `:${ideJump.line}` : ''}`}
               className="flex shrink-0 items-center gap-1 rounded-md border border-zinc-200 bg-zinc-50 px-2 py-1 text-xs text-zinc-700 transition hover:border-sky-500/50 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-300"
             >
               <Code2 className="h-3.5 w-3.5 text-sky-500" />
               <span className="hidden sm:inline">在 IDE 中打开</span>
+              {ideJump.line && (
+                <span className="font-mono text-[10px] text-sky-500">:{ideJump.line}</span>
+              )}
               <span className="font-mono text-[10px] text-zinc-400">
                 {ideJump.mode === 'ssh' ? 'SSH' : '本地'}
               </span>
@@ -177,7 +188,14 @@ export function ReviewDrawer({
           detail={detail}
           isDark={isDark}
           selectedFile={selectedFile}
-          onSelectFile={setSelectedFile}
+          onSelectFile={(f) => {
+            setSelectedFile(f);
+            setSelectedLine(undefined);
+          }}
+          onSelectLine={(f, ln) => {
+            setSelectedFile(f);
+            setSelectedLine(ln);
+          }}
         />
       )}
     </aside>

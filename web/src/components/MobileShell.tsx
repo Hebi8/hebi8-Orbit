@@ -1,19 +1,28 @@
 import { useState } from 'react';
+import { useMutation, useQueryClient } from '@tanstack/react-query';
 import {
+  AlertTriangle,
+  Check,
+  CheckCircle2,
   Command,
   ExternalLink,
   FolderGit2,
   Inbox,
   Layers,
+  MessageSquare,
   PackageCheck,
+  RefreshCw,
+  XCircle,
 } from 'lucide-react';
 import type {
   DeliveryDetailResponse,
   InboxItemView,
   ProjectView,
+  RyugiSyncResponse,
   TaskSummary,
   TaskTimelineResponse,
 } from '../generated/protocol';
+import { api } from '../lib/api';
 import { useWorkbenchStore } from '../store/useWorkbenchStore';
 
 interface MobileShellProps {
@@ -33,6 +42,7 @@ export function MobileShell({
   deliveryDetail,
   onSelectInboxItem,
 }: MobileShellProps) {
+  const queryClient = useQueryClient();
   const {
     mobileTab,
     setMobileTab,
@@ -44,6 +54,34 @@ export function MobileShell({
   } = useWorkbenchStore();
 
   const [paInput, setPaInput] = useState('');
+  const [syncByDelivery, setSyncByDelivery] = useState<Record<string, RyugiSyncResponse>>({});
+  const [syncErrByDelivery, setSyncErrByDelivery] = useState<Record<string, string>>({});
+
+  const syncMutation = useMutation({
+    mutationFn: (deliveryId: string) => api.syncDeliveryRyugi(deliveryId),
+    onSuccess: (res, deliveryId) => {
+      setSyncByDelivery((prev) => ({ ...prev, [deliveryId]: res }));
+      setSyncErrByDelivery((prev) => ({ ...prev, [deliveryId]: '' }));
+      void queryClient.invalidateQueries({ queryKey: ['delivery', deliveryId] });
+      if (selectedTaskId) {
+        void queryClient.invalidateQueries({ queryKey: ['task-timeline', selectedTaskId] });
+      }
+      void queryClient.invalidateQueries({ queryKey: ['bootstrap'] });
+    },
+    onError: (err, deliveryId) => {
+      setSyncErrByDelivery((prev) => ({ ...prev, [deliveryId]: (err as Error).message }));
+    },
+  });
+
+  const completeReviewMutation = useMutation({
+    mutationFn: (deliveryId: string) => api.completeDeliveryReview(deliveryId),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['bootstrap'] });
+      if (selectedTaskId) {
+        void queryClient.invalidateQueries({ queryKey: ['task-timeline', selectedTaskId] });
+      }
+    },
+  });
 
   return (
     <div className="flex min-h-0 flex-1 flex-col md:hidden">
@@ -63,21 +101,39 @@ export function MobileShell({
               </div>
             ) : (
               inboxItems.map((it) => (
-                <button
+                <div
                   key={it.inboxId}
-                  type="button"
-                  onClick={() => {
-                    onSelectInboxItem(it);
-                    setMobileTab('projects');
-                  }}
-                  className="flex min-h-[48px] w-full flex-col rounded-lg border border-zinc-200 bg-white p-3 text-left dark:border-zinc-800 dark:bg-zinc-900"
+                  className="rounded-lg border border-zinc-200 bg-white p-3 dark:border-zinc-800 dark:bg-zinc-900"
                 >
-                  <div className="flex items-center gap-2 text-sm font-medium">
-                    <PackageCheck className="h-4 w-4 text-sky-500" />
-                    <span>{it.title}</span>
-                  </div>
-                  <p className="mt-1 text-xs text-zinc-500">{it.summary}</p>
-                </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onSelectInboxItem(it);
+                      setMobileTab('projects');
+                    }}
+                    className="flex min-h-[44px] w-full flex-col text-left"
+                  >
+                    <div className="flex items-center gap-2 text-sm font-medium">
+                      <PackageCheck className="h-4 w-4 text-sky-500" />
+                      <span>{it.title}</span>
+                    </div>
+                    <p className="mt-1 text-xs text-zinc-500">{it.summary}</p>
+                  </button>
+
+                  {it.category === 'delivery_review' && it.refId && (
+                    <div className="mt-2 flex justify-end border-t border-zinc-200/70 pt-2 dark:border-zinc-800">
+                      <button
+                        type="button"
+                        disabled={completeReviewMutation.isPending}
+                        onClick={() => completeReviewMutation.mutate(it.refId)}
+                        className="flex min-h-[40px] items-center gap-1.5 rounded-md border border-emerald-500/40 bg-emerald-500/10 px-3 text-xs font-medium text-emerald-700 dark:text-emerald-300"
+                      >
+                        <Check className="h-3.5 w-3.5" />
+                        <span>完成审阅</span>
+                      </button>
+                    </div>
+                  )}
+                </div>
               ))
             )}
           </div>
@@ -123,45 +179,146 @@ export function MobileShell({
             )}
 
             {timeline && timeline.deliveries.length > 0 && (
-              <div className="space-y-2 pt-1">
-                {timeline.deliveries.map((d, i) => (
-                  <div
-                    key={d.deliveryId}
-                    className="rounded-lg border border-zinc-200 bg-white p-3 dark:border-zinc-800 dark:bg-zinc-900"
-                  >
-                    <div className="flex items-center justify-between text-xs font-semibold">
-                      <span>
-                        交付 v{i + 1} ({d.headSha.slice(0, 7)})
-                      </span>
-                      <span className="font-mono text-[11px] text-zinc-500">
-                        +{d.manifest.insertions} -{d.manifest.deletions}
-                      </span>
-                    </div>
-                    <p className="mt-1 text-xs text-zinc-500">{d.summary}</p>
-                    <div className="mt-2.5 flex flex-wrap gap-2">
-                      {(d.ryugiBindings ?? []).map((b) => (
-                        <a
-                          key={b.bindingId}
-                          href={b.openUrl}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="flex min-h-[40px] items-center gap-1.5 rounded-md bg-sky-600 px-3 text-xs font-medium text-white"
+              <div className="space-y-3 pt-1">
+                {timeline.deliveries.map((d, i) => {
+                  const dlvAnns = timeline.annotations.filter((a) => a.deliveryId === d.deliveryId);
+                  const syncRes = syncByDelivery[d.deliveryId];
+                  const syncReqErr = syncErrByDelivery[d.deliveryId];
+                  const hasOpenInbox = inboxItems.some(
+                    (it) =>
+                      it.category === 'delivery_review' &&
+                      it.refId === d.deliveryId &&
+                      it.state === 'open',
+                  );
+
+                  return (
+                    <div
+                      key={d.deliveryId}
+                      className="rounded-lg border border-zinc-200 bg-white p-3 dark:border-zinc-800 dark:bg-zinc-900"
+                    >
+                      <div className="flex items-center justify-between text-xs font-semibold">
+                        <span>
+                          交付 v{i + 1} ({d.headSha.slice(0, 7)})
+                        </span>
+                        <span className="font-mono text-[11px] text-zinc-500">
+                          +{d.manifest.insertions} -{d.manifest.deletions}
+                        </span>
+                      </div>
+                      <p className="mt-1 text-xs text-zinc-500">{d.summary}</p>
+
+                      <div className="mt-2.5 flex flex-wrap gap-2">
+                        {(d.ryugiBindings ?? []).map((b) => (
+                          <a
+                            key={b.bindingId}
+                            href={b.openUrl}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="flex min-h-[40px] items-center gap-1.5 rounded-md bg-sky-600 px-3 text-xs font-medium text-white"
+                          >
+                            <Layers className="h-3.5 w-3.5" />
+                            <span>打开 {b.artifactLocator}</span>
+                            <ExternalLink className="h-3 w-3" />
+                          </a>
+                        ))}
+
+                        {((d.ryugiBindings?.length ?? 0) > 0 || d.ryugiSyncState !== 'none') && (
+                          <button
+                            type="button"
+                            disabled={syncMutation.isPending}
+                            onClick={() => syncMutation.mutate(d.deliveryId)}
+                            className="flex min-h-[40px] items-center gap-1.5 rounded-md border border-sky-500/40 bg-sky-500/10 px-3 text-xs font-medium text-sky-600 dark:text-sky-400"
+                          >
+                            <RefreshCw
+                              className={`h-3.5 w-3.5 ${syncMutation.isPending ? 'animate-spin' : ''}`}
+                            />
+                            <span>立即同步批注</span>
+                          </button>
+                        )}
+
+                        <button
+                          type="button"
+                          onClick={() => setSelectedDelivery(d.deliveryId, 'diff')}
+                          className="min-h-[40px] rounded-md border border-zinc-200 px-3 text-xs dark:border-zinc-700"
                         >
-                          <Layers className="h-3.5 w-3.5" />
-                          <span>打开 {b.artifactLocator}</span>
-                          <ExternalLink className="h-3 w-3" />
-                        </a>
-                      ))}
-                      <button
-                        type="button"
-                        onClick={() => setSelectedDelivery(d.deliveryId, 'diff')}
-                        className="min-h-[40px] rounded-md border border-zinc-200 px-3 text-xs dark:border-zinc-700"
-                      >
-                        查看变更 ({d.manifest.filesChanged} 文件)
-                      </button>
+                          查看变更 ({d.manifest.filesChanged} 文件)
+                        </button>
+
+                        {hasOpenInbox && (
+                          <button
+                            type="button"
+                            disabled={completeReviewMutation.isPending}
+                            onClick={() => completeReviewMutation.mutate(d.deliveryId)}
+                            className="flex min-h-[40px] items-center gap-1 rounded-md border border-emerald-500/40 bg-emerald-500/10 px-3 text-xs font-medium text-emerald-700 dark:text-emerald-300"
+                          >
+                            <Check className="h-3.5 w-3.5" />
+                            <span>完成审阅</span>
+                          </button>
+                        )}
+                      </div>
+
+                      {/* Sync Status Banner */}
+                      {syncReqErr && (
+                        <div className="mt-2 flex items-center gap-1.5 rounded border border-rose-500/30 bg-rose-500/10 px-2.5 py-1.5 text-xs text-rose-600 dark:text-rose-400">
+                          <XCircle className="h-3.5 w-3.5 shrink-0" />
+                          <span>同步失败：{syncReqErr}</span>
+                        </div>
+                      )}
+                      {syncRes && (
+                        <div
+                          className={`mt-2 rounded border px-2.5 py-1.5 text-xs ${
+                            !syncRes.errors?.length
+                              ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
+                              : syncRes.bindingsSynced > 0
+                                ? 'border-amber-500/40 bg-amber-500/10 text-amber-800 dark:text-amber-300'
+                                : 'border-rose-500/40 bg-rose-500/10 text-rose-700 dark:text-rose-300'
+                          }`}
+                        >
+                          <div className="flex items-center gap-1.5">
+                            {!syncRes.errors?.length ? (
+                              <CheckCircle2 className="h-3.5 w-3.5 shrink-0" />
+                            ) : syncRes.bindingsSynced > 0 ? (
+                              <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+                            ) : (
+                              <XCircle className="h-3.5 w-3.5 shrink-0" />
+                            )}
+                            <span>
+                              新增 {syncRes.newAnnotations} 条批注，已 ack {syncRes.receiptsAcked}
+                              {syncRes.errors?.length ? `（${syncRes.errors.length} 项错误）` : ''}
+                            </span>
+                          </div>
+                          {syncRes.errors && syncRes.errors.length > 0 && (
+                            <p className="mt-1 font-mono text-[11px]">{syncRes.errors.join('; ')}</p>
+                          )}
+                        </div>
+                      )}
+
+                      {/* Mobile Annotations List (Ryugi + Diff) */}
+                      {dlvAnns.length > 0 && (
+                        <div className="mt-2.5 space-y-1.5 border-t border-zinc-200/80 pt-2.5 dark:border-zinc-800">
+                          <div className="flex items-center gap-1 text-[11px] font-medium text-zinc-500">
+                            <MessageSquare className="h-3 w-3" />
+                            <span>批注 ({dlvAnns.length})</span>
+                          </div>
+                          {dlvAnns.map((ann) => (
+                            <div
+                              key={ann.annotationId}
+                              className="rounded border border-zinc-200/80 bg-zinc-50 px-2.5 py-1.5 text-xs dark:border-zinc-800 dark:bg-zinc-950/70"
+                            >
+                              <div className="font-mono text-[10px] text-zinc-500">
+                                {ann.source === 'ryugi'
+                                  ? `Ryugi · ${ann.anchor.artifact ?? ''} (${ann.anchor.section ?? ''})`
+                                  : `Diff · ${ann.anchor.path ?? ''}:${ann.anchor.startLine ?? ''}`}
+                              </div>
+                              <p className="mt-0.5 whitespace-pre-wrap text-zinc-800 dark:text-zinc-200">
+                                {ann.body}
+                              </p>
+                            </div>
+                          ))}
+                        </div>
+                      )}
                     </div>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             )}
 

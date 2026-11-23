@@ -11,6 +11,19 @@ export interface IDEJumpResult {
   targetMachine: string;
   targetLabel: '只读快照' | '工作目录';
   resolvedPath: string;
+  line?: number;
+}
+
+/**
+ * Encodes each '/' path segment independently with encodeURIComponent so characters
+ * like '#', '?', '%', spaces, or CJK names never truncate IDE URIs while keeping '/'.
+ */
+export function encodeURIPathSegments(rawPath: string): string {
+  const normalized = rawPath.startsWith('/') ? rawPath : `/${rawPath}`;
+  return normalized
+    .split('/')
+    .map((seg, idx) => (idx === 0 ? '' : encodeURIComponent(seg)))
+    .join('/');
 }
 
 /**
@@ -29,7 +42,6 @@ export function buildIDEJump(params: {
 }): IDEJumpResult | null {
   const { scheme, localMachineId, delivery, project, machines, file, line, preferSnapshot } = params;
 
-  // Choose target path & host machine
   let basePath = '';
   let targetMachine = delivery.sourceMachineId;
   let targetLabel: '只读快照' | '工作目录' = '工作目录';
@@ -37,7 +49,6 @@ export function buildIDEJump(params: {
   if (preferSnapshot && delivery.frozenSnapshotDir) {
     basePath = delivery.frozenSnapshotDir;
     targetLabel = '只读快照';
-    // Frozen snapshots live on the Hub host (local_ws machine)
     const hubMachine = machines.find((m) => m.transportMode === 'local_ws');
     if (hubMachine) {
       targetMachine = hubMachine.machineId;
@@ -68,6 +79,7 @@ export function buildIDEJump(params: {
 
   const normalizedBase = basePath.replace(/\/+$/, '');
   const fullPath = file ? `${normalizedBase}/${file.replace(/^\/+/, '')}` : normalizedBase;
+  const encodedPath = encodeURIPathSegments(fullPath);
   const lineSuffix = file && line && line > 0 ? `:${line}` : '';
 
   const isLocal = localMachineId !== '' && localMachineId === targetMachine;
@@ -75,11 +87,12 @@ export function buildIDEJump(params: {
 
   if (isLocal) {
     return {
-      uri: `${proto}://file${fullPath.startsWith('/') ? '' : '/'}${fullPath}${lineSuffix}`,
+      uri: `${proto}://file${encodedPath}${lineSuffix}`,
       mode: 'local',
       targetMachine,
       targetLabel,
       resolvedPath: fullPath,
+      line: file && line && line > 0 ? line : undefined,
     };
   }
 
@@ -88,19 +101,21 @@ export function buildIDEJump(params: {
 
   if (proto === 'zed') {
     return {
-      uri: `zed://ssh/${encodeURIComponent(sshHost)}${fullPath.startsWith('/') ? '' : '/'}${fullPath}${lineSuffix}`,
+      uri: `zed://ssh/${encodeURIComponent(sshHost)}${encodedPath}${lineSuffix}`,
       mode: 'ssh',
       targetMachine,
       targetLabel,
       resolvedPath: fullPath,
+      line: file && line && line > 0 ? line : undefined,
     };
   }
 
   return {
-    uri: `${proto}://vscode-remote/ssh-remote+${encodeURIComponent(sshHost)}${fullPath.startsWith('/') ? '' : '/'}${fullPath}${lineSuffix}`,
+    uri: `${proto}://vscode-remote/ssh-remote+${encodeURIComponent(sshHost)}${encodedPath}${lineSuffix}`,
     mode: 'ssh',
     targetMachine,
     targetLabel,
     resolvedPath: fullPath,
+    line: file && line && line > 0 ? line : undefined,
   };
 }

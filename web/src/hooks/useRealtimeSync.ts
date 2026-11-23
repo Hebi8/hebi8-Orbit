@@ -4,29 +4,27 @@ import type { EventRecord, WSServerMessage } from '../generated/protocol';
 import { useWorkbenchStore } from '../store/useWorkbenchStore';
 
 /**
- * Maintains a gapless WebSocket stream anchored at bootstrap's single-transaction snapshotSeq:
- * 1. Connects to /ws/client?sinceSeq=<cursor>
- * 2. Buffers live `event` frames received while `replay` is in progress
- * 3. On `replay_end`, applies replayed events then drains buffered events with seq > lastAppliedSeq
- *    sorted & deduplicated by seq
- * 4. Reconnects with exponential backoff carrying the latest applied seq
+ * Maintains a gapless WebSocket stream anchored ONCE at the initial bootstrap snapshotSeq:
+ * - Subsequent bootstrap refetches NEVER advance lastAppliedSeqRef ahead of WS events
+ *   that haven't yet invalidated timeline / delivery caches (Blocking #4).
+ * - Buffers live `event` frames received during multi-page `replay` and drains them
+ *   in strict ascending seq order upon `replay_end`.
  */
 export function useRealtimeSync(snapshotSeq: number | undefined) {
   const queryClient = useQueryClient();
   const setWSStatus = useWorkbenchStore((s) => s.setWSStatus);
   const setLastSeq = useWorkbenchStore((s) => s.setLastSeq);
 
+  const initializedRef = useRef<boolean>(false);
   const lastAppliedSeqRef = useRef<number>(0);
-  const startedRef = useRef<boolean>(false);
 
   useEffect(() => {
     if (snapshotSeq === undefined) return;
-    if (snapshotSeq > lastAppliedSeqRef.current) {
-      lastAppliedSeqRef.current = snapshotSeq;
-      setLastSeq(snapshotSeq);
-    }
-    if (startedRef.current) return;
-    startedRef.current = true;
+    // Only seed cursor ONCE from the initial bootstrap snapshot!
+    if (initializedRef.current) return;
+    initializedRef.current = true;
+    lastAppliedSeqRef.current = snapshotSeq;
+    setLastSeq(snapshotSeq);
 
     let cancelled = false;
     let ws: WebSocket | null = null;
@@ -57,6 +55,7 @@ export function useRealtimeSync(snapshotSeq: number | undefined) {
         if (
           ev.visibility === 'inbox' ||
           ev.kind === 'delivery.published' ||
+          ev.kind === 'delivery.review_completed' ||
           ev.kind === 'task.created' ||
           ev.kind === 'task.state_changed'
         ) {
@@ -103,9 +102,11 @@ export function useRealtimeSync(snapshotSeq: number | undefined) {
             replayBatch.push(...msg.events);
           } else if (msg.type === 'replay_end') {
             replaying = false;
-            // Apply replayed events first, then drain buffered live events deduplicated by seq
             applyEvents(replayBatch);
-            if (typeof msg.replayHeadSeq === 'number' && msg.replayHeadSeq > lastAppliedSeqRef.current) {
+            if (
+              typeof msg.replayHeadSeq === 'number' &&
+              msg.replayHeadSeq > lastAppliedSeqRef.current
+            ) {
               lastAppliedSeqRef.current = msg.replayHeadSeq;
               setLastSeq(msg.replayHeadSeq);
             }
@@ -141,7 +142,7 @@ export function useRealtimeSync(snapshotSeq: number | undefined) {
 
     return () => {
       cancelled = true;
-      startedRef.current = false;
+      initializedRef.current = false;
       if (retryTimer !== null) {
         window.clearTimeout(retryTimer);
       }

@@ -9,6 +9,8 @@ import {
   parseDiff,
   type ChangeData,
   type FileData,
+  type GutterOptions,
+  type HunkData,
   type HunkTokens,
   type RenderToken,
   type ViewType,
@@ -19,7 +21,7 @@ import type {
   DeliveryDetailResponse,
   DiffFileStat,
 } from '../generated/protocol';
-import { api } from '../lib/api';
+import { api, makeIdempotencyKey } from '../lib/api';
 import { tokenizeHunksWithShiki } from '../lib/shikiDiff';
 
 interface DiffReviewTabProps {
@@ -27,6 +29,7 @@ interface DiffReviewTabProps {
   isDark: boolean;
   selectedFile: string;
   onSelectFile: (file: string) => void;
+  onSelectLine?: (file: string, line: number) => void;
 }
 
 interface PendingComposer {
@@ -36,6 +39,32 @@ interface PendingComposer {
   line: number;
   contextBefore: string;
   contextAfter: string;
+  idempotencyKey: string;
+}
+
+/**
+ * Extracts context lines strictly within the SAME hunk and SAME side ('old' or 'new')
+ * so anchors never leak lines across hunk boundaries or opposite sides (Blocking #9).
+ */
+function extractSameHunkSideContext(
+  hunks: HunkData[],
+  targetChange: ChangeData,
+  side: 'old' | 'new',
+): { contextBefore: string; contextAfter: string } {
+  const targetHunk = hunks.find((h) => h.changes.includes(targetChange));
+  if (!targetHunk) {
+    return { contextBefore: '', contextAfter: '' };
+  }
+  const lineFn = side === 'old' ? computeOldLineNumber : computeNewLineNumber;
+  const sameSideChanges = targetHunk.changes.filter((ch) => lineFn(ch) > 0);
+  const idx = sameSideChanges.indexOf(targetChange);
+  if (idx < 0) {
+    return { contextBefore: '', contextAfter: '' };
+  }
+  const contextBefore = idx > 0 ? sameSideChanges[idx - 1].content.slice(0, 120) : '';
+  const contextAfter =
+    idx + 1 < sameSideChanges.length ? sameSideChanges[idx + 1].content.slice(0, 120) : '';
+  return { contextBefore, contextAfter };
 }
 
 export function DiffReviewTab({
@@ -43,6 +72,7 @@ export function DiffReviewTab({
   isDark,
   selectedFile,
   onSelectFile,
+  onSelectLine,
 }: DiffReviewTabProps) {
   const queryClient = useQueryClient();
   const [viewType, setViewType] = useState<ViewType>('unified');
@@ -73,7 +103,6 @@ export function DiffReviewTab({
 
   const currentDiffFile = parsedFiles[0] ?? null;
 
-  // Shiki syntax highlighting for the active file's hunks
   useEffect(() => {
     let cancelled = false;
     setTokens(null);
@@ -95,20 +124,25 @@ export function DiffReviewTab({
 
   const createAnnotationMutation = useMutation({
     mutationFn: (vars: { composer: PendingComposer; body: string }) =>
-      api.createAnnotation(detail.delivery.deliveryId, {
-        source: 'diff_drawer',
-        anchor: {
-          path: vars.composer.path,
-          side: vars.composer.side,
-          startLine: vars.composer.line,
-          endLine: vars.composer.line,
-          contextBefore: vars.composer.contextBefore,
-          contextAfter: vars.composer.contextAfter,
-          baseSha: detail.delivery.baseSha,
-          headSha: detail.delivery.headSha,
+      api.createAnnotation(
+        detail.delivery.deliveryId,
+        {
+          source: 'diff_drawer',
+          anchor: {
+            path: vars.composer.path,
+            side: vars.composer.side,
+            startLine: vars.composer.line,
+            endLine: vars.composer.line,
+            contextBefore: vars.composer.contextBefore,
+            contextAfter: vars.composer.contextAfter,
+            baseSha: detail.delivery.baseSha,
+            headSha: detail.delivery.headSha,
+          },
+          body: vars.body,
         },
-        body: vars.body,
-      }),
+        // Reuse stable draft idempotencyKey across retries (Blocking #9)
+        vars.composer.idempotencyKey,
+      ),
     onSuccess: () => {
       setComposer(null);
       setDraftBody('');
@@ -117,18 +151,22 @@ export function DiffReviewTab({
     },
   });
 
-  // Map existing annotations + active inline composer to react-diff-view `widgets`
   const fileAnnotations = useMemo(() => {
     return detail.annotations.filter(
       (a) => a.source !== 'ryugi' && a.anchor.path === activeFile,
     );
   }, [detail.annotations, activeFile]);
 
+  const handleDraftBodyChange = (nextBody: string) => {
+    setDraftBody(nextBody);
+    // Refresh idempotencyKey ONLY when the user actually edits the draft body
+    setComposer((prev) => (prev ? { ...prev, idempotencyKey: makeIdempotencyKey() } : null));
+  };
+
   const widgets = useMemo<Record<string, ReactNode>>(() => {
     if (!currentDiffFile) return {};
     const map: Record<string, ReactNode[]> = {};
 
-    // Index changes by (side, lineNumber) so saved annotations pin cleanly to their exact lines
     const keyBySideLine = new Map<string, string>();
     for (const hunk of currentDiffFile.hunks) {
       for (const ch of hunk.changes) {
@@ -171,7 +209,7 @@ export function DiffReviewTab({
           </div>
           <textarea
             value={draftBody}
-            onChange={(e) => setDraftBody(e.target.value)}
+            onChange={(e) => handleDraftBodyChange(e.target.value)}
             rows={2}
             placeholder="写下针对该行的具体改动意见..."
             className="w-full rounded-md border border-zinc-300 bg-white px-2.5 py-1.5 text-base sm:text-xs text-zinc-900 focus:border-sky-500 focus:outline-none dark:border-zinc-700 dark:bg-zinc-950 dark:text-zinc-100"
@@ -215,25 +253,29 @@ export function DiffReviewTab({
     return combined;
   }, [currentDiffFile, fileAnnotations, composer, activeFile, draftBody, createAnnotationMutation]);
 
-  const handleOpenComposer = (change: ChangeData | null, preferredSide?: 'old' | 'new') => {
+  const handleOpenComposer = (change: ChangeData | null, explicitSide: 'old' | 'new') => {
     if (!change || !currentDiffFile) return;
-    const newLn = computeNewLineNumber(change);
     const oldLn = computeOldLineNumber(change);
-    const side: 'old' | 'new' =
-      preferredSide === 'old' && oldLn > 0
-        ? 'old'
-        : newLn > 0
-          ? 'new'
-          : 'old';
-    const line = side === 'new' ? newLn : oldLn;
+    const newLn = computeNewLineNumber(change);
+
+    // Strictly honor the clicked gutter's side (left='old', right='new') when that side has a line number
+    let side: 'old' | 'new' = explicitSide;
+    let line = side === 'old' ? oldLn : newLn;
+    if (line <= 0) {
+      side = side === 'old' ? 'new' : 'old';
+      line = side === 'old' ? oldLn : newLn;
+    }
     if (line <= 0) return;
 
-    // Extract nearby context lines for stable anchoring
-    const allChanges = currentDiffFile.hunks.flatMap((h) => h.changes);
-    const idx = allChanges.indexOf(change);
-    const contextBefore = idx > 0 ? allChanges[idx - 1].content.slice(0, 120) : '';
-    const contextAfter =
-      idx >= 0 && idx + 1 < allChanges.length ? allChanges[idx + 1].content.slice(0, 120) : '';
+    const { contextBefore, contextAfter } = extractSameHunkSideContext(
+      currentDiffFile.hunks,
+      change,
+      side,
+    );
+
+    if (onSelectLine) {
+      onSelectLine(activeFile, line);
+    }
 
     setComposer({
       changeKey: getChangeKey(change),
@@ -242,8 +284,30 @@ export function DiffReviewTab({
       line,
       contextBefore,
       contextAfter,
+      idempotencyKey: makeIdempotencyKey(),
     });
     setDraftBody('');
+  };
+
+  // Explicit side-aware gutter renderer so Unified view distinguishes old (left) vs new (right) clicks
+  const renderGutter = ({ change, side, renderDefault }: GutterOptions) => {
+    const lineNo = side === 'old' ? computeOldLineNumber(change) : computeNewLineNumber(change);
+    if (lineNo <= 0) {
+      return renderDefault();
+    }
+    return (
+      <button
+        type="button"
+        onClick={(e) => {
+          e.stopPropagation();
+          handleOpenComposer(change, side);
+        }}
+        title={`在 ${side} 侧第 ${lineNo} 行添加批注`}
+        className="block w-full cursor-pointer text-right font-mono hover:text-sky-500"
+      >
+        {renderDefault()}
+      </button>
+    );
   };
 
   const renderShikiToken: RenderToken = (token, defaultRender, index) => {
@@ -267,11 +331,11 @@ export function DiffReviewTab({
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      {/* Sub-toolbar: File strip + Unified/Split switch */}
+      {/* Sub-toolbar: Hint + Unified/Split switch */}
       <div className="flex items-center justify-between gap-2 border-b border-zinc-200 px-3 py-2 dark:border-zinc-800">
         <div className="flex items-center gap-1.5 text-[11px] text-zinc-500">
           <MessageSquarePlus className="h-3.5 w-3.5 text-sky-500" />
-          <span>点击任意行号即可原地添加行级批注</span>
+          <span>点击左/右行号即可分别在旧侧/新侧添加行级批注</span>
         </div>
 
         <div className="flex items-center rounded-md border border-zinc-200 p-0.5 dark:border-zinc-800">
@@ -336,9 +400,7 @@ export function DiffReviewTab({
                   <span>
                     <span className="text-emerald-600 dark:text-emerald-400">+{f.insertions}</span>{' '}
                     <span className="text-rose-600 dark:text-rose-400">-{f.deletions}</span>
-                    {annCount > 0 && (
-                      <span className="ml-1 text-amber-500">·{annCount}</span>
-                    )}
+                    {annCount > 0 && <span className="ml-1 text-amber-500">·{annCount}</span>}
                   </span>
                 </div>
               </button>
@@ -365,10 +427,8 @@ export function DiffReviewTab({
                 hunks={currentDiffFile.hunks}
                 tokens={tokens}
                 renderToken={renderShikiToken}
+                renderGutter={renderGutter}
                 widgets={widgets}
-                gutterEvents={{
-                  onClick: ({ change, side }) => handleOpenComposer(change, side),
-                }}
               >
                 {(hunks) => hunks.map((hunk) => <Hunk key={hunk.content} hunk={hunk} />)}
               </Diff>

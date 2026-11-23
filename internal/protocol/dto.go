@@ -289,7 +289,16 @@ type ManualImportResponse struct {
 	Delivery      DeliveryView       `json:"delivery"`
 	RyugiBindings []RyugiBindingView `json:"ryugiBindings"`
 	InboxItem     InboxItemView      `json:"inboxItem"`
+	Created       bool               `json:"created"`
 	RyugiError    string             `json:"ryugiError,omitempty"`
+}
+
+// CompleteReviewResponse is returned by POST /api/deliveries/:deliveryId/complete-review.
+type CompleteReviewResponse struct {
+	DeliveryID string     `json:"deliveryId"`
+	InboxID    string     `json:"inboxId"`
+	InboxState InboxState `json:"inboxState"`
+	ResolvedAt int64      `json:"resolvedAt"`
 }
 
 // CreateAnnotationRequest creates a review annotation anchored on a delivery.

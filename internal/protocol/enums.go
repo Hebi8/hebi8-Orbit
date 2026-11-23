@@ -552,9 +552,11 @@ const (
 	EventAttemptFinished      EventKind = "attempt.finished"
 	EventResourceWaiting      EventKind = "resource.waiting"
 	EventResourceAcquired     EventKind = "resource.acquired"
-	EventDeliveryPublished    EventKind = "delivery.published"
-	EventDeliveryVerified     EventKind = "delivery.verified"
-	EventAnnotationCreated    EventKind = "annotation.created"
+	EventDeliveryPublished       EventKind = "delivery.published"
+	EventDeliveryVerified        EventKind = "delivery.verified"
+	EventDeliveryRyugiUpdated    EventKind = "delivery.ryugi_updated"
+	EventDeliveryReviewCompleted EventKind = "delivery.review_completed"
+	EventAnnotationCreated       EventKind = "annotation.created"
 	EventAnnotationAddressed  EventKind = "annotation.addressed"
 	EventApprovalRequested    EventKind = "approval.requested"
 	EventApprovalDecided      EventKind = "approval.decided"
@@ -583,6 +585,8 @@ var AllEventKinds = []EventKind{
 	EventResourceAcquired,
 	EventDeliveryPublished,
 	EventDeliveryVerified,
+	EventDeliveryRyugiUpdated,
+	EventDeliveryReviewCompleted,
 	EventAnnotationCreated,
 	EventAnnotationAddressed,
 	EventApprovalRequested,

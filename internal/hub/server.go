@@ -60,6 +60,9 @@ func NewServer(ctx context.Context, opts ServerOptions) (*Server, error) {
 		return nil, fmt.Errorf("store is required")
 	}
 	cfg := opts.HubConfig
+	if err := ValidateListenAddr(cfg); err != nil {
+		return nil, err
+	}
 	cfg.DataDir = protocol.ExpandPath(cfg.DataDir)
 	cfg.ConfigDir = protocol.ExpandPath(cfg.ConfigDir)
 	cfg.RyugiServerHome = protocol.ExpandPath(cfg.RyugiServerHome)
@@ -82,15 +85,6 @@ func NewServer(ctx context.Context, opts ServerOptions) (*Server, error) {
 			ServerHome: cfg.RyugiServerHome,
 		}
 	}
-	ryugiBridge := NewRyugiBridge(RyugiBridgeConfig{
-		Store:        opts.Store,
-		Broker:       broker,
-		Runner:       runner,
-		DataDir:      cfg.DataDir,
-		Port:         cfg.RyugiPort,
-		PublicOrigin: cfg.RyugiPublicOrigin,
-		PollInterval: time.Duration(cfg.RyugiPollIntervalSeconds) * time.Second,
-	})
 
 	s := &Server{
 		hubCfg:   cfg,
@@ -98,9 +92,18 @@ func NewServer(ctx context.Context, opts ServerOptions) (*Server, error) {
 		machines: protocol.MachinesConfig{SchemaVersion: 1, Machines: map[string]protocol.MachineConfig{}},
 		store:    opts.Store,
 		broker:   broker,
-		ryugi:    ryugiBridge,
 		webFS:    opts.WebFS,
 	}
+	s.ryugi = NewRyugiBridge(RyugiBridgeConfig{
+		Store:        opts.Store,
+		Broker:       broker,
+		Runner:       runner,
+		DataDir:      cfg.DataDir,
+		Port:         cfg.RyugiPort,
+		PublicOrigin: cfg.RyugiPublicOrigin,
+		PollInterval: time.Duration(cfg.RyugiPollIntervalSeconds) * time.Second,
+		IsPaused:     s.IsGCPaused,
+	})
 
 	// Best-effort initial config load if projects.yaml / machines.yaml exist in configDir
 	if cfg.ConfigDir != "" {
@@ -207,6 +210,7 @@ func (s *Server) buildRouter() http.Handler {
 		api.Get("/deliveries/{deliveryId}/diff", s.handleGetDeliveryDiff)
 		api.Post("/deliveries/{deliveryId}/annotations", s.handleCreateAnnotation)
 		api.Post("/deliveries/{deliveryId}/ryugi/sync", s.handleSyncDeliveryRyugi)
+		api.Post("/deliveries/{deliveryId}/complete-review", s.handleCompleteDeliveryReview)
 
 		api.Put("/blobs/{sha256}", s.handlePutBlob)
 		api.Get("/blobs/{sha256}", s.handleGetBlob)
@@ -322,7 +326,7 @@ func (s *Server) handleManualImport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Verify every declared blob exists in delivery_blobs and on disk
+	// Verify every declared blob exists in delivery_blobs, matches size, and is present on disk
 	for _, b := range req.Blobs {
 		if !sha256Regex.MatchString(b.SHA256) {
 			writeAPIError(w, http.StatusBadRequest, "ERR_INVALID_BLOB_SHA", "invalid blob sha256: "+b.SHA256)
@@ -331,6 +335,10 @@ func (s *Server) handleManualImport(w http.ResponseWriter, r *http.Request) {
 		rec, err := s.store.GetBlobRecord(r.Context(), b.SHA256)
 		if err != nil {
 			writeAPIError(w, http.StatusBadRequest, "ERR_BLOB_MISSING", "declared blob not uploaded: "+b.SHA256)
+			return
+		}
+		if rec.SizeBytes != b.Size {
+			writeAPIError(w, http.StatusBadRequest, "ERR_BLOB_SIZE_MISMATCH", fmt.Sprintf("declared blob %s size %d does not match stored size %d", b.SHA256, b.Size, rec.SizeBytes))
 			return
 		}
 		if _, err := os.Stat(rec.StoragePath); err != nil {
@@ -395,6 +403,14 @@ func (s *Server) handleManualImport(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusBadRequest, "ERR_OWNERSHIP_MISMATCH", err.Error())
 		return
 	}
+	if errors.Is(err, store.ErrConflict) {
+		writeAPIError(w, http.StatusConflict, "ERR_DELIVERY_CONFLICT", err.Error())
+		return
+	}
+	if errors.Is(err, store.ErrBlobMismatch) {
+		writeAPIError(w, http.StatusBadRequest, "ERR_BLOB_SIZE_MISMATCH", err.Error())
+		return
+	}
 	if err != nil {
 		writeAPIError(w, http.StatusInternalServerError, "ERR_MANUAL_IMPORT_FAILED", err.Error())
 		return
@@ -410,6 +426,7 @@ func (s *Server) handleManualImport(w http.ResponseWriter, r *http.Request) {
 		Delivery:      res.Delivery,
 		RyugiBindings: []protocol.RyugiBindingView{},
 		InboxItem:     res.InboxItem,
+		Created:       res.Created,
 	}
 	if len(discoveredArtifacts) > 0 {
 		bindings, regErr := s.ryugi.RegisterDelivery(r.Context(), req.DeliveryID)
@@ -425,7 +442,11 @@ func (s *Server) handleManualImport(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	writeJSON(w, http.StatusCreated, resp)
+	status := http.StatusOK
+	if res.Created {
+		status = http.StatusCreated
+	}
+	writeJSON(w, status, resp)
 }
 
 func (s *Server) handleGetDelivery(w http.ResponseWriter, r *http.Request) {
@@ -554,9 +575,30 @@ func (s *Server) handleSyncDeliveryRyugi(w http.ResponseWriter, r *http.Request)
 		writeAPIError(w, http.StatusNotFound, "ERR_DELIVERY_NOT_FOUND", "delivery not found")
 		return
 	}
+	if errors.Is(err, ErrSyncPaused) {
+		writeAPIError(w, http.StatusConflict, "ERR_SYNC_PAUSED", err.Error())
+		return
+	}
 	if err != nil {
 		writeAPIError(w, http.StatusInternalServerError, "ERR_RYUGI_SYNC", err.Error())
 		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) handleCompleteDeliveryReview(w http.ResponseWriter, r *http.Request) {
+	deliveryID := chi.URLParam(r, "deliveryId")
+	resp, ev, err := s.store.CompleteDeliveryReview(r.Context(), deliveryID, actorFromContext(r.Context()))
+	if errors.Is(err, store.ErrNotFound) {
+		writeAPIError(w, http.StatusNotFound, "ERR_DELIVERY_NOT_FOUND", "delivery not found")
+		return
+	}
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, "ERR_COMPLETE_REVIEW", err.Error())
+		return
+	}
+	if ev != nil {
+		s.broker.Broadcast(*ev)
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -634,9 +676,32 @@ func (s *Server) handleGetBlob(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusInternalServerError, "ERR_BLOB_LOOKUP", err.Error())
 		return
 	}
+	f, err := os.Open(rec.StoragePath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			writeAPIError(w, http.StatusNotFound, "ERR_BLOB_NOT_FOUND", "blob file missing")
+			return
+		}
+		writeAPIError(w, http.StatusInternalServerError, "ERR_BLOB_OPEN", err.Error())
+		return
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, "ERR_BLOB_STAT", err.Error())
+		return
+	}
+
+	// Never allow browser HTML/JS sniffing or inline rendering on the Hub control-plane origin.
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, digest))
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Cache-Control", "immutable, max-age=31536000")
 	w.Header().Set("ETag", `"`+digest+`"`)
-	http.ServeFile(w, r, rec.StoragePath)
+	w.Header().Set("Content-Length", strconv.FormatInt(info.Size(), 10))
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.Copy(w, f)
 }
 
 func (s *Server) handleHeadBlob(w http.ResponseWriter, r *http.Request) {

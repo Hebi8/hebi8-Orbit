@@ -18,6 +18,7 @@ var (
 	ErrNotFound          = errors.New("not found")
 	ErrConflict          = errors.New("conflict")
 	ErrOwnershipMismatch = errors.New("ownership mismatch")
+	ErrBlobMismatch      = errors.New("blob missing or size mismatch")
 )
 
 // Store manages the single-writer SQLite WAL pool and a separate read-only query pool.

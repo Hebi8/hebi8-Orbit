@@ -156,6 +156,7 @@ export function App() {
           project={activeProject}
           machines={machines}
           tasks={tasks}
+          inboxItems={inboxItems}
           timeline={timelineQuery.data}
           isLoadingTimeline={timelineQuery.isLoading}
         />
