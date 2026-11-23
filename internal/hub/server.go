@@ -112,6 +112,11 @@ func NewServer(ctx context.Context, opts ServerOptions) (*Server, error) {
 		}
 	}
 
+	// Calibrate permissions on existing active=1 frozen Ryugi snapshots on startup (preserving comments.json/.state)
+	if err := s.ryugi.CalibrateActiveBindings(ctx); err != nil {
+		return nil, err
+	}
+
 	s.router = s.buildRouter()
 	return s, nil
 }
@@ -429,12 +434,19 @@ func (s *Server) handleManualImport(w http.ResponseWriter, r *http.Request) {
 		Created:       res.Created,
 	}
 	if len(discoveredArtifacts) > 0 {
-		bindings, regErr := s.ryugi.RegisterDelivery(r.Context(), req.DeliveryID)
-		if bindings != nil {
-			resp.RyugiBindings = bindings
-		}
-		if regErr != nil {
-			resp.RyugiError = regErr.Error()
+		// On exact idempotent replay where Ryugi is already ready, return existing bindings directly
+		// without re-invoking `ryugi start` or emitting duplicate delivery.ryugi_updated events.
+		needsRegister := res.Created ||
+			res.Delivery.RyugiSyncState == protocol.RyugiSyncPending ||
+			res.Delivery.RyugiSyncState == protocol.RyugiSyncFailed
+		if needsRegister {
+			bindings, regErr := s.ryugi.RegisterDelivery(r.Context(), req.DeliveryID)
+			if bindings != nil {
+				resp.RyugiBindings = bindings
+			}
+			if regErr != nil {
+				resp.RyugiError = regErr.Error()
+			}
 		}
 		if updatedDlv, updatedBindings, _, _, err := s.store.GetDeliveryDetail(r.Context(), req.DeliveryID); err == nil {
 			resp.Delivery = updatedDlv
@@ -477,7 +489,8 @@ func (s *Server) handleGetDelivery(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleGetDeliveryDiff(w http.ResponseWriter, r *http.Request) {
 	deliveryID := chi.URLParam(r, "deliveryId")
-	fileParam := strings.TrimSpace(r.URL.Query().Get("file"))
+	// Preserve leading/trailing whitespace in file names verbatim (no TrimSpace)
+	fileParam := r.URL.Query().Get("file")
 
 	dlv, _, _, proj, err := s.store.GetDeliveryDetail(r.Context(), deliveryID)
 	if errors.Is(err, store.ErrNotFound) {
@@ -693,15 +706,14 @@ func (s *Server) handleGetBlob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Never allow browser HTML/JS sniffing or inline rendering on the Hub control-plane origin.
+	// Lock Content-Type + attachment disposition BEFORE http.ServeContent so Go never sniffs
+	// HTML/JS while still supporting HTTP Range, If-Range, and conditional ETag/ModTime requests.
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, digest))
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Cache-Control", "immutable, max-age=31536000")
 	w.Header().Set("ETag", `"`+digest+`"`)
-	w.Header().Set("Content-Length", strconv.FormatInt(info.Size(), 10))
-	w.WriteHeader(http.StatusOK)
-	_, _ = io.Copy(w, f)
+	http.ServeContent(w, r, digest, info.ModTime(), f)
 }
 
 func (s *Server) handleHeadBlob(w http.ResponseWriter, r *http.Request) {
@@ -760,6 +772,11 @@ func (s *Server) handleGCPause(w http.ResponseWriter, r *http.Request) {
 		ExpiresAt: s.gcExpiresAt,
 	}
 	s.mu.Unlock()
+
+	// When pausing for backup/maintenance, wait until every in-flight Ryugi sync (read->commit->ack) exits.
+	if req.Paused {
+		s.ryugi.DrainInFlight()
+	}
 
 	writeJSON(w, http.StatusOK, resp)
 }

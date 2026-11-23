@@ -4,27 +4,31 @@ import type { EventRecord, WSServerMessage } from '../generated/protocol';
 import { useWorkbenchStore } from '../store/useWorkbenchStore';
 
 /**
- * Maintains a gapless WebSocket stream anchored ONCE at the initial bootstrap snapshotSeq:
- * - Subsequent bootstrap refetches NEVER advance lastAppliedSeqRef ahead of WS events
- *   that haven't yet invalidated timeline / delivery caches (Blocking #4).
- * - Buffers live `event` frames received during multi-page `replay` and drains them
- *   in strict ascending seq order upon `replay_end`.
+ * Maintains a persistent, gapless WebSocket stream seeded ONCE from the initial bootstrap snapshotSeq:
+ * - The effect depends only on `bootstrapReady` (boolean), NOT on `snapshotSeq`, so subsequent
+ *   bootstrap invalidations/refetches never disconnect WS or skip events (Item #3).
+ * - Reconnects always carry `lastAppliedSeqRef.current`.
  */
 export function useRealtimeSync(snapshotSeq: number | undefined) {
   const queryClient = useQueryClient();
   const setWSStatus = useWorkbenchStore((s) => s.setWSStatus);
   const setLastSeq = useWorkbenchStore((s) => s.setLastSeq);
 
-  const initializedRef = useRef<boolean>(false);
+  const initialSeqRef = useRef<number | null>(null);
+  if (snapshotSeq !== undefined && initialSeqRef.current === null) {
+    initialSeqRef.current = snapshotSeq;
+  }
+
+  const bootstrapReady = initialSeqRef.current !== null;
   const lastAppliedSeqRef = useRef<number>(0);
 
   useEffect(() => {
-    if (snapshotSeq === undefined) return;
-    // Only seed cursor ONCE from the initial bootstrap snapshot!
-    if (initializedRef.current) return;
-    initializedRef.current = true;
-    lastAppliedSeqRef.current = snapshotSeq;
-    setLastSeq(snapshotSeq);
+    if (!bootstrapReady || initialSeqRef.current === null) return;
+
+    if (lastAppliedSeqRef.current < initialSeqRef.current) {
+      lastAppliedSeqRef.current = initialSeqRef.current;
+      setLastSeq(initialSeqRef.current);
+    }
 
     let cancelled = false;
     let ws: WebSocket | null = null;
@@ -142,11 +146,10 @@ export function useRealtimeSync(snapshotSeq: number | undefined) {
 
     return () => {
       cancelled = true;
-      initializedRef.current = false;
       if (retryTimer !== null) {
         window.clearTimeout(retryTimer);
       }
       ws?.close();
     };
-  }, [snapshotSeq, queryClient, setLastSeq, setWSStatus]);
+  }, [bootstrapReady, queryClient, setLastSeq, setWSStatus]);
 }

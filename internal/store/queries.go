@@ -709,18 +709,29 @@ func (s *Store) CreateManualImportDelivery(ctx context.Context, p ManualImportPa
 	now := time.Now().UnixMilli()
 
 	err := s.WithWriteTx(ctx, func(tx *sql.Tx) error {
-		// Check if delivery already exists (strict conflict validation vs idempotent replay)
-		var existingProjectID, existingTaskID, existingAttemptID, existingBaseSHA, existingHeadSHA, existingGitRef string
+		resolvedKind := resolveDeliveryKind(p.Kind, p.Manifest)
+
+		// Check if delivery already exists (strict immutable metadata + canonical manifest validation)
+		var existingProjectID, existingTaskID, existingAttemptID, existingBaseSHA, existingHeadSHA, existingGitRef, existingKind, existingSummary, existingManifestJSON string
 		err := tx.QueryRowContext(ctx, `
-			SELECT project_id, task_id, attempt_id, base_sha, head_sha, git_ref
+			SELECT project_id, task_id, attempt_id, base_sha, head_sha, git_ref, kind, summary, manifest_json
 			FROM deliveries WHERE delivery_id = ?
-		`, p.DeliveryID).Scan(&existingProjectID, &existingTaskID, &existingAttemptID, &existingBaseSHA, &existingHeadSHA, &existingGitRef)
+		`, p.DeliveryID).Scan(
+			&existingProjectID, &existingTaskID, &existingAttemptID,
+			&existingBaseSHA, &existingHeadSHA, &existingGitRef,
+			&existingKind, &existingSummary, &existingManifestJSON,
+		)
 		if err == nil {
+			var existingManifest protocol.DeliveryManifest
+			_ = json.Unmarshal([]byte(existingManifestJSON), &existingManifest)
 			if existingProjectID != p.ProjectID ||
 				(p.TaskID != "" && existingTaskID != p.TaskID) ||
 				existingBaseSHA != p.BaseSHA ||
 				existingHeadSHA != p.HeadSHA ||
-				existingGitRef != p.GitRef {
+				existingGitRef != p.GitRef ||
+				existingKind != string(resolvedKind) ||
+				existingSummary != p.Summary ||
+				canonicalManifestJSON(existingManifest) != canonicalManifestJSON(p.Manifest) {
 				return fmt.Errorf("%w: delivery %s already exists with different immutable metadata", ErrConflict, p.DeliveryID)
 			}
 			res.Created = false
@@ -864,19 +875,9 @@ func (s *Store) CreateManualImportDelivery(ctx context.Context, p ManualImportPa
 			ryugiSyncState = protocol.RyugiSyncPending
 		}
 
-		kind := p.Kind
-		if kind == "" {
-			switch {
-			case len(p.Manifest.RyugiArtifacts) > 0 && p.Manifest.FilesChanged > 0:
-				kind = protocol.DeliveryMixed
-			case len(p.Manifest.RyugiArtifacts) > 0:
-				kind = protocol.DeliveryRyugiArtifact
-			default:
-				kind = protocol.DeliveryCodeDiff
-			}
-		}
+		kind := resolvedKind
 
-		manifestBytes, err := json.Marshal(p.Manifest)
+		manifestBytes, err := json.Marshal(normalizeManifest(p.Manifest))
 		if err != nil {
 			return err
 		}
@@ -1805,4 +1806,49 @@ func randomHex(nBytes int) string {
 	b := make([]byte, nBytes)
 	_, _ = rand.Read(b)
 	return hex.EncodeToString(b)
+}
+
+func resolveDeliveryKind(kind protocol.DeliveryKind, manifest protocol.DeliveryManifest) protocol.DeliveryKind {
+	if kind != "" {
+		return kind
+	}
+	switch {
+	case len(manifest.RyugiArtifacts) > 0 && manifest.FilesChanged > 0:
+		return protocol.DeliveryMixed
+	case len(manifest.RyugiArtifacts) > 0:
+		return protocol.DeliveryRyugiArtifact
+	default:
+		return protocol.DeliveryCodeDiff
+	}
+}
+
+func normalizeManifest(m protocol.DeliveryManifest) protocol.DeliveryManifest {
+	out := protocol.DeliveryManifest{
+		FilesChanged: m.FilesChanged,
+		Insertions:   m.Insertions,
+		Deletions:    m.Deletions,
+		WorktreePath: m.WorktreePath,
+	}
+	if len(m.Blobs) > 0 {
+		out.Blobs = append([]protocol.BlobManifestItem(nil), m.Blobs...)
+		sort.Slice(out.Blobs, func(i, j int) bool {
+			if out.Blobs[i].Path != out.Blobs[j].Path {
+				return out.Blobs[i].Path < out.Blobs[j].Path
+			}
+			if out.Blobs[i].SHA256 != out.Blobs[j].SHA256 {
+				return out.Blobs[i].SHA256 < out.Blobs[j].SHA256
+			}
+			return out.Blobs[i].Size < out.Blobs[j].Size
+		})
+	}
+	if len(m.RyugiArtifacts) > 0 {
+		out.RyugiArtifacts = append([]string(nil), m.RyugiArtifacts...)
+		sort.Strings(out.RyugiArtifacts)
+	}
+	return out
+}
+
+func canonicalManifestJSON(m protocol.DeliveryManifest) string {
+	b, _ := json.Marshal(normalizeManifest(m))
+	return string(b)
 }

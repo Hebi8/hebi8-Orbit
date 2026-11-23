@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -136,6 +138,82 @@ func pendingRecordPath(dataDir, deliveryID string) string {
 	return filepath.Join(dataDir, "cli-pending", deliveryID+".json")
 }
 
+func pendingBlobPath(dataDir, sha256Hex string) string {
+	return filepath.Join(dataDir, "cli-pending", "blobs", sha256Hex)
+}
+
+// stagePendingBlob copies attachment bytes into <dataDir>/cli-pending/blobs/<sha256>
+// while verifying the digest so `--resume` remains self-contained even if source files change or vanish.
+func stagePendingBlob(dataDir string, blob gitops.PackagedBlob) (string, error) {
+	dest := pendingBlobPath(dataDir, blob.Item.SHA256)
+	if info, err := os.Stat(dest); err == nil && info.Size() == blob.Item.Size {
+		return dest, nil
+	}
+	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+		return "", err
+	}
+	src, err := os.Open(blob.LocalPath)
+	if err != nil {
+		return "", err
+	}
+	defer src.Close()
+
+	tmp := dest + ".tmp-" + ulid.Make().String()
+	dst, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		return "", err
+	}
+	defer func() {
+		_ = dst.Close()
+		_ = os.Remove(tmp)
+	}()
+
+	h := sha256.New()
+	n, err := io.Copy(io.MultiWriter(dst, h), src)
+	if err != nil {
+		return "", err
+	}
+	if err := dst.Close(); err != nil {
+		return "", err
+	}
+	actual := hex.EncodeToString(h.Sum(nil))
+	if actual != blob.Item.SHA256 || n != blob.Item.Size {
+		return "", fmt.Errorf("attachment %s changed during staging (expected %s/%d, got %s/%d)", blob.LocalPath, blob.Item.SHA256, blob.Item.Size, actual, n)
+	}
+	if err := os.Rename(tmp, dest); err != nil {
+		return "", err
+	}
+	return dest, nil
+}
+
+// cleanupPendingDelivery removes pendingPath and deletes any staged pending blobs
+// no longer referenced by other remaining cli-pending/*.json records.
+func cleanupPendingDelivery(dataDir, pendingPath string, blobs []gitops.PackagedBlob) {
+	_ = os.Remove(pendingPath)
+	if len(blobs) == 0 {
+		return
+	}
+	stillReferenced := map[string]struct{}{}
+	entries, err := os.ReadDir(filepath.Join(dataDir, "cli-pending"))
+	if err == nil {
+		for _, e := range entries {
+			if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+				continue
+			}
+			if other, err := loadPendingRecord(filepath.Join(dataDir, "cli-pending", e.Name())); err == nil {
+				for _, b := range other.Blobs {
+					stillReferenced[b.Item.SHA256] = struct{}{}
+				}
+			}
+		}
+	}
+	for _, b := range blobs {
+		if _, used := stillReferenced[b.Item.SHA256]; !used {
+			_ = os.Remove(pendingBlobPath(dataDir, b.Item.SHA256))
+		}
+	}
+}
+
 func savePendingRecord(path string, rec pendingDeliveryRecord) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
@@ -236,6 +314,12 @@ func runDeliver(ctx context.Context, args []string, stdout, stderr io.Writer) er
 			dlvID = "dlv_" + ulid.Make().String()
 		}
 
+		// Protect any existing pending delivery record from being overwritten or re-committed
+		pendingPath = pendingRecordPath(dataDir, dlvID)
+		if _, err := os.Stat(pendingPath); err == nil {
+			return fmt.Errorf("pending delivery %s already exists at %s; use `orbit deliver --resume %s` instead of re-packaging", dlvID, pendingPath, dlvID)
+		}
+
 		var attachInputs []gitops.AttachmentInput
 		for _, raw := range attaches {
 			localPath := raw
@@ -264,6 +348,17 @@ func runDeliver(ctx context.Context, args []string, stdout, stderr io.Writer) er
 		})
 		if err != nil {
 			return fmt.Errorf("package checkpoint: %w", err)
+		}
+
+		// Stage attachment bytes into cli-pending/blobs/<sha256> so --resume is resilient to source file edits/deletions
+		stagedBlobs := make([]gitops.PackagedBlob, len(pkg.Blobs))
+		for i, b := range pkg.Blobs {
+			stagedPath, err := stagePendingBlob(dataDir, b)
+			if err != nil {
+				return fmt.Errorf("stage attachment %s: %w", b.Item.Path, err)
+			}
+			b.LocalPath = stagedPath
+			stagedBlobs[i] = b
 		}
 
 		sumText := strings.TrimSpace(*summary)
@@ -298,13 +393,12 @@ func runDeliver(ctx context.Context, args []string, stdout, stderr io.Writer) er
 			MirrorPath:     mirrorPath,
 			HubURL:         hubURL,
 			Manifest:       pkg.Manifest,
-			Blobs:          pkg.Blobs,
+			Blobs:          stagedBlobs,
 			RequestPayload: reqPayload,
 			CreatedAt:      time.Now().UnixMilli(),
 		}
 
 		// 2. Persist immutable pending record BEFORE push/upload/import so retries never re-commit
-		pendingPath = pendingRecordPath(dataDir, dlvID)
 		if err := savePendingRecord(pendingPath, rec); err != nil {
 			return fmt.Errorf("persist pending delivery record: %w", err)
 		}
@@ -362,17 +456,20 @@ func runDeliver(ctx context.Context, args []string, stdout, stderr io.Writer) er
 		)
 	}
 
-	// 6. All steps succeeded -> clean up pending delivery record
-	_ = os.Remove(pendingPath)
+	var result protocol.ManualImportResponse
+	if err := json.Unmarshal(respBytes, &result); err != nil {
+		return failWithResumeHint("decode manual-import response", err)
+	}
+	if result.Delivery.DeliveryID != rec.DeliveryID || result.Delivery.HeadSHA != rec.HeadSHA {
+		return failWithResumeHint("verify manual-import response", fmt.Errorf("hub returned mismatched delivery %s/%s", result.Delivery.DeliveryID, result.Delivery.HeadSHA))
+	}
+
+	// 6. All steps confirmed matching by Hub -> clean up pending delivery record and unreferenced staged blobs
+	cleanupPendingDelivery(dataDir, pendingPath, rec.Blobs)
 
 	if *jsonOut {
 		_, err := stdout.Write(append(bytes.TrimSpace(respBytes), '\n'))
 		return err
-	}
-
-	var result protocol.ManualImportResponse
-	if err := json.Unmarshal(respBytes, &result); err != nil {
-		return fmt.Errorf("decode manual-import response: %w", err)
 	}
 
 	shortBase := shortSHA(result.Delivery.BaseSHA)

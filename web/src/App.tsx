@@ -162,6 +162,7 @@ export function App() {
         />
 
         <ReviewDrawer
+          key={selectedDeliveryId ?? 'none'}
           detail={deliveryDetailQuery.data}
           isLoading={deliveryDetailQuery.isLoading}
           allTaskDeliveries={timelineQuery.data?.deliveries ?? []}

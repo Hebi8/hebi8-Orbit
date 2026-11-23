@@ -34,13 +34,10 @@ func actorFromContext(ctx context.Context) string {
 	return "unknown"
 }
 
-// ValidateListenAddr enforces that when Tailscale-User-Login auth is active (!DevOpen),
-// orbit-hub MUST bind strictly to a loopback interface (127.0.0.1 / ::1 / localhost) so
-// untrusted peers cannot spoof Tailscale-User-Login headers by connecting directly.
+// ValidateListenAddr unconditionally enforces that orbit-hub binds strictly to a loopback
+// interface (127.0.0.1 / ::1 / localhost), even in devOpen mode, so untrusted peers can
+// never connect directly or spoof Tailscale-User-Login headers.
 func ValidateListenAddr(cfg protocol.HubConfig) error {
-	if cfg.DevOpen {
-		return nil
-	}
 	addr := strings.TrimSpace(cfg.ListenAddr)
 	if addr == "" {
 		return fmt.Errorf("listenAddr is required")
@@ -51,14 +48,14 @@ func ValidateListenAddr(cfg protocol.HubConfig) error {
 	}
 	host = strings.Trim(host, "[]")
 	if host == "" {
-		return fmt.Errorf("non-loopback listenAddr %q is forbidden when Tailscale header auth is enabled (bind 127.0.0.1 or ::1)", addr)
+		return fmt.Errorf("non-loopback listenAddr %q is forbidden (bind 127.0.0.1, ::1, or localhost)", addr)
 	}
 	if strings.EqualFold(host, "localhost") {
 		return nil
 	}
 	ip := net.ParseIP(host)
 	if ip == nil || !ip.IsLoopback() {
-		return fmt.Errorf("non-loopback listenAddr %q is forbidden when Tailscale header auth is enabled (bind 127.0.0.1 or ::1)", addr)
+		return fmt.Errorf("non-loopback listenAddr %q is forbidden (bind 127.0.0.1, ::1, or localhost)", addr)
 	}
 	return nil
 }

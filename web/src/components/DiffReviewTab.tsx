@@ -29,10 +29,11 @@ interface DiffReviewTabProps {
   isDark: boolean;
   selectedFile: string;
   onSelectFile: (file: string) => void;
-  onSelectLine?: (file: string, line: number) => void;
+  onSelectLine?: (file: string, line: number | undefined) => void;
 }
 
 interface PendingComposer {
+  deliveryId: string;
   changeKey: string;
   path: string;
   side: 'old' | 'new';
@@ -122,10 +123,19 @@ export function DiffReviewTab({
     };
   }, [currentDiffFile, activeFile, isDark]);
 
+  // Reset draft composer whenever active delivery switches (Item #9)
+  useEffect(() => {
+    setComposer(null);
+    setDraftBody('');
+  }, [detail.delivery.deliveryId]);
+
   const createAnnotationMutation = useMutation({
-    mutationFn: (vars: { composer: PendingComposer; body: string }) =>
-      api.createAnnotation(
-        detail.delivery.deliveryId,
+    mutationFn: (vars: { composer: PendingComposer; body: string }) => {
+      if (vars.composer.deliveryId !== detail.delivery.deliveryId) {
+        return Promise.reject(new Error('交付已切换，请重新选择行号后再提交批注'));
+      }
+      return api.createAnnotation(
+        vars.composer.deliveryId,
         {
           source: 'diff_drawer',
           anchor: {
@@ -140,13 +150,13 @@ export function DiffReviewTab({
           },
           body: vars.body,
         },
-        // Reuse stable draft idempotencyKey across retries (Blocking #9)
         vars.composer.idempotencyKey,
-      ),
-    onSuccess: () => {
+      );
+    },
+    onSuccess: (_res, vars) => {
       setComposer(null);
       setDraftBody('');
-      void queryClient.invalidateQueries({ queryKey: ['delivery', detail.delivery.deliveryId] });
+      void queryClient.invalidateQueries({ queryKey: ['delivery', vars.composer.deliveryId] });
       void queryClient.invalidateQueries({ queryKey: ['task-timeline', detail.delivery.taskId] });
     },
   });
@@ -187,7 +197,7 @@ export function DiffReviewTab({
       map[ck].push(<InlineAnnotationCard key={ann.annotationId} annotation={ann} />);
     }
 
-    if (composer && composer.path === activeFile) {
+    if (composer && composer.deliveryId === detail.delivery.deliveryId && composer.path === activeFile) {
       const ck = composer.changeKey;
       if (!map[ck]) map[ck] = [];
       map[ck].push(
@@ -273,11 +283,20 @@ export function DiffReviewTab({
       side,
     );
 
+    // Only pass a target line number to IDE jump when the clicked change maps to a new-side line;
+    // clicking a pure deleted line opens the file without passing an obsolete old-file line number (Item #9).
     if (onSelectLine) {
-      onSelectLine(activeFile, line);
+      if (side === 'new' && newLn > 0) {
+        onSelectLine(activeFile, newLn);
+      } else if (newLn > 0) {
+        onSelectLine(activeFile, newLn);
+      } else {
+        onSelectLine(activeFile, undefined);
+      }
     }
 
     setComposer({
+      deliveryId: detail.delivery.deliveryId,
       changeKey: getChangeKey(change),
       path: activeFile,
       side,

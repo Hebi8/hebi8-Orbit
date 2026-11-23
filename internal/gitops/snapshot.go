@@ -339,6 +339,27 @@ func calibrateExistingFrozenSnapshot(targetRoot, deliveryID string) ([]ExportedA
 	return freezeRyugiArtifactsDir(artifactsRoot, targetRoot, deliveryID)
 }
 
+// CalibrateFrozenSnapshot idempotently calibrates permissions on an existing frozen snapshot
+// directory without re-exporting or touching existing comments.json/.state files.
+// Returns nil without error if targetDir does not exist.
+func CalibrateFrozenSnapshot(targetDir, deliveryID string) ([]ExportedArtifact, error) {
+	absTarget, err := filepath.Abs(targetDir)
+	if err != nil {
+		return nil, err
+	}
+	info, err := os.Stat(absTarget)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if !info.IsDir() {
+		return nil, nil
+	}
+	return calibrateExistingFrozenSnapshot(absTarget, deliveryID)
+}
+
 // RemoveFrozenDir safely removes a frozen snapshot directory by restoring write permissions first.
 func RemoveFrozenDir(dir string) error {
 	if _, err := os.Stat(dir); os.IsNotExist(err) {

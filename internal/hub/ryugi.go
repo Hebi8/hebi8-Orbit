@@ -93,6 +93,7 @@ type RyugiBridge struct {
 
 	mu       sync.Mutex
 	inFlight map[string]*singleFlightEntry
+	syncOpMu sync.RWMutex // held for read during SyncBinding (fetch->commit->ack); DrainInFlight acquires write lock
 }
 
 type singleFlightEntry struct {
@@ -131,6 +132,38 @@ func NewRyugiBridge(cfg RyugiBridgeConfig) *RyugiBridge {
 
 func (b *RyugiBridge) isPaused() bool {
 	return b.isPausedFn != nil && b.isPausedFn()
+}
+
+// DrainInFlight blocks until every currently executing SyncBinding (read -> SQLite COMMIT -> ack)
+// finishes. Callers MUST set the paused state BEFORE calling DrainInFlight so no new syncs begin.
+func (b *RyugiBridge) DrainInFlight() {
+	b.syncOpMu.Lock()
+	b.syncOpMu.Unlock()
+}
+
+// CalibrateActiveBindings scans all active=1 Ryugi bindings at startup and idempotently
+// calibrates permissions on each existing frozen_project_dir without re-exporting or touching comments.
+func (b *RyugiBridge) CalibrateActiveBindings(ctx context.Context) error {
+	records, err := b.store.ListRyugiBindings(ctx, "", true)
+	if err != nil {
+		return err
+	}
+	seen := map[string]struct{}{}
+	var errs []string
+	for _, rec := range records {
+		key := rec.DeliveryID + "\x00" + rec.FrozenProjectDir
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		if _, err := gitops.CalibrateFrozenSnapshot(rec.FrozenProjectDir, rec.DeliveryID); err != nil {
+			errs = append(errs, fmt.Sprintf("%s (%s): %v", rec.DeliveryID, rec.FrozenProjectDir, err))
+		}
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("calibrate active ryugi bindings: %s", strings.Join(errs, "; "))
+	}
+	return nil
 }
 
 func (b *RyugiBridge) bindingGate(bindingID string) *singleFlightEntry {
@@ -407,10 +440,14 @@ func (b *RyugiBridge) SyncDelivery(ctx context.Context, deliveryID string) (prot
 }
 
 // SyncBinding runs a single-flight sync for one binding_id.
-// Strictly commits to SQLite BEFORE acking ANY Ryugi receipt, preserves every distinct
-// page receipt across pagination, fails fast on malformed thread payloads, surfaces
-// document changes errors verbatim, and tracks monotonic revisions for A -> B -> A state changes.
+// Holds syncOpMu.RLock across the full read -> SQLite COMMIT -> ack section so gc-pause can drain
+// all in-flight syncs cleanly. Preserves every distinct page receipt across pagination, fails fast
+// on malformed thread payloads or human messages missing stable msg.ID, surfaces document changes
+// errors verbatim, and tracks monotonic revisions for A -> B -> A state changes.
 func (b *RyugiBridge) SyncBinding(ctx context.Context, bindingID string) (BindingSyncResult, error) {
+	b.syncOpMu.RLock()
+	defer b.syncOpMu.RUnlock()
+
 	if b.isPaused() {
 		return BindingSyncResult{}, ErrSyncPaused
 	}
@@ -466,13 +503,17 @@ func (b *RyugiBridge) SyncBinding(ctx context.Context, bindingID string) (Bindin
 			if th.Status == "withdrawn" || th.Status == "draft" {
 				continue
 			}
-			for _, msg := range th.Messages {
+			for msgIdx, msg := range th.Messages {
 				if msg.Author != "human" {
 					continue
 				}
 				text := strings.TrimSpace(msg.Text)
 				if text == "" {
 					continue
+				}
+				msgID := strings.TrimSpace(msg.ID)
+				if msgID == "" {
+					return BindingSyncResult{}, fmt.Errorf("thread %s human message #%d missing stable id (aborting ack to preserve unread)", th.ID, msgIdx)
 				}
 				anchor := protocol.AnnotationAnchor{
 					Artifact: rec.ArtifactLocator,
@@ -494,7 +535,7 @@ func (b *RyugiBridge) SyncBinding(ctx context.Context, bindingID string) (Bindin
 					anchor.Page = page
 				}
 				incoming = append(incoming, store.IncomingRyugiAnnotation{
-					ExternalKey: fmt.Sprintf("ryugi:%s:threads:%s:%s", rec.BindingID, th.ID, msg.ID),
+					ExternalKey: fmt.Sprintf("ryugi:%s:threads:%s:%s", rec.BindingID, th.ID, msgID),
 					Anchor:      anchor,
 					Body:        text,
 				})

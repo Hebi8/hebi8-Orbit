@@ -45,7 +45,19 @@ func ComputeMirrorDiff(ctx context.Context, mirrorPath, baseSHA, headSHA, filePa
 
 	args := []string{"-c", "core.quotePath=false", "--git-dir", absMirror, "diff", "-U3", "--no-color", "-M", baseSHA, headSHA}
 	if cleanFile != "" {
-		args = append(args, "--", ":(literal)"+cleanFile)
+		// For renames/copies, include both old and new literal pathspecs so git preserves rename diff headers.
+		var oldMatch string
+		for _, f := range files {
+			if f.Path == cleanFile && f.OldPath != "" {
+				oldMatch = f.OldPath
+				break
+			}
+		}
+		args = append(args, "--")
+		if oldMatch != "" {
+			args = append(args, ":(literal)"+oldMatch)
+		}
+		args = append(args, ":(literal)"+cleanFile)
 	}
 	diffText, err := runGit(ctx, "", nil, args...)
 	if err != nil {

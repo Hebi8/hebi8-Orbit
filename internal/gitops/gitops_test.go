@@ -207,8 +207,29 @@ func TestPackageCheckpoint_UnicodePathsAndSubdirectoryInvocation(t *testing.T) {
 	if !foundRename {
 		t.Fatalf("expected renamed unicode file stat, got %+v", files)
 	}
-	if !strings.Contains(diffText, "line two updated") || strings.Contains(diffText, "from root") {
-		t.Fatalf("literal single-file unicode diff unexpected:\n%s", diffText)
+	if !strings.Contains(diffText, "rename from ") || !strings.Contains(diffText, "rename to ") || !strings.Contains(diffText, "line two updated") || strings.Contains(diffText, "from root") {
+		t.Fatalf("literal single-file unicode rename diff unexpected:\n%s", diffText)
+	}
+
+	// Verify filenames with leading/trailing spaces survive end-to-end without trimming
+	spacedFile := " leading space .txt"
+	if err := os.WriteFile(filepath.Join(repo, spacedFile), []byte("spaced content\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pkgSp, err := gitops.PackageCheckpoint(ctx, gitops.PackageOptions{
+		RepoDir:       repo,
+		DeliveryID:    "dlv_01SPACED000000000001",
+		ReviewBaseSHA: baseSHA,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gitops.PushDeliveryRef(ctx, repo, mirror, pkgSp.DeliveryID, pkgSp.HeadSHA); err != nil {
+		t.Fatal(err)
+	}
+	_, spDiff, err := gitops.ComputeMirrorDiff(ctx, mirror, baseSHA, pkgSp.HeadSHA, spacedFile)
+	if err != nil || !strings.Contains(spDiff, "spaced content") {
+		t.Fatalf("expected leading/trailing spaced filename diff, err=%v diff=%s", err, spDiff)
 	}
 }
 
@@ -404,6 +425,20 @@ func TestPackageCheckpoint_DirtySubmoduleHeadAdvanceAndWorkingTreeEdit(t *testin
 	})
 	if !errors.Is(err, gitops.ErrDirtySubmodule) {
 		t.Fatalf("expected ErrDirtySubmodule for uncommitted submodule working tree edit, got %v", err)
+	}
+
+	// Case 1b: Even when submodule has status.showUntrackedFiles=no, an untracked file MUST be caught!
+	runCmd(t, subDir, env, "git", "checkout", "--", "README.md")
+	runCmd(t, subDir, env, "git", "config", "status.showUntrackedFiles", "no")
+	if err := os.WriteFile(filepath.Join(subDir, "sneaky_untracked.txt"), []byte("untracked\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err = gitops.PackageCheckpoint(ctx, gitops.PackageOptions{
+		RepoDir:    mainRepo,
+		DeliveryID: "dlv_01SUBUNTRK00000001",
+	})
+	if !errors.Is(err, gitops.ErrDirtySubmodule) {
+		t.Fatalf("expected ErrDirtySubmodule for untracked file even with status.showUntrackedFiles=no, got %v", err)
 	}
 
 	// Case 2: Commit inside submodule so HEAD advances ('+' flag) -> MUST also be rejected!

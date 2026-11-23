@@ -134,16 +134,22 @@ func TestOrbitCLI_DeliverFromSubdirAndStatus(t *testing.T) {
 
 func TestOrbitCLI_ResumeReusesExactFixedHeadSHA(t *testing.T) {
 	ctx := context.Background()
-	_, dataDir, repo, ts := setupCLITestEnv(t)
+	tmp, dataDir, repo, ts := setupCLITestEnv(t)
 	dlvID := "dlv_01RESUMETEST0000000001"
 
-	// 1. First attempt fails because hub URL is unreachable -> must persist cli-pending/<dlvId>.json
+	attachFile := filepath.Join(tmp, "ephemeral.png")
+	if err := os.WriteFile(attachFile, []byte("original-attachment-bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. First attempt fails because hub URL is unreachable -> must persist cli-pending/<dlvId>.json + staged blob copy
 	var out, errBuf bytes.Buffer
 	err := run(ctx, []string{
 		"deliver",
 		"--project", "demo-app",
 		"--repo", repo,
 		"--delivery-id", dlvID,
+		"--attach", attachFile + ":assets/ephemeral.png",
 		"--hub", "http://127.0.0.1:1",
 		"--data-dir", dataDir,
 		"--mirror", filepath.Join(dataDir, "git", "demo-app.git"),
@@ -162,9 +168,34 @@ func TestOrbitCLI_ResumeReusesExactFixedHeadSHA(t *testing.T) {
 		t.Fatalf("expected pending record saved at %s: %v", pPath, err)
 	}
 	originalHeadSHA := rec.HeadSHA
+	stagedBlob := pendingBlobPath(dataDir, rec.Blobs[0].Item.SHA256)
+	if _, err := os.Stat(stagedBlob); err != nil {
+		t.Fatalf("expected staged pending blob at %s: %v", stagedBlob, err)
+	}
 
-	// 2. Mutate working tree AFTER packaging -> --resume MUST NOT re-commit or change HeadSHA!
+	// 2. Re-invoking deliver WITHOUT --resume on existing pending deliveryId MUST fail and protect pending file!
+	out.Reset()
+	errBuf.Reset()
+	err = run(ctx, []string{
+		"deliver",
+		"--project", "demo-app",
+		"--repo", repo,
+		"--delivery-id", dlvID,
+		"--hub", ts.URL,
+		"--data-dir", dataDir,
+		"--mirror", filepath.Join(dataDir, "git", "demo-app.git"),
+		"--summary", "Must not overwrite pending",
+	}, &out, &errBuf)
+	if err == nil || !strings.Contains(err.Error(), "--resume "+dlvID) {
+		t.Fatalf("expected deliver without --resume on existing pending deliveryId to fail cleanly, got err=%v", err)
+	}
+
+	// 3. Mutate working tree AND delete original attachment file BEFORE --resume ->
+	//    --resume MUST still upload staged attachment bytes and reuse exact originalHeadSHA!
 	if err := os.WriteFile(filepath.Join(repo, "main.go"), []byte("package main\n// mutated after failure!\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(attachFile); err != nil {
 		t.Fatal(err)
 	}
 
@@ -185,10 +216,13 @@ func TestOrbitCLI_ResumeReusesExactFixedHeadSHA(t *testing.T) {
 	if err := json.Unmarshal(out.Bytes(), &resp); err != nil {
 		t.Fatalf("decode resume json: %v", err)
 	}
-	if resp.Delivery.HeadSHA != originalHeadSHA {
-		t.Fatalf("CRITICAL: --resume changed headSha! orig=%s resumed=%s", originalHeadSHA, resp.Delivery.HeadSHA)
+	if resp.Delivery.HeadSHA != originalHeadSHA || len(resp.Delivery.Manifest.Blobs) != 1 {
+		t.Fatalf("CRITICAL: --resume mismatch! orig=%s resumed=%s blobs=%d", originalHeadSHA, resp.Delivery.HeadSHA, len(resp.Delivery.Manifest.Blobs))
 	}
 	if _, err := os.Stat(pPath); !os.IsNotExist(err) {
 		t.Fatalf("expected pending file deleted after successful --resume")
+	}
+	if _, err := os.Stat(stagedBlob); !os.IsNotExist(err) {
+		t.Fatalf("expected staged pending blob cleaned up after successful --resume")
 	}
 }

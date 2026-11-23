@@ -276,7 +276,7 @@ func checkRegisteredSubmodules(ctx context.Context, repoRoot string) error {
 	}
 	for _, subRel := range splitNUL(pathsOut) {
 		subAbs := filepath.Join(repoRoot, filepath.FromSlash(subRel))
-		porcelain, err := runGit(ctx, subAbs, nil, "-c", "core.quotePath=false", "status", "--porcelain")
+		porcelain, err := runGit(ctx, subAbs, nil, "-c", "core.quotePath=false", "status", "--porcelain", "--untracked-files=all")
 		if err != nil {
 			return fmt.Errorf("%w: inspect submodule %s: %v", ErrDirtySubmodule, subRel, err)
 		}
@@ -321,7 +321,7 @@ func checkIndexGitlinks(ctx context.Context, repoRoot string, indexEnv []string)
 		}
 		// Double-check working tree cleanliness for every gitlink
 		subAbs := filepath.Join(repoRoot, filepath.FromSlash(norm))
-		porcelain, err := runGit(ctx, subAbs, nil, "-c", "core.quotePath=false", "status", "--porcelain")
+		porcelain, err := runGit(ctx, subAbs, nil, "-c", "core.quotePath=false", "status", "--porcelain", "--untracked-files=all")
 		if err != nil {
 			return fmt.Errorf("%w: inspect gitlink %s: %v", ErrDirtySubmodule, norm, err)
 		}

@@ -237,21 +237,23 @@ func TestAuthAndCrossOriginDefense(t *testing.T) {
 		t.Fatalf("expected 403 for Tailscale write without Origin header, got %d", resp.StatusCode)
 	}
 
-	// 10. ValidateListenAddr rejects non-loopback in production mode (!DevOpen)
-	for _, badAddr := range []string{"0.0.0.0:4310", ":4310", "[::]:4310", "192.168.1.10:4310"} {
-		badCfg := protocol.DefaultHubConfig()
-		badCfg.DevOpen = false
-		badCfg.ListenAddr = badAddr
-		if err := hub.ValidateListenAddr(badCfg); err == nil {
-			t.Fatalf("expected ValidateListenAddr to reject non-loopback %q", badAddr)
+	// 10. ValidateListenAddr unconditionally rejects non-loopback EVEN when DevOpen == true (Item #6)
+	for _, devOpen := range []bool{false, true} {
+		for _, badAddr := range []string{"0.0.0.0:4310", ":4310", "[::]:4310", "192.168.1.10:4310"} {
+			badCfg := protocol.DefaultHubConfig()
+			badCfg.DevOpen = devOpen
+			badCfg.ListenAddr = badAddr
+			if err := hub.ValidateListenAddr(badCfg); err == nil {
+				t.Fatalf("expected ValidateListenAddr(devOpen=%v) to reject non-loopback %q", devOpen, badAddr)
+			}
 		}
-	}
-	for _, okAddr := range []string{"127.0.0.1:4310", "[::1]:4310", "localhost:4310"} {
-		okCfg := protocol.DefaultHubConfig()
-		okCfg.DevOpen = false
-		okCfg.ListenAddr = okAddr
-		if err := hub.ValidateListenAddr(okCfg); err != nil {
-			t.Fatalf("expected ValidateListenAddr to allow loopback %q, got %v", okAddr, err)
+		for _, okAddr := range []string{"127.0.0.1:4310", "[::1]:4310", "localhost:4310"} {
+			okCfg := protocol.DefaultHubConfig()
+			okCfg.DevOpen = devOpen
+			okCfg.ListenAddr = okAddr
+			if err := hub.ValidateListenAddr(okCfg); err != nil {
+				t.Fatalf("expected ValidateListenAddr(devOpen=%v) to allow loopback %q, got %v", devOpen, okAddr, err)
+			}
 		}
 	}
 
@@ -323,6 +325,22 @@ func TestBlobsStreamingSHA256AndAnnotationsIdempotency(t *testing.T) {
 			htmlGet.Header.Get("Content-Type"),
 			htmlGet.Header.Get("Content-Disposition"),
 			htmlGet.Header.Get("X-Content-Type-Options"))
+	}
+
+	// Verify HTTP Range support via http.ServeContent while keeping octet-stream + attachment (Item #11)
+	rangeReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/blobs/"+htmlHex, nil)
+	rangeReq.Header.Set("Range", "bytes=0-8")
+	rangeResp, err := http.DefaultClient.Do(rangeReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rangeBytes, _ := io.ReadAll(rangeResp.Body)
+	rangeResp.Body.Close()
+	if rangeResp.StatusCode != http.StatusPartialContent || string(rangeBytes) != "<!doctype" ||
+		rangeResp.Header.Get("Content-Type") != "application/octet-stream" ||
+		!strings.Contains(rangeResp.Header.Get("Content-Disposition"), "attachment;") {
+		t.Fatalf("unexpected Range response: status=%d body=%q ct=%q cd=%q",
+			rangeResp.StatusCode, string(rangeBytes), rangeResp.Header.Get("Content-Type"), rangeResp.Header.Get("Content-Disposition"))
 	}
 
 	req, _ = http.NewRequest(http.MethodPut, ts.URL+"/api/blobs/"+goodHex, bytes.NewReader(payload))
@@ -470,6 +488,48 @@ func TestBlobsStreamingSHA256AndAnnotationsIdempotency(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusConflict {
 		t.Fatalf("expected 409 Conflict for mismatched existing deliveryId, got %d", resp.StatusCode)
+	}
+
+	// Conflicting manual-import reusing same deliveryId with different summary/manifest -> 409 Conflict (Item #5)
+	conflictSummaryBody, _ := json.Marshal(protocol.ManualImportRequest{
+		DeliveryID: dlvID,
+		ProjectID:  "demo-app",
+		Summary:    "tampered summary",
+		BaseSHA:    pkg.ReviewBaseSHA,
+		HeadSHA:    pkg.HeadSHA,
+		GitRef:     "refs/orbit/deliveries/" + dlvID,
+		Blobs:      []protocol.BlobManifestItem{{Path: "notes/extra.bin", SHA256: goodHex, Size: int64(len(payload))}},
+	})
+	req, _ = http.NewRequest(http.MethodPost, ts.URL+"/api/deliveries/manual-import", bytes.NewReader(conflictSummaryBody))
+	req.Header.Set("X-Orbit-Request", "1")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict for mismatched summary on existing deliveryId, got %d", resp.StatusCode)
+	}
+
+	// Conflicting manual-import reusing same deliveryId with different blobs manifest -> 409 Conflict (Item #5)
+	conflictManifestBody, _ := json.Marshal(protocol.ManualImportRequest{
+		DeliveryID: dlvID,
+		ProjectID:  "demo-app",
+		Summary:    "Add greeting",
+		BaseSHA:    pkg.ReviewBaseSHA,
+		HeadSHA:    pkg.HeadSHA,
+		GitRef:     "refs/orbit/deliveries/" + dlvID,
+		Blobs:      nil, // missing blob from original manifest
+	})
+	req, _ = http.NewRequest(http.MethodPost, ts.URL+"/api/deliveries/manual-import", bytes.NewReader(conflictManifestBody))
+	req.Header.Set("X-Orbit-Request", "1")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict for mismatched manifest blobs on existing deliveryId, got %d", resp.StatusCode)
 	}
 
 	// Complete review endpoint resolves inbox item
@@ -1072,5 +1132,216 @@ func TestWebSocket_PaginatedReplayOver1000AndLiveBurstNoDrops(t *testing.T) {
 			lastSeq = msg.Event.Seq
 			liveReceived++
 		}
+	}
+}
+
+// Items #1, #2, #5, #10:
+// - Startup CalibrateActiveBindings upgrades old 0555 <artifactDir> to 0755 preserving comments.json
+// - Exact manual-import replay of ready delivery skips redundant `ryugi start` and duplicate events
+// - Human message missing stable msg.ID fails fast and never acks
+// - gc-pause drains in-flight SyncBinding before returning 200 OK
+func TestRyugiBridge_StartupCalibrationReadyReplayMissingMsgIDAndGCPauseDrain(t *testing.T) {
+	var mu sync.Mutex
+	startCount := 0
+	ackCount := 0
+	missingMsgID := false
+
+	inFlightEntered := make(chan struct{})
+	releaseInFlight := make(chan struct{})
+	blockNextList := false
+
+	fake := &fakeRyugiRunner{
+		handler: func(args []string) ([]byte, error) {
+			joined := strings.Join(args, " ")
+			mu.Lock()
+			if strings.HasPrefix(joined, "start ") {
+				startCount++
+				mu.Unlock()
+				return []byte(`{"schema":"ryugi.cli/v1","command":"start","outcome":"success","data":{"url":"http://localhost:27319/document/CalibDrain12345678901"}}`), nil
+			}
+			if strings.HasPrefix(joined, "comment list ") {
+				shouldBlock := blockNextList
+				isMissingID := missingMsgID
+				blockNextList = false
+				mu.Unlock()
+				if shouldBlock {
+					close(inFlightEntered)
+					<-releaseInFlight
+				}
+				if isMissingID {
+					return []byte(`{"schema":"ryugi.cli/v1","command":"comment.list","outcome":"success","data":{"artifact":"document/spec","sections":{"threads":{"items":[{"id":"t1","anchor":{"blockId":"p1"},"status":"open","messages":[{"id":"","author":"human","text":"no id must fail"}]}],"receipt":"rcpt-missing-id","page":{"hasMore":false,"nextCursor":null}}}}}`), nil
+				}
+				return []byte(`{"schema":"ryugi.cli/v1","command":"comment.list","outcome":"success","data":{"artifact":"document/spec","sections":{"threads":{"items":[{"id":"t_ok","anchor":{"blockId":"p1"},"status":"open","messages":[{"id":"m_ok","author":"human","text":"valid note"}]}],"receipt":"rcpt-drain-1","page":{"hasMore":false,"nextCursor":null}}}}}`), nil
+			}
+			if strings.HasPrefix(joined, "changes ") {
+				mu.Unlock()
+				return []byte(`{"schema":"ryugi.cli/v1","command":"changes","outcome":"success","data":{"artifact":"document/spec","empty":true,"diff":""}}`), nil
+			}
+			if strings.HasPrefix(joined, "comment ack") {
+				ackCount++
+				mu.Unlock()
+				return []byte(`{"schema":"ryugi.cli/v1","command":"comment.ack","outcome":"success","data":{"status":"acknowledged"}}`), nil
+			}
+			mu.Unlock()
+			return []byte(`{"schema":"ryugi.cli/v1","outcome":"success","data":{}}`), nil
+		},
+	}
+
+	srv, st, cfgDir, dataDir := setupTestHub(t, func(c *protocol.HubConfig) { c.DevOpen = true }, fake)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	ctx := context.Background()
+
+	// Seed repo + delivery with Ryugi artifact
+	repo := t.TempDir()
+	gitEnv := append(os.Environ(),
+		"GIT_AUTHOR_NAME=Tester", "GIT_AUTHOR_EMAIL=tester@example.com",
+		"GIT_COMMITTER_NAME=Tester", "GIT_COMMITTER_EMAIL=tester@example.com",
+	)
+	runG := func(args ...string) {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repo
+		cmd.Env = gitEnv
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, string(out))
+		}
+	}
+	runG("init", "-b", "main")
+	artDir := filepath.Join(repo, ".ryugi", "artifacts", "document", "spec")
+	_ = os.MkdirAll(artDir, 0o755)
+	_ = os.WriteFile(filepath.Join(artDir, "doc.xml"), []byte("<doc><p id=\"p1\">Hello</p></doc>\n"), 0o644)
+	runG("add", ".")
+	runG("commit", "-m", "add doc")
+
+	dlvID := "dlv_01DRAINANDCALIB00001"
+	pkg, err := gitops.PackageCheckpoint(ctx, gitops.PackageOptions{RepoDir: repo, DeliveryID: dlvID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gitops.PushDeliveryRef(ctx, repo, filepath.Join(dataDir, "git", "demo-app.git"), dlvID, pkg.HeadSHA); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = gitops.RemoveFrozenDir(filepath.Join(dataDir, "deliveries", dlvID)) })
+
+	importBody, _ := json.Marshal(protocol.ManualImportRequest{
+		DeliveryID: dlvID,
+		ProjectID:  "demo-app",
+		Title:      "Calib & Drain",
+		Summary:    "Check startup calibration and ready replay",
+		BaseSHA:    pkg.ReviewBaseSHA,
+		HeadSHA:    pkg.HeadSHA,
+		GitRef:     "refs/orbit/deliveries/" + dlvID,
+	})
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/deliveries/manual-import", bytes.NewReader(importBody))
+	req.Header.Set("X-Orbit-Request", "1")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil || resp.StatusCode != http.StatusCreated {
+		t.Fatalf("initial manual-import failed: err=%v resp=%v", err, resp)
+	}
+	resp.Body.Close()
+
+	// Item #5: exact idempotent replay while ryugi_sync_state=='ready' MUST NOT call `ryugi start` again!
+	seqBeforeReplay, _ := st.MaxEventSeq(ctx)
+	req, _ = http.NewRequest(http.MethodPost, ts.URL+"/api/deliveries/manual-import", bytes.NewReader(importBody))
+	req.Header.Set("X-Orbit-Request", "1")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("replay manual-import failed: err=%v resp=%v", err, resp)
+	}
+	var replayResp protocol.ManualImportResponse
+	_ = json.NewDecoder(resp.Body).Decode(&replayResp)
+	resp.Body.Close()
+	seqAfterReplay, _ := st.MaxEventSeq(ctx)
+	if startCount != 1 || len(replayResp.RyugiBindings) != 1 || seqAfterReplay != seqBeforeReplay {
+		t.Fatalf("expected ready replay to skip ryugi start and extra events: startCount=%d bindings=%d seq=%d->%d",
+			startCount, len(replayResp.RyugiBindings), seqBeforeReplay, seqAfterReplay)
+	}
+
+	// Item #10: Human message missing stable msg.ID MUST return error and NOT ack!
+	mu.Lock()
+	missingMsgID = true
+	mu.Unlock()
+	if _, err := srv.RyugiBridge().SyncBinding(ctx, replayResp.RyugiBindings[0].BindingID); err == nil {
+		t.Fatalf("expected SyncBinding to reject human message missing stable msg.ID")
+	}
+	if ackCount != 0 {
+		t.Fatalf("expected 0 acks when human message missing msg.ID, got %d", ackCount)
+	}
+
+	// Item #2: gc-pause MUST wait until in-flight SyncBinding completes its read->commit->ack before returning!
+	mu.Lock()
+	missingMsgID = false
+	blockNextList = true
+	mu.Unlock()
+
+	syncDone := make(chan error, 1)
+	go func() {
+		_, err := srv.RyugiBridge().SyncBinding(ctx, replayResp.RyugiBindings[0].BindingID)
+		syncDone <- err
+	}()
+	<-inFlightEntered
+
+	pauseDone := make(chan int, 1)
+	go func() {
+		pReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/admin/gc-pause", strings.NewReader(`{"paused":true,"reason":"backup"}`))
+		pReq.Header.Set("X-Orbit-Request", "1")
+		pResp, err := http.DefaultClient.Do(pReq)
+		if err != nil {
+			pauseDone <- 0
+			return
+		}
+		pResp.Body.Close()
+		pauseDone <- pResp.StatusCode
+	}()
+
+	// Verify gc-pause is STILL waiting while SyncBinding is in-flight
+	select {
+	case code := <-pauseDone:
+		t.Fatalf("gc-pause returned prematurely (%d) while SyncBinding was still in-flight!", code)
+	case <-time.After(80 * time.Millisecond):
+	}
+
+	// Release in-flight sync -> both SyncBinding and gc-pause must finish cleanly, with ackCount == 1 BEFORE pause returns
+	close(releaseInFlight)
+	if err := <-syncDone; err != nil {
+		t.Fatalf("in-flight SyncBinding failed: %v", err)
+	}
+	if code := <-pauseDone; code != http.StatusOK {
+		t.Fatalf("expected gc-pause 200 after drain, got %d", code)
+	}
+	mu.Lock()
+	gotAck := ackCount
+	mu.Unlock()
+	if gotAck != 1 {
+		t.Fatalf("expected in-flight sync to finish ack before gc-pause returned, got ackCount=%d", gotAck)
+	}
+
+	// Item #1: Simulate legacy 0555 <artifactDir> with existing comments.json, then restart NewServer -> auto-calibrates to 0755 preserving comments.json!
+	frozenSpecDir := filepath.Join(dataDir, "deliveries", dlvID, ".ryugi", "artifacts", "document", "spec")
+	commentsPath := filepath.Join(frozenSpecDir, "comments.json")
+	if err := os.WriteFile(commentsPath, []byte(`{"version":1,"threads":[]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(frozenSpecDir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+
+	restartCfg := protocol.DefaultHubConfig()
+	restartCfg.ConfigDir = cfgDir
+	restartCfg.DataDir = dataDir
+	restartCfg.DevOpen = true
+	if _, err := hub.NewServer(ctx, hub.ServerOptions{
+		HubConfig:   restartCfg,
+		Store:       st,
+		RyugiRunner: fake,
+	}); err != nil {
+		t.Fatalf("restarted NewServer calibration failed: %v", err)
+	}
+	stDir, err := os.Stat(frozenSpecDir)
+	if err != nil || stDir.Mode().Perm() != 0o755 {
+		t.Fatalf("expected startup calibration to restore <artifactDir> 0755, got perm=%04o err=%v", stDir.Mode().Perm(), err)
+	}
+	if raw, err := os.ReadFile(commentsPath); err != nil || string(raw) != `{"version":1,"threads":[]}` {
+		t.Fatalf("expected comments.json preserved across startup calibration, got %q err=%v", string(raw), err)
 	}
 }
