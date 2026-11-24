@@ -295,14 +295,20 @@ func (s *Server) dispatchAttemptRecord(ctx context.Context, att store.AttemptRec
 		}
 		anchor = route.Anchor
 	}
-	// B10: Atomically bind runner_instance_id BEFORE sending attempt.dispatch (only if still leased & !cancel_requested),
-	// so any concurrent cancel sees a dispatched attempt and persists cancel_requested=1.
-	bound, err := s.store.TryBindAttemptDispatched(ctx, att.AttemptID, instID)
-	if err != nil || !bound {
-		return false
-	}
 	frame := s.buildAttemptDispatchFrame(ctx, att, proj, anchor, promptOverride, swarmIdleTimeoutMs)
-	if _, err := s.runners.DispatchAttempt(att.MachineID, frame); err != nil {
+	// B10: Atomically bind runner_instance_id INSIDE the serialized runner write pump right before
+	// writing attempt.dispatch (only if still leased & !cancel_requested), so any concurrent cancel
+	// either aborts dispatch before it ever touches the wire, or is strictly ordered AFTER dispatch.
+	if _, err := s.runners.DispatchAttemptWithHook(att.MachineID, frame, func(activeInstID string) error {
+		bound, err := s.store.TryBindAttemptDispatched(ctx, att.AttemptID, activeInstID)
+		if err != nil {
+			return err
+		}
+		if !bound {
+			return fmt.Errorf("attempt %s already cancelled or bound", att.AttemptID)
+		}
+		return nil
+	}); err != nil {
 		return false
 	}
 	return true
@@ -315,6 +321,16 @@ func (s *Server) dispatchPendingLeasedForMachine(ctx context.Context, machineID 
 	}
 	for _, att := range atts {
 		s.dispatchAttemptRecord(ctx, att, "", 0)
+	}
+}
+
+func (s *Server) drainPendingQueues(ctx context.Context) {
+	notices, err := s.store.ListTasksPendingQueueDrain(ctx)
+	if err != nil {
+		return
+	}
+	for _, n := range notices {
+		s.consumeAndDispatchNextPendingInput(ctx, n.TaskID, n.SteerInputID)
 	}
 }
 
@@ -331,9 +347,6 @@ func (s *Server) consumeAndDispatchNextPendingInput(ctx context.Context, taskID,
 	if err != nil {
 		return
 	}
-	if route.Adapter == protocol.AdapterSSHDeploy {
-		return
-	}
 	var anchorPtr *protocol.ProjectAnchorConfig
 	if route.HasAnchor {
 		a := route.Anchor
@@ -347,6 +360,35 @@ func (s *Server) consumeAndDispatchNextPendingInput(ctx context.Context, taskID,
 		Anchor:           anchorPtr,
 		AnchorCapability: route.Capability,
 		LeaseTTLMs:       s.leaseTTL.Milliseconds(),
+		// NEW-1: Validate the FINAL resolved route (machine, adapter, anchor, actor) inside the consume tx.
+		ValidateRoute: func(finalMachineID string, finalAdapter protocol.Adapter, finalAnchor *protocol.ProjectAnchorConfig, finalActor protocol.ActorKind) error {
+			s.mu.RLock()
+			mCfg, hasMachine := s.machines.Machines[finalMachineID]
+			s.mu.RUnlock()
+			if !hasMachine && len(s.machines.Machines) > 0 {
+				return fmt.Errorf("%w: unknown machine %q", store.ErrInvalidInput, finalMachineID)
+			}
+			finalRoute := resolvedRoute{
+				MachineID:  finalMachineID,
+				MachineCfg: mCfg,
+				Adapter:    finalAdapter,
+			}
+			if finalAnchor != nil {
+				finalRoute.Anchor = *finalAnchor
+				finalRoute.HasAnchor = true
+			}
+			if finalRoute.Adapter == protocol.AdapterSSHDeploy || finalRoute.MachineCfg.Transport == protocol.TransportSSHOutbound ||
+				(finalRoute.HasAnchor && finalRoute.Anchor.DeployStrategy != nil) {
+				return fmt.Errorf("%w: ssh_deploy cannot be auto-consumed from queue", store.ErrForbidden)
+			}
+			if err := enforcePostRouteGuard(finalActor, finalRoute); err != nil {
+				return fmt.Errorf("%w: %v", store.ErrForbidden, err)
+			}
+			if _, _, err := s.validateAdapterSupport(finalRoute); err != nil {
+				return fmt.Errorf("%w: %v", store.ErrInvalidInput, err)
+			}
+			return nil
+		},
 	})
 	if err != nil || att == nil {
 		return
@@ -357,7 +399,8 @@ func (s *Server) consumeAndDispatchNextPendingInput(ctx context.Context, taskID,
 	s.dispatchAttemptRecord(ctx, *att, "", 0)
 }
 
-// StartMaintenance launches the background lease expiration scanner goroutine.
+// StartMaintenance launches the background lease expiration, approval expiry (B7),
+// and durable queue-drain recovery (B9) scanner goroutine.
 func (s *Server) StartMaintenance(ctx context.Context, wg *sync.WaitGroup) {
 	interval := s.maintenanceInterval
 	if interval <= 0 {
@@ -366,6 +409,35 @@ func (s *Server) StartMaintenance(ctx context.Context, wg *sync.WaitGroup) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		runPass := func() {
+			now := time.Now().UnixMilli()
+			if _, events, err := s.store.ScanExpiredAttempts(ctx, now); err == nil && len(events) > 0 {
+				s.broker.Broadcast(events...)
+			}
+			// B7: Proactively expire timed-out pending approvals even without human click, and unblock runners.
+			if notices, events, err := s.store.ScanExpiredApprovals(ctx, now); err == nil {
+				if len(events) > 0 {
+					s.broker.Broadcast(events...)
+				}
+				for _, n := range notices {
+					if n.MachineID != "" {
+						_ = s.runners.SendApprovalDecision(n.MachineID, protocol.ApprovalDecisionFrame{
+							Type:          protocol.RunnerMsgApprovalDecide,
+							ApprovalID:    n.Decision.ApprovalID,
+							DecisionID:    n.Decision.DecisionID,
+							AttemptID:     n.Decision.AttemptID,
+							PayloadSHA256: n.Decision.PayloadSHA256,
+							DecidedBy:     n.Decision.DecidedBy,
+							Expired:       true,
+						})
+					}
+				}
+			}
+			// B9: Recover any durable pending_queue_drain tasks across Hub restarts.
+			s.drainPendingQueues(ctx)
+		}
+		// Run an immediate startup recovery pass
+		runPass()
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
@@ -373,10 +445,7 @@ func (s *Server) StartMaintenance(ctx context.Context, wg *sync.WaitGroup) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				_, events, err := s.store.ScanExpiredAttempts(ctx, time.Now().UnixMilli())
-				if err == nil && len(events) > 0 {
-					s.broker.Broadcast(events...)
-				}
+				runPass()
 			}
 		}
 	}()

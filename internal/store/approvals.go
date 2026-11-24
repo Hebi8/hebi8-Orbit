@@ -510,6 +510,12 @@ func (s *Store) ReconcileRunnerHello(ctx context.Context, hello protocol.RunnerH
 						return err
 					}
 					if att.CancelReasonKind == "steer" {
+						if _, err := tx.ExecContext(ctx, `
+							UPDATE tasks SET pending_queue_drain = 1, pending_steer_input_id = ?
+							WHERE task_id = ?
+						`, att.SteerInputID, att.TaskID); err != nil {
+							return err
+						}
 						res.SteerTasksToConsume = append(res.SteerTasksToConsume, SteerConsumeNotice{
 							TaskID:       att.TaskID,
 							SteerInputID: att.SteerInputID,
@@ -552,36 +558,109 @@ func (s *Store) ReconcileRunnerHello(ctx context.Context, hello protocol.RunnerH
 					continue
 				}
 
-				// Redeliver any *_pending_delivery approvals whose ACP handle is still live in memory
+				// Redeliver any *_pending_delivery approvals AND unblock already-expired/timed-out approvals
+				// whose ACP handle is still live in memory (B7).
 				apRows, err := tx.QueryContext(ctx, approvalSelectSQL+`
-					WHERE attempt_id = ? AND state IN ('approved_pending_delivery', 'rejected_pending_delivery')
+					WHERE attempt_id = ? AND state IN ('pending', 'approved_pending_delivery', 'rejected_pending_delivery', 'expired', 'uncertain')
 					ORDER BY created_at ASC
 				`, aid)
 				if err != nil {
 					return err
 				}
+				var attemptApprovals []protocol.ApprovalView
 				for apRows.Next() {
 					ap, err := scanApprovalView(apRows)
 					if err != nil {
 						apRows.Close()
 						return err
 					}
-					if liveApprovalSet[ap.ApprovalID] && ap.DecisionID != "" && ap.SelectedOptionID != "" {
-						decBy := protocol.ApprovalDecidedByHuman
-						if ap.DecidedBy != nil {
-							decBy = *ap.DecidedBy
+					attemptApprovals = append(attemptApprovals, ap)
+				}
+				apRows.Close()
+				for _, ap := range attemptApprovals {
+					if !liveApprovalSet[ap.ApprovalID] {
+						continue
+					}
+					switch ap.State {
+					case protocol.ApprovalApprovedPendingDelivery, protocol.ApprovalRejectedPendingDelivery:
+						if ap.DecisionID != "" && ap.SelectedOptionID != "" {
+							decBy := protocol.ApprovalDecidedByHuman
+							if ap.DecidedBy != nil {
+								decBy = *ap.DecidedBy
+							}
+							res.Reconcile.RedeliverApprovals = append(res.Reconcile.RedeliverApprovals, protocol.ApprovalDecisionPayload{
+								ApprovalID:    ap.ApprovalID,
+								DecisionID:    ap.DecisionID,
+								AttemptID:     ap.AttemptID,
+								PayloadSHA256: ap.PayloadSHA256,
+								OptionID:      ap.SelectedOptionID,
+								DecidedBy:     decBy,
+							})
+						}
+					case protocol.ApprovalPending:
+						if ap.ExpiresAt > 0 && ap.ExpiresAt <= now {
+							if _, err := tx.ExecContext(ctx, `UPDATE approvals SET state = 'expired' WHERE approval_id = ? AND state = 'pending'`, ap.ApprovalID); err != nil {
+								return err
+							}
+							if _, err := tx.ExecContext(ctx, `UPDATE inbox_items SET state = 'resolved', resolved_at = ?, updated_at = ? WHERE inbox_id = ? AND state = 'open'`, now, now, "inb:apr:"+ap.ApprovalID); err != nil {
+								return err
+							}
+							ev, err := insertEventTx(ctx, tx, eventInsert{
+								StreamID:   "task:" + ap.TaskID,
+								ProjectID:  ap.ProjectID,
+								TaskID:     ap.TaskID,
+								AttemptID:  ap.AttemptID,
+								ActorKind:  protocol.ActorSystem,
+								ActorID:    "approval-expiry",
+								Kind:       protocol.EventApprovalExpired,
+								Visibility: protocol.VisibilityInbox,
+								Payload: map[string]any{
+									"approvalId": ap.ApprovalID,
+									"prevState":  ap.State,
+									"newState":   protocol.ApprovalExpired,
+								},
+								CreatedAt: now,
+							})
+							if err != nil {
+								return err
+							}
+							res.Events = append(res.Events, ev)
+							if err := restoreAttemptAfterApprovalSettledTx(ctx, tx, ap.TaskID, ap.AttemptID, now); err != nil {
+								return err
+							}
+							res.Reconcile.RedeliverApprovals = append(res.Reconcile.RedeliverApprovals, protocol.ApprovalDecisionPayload{
+								ApprovalID:    ap.ApprovalID,
+								DecisionID:    "exp_" + ap.ApprovalID,
+								AttemptID:     ap.AttemptID,
+								PayloadSHA256: ap.PayloadSHA256,
+								DecidedBy:     protocol.ApprovalDecidedByPolicy,
+								Expired:       true,
+							})
+						}
+					case protocol.ApprovalExpired, protocol.ApprovalUncertain:
+						decID := ap.DecisionID
+						if decID == "" {
+							decID = "exp_" + ap.ApprovalID
 						}
 						res.Reconcile.RedeliverApprovals = append(res.Reconcile.RedeliverApprovals, protocol.ApprovalDecisionPayload{
 							ApprovalID:    ap.ApprovalID,
-							DecisionID:    ap.DecisionID,
+							DecisionID:    decID,
 							AttemptID:     ap.AttemptID,
 							PayloadSHA256: ap.PayloadSHA256,
-							OptionID:      ap.SelectedOptionID,
-							DecidedBy:     decBy,
+							DecidedBy:     protocol.ApprovalDecidedByPolicy,
+							Expired:       true,
 						})
 					}
 				}
-				apRows.Close()
+
+				// B16: Redeliver any still-posted @worker board messages for live native swarm attempts.
+				if att.State == protocol.AttemptSwarmMonitoring {
+					bmList, err := listPendingNativeBoardMessagesTx(ctx, tx, att.TaskID, aid)
+					if err != nil {
+						return err
+					}
+					res.Reconcile.PendingBoardMessages = append(res.Reconcile.PendingBoardMessages, bmList...)
+				}
 				continue
 			}
 
@@ -604,6 +683,12 @@ func (s *Store) ReconcileRunnerHello(ctx context.Context, hello protocol.RunnerH
 					return err
 				}
 				if att.CancelReasonKind == "steer" {
+					if _, err := tx.ExecContext(ctx, `
+						UPDATE tasks SET pending_queue_drain = 1, pending_steer_input_id = ?
+						WHERE task_id = ?
+					`, att.SteerInputID, att.TaskID); err != nil {
+						return err
+					}
 					res.SteerTasksToConsume = append(res.SteerTasksToConsume, SteerConsumeNotice{
 						TaskID:       att.TaskID,
 						SteerInputID: att.SteerInputID,
@@ -1106,4 +1191,93 @@ func expireOrMarkUncertainApprovalsTx(ctx context.Context, tx *sql.Tx, attemptID
 		*events = append(*events, ev)
 	}
 	return hasUncertain, nil
+}
+
+// ExpiredApprovalNotice tells Hub's maintenance loop which machine/handle to unblock after background expiry (B7).
+type ExpiredApprovalNotice struct {
+	MachineID string
+	Decision  protocol.ApprovalDecisionPayload
+}
+
+// ScanExpiredApprovals transitions all pending approvals past expires_at to 'expired' in a single write tx,
+// resolves their inbox cards, restores waiting_approval attempts when no other pending approvals remain,
+// and returns notices so Hub can immediately send Expired=true unblocks to connected runners (B7).
+func (s *Store) ScanExpiredApprovals(ctx context.Context, now int64) ([]ExpiredApprovalNotice, []protocol.EventRecord, error) {
+	if now == 0 {
+		now = time.Now().UnixMilli()
+	}
+	var notices []ExpiredApprovalNotice
+	var events []protocol.EventRecord
+
+	err := s.WithWriteTx(ctx, func(tx *sql.Tx) error {
+		rows, err := tx.QueryContext(ctx, approvalSelectSQL+`
+			WHERE state = 'pending' AND expires_at > 0 AND expires_at <= ?
+			ORDER BY expires_at ASC
+		`, now)
+		if err != nil {
+			return err
+		}
+		var list []protocol.ApprovalView
+		for rows.Next() {
+			ap, err := scanApprovalView(rows)
+			if err != nil {
+				rows.Close()
+				return err
+			}
+			list = append(list, ap)
+		}
+		rows.Close()
+
+		for _, ap := range list {
+			if _, err := tx.ExecContext(ctx, `UPDATE approvals SET state = 'expired' WHERE approval_id = ? AND state = 'pending'`, ap.ApprovalID); err != nil {
+				return err
+			}
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE inbox_items SET state = 'resolved', resolved_at = ?, updated_at = ?
+				WHERE inbox_id = ? AND state = 'open'
+			`, now, now, "inb:apr:"+ap.ApprovalID); err != nil {
+				return err
+			}
+			var machineID string
+			_ = tx.QueryRowContext(ctx, `SELECT machine_id FROM attempts WHERE attempt_id = ?`, ap.AttemptID).Scan(&machineID)
+
+			ev, err := insertEventTx(ctx, tx, eventInsert{
+				StreamID:   "task:" + ap.TaskID,
+				ProjectID:  ap.ProjectID,
+				TaskID:     ap.TaskID,
+				AttemptID:  ap.AttemptID,
+				ActorKind:  protocol.ActorSystem,
+				ActorID:    "approval-expiry",
+				Kind:       protocol.EventApprovalExpired,
+				Visibility: protocol.VisibilityInbox,
+				Payload: map[string]any{
+					"approvalId": ap.ApprovalID,
+					"prevState":  ap.State,
+					"newState":   protocol.ApprovalExpired,
+				},
+				CreatedAt: now,
+			})
+			if err != nil {
+				return err
+			}
+			events = append(events, ev)
+
+			if err := restoreAttemptAfterApprovalSettledTx(ctx, tx, ap.TaskID, ap.AttemptID, now); err != nil {
+				return err
+			}
+			notices = append(notices, ExpiredApprovalNotice{
+				MachineID: machineID,
+				Decision: protocol.ApprovalDecisionPayload{
+					ApprovalID:    ap.ApprovalID,
+					DecisionID:    "exp_" + ap.ApprovalID,
+					AttemptID:     ap.AttemptID,
+					PayloadSHA256: ap.PayloadSHA256,
+					DecidedBy:     protocol.ApprovalDecidedByPolicy,
+					Expired:       true,
+				},
+			})
+		}
+		return nil
+	})
+	return notices, events, err
 }

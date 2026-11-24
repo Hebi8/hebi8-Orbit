@@ -155,12 +155,26 @@ func (g *RunnerGateway) ReportedAdapters(machineID string) []protocol.Adapter {
 
 // DispatchAttempt sends an attempt.dispatch frame to machineID if connected.
 func (g *RunnerGateway) DispatchAttempt(machineID string, frame protocol.AttemptDispatchFrame) (string, error) {
+	return g.DispatchAttemptWithHook(machineID, frame, nil)
+}
+
+// DispatchAttemptWithHook sends an attempt.dispatch frame synchronously via the runner's serialized
+// write pump, running onStart right before conn.Write so dispatch binding and subsequent cancel frames
+// are strictly ordered on the wire (B10).
+func (g *RunnerGateway) DispatchAttemptWithHook(machineID string, frame protocol.AttemptDispatchFrame, onStart func(runnerInstanceID string) error) (string, error) {
 	rc := g.get(machineID)
 	if rc == nil {
 		return "", fmt.Errorf("runner %s not connected", machineID)
 	}
 	frame.Type = protocol.RunnerMsgAttemptDispatch
-	if err := rc.sendJSON(frame); err != nil {
+	var startHook func() error
+	if onStart != nil {
+		instID := rc.runnerInstanceID
+		startHook = func() error {
+			return onStart(instID)
+		}
+	}
+	if err := rc.sendJSONSync(frame, startHook, nil); err != nil {
 		return "", err
 	}
 	return rc.runnerInstanceID, nil
@@ -326,15 +340,19 @@ func (s *Server) handleRunnerWS(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	// 3. Send hub.welcome as the very first frame BEFORE starting dispatch of pending leased attempts.
-	// B6: Mark redelivered approvals as delivery_attempted right before writing hub.welcome.
+	// B6: Mark non-expired redelivered approvals as delivery_attempted right before writing hub.welcome.
+	// If marking delivery_attempted fails, STOP and close the connection rather than sending without recording!
 	var redeliverIDs []string
 	for _, ap := range recRes.Reconcile.RedeliverApprovals {
-		if ap.ApprovalID != "" {
+		if ap.ApprovalID != "" && !ap.Expired {
 			redeliverIDs = append(redeliverIDs, ap.ApprovalID)
 		}
 	}
 	if len(redeliverIDs) > 0 {
-		_ = s.store.MarkApprovalsDeliveryAttempted(r.Context(), redeliverIDs)
+		if err := s.store.MarkApprovalsDeliveryAttempted(r.Context(), redeliverIDs); err != nil {
+			_ = conn.Close(websocket.StatusInternalError, "failed to record approval delivery attempt")
+			return
+		}
 	}
 	welcome := protocol.HubWelcomeFrame{
 		Type:                protocol.RunnerMsgHubWelcome,
@@ -388,10 +406,11 @@ func (s *Server) handleRunnerWS(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	// 5. Auto-consume any steered tasks whose cancelled attempts settled during reconcile (B9),
-	//    and dispatch any queued/leased attempts waiting for this machine.
+	//    drain any durable pending_queue_drain tasks (B9 crash recovery), and dispatch leased attempts.
 	for _, notice := range recRes.SteerTasksToConsume {
 		s.consumeAndDispatchNextPendingInput(ctx, notice.TaskID, notice.SteerInputID)
 	}
+	s.drainPendingQueues(ctx)
 	s.dispatchPendingLeasedForMachine(ctx, hello.MachineID)
 
 	// 6. Read loop for runner.heartbeat and attempt.outbox_batch

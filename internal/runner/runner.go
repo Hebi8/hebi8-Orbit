@@ -49,6 +49,7 @@ type Config struct {
 	ConfigApplyTimeout      time.Duration
 	ChunkCoalesceWindow     time.Duration
 	DefaultSwarmIdleTimeout time.Duration
+	DeliveryRetryInterval   time.Duration
 	IdleCloseSeconds        int
 	ReconnectInitialDelay   time.Duration
 	ReconnectMaxDelay       time.Duration
@@ -90,6 +91,8 @@ type attemptContext struct {
 	resumeState             protocol.ResumeState
 	providerSessionID       acp.SessionId
 	promptReturned          bool
+	inFlightPrompts         int
+	lastStopReason          acp.StopReason
 	promptDoneCh            chan struct{}
 	promptDoneOnce          sync.Once
 	hasDelivery             bool
@@ -98,9 +101,14 @@ type attemptContext struct {
 	finalizing              bool
 	finalized               bool
 	heldResources           []string
+	reservedWorker          bool
 	tracker                 *ActiveSwarmTracker
 	pendingApprovals        map[string]*pendingApprovalHandle
 	ackPendingWG            sync.WaitGroup
+	boardQueue              []protocol.BoardMessageDispatchFrame
+	boardDelivered          map[string]bool
+	boardQueuedIDs          map[string]bool
+	boardDraining           bool
 	swarmIdleTimeout        time.Duration
 	swarmIdleTimer          *time.Timer
 	cancelFn                context.CancelFunc
@@ -118,11 +126,13 @@ type Runner struct {
 	httpClient *http.Client
 	deliverMu  sync.Mutex
 
-	mu            sync.Mutex
-	sessions      map[string]*sessionSlot
-	attempts      map[string]*attemptContext
-	sessionOwner  map[acp.SessionId]string
-	resourceLocks map[string]string // resourceName -> attemptID
+	mu                sync.Mutex
+	sessions          map[string]*sessionSlot
+	attempts          map[string]*attemptContext
+	sessionOwner      map[acp.SessionId]string
+	resourceLocks     map[string]string // resourceName -> attemptID
+	cancelledAttempts map[string]bool   // B10: attemptID cancelled before/during dispatch
+	reservedWorkers   int               // S1: atomic hard-cap reservation for MaxLiveWorkers
 
 	connMu   sync.Mutex
 	wsConn   *websocket.Conn
@@ -167,6 +177,9 @@ func New(ctx context.Context, cfg Config) (*Runner, error) {
 	if cfg.DefaultSwarmIdleTimeout <= 0 {
 		cfg.DefaultSwarmIdleTimeout = 120 * time.Second
 	}
+	if cfg.DeliveryRetryInterval <= 0 {
+		cfg.DeliveryRetryInterval = 2 * time.Second
+	}
 	if cfg.ReconnectInitialDelay <= 0 {
 		cfg.ReconnectInitialDelay = 1 * time.Second
 	}
@@ -189,17 +202,18 @@ func New(ctx context.Context, cfg Config) (*Runner, error) {
 	}
 
 	r := &Runner{
-		cfg:           cfg,
-		instanceID:    "run_" + ulid.Make().String(),
-		outbox:        outbox,
-		driver:        cfg.Driver,
-		httpClient:    &http.Client{Timeout: 30 * time.Second},
-		sessions:      map[string]*sessionSlot{},
-		attempts:      map[string]*attemptContext{},
-		sessionOwner:  map[acp.SessionId]string{},
-		resourceLocks: map[string]string{},
-		hbPeriod:      10 * time.Second,
-		outboxWakeCh:  make(chan struct{}, 1),
+		cfg:               cfg,
+		instanceID:        "run_" + ulid.Make().String(),
+		outbox:            outbox,
+		driver:            cfg.Driver,
+		httpClient:        &http.Client{Timeout: 30 * time.Second},
+		sessions:          map[string]*sessionSlot{},
+		attempts:          map[string]*attemptContext{},
+		sessionOwner:      map[acp.SessionId]string{},
+		resourceLocks:     map[string]string{},
+		cancelledAttempts: map[string]bool{},
+		hbPeriod:          10 * time.Second,
+		outboxWakeCh:      make(chan struct{}, 1),
 	}
 	r.coalescer = NewChunkCoalescer(cfg.ChunkCoalesceWindow, r.flushCoalescedChunk)
 	return r, nil
@@ -363,8 +377,16 @@ func (r *Runner) getOrCreateSessionSlot(wbSessionID string) *sessionSlot {
 }
 
 // HandleDispatch accepts an attempt.dispatch frame (deduplicated by attemptId) and starts execution.
+// B10: Rejects any attemptId already cancelled locally (in-memory or persisted in Outbox cancelled_attempts).
 func (r *Runner) HandleDispatch(dispatch protocol.AttemptDispatchFrame) {
+	if cancelled, err := r.outbox.IsAttemptCancelled(r.runCtx, dispatch.AttemptID); err == nil && cancelled {
+		return
+	}
 	r.mu.Lock()
+	if r.cancelledAttempts[dispatch.AttemptID] {
+		r.mu.Unlock()
+		return
+	}
 	if _, exists := r.attempts[dispatch.AttemptID]; exists {
 		r.mu.Unlock()
 		return
@@ -380,6 +402,8 @@ func (r *Runner) HandleDispatch(dispatch protocol.AttemptDispatchFrame) {
 		promptDoneCh:     make(chan struct{}),
 		tracker:          NewActiveSwarmTracker(dispatch.AttemptID),
 		pendingApprovals: map[string]*pendingApprovalHandle{},
+		boardDelivered:   map[string]bool{},
+		boardQueuedIDs:   map[string]bool{},
 		swarmIdleTimeout: swarmTimeout,
 		cancelFn:         cancel,
 		doneCh:           make(chan struct{}),
@@ -397,11 +421,18 @@ func (r *Runner) HandleDispatch(dispatch protocol.AttemptDispatchFrame) {
 
 func (r *Runner) executeAttempt(ctx context.Context, att *attemptContext) {
 	dispatch := att.dispatch
-	defer r.releaseAttemptResources(att)
+	// B19: Resources are released by completeInMemoryFinalize strictly AFTER durable Outbox persistence;
+	// this defer only cleans up temporary worker reservations or shutdown exits when Runner itself stops.
+	defer func() {
+		r.releaseWorkerReservation(att)
+		if r.runCtx.Err() != nil {
+			r.releaseAttemptResources(att)
+		}
+	}()
 
 	// B18: Reject unsupported session adapters explicitly instead of silently running agy.
 	if protocol.SessionAdapter(dispatch.Adapter).IsValid() && !slices.Contains(r.cfg.SupportedAdapters, dispatch.Adapter) {
-		_ = r.finalizeAttempt(att, protocol.AttemptFailed, map[string]any{
+		r.finalizeAttemptDurable(att, protocol.AttemptFailed, map[string]any{
 			"state":       string(protocol.AttemptFailed),
 			"errorCode":   "UNSUPPORTED_ADAPTER",
 			"errorDetail": fmt.Sprintf("runner %s does not support adapter %q (supported: %v)", r.cfg.MachineID, dispatch.Adapter, r.cfg.SupportedAdapters),
@@ -418,7 +449,7 @@ func (r *Runner) executeAttempt(ctx context.Context, att *attemptContext) {
 	if len(dispatch.RequiredResources) > 0 {
 		for {
 			if err := ctx.Err(); err != nil {
-				_ = r.finalizeAttempt(att, protocol.AttemptCancelled, map[string]any{
+				r.finalizeAttemptDurable(att, protocol.AttemptCancelled, map[string]any{
 					"state":       string(protocol.AttemptCancelled),
 					"errorCode":   "CANCELLED",
 					"errorDetail": "cancelled while waiting for resources",
@@ -435,7 +466,7 @@ func (r *Runner) executeAttempt(ctx context.Context, att *attemptContext) {
 			})
 			select {
 			case <-ctx.Done():
-				_ = r.finalizeAttempt(att, protocol.AttemptCancelled, map[string]any{
+				r.finalizeAttemptDurable(att, protocol.AttemptCancelled, map[string]any{
 					"state":       string(protocol.AttemptCancelled),
 					"errorCode":   "CANCELLED",
 					"errorDetail": "cancelled while waiting for resources",
@@ -452,7 +483,7 @@ func (r *Runner) executeAttempt(ctx context.Context, att *attemptContext) {
 	// 3. Prepare isolated worktree and fixed review base SHA
 	worktreePath, baseSHA, err := PrepareWorktree(ctx, dispatch, r.cfg.DataDir)
 	if err != nil {
-		_ = r.finalizeAttempt(att, protocol.AttemptFailed, map[string]any{
+		r.finalizeAttemptDurable(att, protocol.AttemptFailed, map[string]any{
 			"state":       string(protocol.AttemptFailed),
 			"errorCode":   "WORKTREE_PREPARE_FAILED",
 			"errorDetail": err.Error(),
@@ -469,9 +500,16 @@ func (r *Runner) executeAttempt(ctx context.Context, att *attemptContext) {
 	if wbSessionID == "" {
 		wbSessionID = "ses_" + dispatch.AttemptID
 	}
-	// S1: Enforce MaxLiveWorkers by evicting the least-recently-used idle session before starting a new worker.
+	// S1: Atomically enforce MaxLiveWorkers hard cap (evicting LRU idle sessions first; waiting if all workers busy).
 	if r.cfg.MaxLiveWorkers > 0 {
-		r.evictIdleSessionsIfOverLimit(ctx, wbSessionID)
+		if err := r.reserveLiveWorkerSlot(ctx, att, wbSessionID); err != nil {
+			r.finalizeAttemptDurable(att, protocol.AttemptCancelled, map[string]any{
+				"state":       string(protocol.AttemptCancelled),
+				"errorCode":   "CANCELLED",
+				"errorDetail": "cancelled while waiting for available worker slot",
+			})
+			return
+		}
 	}
 	slot := r.getOrCreateSessionSlot(wbSessionID)
 
@@ -480,13 +518,12 @@ func (r *Runner) executeAttempt(ctx context.Context, att *attemptContext) {
 	if err != nil {
 		slot.runtimeState = protocol.SessionDead
 		slot.mu.Unlock()
-		// Immediate release of held resources on CONFIG_APPLY_FAILED / session failure
-		r.releaseAttemptResources(att)
+		r.releaseWorkerReservation(att)
 		errCode := "SESSION_PREPARE_FAILED"
 		if strings.Contains(err.Error(), "CONFIG_APPLY_FAILED") {
 			errCode = "CONFIG_APPLY_FAILED"
 		}
-		_ = r.finalizeAttempt(att, protocol.AttemptFailed, map[string]any{
+		r.finalizeAttemptDurable(att, protocol.AttemptFailed, map[string]any{
 			"state":        string(protocol.AttemptFailed),
 			"worktreePath": worktreePath,
 			"baseSha":      baseSHA,
@@ -506,12 +543,16 @@ func (r *Runner) executeAttempt(ctx context.Context, att *attemptContext) {
 	att.mu.Lock()
 	att.slot = slot
 	att.providerSessionID = sid
+	att.inFlightPrompts++
+	att.promptReturned = false
 	att.mu.Unlock()
 
 	r.mu.Lock()
 	r.sessionOwner[sid] = dispatch.AttemptID
 	r.mu.Unlock()
 	slot.mu.Unlock()
+	// Session is now live and counted under slot.runtimeState == SessionLive -> release pre-creation reservation
+	r.releaseWorkerReservation(att)
 
 	// 5. Enter running state and send ACP session/prompt
 	r.setAttemptState(att, protocol.AttemptRunning, map[string]any{
@@ -534,7 +575,11 @@ func (r *Runner) executeAttempt(ctx context.Context, att *attemptContext) {
 
 	att.mu.Lock()
 	alreadyFinal := att.finalized
-	att.promptReturned = true
+	if att.inFlightPrompts > 0 {
+		att.inFlightPrompts--
+	}
+	att.promptReturned = (att.inFlightPrompts == 0)
+	att.lastStopReason = promptResp.StopReason
 	finalReq := att.finalRequested
 	explicitDlvID := att.explicitFinalDeliveryID
 	hasDelivery := att.hasDelivery
@@ -545,41 +590,8 @@ func (r *Runner) executeAttempt(ctx context.Context, att *attemptContext) {
 		return
 	}
 
-	// B2: If `orbit deliver --final` ran during the in-flight Prompt(), deferring finalization until
-	// Prompt() returns guarantees exclusive sessionOwner ownership and prevents overlapping turns!
-	if finalReq {
-		att.ackPendingWG.Wait()
-		r.coalescer.FlushAttempt(dispatch.AttemptID)
-		activeWorkers := att.tracker.ActiveWorkerCount()
-		sessionLocked := false
-		if activeWorkers > 0 {
-			r.isolateAndCloseSession(slot, sid)
-			sessionLocked = true
-		}
-		_, _, rejCount, nonZeroCount := att.tracker.Stats()
-		unresRej, unresNonZero := att.tracker.UnresolvedCounts()
-		payload := map[string]any{
-			"state":                       string(protocol.AttemptSucceeded),
-			"completionSource":            string(protocol.CompletionExplicitDeliver),
-			"deliveryId":                  explicitDlvID,
-			"sessionLocked":               sessionLocked,
-			"rejectedToolCount":           rejCount,
-			"nonZeroExitCount":            nonZeroCount,
-			"unresolvedRejectedToolCount": unresRej,
-			"unresolvedNonZeroExitCount":  unresNonZero,
-		}
-		if promptResp.Usage != nil {
-			payload["tokenUsage"] = map[string]any{
-				"input":      promptResp.Usage.InputTokens,
-				"output":     promptResp.Usage.OutputTokens,
-				"cachedRead": promptResp.Usage.CachedReadTokens,
-				"thought":    promptResp.Usage.ThoughtTokens,
-			}
-		}
-		_ = r.finalizeAttempt(att, protocol.AttemptSucceeded, payload)
-		return
-	}
-
+	// B1: ALWAYS adjudicate promptErr and ACP StopReason FIRST — an earlier in-flight `orbit deliver --final`
+	// MUST NEVER promote an errored, cancelled, refused, or truncated prompt into `succeeded`!
 	if promptErr != nil {
 		r.coalescer.FlushAttempt(dispatch.AttemptID)
 		if errors.Is(ctx.Err(), context.Canceled) {
@@ -588,7 +600,7 @@ func (r *Runner) executeAttempt(ctx context.Context, att *attemptContext) {
 				r.isolateAndCloseSession(slot, sid)
 				sessionLocked = true
 			}
-			_ = r.finalizeAttempt(att, protocol.AttemptCancelled, map[string]any{
+			r.finalizeAttemptDurable(att, protocol.AttemptCancelled, map[string]any{
 				"state":         string(protocol.AttemptCancelled),
 				"sessionLocked": sessionLocked,
 				"errorCode":     "CANCELLED",
@@ -596,7 +608,7 @@ func (r *Runner) executeAttempt(ctx context.Context, att *attemptContext) {
 			})
 			return
 		}
-		_ = r.finalizeAttempt(att, protocol.AttemptFailed, map[string]any{
+		r.finalizeAttemptDurable(att, protocol.AttemptFailed, map[string]any{
 			"state":       string(protocol.AttemptFailed),
 			"errorCode":   "ACP_PROMPT_FAILED",
 			"errorDetail": promptErr.Error(),
@@ -613,7 +625,7 @@ func (r *Runner) executeAttempt(ctx context.Context, att *attemptContext) {
 			r.isolateAndCloseSession(slot, sid)
 			sessionLocked = true
 		}
-		_ = r.finalizeAttempt(att, protocol.AttemptCancelled, map[string]any{
+		r.finalizeAttemptDurable(att, protocol.AttemptCancelled, map[string]any{
 			"state":         string(protocol.AttemptCancelled),
 			"stopReason":    string(promptResp.StopReason),
 			"sessionLocked": sessionLocked,
@@ -624,7 +636,7 @@ func (r *Runner) executeAttempt(ctx context.Context, att *attemptContext) {
 
 	case acp.StopReasonRefusal, acp.StopReasonMaxTokens, acp.StopReasonMaxTurnRequests:
 		r.coalescer.FlushAttempt(dispatch.AttemptID)
-		_ = r.finalizeAttempt(att, protocol.AttemptFailed, map[string]any{
+		r.finalizeAttemptDurable(att, protocol.AttemptFailed, map[string]any{
 			"state":       string(protocol.AttemptFailed),
 			"stopReason":  string(promptResp.StopReason),
 			"errorCode":   "ABNORMAL_STOP_REASON",
@@ -633,16 +645,52 @@ func (r *Runner) executeAttempt(ctx context.Context, att *attemptContext) {
 		return
 
 	case acp.StopReasonEndTurn, "":
-		// Proceed with normal completion / swarm monitoring checks below.
+		// Proceed with explicit final delivery / swarm monitoring / normal completion checks below.
 
 	default:
 		r.coalescer.FlushAttempt(dispatch.AttemptID)
-		_ = r.finalizeAttempt(att, protocol.AttemptFailed, map[string]any{
+		r.finalizeAttemptDurable(att, protocol.AttemptFailed, map[string]any{
 			"state":       string(protocol.AttemptFailed),
 			"stopReason":  string(promptResp.StopReason),
 			"errorCode":   "UNKNOWN_STOP_REASON",
 			"errorDetail": fmt.Sprintf("unexpected stopReason %q", promptResp.StopReason),
 		})
+		return
+	}
+
+	// B2: If `orbit deliver --final` ran during the in-flight Prompt() AND the prompt ended cleanly (end_turn),
+	// finalize now after Prompt() has released exclusive sessionOwner ownership.
+	if finalReq {
+		att.ackPendingWG.Wait()
+		r.coalescer.FlushAttempt(dispatch.AttemptID)
+		activeWorkers := att.tracker.ActiveWorkerCount()
+		sessionLocked := false
+		if activeWorkers > 0 {
+			r.isolateAndCloseSession(slot, sid)
+			sessionLocked = true
+		}
+		_, _, rejCount, nonZeroCount := att.tracker.Stats()
+		unresRej, unresNonZero := att.tracker.UnresolvedCounts()
+		payload := map[string]any{
+			"state":                       string(protocol.AttemptSucceeded),
+			"stopReason":                  string(acp.StopReasonEndTurn),
+			"completionSource":            string(protocol.CompletionExplicitDeliver),
+			"deliveryId":                  explicitDlvID,
+			"sessionLocked":               sessionLocked,
+			"rejectedToolCount":           rejCount,
+			"nonZeroExitCount":            nonZeroCount,
+			"unresolvedRejectedToolCount": unresRej,
+			"unresolvedNonZeroExitCount":  unresNonZero,
+		}
+		if promptResp.Usage != nil {
+			payload["tokenUsage"] = map[string]any{
+				"input":      promptResp.Usage.InputTokens,
+				"output":     promptResp.Usage.OutputTokens,
+				"cachedRead": promptResp.Usage.CachedReadTokens,
+				"thought":    promptResp.Usage.ThoughtTokens,
+			}
+		}
+		r.finalizeAttemptDurable(att, protocol.AttemptSucceeded, payload)
 		return
 	}
 
@@ -665,10 +713,17 @@ func (r *Runner) executeAttempt(ctx context.Context, att *attemptContext) {
 	_, _, rejCount, nonZeroCount := att.tracker.Stats()
 	unresRej, unresNonZero := att.tracker.UnresolvedCounts()
 
-	// B1: Non-_scratch project turns MUST have a verified delivery before succeeding;
-	// pure _scratch freeform chat may succeed directly on clean end_turn.
+	// B1 & B13: Non-_scratch project turns MUST have a verified delivery before succeeding.
+	// If a locally persisted final delivery is still awaiting mirror-push / blob-upload retry (B13),
+	// keep the attempt open so background retry (or `--resume`) publishes and finalizes it formally
+	// instead of failing early with NO_VERIFIED_DELIVERY!
 	if dispatch.ProjectID != protocol.ScratchProjectID && !hasDelivery {
-		_ = r.finalizeAttempt(att, protocol.AttemptFailed, map[string]any{
+		if hasPendingFinal, err := r.outbox.HasUnemittedFinalDelivery(ctx, dispatch.AttemptID); err == nil && hasPendingFinal {
+			go r.retryPendingDeliveries(r.runCtx)
+			<-ctx.Done()
+			return
+		}
+		r.finalizeAttemptDurable(att, protocol.AttemptFailed, map[string]any{
 			"state":                       string(protocol.AttemptFailed),
 			"stopReason":                  string(acp.StopReasonEndTurn),
 			"errorCode":                   "NO_VERIFIED_DELIVERY",
@@ -682,7 +737,7 @@ func (r *Runner) executeAttempt(ctx context.Context, att *attemptContext) {
 	}
 	if unresRej > 0 || unresNonZero > 0 {
 		r.isolateAndCloseSession(slot, sid)
-		_ = r.finalizeAttempt(att, protocol.AttemptNeedsVerification, map[string]any{
+		r.finalizeAttemptDurable(att, protocol.AttemptNeedsVerification, map[string]any{
 			"state":                       string(protocol.AttemptNeedsVerification),
 			"stopReason":                  string(acp.StopReasonEndTurn),
 			"completionSource":            string(protocol.CompletionPromptEndTurn),
@@ -714,7 +769,7 @@ func (r *Runner) executeAttempt(ctx context.Context, att *attemptContext) {
 			"thought":    promptResp.Usage.ThoughtTokens,
 		}
 	}
-	_ = r.finalizeAttempt(att, protocol.AttemptSucceeded, payload)
+	r.finalizeAttemptDurable(att, protocol.AttemptSucceeded, payload)
 }
 
 func (r *Runner) isolateAndCloseSession(slot *sessionSlot, sid acp.SessionId) {
@@ -734,47 +789,111 @@ func (r *Runner) isolateAndCloseSession(slot *sessionSlot, sid acp.SessionId) {
 	}
 }
 
-func (r *Runner) evictIdleSessionsIfOverLimit(ctx context.Context, excludeWBSessionID string) {
+func (r *Runner) releaseWorkerReservation(att *attemptContext) {
+	if att == nil {
+		return
+	}
+	att.mu.Lock()
+	had := att.reservedWorker
+	att.reservedWorker = false
+	att.mu.Unlock()
+	if !had {
+		return
+	}
+	r.mu.Lock()
+	if r.reservedWorkers > 0 {
+		r.reservedWorkers--
+	}
+	r.mu.Unlock()
+}
+
+// reserveLiveWorkerSlot atomically enforces MaxLiveWorkers as a hard cap (S1):
+// reuses an already-live slot without consuming extra capacity, evicts LRU idle sessions first,
+// and waits in waiting_resource if all live slots are currently busy with active prompts/swarms.
+func (r *Runner) reserveLiveWorkerSlot(ctx context.Context, att *attemptContext, wbSessionID string) error {
+	if r.cfg.MaxLiveWorkers <= 0 {
+		return nil
+	}
 	type cand struct {
 		wbID       string
 		lastActive time.Time
 	}
-	r.mu.Lock()
-	slots := make([]*sessionSlot, 0, len(r.sessions))
-	for _, s := range r.sessions {
-		slots = append(slots, s)
-	}
-	r.mu.Unlock()
+	notifiedWait := false
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		r.mu.Lock()
+		if existing, ok := r.sessions[wbSessionID]; ok {
+			existing.mu.Lock()
+			alreadyLive := existing.runtimeState == protocol.SessionLive && existing.providerSessionID != "" && !existing.locked
+			existing.mu.Unlock()
+			if alreadyLive {
+				r.mu.Unlock()
+				return nil
+			}
+		}
+		liveCount := 0
+		var idleCands []cand
+		for _, s := range r.sessions {
+			s.mu.Lock()
+			isLive := s.runtimeState == protocol.SessionLive && s.providerSessionID != ""
+			inFlight := s.inFlightPrompt
+			wbID := s.wbSessionID
+			lastAct := s.lastActivityAt
+			s.mu.Unlock()
+			if !isLive {
+				continue
+			}
+			liveCount++
+			if wbID != wbSessionID && !inFlight {
+				idleCands = append(idleCands, cand{wbID: wbID, lastActive: lastAct})
+			}
+		}
+		if liveCount+r.reservedWorkers < r.cfg.MaxLiveWorkers {
+			r.reservedWorkers++
+			r.mu.Unlock()
+			att.mu.Lock()
+			att.reservedWorker = true
+			att.mu.Unlock()
+			if notifiedWait {
+				r.setAttemptState(att, protocol.AttemptPreparing, map[string]any{
+					"state": string(protocol.AttemptPreparing),
+				})
+			}
+			return nil
+		}
+		r.mu.Unlock()
 
-	liveCount := 0
-	var idleCands []cand
-	for _, s := range slots {
-		s.mu.Lock()
-		isLive := s.runtimeState == protocol.SessionLive && s.providerSessionID != ""
-		inFlight := s.inFlightPrompt
-		wbID := s.wbSessionID
-		lastAct := s.lastActivityAt
-		s.mu.Unlock()
-		if !isLive {
+		// Try evicting LRU idle sessions outside r.mu (CloseSessionSafely checks ownership/swarm/approvals).
+		evicted := false
+		if len(idleCands) > 0 {
+			sort.Slice(idleCands, func(i, j int) bool {
+				return idleCands[i].lastActive.Before(idleCands[j].lastActive)
+			})
+			for _, c := range idleCands {
+				if closed, _ := r.CloseSessionSafely(ctx, c.wbID); closed {
+					evicted = true
+					break
+				}
+			}
+		}
+		if evicted {
 			continue
 		}
-		liveCount++
-		if wbID != excludeWBSessionID && !inFlight {
-			idleCands = append(idleCands, cand{wbID: wbID, lastActive: lastAct})
+
+		// All MaxLiveWorkers slots are actively busy — wait cleanly until one frees up or ctx cancels!
+		if !notifiedWait {
+			notifiedWait = true
+			r.setAttemptState(att, protocol.AttemptWaitingResource, map[string]any{
+				"state":         string(protocol.AttemptWaitingResource),
+				"waitingReason": fmt.Sprintf("等待可用 Worker 槽位（上限 %d）", r.cfg.MaxLiveWorkers),
+			})
 		}
-	}
-	if liveCount < r.cfg.MaxLiveWorkers {
-		return
-	}
-	sort.Slice(idleCands, func(i, j int) bool {
-		return idleCands[i].lastActive.Before(idleCands[j].lastActive)
-	})
-	for _, c := range idleCands {
-		if liveCount < r.cfg.MaxLiveWorkers {
-			break
-		}
-		if closed, _ := r.CloseSessionSafely(ctx, c.wbID); closed {
-			liveCount--
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(100 * time.Millisecond):
 		}
 	}
 }
@@ -990,7 +1109,7 @@ func (r *Runner) onSwarmIdleTimeout(att *attemptContext, slot *sessionSlot) {
 	r.isolateAndCloseSession(slot, sid)
 
 	r.coalescer.FlushAttempt(att.dispatch.AttemptID)
-	_ = r.finalizeAttempt(att, protocol.AttemptNeedsVerification, map[string]any{
+	r.finalizeAttemptDurable(att, protocol.AttemptNeedsVerification, map[string]any{
 		"state":            string(protocol.AttemptNeedsVerification),
 		"completionSource": string(protocol.CompletionQuietTimeout),
 		"sessionLocked":    true,
@@ -1001,9 +1120,15 @@ func (r *Runner) onSwarmIdleTimeout(att *attemptContext, slot *sessionSlot) {
 
 // HandleCancel cancels an active attempt (including swarm_monitoring) via ACP session/cancel.
 // B2: Waits briefly for in-flight Prompt() exit and isolates/closes old SID if prompt or swarm workers remain active.
-// B10: Confirms cancellation for unknown leased attempts never accepted by this runner.
+// B10: Durably records cancelled attemptId (memory + Outbox SQLite) even when HandleCancel arrives before HandleDispatch!
 func (r *Runner) HandleCancel(frame protocol.AttemptCancelFrame) {
+	if frame.AttemptID != "" {
+		_ = r.outbox.RecordCancelledAttempt(context.Background(), frame.AttemptID, frame.LeaseToken)
+	}
 	r.mu.Lock()
+	if frame.AttemptID != "" {
+		r.cancelledAttempts[frame.AttemptID] = true
+	}
 	att, ok := r.attempts[frame.AttemptID]
 	r.mu.Unlock()
 	if !ok {
@@ -1031,7 +1156,7 @@ func (r *Runner) HandleCancel(frame protocol.AttemptCancelFrame) {
 	sid := att.providerSessionID
 	slot := att.slot
 	cancelFn := att.cancelFn
-	promptReturned := att.promptReturned
+	hasInFlight := att.inFlightPrompts > 0 || !att.promptReturned
 	if att.swarmIdleTimer != nil {
 		att.swarmIdleTimer.Stop()
 	}
@@ -1052,7 +1177,7 @@ func (r *Runner) HandleCancel(frame protocol.AttemptCancelFrame) {
 	}
 
 	// B2: Wait briefly for an in-flight Prompt() to wind down cleanly before releasing session ownership.
-	if sid != "" && !promptReturned {
+	if sid != "" && hasInFlight {
 		select {
 		case <-att.promptDoneCh:
 		case <-time.After(1500 * time.Millisecond):
@@ -1060,7 +1185,7 @@ func (r *Runner) HandleCancel(frame protocol.AttemptCancelFrame) {
 	}
 
 	att.mu.Lock()
-	stillRunning := sid != "" && !att.promptReturned
+	stillRunning := sid != "" && (att.inFlightPrompts > 0 || !att.promptReturned)
 	att.mu.Unlock()
 
 	sessionLocked := false
@@ -1071,7 +1196,7 @@ func (r *Runner) HandleCancel(frame protocol.AttemptCancelFrame) {
 	}
 
 	r.coalescer.FlushAttempt(att.dispatch.AttemptID)
-	_ = r.finalizeAttempt(att, protocol.AttemptCancelled, map[string]any{
+	r.finalizeAttemptDurable(att, protocol.AttemptCancelled, map[string]any{
 		"state":         string(protocol.AttemptCancelled),
 		"sessionLocked": sessionLocked,
 		"errorCode":     "CANCELLED",
@@ -1131,15 +1256,15 @@ func (r *Runner) HandleLocalDeliver(ctx context.Context, req LocalDeliverRequest
 		activeWorkers := att.tracker.ActiveWorkerCount()
 		att.mu.Lock()
 		att.hasDelivery = true
-		promptReturned := att.promptReturned
-		if !promptReturned && req.Final {
+		noInFlightPrompt := att.promptReturned && att.inFlightPrompts == 0
+		if !noInFlightPrompt && req.Final {
 			att.finalRequested = true
 			att.explicitFinalDeliveryID = dlvID
 		}
 		att.mu.Unlock()
 
 		finalized := false
-		if promptReturned && (req.Final || activeWorkers == 0) {
+		if noInFlightPrompt && (req.Final || activeWorkers == 0) {
 			sessionLocked := false
 			if activeWorkers > 0 {
 				r.isolateAndCloseSession(slot, sid)
@@ -1149,6 +1274,7 @@ func (r *Runner) HandleLocalDeliver(ctx context.Context, req LocalDeliverRequest
 			unresRej, unresNonZero := att.tracker.UnresolvedCounts()
 			if err := r.finalizeAttempt(att, protocol.AttemptSucceeded, map[string]any{
 				"state":                       string(protocol.AttemptSucceeded),
+				"stopReason":                  string(acp.StopReasonEndTurn),
 				"completionSource":            string(protocol.CompletionExplicitDeliver),
 				"deliveryId":                  dlvID,
 				"sessionLocked":               sessionLocked,
@@ -1286,11 +1412,11 @@ func (r *Runner) HandleLocalDeliver(ctx context.Context, req LocalDeliverRequest
 
 	activeWorkers := att.tracker.ActiveWorkerCount()
 	att.mu.Lock()
-	promptReturned := att.promptReturned
+	noInFlightPrompt := att.promptReturned && att.inFlightPrompts == 0
 	alreadyFinal := att.finalized
 	att.mu.Unlock()
 
-	shouldFinalizeNow := promptReturned && !alreadyFinal && (req.Final || pd.IsFinal || activeWorkers == 0)
+	shouldFinalizeNow := noInFlightPrompt && !alreadyFinal && (req.Final || pd.IsFinal || activeWorkers == 0)
 
 	dlvPayload := map[string]any{
 		"deliveryId": pd.DeliveryID,
@@ -1314,6 +1440,7 @@ func (r *Runner) HandleLocalDeliver(ctx context.Context, req LocalDeliverRequest
 		unresRej, unresNonZero := att.tracker.UnresolvedCounts()
 		finalPayload = map[string]any{
 			"state":                       string(protocol.AttemptSucceeded),
+			"stopReason":                  string(acp.StopReasonEndTurn),
 			"completionSource":            string(protocol.CompletionExplicitDeliver),
 			"deliveryId":                  pd.DeliveryID,
 			"sessionLocked":               sessionLocked,
@@ -1357,7 +1484,7 @@ func (r *Runner) HandleLocalDeliver(ctx context.Context, req LocalDeliverRequest
 	} else {
 		att.mu.Lock()
 		att.hasDelivery = true
-		if !promptReturned && (req.Final || pd.IsFinal) {
+		if !noInFlightPrompt && (req.Final || pd.IsFinal) {
 			att.finalRequested = true
 			att.explicitFinalDeliveryID = pd.DeliveryID
 		}
@@ -2008,9 +2135,13 @@ func defaultPermissionPolicy(worktreePath, desiredMode string, req acp.RequestPe
 		return "", false
 	}
 
+	canonWT := ""
+	if strings.TrimSpace(worktreePath) != "" {
+		canonWT = canonicalWorktreeCheckPath(worktreePath)
+	}
 	locs, hasLocs := req.ToolCall.Locations.Value()
 	allLocationsInWorktree := func(requireNonEmpty bool, forbidGitInternals bool) bool {
-		if strings.TrimSpace(worktreePath) == "" {
+		if canonWT == "" {
 			return false
 		}
 		if requireNonEmpty && (!hasLocs || len(locs) == 0) {
@@ -2019,31 +2150,9 @@ func defaultPermissionPolicy(worktreePath, desiredMode string, req acp.RequestPe
 		if !hasLocs || len(locs) == 0 {
 			return true
 		}
-		canonWT := canonicalWorktreeCheckPath(worktreePath)
-		if canonWT == "" {
-			return false
-		}
 		for _, loc := range locs {
-			p := strings.TrimSpace(loc.Path)
-			if p == "" {
+			if !isPathWithinWorktree(canonWT, loc.Path, forbidGitInternals) {
 				return false
-			}
-			if !filepath.IsAbs(p) {
-				p = filepath.Join(canonWT, p)
-			}
-			canonLoc := canonicalWorktreeCheckPath(p)
-			if canonLoc == "" {
-				return false
-			}
-			rel, err := filepath.Rel(canonWT, canonLoc)
-			if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
-				return false
-			}
-			if forbidGitInternals {
-				slashed := filepath.ToSlash(rel)
-				if slashed == ".git" || strings.HasPrefix(slashed, ".git/") {
-					return false
-				}
 			}
 		}
 		return true
@@ -2069,7 +2178,7 @@ func defaultPermissionPolicy(worktreePath, desiredMode string, req acp.RequestPe
 		if !allLocationsInWorktree(false, false) {
 			return "", false
 		}
-		if isWhitelistedLocalCommand(req) {
+		if isWhitelistedLocalCommand(req, canonWT) {
 			return allowOptID, true
 		}
 		return "", false
@@ -2079,6 +2188,9 @@ func defaultPermissionPolicy(worktreePath, desiredMode string, req acp.RequestPe
 	}
 }
 
+// canonicalWorktreeCheckPath resolves symlinks even when multiple parent directories of a new file
+// do not exist yet by walking UP to the deepest existing ancestor, resolving symlinks on that ancestor,
+// and rejoining the remaining path segments. Never falls back to an un-resolved path (B5).
 func canonicalWorktreeCheckPath(p string) string {
 	abs, err := filepath.Abs(p)
 	if err != nil {
@@ -2087,16 +2199,59 @@ func canonicalWorktreeCheckPath(p string) string {
 	if real, err := filepath.EvalSymlinks(abs); err == nil {
 		return filepath.Clean(real)
 	}
-	// Target file may not exist yet (e.g., new file edit) -> resolve nearest existing ancestor.
-	dir := filepath.Dir(abs)
-	base := filepath.Base(abs)
-	if realDir, err := filepath.EvalSymlinks(dir); err == nil {
-		return filepath.Clean(filepath.Join(realDir, base))
+	cur := filepath.Clean(abs)
+	var tail []string
+	for {
+		parent := filepath.Dir(cur)
+		base := filepath.Base(cur)
+		if parent == cur {
+			// Reached filesystem root without resolving
+			return ""
+		}
+		if base == ".." {
+			return ""
+		}
+		tail = append([]string{base}, tail...)
+		cur = parent
+		if realAnc, err := filepath.EvalSymlinks(cur); err == nil {
+			parts := append([]string{realAnc}, tail...)
+			return filepath.Clean(filepath.Join(parts...))
+		}
 	}
-	return filepath.Clean(abs)
 }
 
-func isWhitelistedLocalCommand(req acp.RequestPermissionRequest) bool {
+func isPathWithinWorktree(canonWT, rawPath string, forbidGitInternals bool) bool {
+	p := strings.TrimSpace(rawPath)
+	if p == "" || canonWT == "" {
+		return false
+	}
+	if !filepath.IsAbs(p) {
+		p = filepath.Join(canonWT, p)
+	}
+	canonLoc := canonicalWorktreeCheckPath(p)
+	if canonLoc == "" {
+		return false
+	}
+	rel, err := filepath.Rel(canonWT, canonLoc)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return false
+	}
+	if forbidGitInternals {
+		slashed := filepath.ToSlash(rel)
+		if slashed == ".git" || strings.HasPrefix(slashed, ".git/") {
+			return false
+		}
+	}
+	return true
+}
+
+// isWhitelistedLocalCommand strictly verifies worktree-confined safe commands (B5).
+// Anything whose executable, working directory, or flags cannot be positively proven confined
+// to canonWT returns false so it routes to explicit human approval.
+func isWhitelistedLocalCommand(req acp.RequestPermissionRequest, canonWT string) bool {
+	if canonWT == "" {
+		return false
+	}
 	rawIn, ok := req.ToolCall.RawInput.Value()
 	if !ok || len(rawIn) == 0 {
 		return false
@@ -2105,6 +2260,15 @@ func isWhitelistedLocalCommand(req acp.RequestPermissionRequest) bool {
 	if err := json.Unmarshal(rawIn, &m); err != nil {
 		return false
 	}
+	// If tool input specifies an explicit working directory, it MUST resolve strictly inside canonWT.
+	for _, ck := range []string{"cwd", "Cwd", "workdir", "working_directory", "dir"} {
+		if s, ok := m[ck].(string); ok && strings.TrimSpace(s) != "" {
+			if !isPathWithinWorktree(canonWT, s, true) {
+				return false
+			}
+		}
+	}
+
 	cmd := ""
 	for _, k := range []string{"command", "cmd", "CommandLine"} {
 		if s, ok := m[k].(string); ok && strings.TrimSpace(s) != "" {
@@ -2115,8 +2279,8 @@ func isWhitelistedLocalCommand(req acp.RequestPermissionRequest) bool {
 	if cmd == "" {
 		return false
 	}
-	// Reject any shell chaining, redirection, subshell, or multi-line command injection.
-	for _, meta := range []string{"&&", "||", ";", "|", "`", "$(", ">", "<", "\n", "\r"} {
+	// Reject shell metacharacters, subshells, env expansion, redirection, globbing, tilde, or multi-line injection.
+	for _, meta := range []string{"&&", "||", ";", "|", "`", "$", ">", "<", "\n", "\r", "(", ")", "~", "&"} {
 		if strings.Contains(cmd, meta) {
 			return false
 		}
@@ -2125,25 +2289,95 @@ func isWhitelistedLocalCommand(req acp.RequestPermissionRequest) bool {
 	if len(fields) < 2 {
 		return false
 	}
-	bin := filepath.Base(fields[0])
+	// Require bare trusted executable name (never ./git, /tmp/go, etc.).
+	exe := fields[0]
+	if strings.ContainsAny(exe, "/\\") {
+		return false
+	}
 	sub := fields[1]
-	switch bin {
+	args := fields[2:]
+
+	// Common argument path hygiene: reject parent traversal segments (`..`) or paths outside canonWT.
+	hasParentTraversal := func(s string) bool {
+		if s == ".." {
+			return true
+		}
+		norm := strings.ReplaceAll(s, "\\", "/")
+		for _, seg := range strings.Split(norm, "/") {
+			if seg == ".." {
+				return true
+			}
+		}
+		return false
+	}
+	checkArgPaths := func(argList []string, forbidGit bool) bool {
+		for _, a := range argList {
+			trimmed := strings.Trim(a, `"'`)
+			if hasParentTraversal(trimmed) {
+				return false
+			}
+			if strings.HasPrefix(trimmed, "/") && !isPathWithinWorktree(canonWT, trimmed, forbidGit) {
+				return false
+			}
+			if idx := strings.Index(trimmed, "=/"); idx >= 0 {
+				if !isPathWithinWorktree(canonWT, trimmed[idx+1:], forbidGit) {
+					return false
+				}
+			}
+			if idx := strings.Index(trimmed, "="); idx >= 0 {
+				if hasParentTraversal(trimmed[idx+1:]) {
+					return false
+				}
+			}
+		}
+		return true
+	}
+
+	switch exe {
 	case "orbit":
-		return sub == "deliver" || sub == "status" || sub == "brief"
+		if sub != "deliver" && sub != "status" && sub != "brief" {
+			return false
+		}
+		for _, a := range args {
+			lower := strings.ToLower(a)
+			for _, bad := range []string{"--repo", "--mirror", "--data-dir", "--config-dir", "--hub", "--sock", "--token"} {
+				if lower == bad || strings.HasPrefix(lower, bad+"=") {
+					return false
+				}
+			}
+		}
+		return checkArgPaths(args, true)
+
 	case "git":
 		switch sub {
 		case "status", "diff", "log", "show", "rev-parse", "ls-files":
-			return true
 		default:
 			return false
 		}
+		for _, a := range args {
+			for _, bad := range []string{"-C", "-c", "--git-dir", "--work-tree", "--exec-path", "--output", "-o", "--ext-diff", "--textconv", "--no-index"} {
+				if a == bad || strings.HasPrefix(a, bad+"=") {
+					return false
+				}
+			}
+		}
+		return checkArgPaths(args, false)
+
 	case "go":
 		switch sub {
-		case "test", "vet", "build", "list":
-			return true
+		case "test", "vet", "list":
 		default:
 			return false
 		}
+		for _, a := range args {
+			for _, bad := range []string{"-exec", "-toolexec", "-o", "-C", "-overlay", "-modfile", "-pkgdir"} {
+				if a == bad || strings.HasPrefix(a, bad+"=") {
+					return false
+				}
+			}
+		}
+		return checkArgPaths(args, true)
+
 	default:
 		return false
 	}
@@ -2248,6 +2482,26 @@ func (r *Runner) finalizeAttempt(att *attemptContext, terminalState protocol.Att
 	return nil
 }
 
+// finalizeAttemptDurable retries persisting the terminal state to the local Outbox SQLite
+// until durable persistence succeeds (or the Runner itself shuts down), ensuring a transient
+// Outbox write error NEVER drops terminal state or leaks resources/heartbeat leases (B19).
+func (r *Runner) finalizeAttemptDurable(att *attemptContext, terminalState protocol.AttemptState, payload map[string]any) {
+	backoff := 100 * time.Millisecond
+	for {
+		if err := r.finalizeAttempt(att, terminalState, payload); err == nil {
+			return
+		}
+		select {
+		case <-r.runCtx.Done():
+			return
+		case <-time.After(backoff):
+			if backoff < 500*time.Millisecond {
+				backoff *= 2
+			}
+		}
+	}
+}
+
 func (r *Runner) completeInMemoryFinalize(att *attemptContext, terminalState protocol.AttemptState) {
 	att.mu.Lock()
 	if att.finalized {
@@ -2265,6 +2519,7 @@ func (r *Runner) completeInMemoryFinalize(att *attemptContext, terminalState pro
 	cancelFn := att.cancelFn
 	att.mu.Unlock()
 
+	r.releaseWorkerReservation(att)
 	r.releaseAttemptResources(att)
 
 	r.mu.Lock()
@@ -2278,7 +2533,8 @@ func (r *Runner) completeInMemoryFinalize(att *attemptContext, terminalState pro
 	}
 }
 
-// HandleBoardMessage delivers a Hub board.message @mention into an active swarm_monitoring attempt (B16).
+// HandleBoardMessage queues a Hub board.message @mention into an active swarm_monitoring attempt
+// and drains messages serially in #seq order (deduped by messageId, NEVER dropping a second message!) (B16 & B2).
 func (r *Runner) HandleBoardMessage(frame protocol.BoardMessageDispatchFrame) {
 	r.mu.Lock()
 	att := r.attempts[frame.AttemptID]
@@ -2292,40 +2548,168 @@ func (r *Runner) HandleBoardMessage(frame protocol.BoardMessageDispatchFrame) {
 		att.mu.Unlock()
 		return
 	}
-	sid := att.providerSessionID
-	slot := att.slot
-	leaseToken := att.dispatch.LeaseToken
-	att.mu.Unlock()
-
-	slot.mu.Lock()
-	if slot.locked || slot.inFlightPrompt || slot.providerSessionID != sid {
-		slot.mu.Unlock()
+	if frame.MessageID != "" {
+		if att.boardDelivered[frame.MessageID] || att.boardQueuedIDs[frame.MessageID] {
+			att.mu.Unlock()
+			return
+		}
+		att.boardQueuedIDs[frame.MessageID] = true
+	}
+	att.boardQueue = append(att.boardQueue, frame)
+	if att.boardDraining {
+		att.mu.Unlock()
 		return
 	}
-	slot.inFlightPrompt = true
-	slot.promptOwnerAttemptID = att.dispatch.AttemptID
-	slot.mu.Unlock()
+	att.boardDraining = true
+	att.mu.Unlock()
 
-	msgText := fmt.Sprintf("[Board Message #%d from %s targeting @%s]\n%s", frame.Seq, frame.AuthorName, frame.TargetMention, frame.Body)
-	pctx, cancel := context.WithTimeout(r.runCtx, 2*time.Minute)
-	_, err := r.driver.Prompt(pctx, sid, msgText)
-	cancel()
+	r.wg.Add(1)
+	go func() {
+		defer r.wg.Done()
+		r.drainBoardMessages(att)
+	}()
+}
 
-	slot.mu.Lock()
-	if slot.promptOwnerAttemptID == att.dispatch.AttemptID {
-		slot.inFlightPrompt = false
-		slot.promptOwnerAttemptID = ""
-	}
-	slot.lastActivityAt = time.Now()
-	slot.mu.Unlock()
+func (r *Runner) drainBoardMessages(att *attemptContext) {
+	for {
+		att.mu.Lock()
+		if att.finalized || att.state != protocol.AttemptSwarmMonitoring || len(att.boardQueue) == 0 {
+			att.boardDraining = false
+			att.mu.Unlock()
+			return
+		}
+		frame := att.boardQueue[0]
+		att.boardQueue = att.boardQueue[1:]
+		sid := att.providerSessionID
+		slot := att.slot
+		leaseToken := att.dispatch.LeaseToken
+		attemptID := att.dispatch.AttemptID
+		att.mu.Unlock()
 
-	if err == nil {
-		r.resetSwarmIdleTimerIfMonitoring(att)
-		_, _ = r.enqueueOutbox(r.runCtx, frame.AttemptID, leaseToken, protocol.OutboxFrameBoardAck, map[string]any{
-			"messageId":  frame.MessageID,
-			"memberName": frame.TargetMention,
-			"seq":        frame.Seq,
-		})
+		// Wait cleanly if another prompt currently holds slot.inFlightPrompt instead of dropping the message.
+		acquired := false
+		for !acquired {
+			if r.runCtx.Err() != nil {
+				att.mu.Lock()
+				att.boardDraining = false
+				att.mu.Unlock()
+				return
+			}
+			att.mu.Lock()
+			if att.finalized || att.state != protocol.AttemptSwarmMonitoring {
+				att.boardDraining = false
+				att.mu.Unlock()
+				return
+			}
+			att.mu.Unlock()
+
+			slot.mu.Lock()
+			if slot.locked || slot.providerSessionID != sid {
+				slot.mu.Unlock()
+				att.mu.Lock()
+				att.boardDraining = false
+				att.mu.Unlock()
+				return
+			}
+			if !slot.inFlightPrompt {
+				slot.inFlightPrompt = true
+				slot.promptOwnerAttemptID = attemptID
+				att.mu.Lock()
+				att.inFlightPrompts++
+				att.promptReturned = false
+				att.mu.Unlock()
+				acquired = true
+			}
+			slot.mu.Unlock()
+			if !acquired {
+				select {
+				case <-r.runCtx.Done():
+					att.mu.Lock()
+					att.boardDraining = false
+					att.mu.Unlock()
+					return
+				case <-time.After(30 * time.Millisecond):
+				}
+			}
+		}
+
+		msgText := fmt.Sprintf("[Board Message #%d from %s targeting @%s]\n%s", frame.Seq, frame.AuthorName, frame.TargetMention, frame.Body)
+		pctx, cancel := context.WithTimeout(r.runCtx, 2*time.Minute)
+		resp, err := r.driver.Prompt(pctx, sid, msgText)
+		cancel()
+
+		slot.mu.Lock()
+		if slot.promptOwnerAttemptID == attemptID {
+			slot.inFlightPrompt = false
+			slot.promptOwnerAttemptID = ""
+		}
+		slot.lastActivityAt = time.Now()
+		slot.mu.Unlock()
+
+		att.mu.Lock()
+		if att.inFlightPrompts > 0 {
+			att.inFlightPrompts--
+		}
+		att.promptReturned = (att.inFlightPrompts == 0)
+		finalReq := att.finalRequested
+		explicitDlvID := att.explicitFinalDeliveryID
+		alreadyFinal := att.finalized
+		att.mu.Unlock()
+
+		cleanTurn := err == nil && (resp.StopReason == acp.StopReasonEndTurn || resp.StopReason == "")
+		if cleanTurn {
+			att.mu.Lock()
+			if frame.MessageID != "" {
+				att.boardDelivered[frame.MessageID] = true
+				delete(att.boardQueuedIDs, frame.MessageID)
+			}
+			att.mu.Unlock()
+			r.resetSwarmIdleTimerIfMonitoring(att)
+			// B16: Advance cursor honestly — native swarm board messages are delivered into the
+			// coordinator ACP session, so advance the coordinator cursor rather than fabricating
+			// private target-worker consumption without evidence.
+			ackMember := "coordinator"
+			if strings.EqualFold(strings.TrimPrefix(strings.TrimSpace(frame.TargetMention), "@"), "coordinator") {
+				ackMember = "coordinator"
+			}
+			_, _ = r.enqueueOutbox(r.runCtx, frame.AttemptID, leaseToken, protocol.OutboxFrameBoardAck, map[string]any{
+				"messageId":  frame.MessageID,
+				"memberName": ackMember,
+				"seq":        frame.Seq,
+			})
+		} else {
+			att.mu.Lock()
+			if frame.MessageID != "" {
+				delete(att.boardQueuedIDs, frame.MessageID)
+			}
+			att.mu.Unlock()
+		}
+
+		// B2: If `orbit deliver --final` executed during this board prompt and prompt ended cleanly,
+		// finalize NOW after releasing slot.inFlightPrompt so SID is never reused early!
+		if finalReq && !alreadyFinal && cleanTurn {
+			att.ackPendingWG.Wait()
+			r.coalescer.FlushAttempt(attemptID)
+			activeWorkers := att.tracker.ActiveWorkerCount()
+			sessionLocked := false
+			if activeWorkers > 0 {
+				r.isolateAndCloseSession(slot, sid)
+				sessionLocked = true
+			}
+			_, _, rejCount, nonZeroCount := att.tracker.Stats()
+			unresRej, unresNonZero := att.tracker.UnresolvedCounts()
+			r.finalizeAttemptDurable(att, protocol.AttemptSucceeded, map[string]any{
+				"state":                       string(protocol.AttemptSucceeded),
+				"stopReason":                  string(acp.StopReasonEndTurn),
+				"completionSource":            string(protocol.CompletionExplicitDeliver),
+				"deliveryId":                  explicitDlvID,
+				"sessionLocked":               sessionLocked,
+				"rejectedToolCount":           rejCount,
+				"nonZeroExitCount":            nonZeroCount,
+				"unresolvedRejectedToolCount": unresRej,
+				"unresolvedNonZeroExitCount":  unresNonZero,
+			})
+		}
 	}
 }
 
@@ -2531,6 +2915,9 @@ func (r *Runner) connectAndServeWS(ctx context.Context) error {
 	}
 	for _, redeliver := range welcome.Reconcile.RedeliverApprovals {
 		r.HandleApprovalDecision(redeliver)
+	}
+	for _, pendingBM := range welcome.Reconcile.PendingBoardMessages {
+		r.HandleBoardMessage(pendingBM)
 	}
 
 	// Retry any offline pending deliveries and wake outbox flush immediately
@@ -2855,12 +3242,12 @@ func (r *Runner) retryPendingDeliveries(ctx context.Context) {
 				}
 			} else {
 				att.mu.Lock()
-				promptReturned := att.promptReturned
+				noInFlightPrompt := att.promptReturned && att.inFlightPrompts == 0
 				alreadyFinal := att.finalized
 				sid := att.providerSessionID
 				slot := att.slot
 				att.mu.Unlock()
-				if promptReturned && !alreadyFinal {
+				if noInFlightPrompt && !alreadyFinal {
 					emitFinal = true
 					sessionLocked := false
 					if att.tracker.ActiveWorkerCount() > 0 {
@@ -2871,6 +3258,7 @@ func (r *Runner) retryPendingDeliveries(ctx context.Context) {
 					unresRej, unresNonZero := att.tracker.UnresolvedCounts()
 					finalPayload = map[string]any{
 						"state":                       string(protocol.AttemptSucceeded),
+						"stopReason":                  string(acp.StopReasonEndTurn),
 						"completionSource":            string(protocol.CompletionExplicitDeliver),
 						"deliveryId":                  pd.DeliveryID,
 						"sessionLocked":               sessionLocked,
@@ -2921,7 +3309,7 @@ func (r *Runner) outboxPumpLoop() {
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 	// B13: Periodically retry failed pending deliveries even while WS stays continuously connected.
-	deliveryRetryTicker := time.NewTicker(2 * time.Second)
+	deliveryRetryTicker := time.NewTicker(r.cfg.DeliveryRetryInterval)
 	defer deliveryRetryTicker.Stop()
 
 	flush := func() {

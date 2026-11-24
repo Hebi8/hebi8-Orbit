@@ -24,19 +24,58 @@ export function BoardPanel({
 }) {
   const qc = useQueryClient();
   const members = board?.members ?? fallbackMembers;
-  const messages = [...(board?.messages ?? [])].sort((a, b) => a.seq - b.seq);
+  const [olderMessages, setOlderMessages] = useState<TaskBoardResponse['messages']>([]);
+  const [olderHasMore, setOlderHasMore] = useState<boolean | null>(null);
+  const [loadingOlder, setLoadingOlder] = useState(false);
+
+  useEffect(() => {
+    setOlderMessages([]);
+    setOlderHasMore(null);
+  }, [taskId]);
+
+  const msgById = new Map<string, TaskBoardResponse['messages'][number]>();
+  for (const m of olderMessages) msgById.set(m.messageId, m);
+  for (const m of board?.messages ?? []) msgById.set(m.messageId, m);
+  const messages = [...msgById.values()].sort((a, b) => a.seq - b.seq);
+  const hasMore = olderHasMore !== null ? olderHasMore : !!board?.hasMore;
+  const oldestSeq = messages.length > 0 ? messages[0].seq : 0;
+
+  const loadOlder = async () => {
+    if (loadingOlder || !hasMore || oldestSeq <= 1) return;
+    setLoadingOlder(true);
+    try {
+      const page = await api.getBoard(taskId, { beforeSeq: oldestSeq, limit: 200 });
+      setOlderMessages((prev) => {
+        const merged = new Map<string, TaskBoardResponse['messages'][number]>();
+        for (const m of page.messages) merged.set(m.messageId, m);
+        for (const m of prev) merged.set(m.messageId, m);
+        return [...merged.values()].sort((a, b) => a.seq - b.seq);
+      });
+      setOlderHasMore(!!page.hasMore);
+    } catch (e) {
+      toast(errMsg(e), 'err');
+    } finally {
+      setLoadingOlder(false);
+    }
+  };
+
   const latest = board?.latestSeq ?? 0;
   const [target, setTarget] = useState<string>(worker ?? '');
   const [text, setText] = useState('');
   const listRef = useRef<HTMLDivElement | null>(null);
+  const prevLatestSeqRef = useRef<number>(0);
 
   useEffect(() => {
     if (worker) setTarget(worker);
   }, [worker]);
   useEffect(() => {
-    const el = listRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
-  }, [messages.length]);
+    const newest = messages.length > 0 ? messages[messages.length - 1].seq : 0;
+    if (newest > prevLatestSeqRef.current) {
+      prevLatestSeqRef.current = newest;
+      const el = listRef.current;
+      if (el) el.scrollTop = el.scrollHeight;
+    }
+  }, [messages]);
 
   const post = useMutation({
     mutationFn: (v: { target: string; body: string }) =>
@@ -102,6 +141,13 @@ export function BoardPanel({
         })}
       </div>
       <div className="blist" ref={listRef}>
+        {hasMore && (
+          <div style={{ padding: '6px 0 10px', textAlign: 'center' }}>
+            <button type="button" className="btn ghost" disabled={loadingOlder} onClick={() => void loadOlder()}>
+              {loadingOlder ? '正在加载更早消息…' : `加载 #${oldestSeq} 之前的更早消息`}
+            </button>
+          </div>
+        )}
         {messages.length === 0 && <div className="empty">消息板还是空的</div>}
         {messages.map((msg) => {
           const you = msg.authorName === 'human' || msg.authorName === 'user';

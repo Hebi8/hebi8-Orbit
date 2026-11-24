@@ -1171,3 +1171,329 @@ func TestS10_E2E_DualRoundCombinedDiffAndRyugiAnnotations(t *testing.T) {
 		t.Fatalf("v1 delivery diff not preserved/reopenable (%d): %s", respV1.StatusCode, string(rawV1))
 	}
 }
+
+func TestRound2RunnerHardening(t *testing.T) {
+	t.Run("B1_InFlightFinalCannotOverrideRefusalStopReason", func(t *testing.T) {
+		env := newTestEnv(t)
+		drv := NewFakeAcpDriver()
+		var runRef *runner.Runner
+		var attID atomic.Value
+
+		drv.OnPrompt = func(ctx context.Context, d *FakeAcpDriver, sid acp.SessionId, promptText string) (acp.PromptResponse, error) {
+			eventually(t, 2*time.Second, func() bool {
+				id, _ := attID.Load().(string)
+				if id == "" {
+					return false
+				}
+				rec, err := env.st.GetAttemptRecord(context.Background(), id)
+				return err == nil && rec.WorktreePath != ""
+			}, "worktree not ready")
+			rec, _ := env.st.GetAttemptRecord(context.Background(), attID.Load().(string))
+			_ = os.WriteFile(filepath.Join(rec.WorktreePath, "app.go"), []byte("package main\n// refusal after deliver\nfunc main() {}\n"), 0o644)
+			if _, err := runRef.HandleLocalDeliver(context.Background(), runner.LocalDeliverRequest{
+				AttemptID: rec.AttemptID, Summary: "early final", Final: true,
+			}); err != nil {
+				t.Errorf("HandleLocalDeliver failed: %v", err)
+			}
+			// Agent then terminates with abnormal StopReasonRefusal!
+			return acp.PromptResponse{StopReason: acp.StopReasonRefusal}, nil
+		}
+
+		runRef = env.startRunner("hub-node", "", "", drv, nil)
+		_, raw := env.apiReq(http.MethodPost, "/api/projects/demo-app/tasks", protocol.CreateTaskRequest{Goal: "refusal after final"}, nil)
+		var cr protocol.CreateTaskResponse
+		_ = json.Unmarshal(raw, &cr)
+		attID.Store(cr.Attempt.AttemptID)
+
+		eventually(t, 3*time.Second, func() bool {
+			rec, err := env.st.GetAttemptRecord(context.Background(), cr.Attempt.AttemptID)
+			return err == nil && rec.State == protocol.AttemptFailed && rec.ErrorCode == "ABNORMAL_STOP_REASON"
+		}, "in-flight --final improperly overrode StopReasonRefusal into succeeded")
+	})
+
+	t.Run("B1_UnrelatedCommandExitZeroDoesNotClearFailedTest", func(t *testing.T) {
+		tr := runner.NewActiveSwarmTracker("att_cmd_scope")
+		tr.ObserveToolCall(&acp.SessionUpdateToolCall{
+			ToolCallId: "tc-test-fail", Name: acp.Ptr("run_command"), Status: acp.ToolCallStatusCompleted,
+			RawInput: json.RawMessage(`{"command":"go test ./..."}`), RawOutput: json.RawMessage(`{"exit_code":1}`),
+		})
+		// Unrelated command exits 0 -> MUST NOT clear failed `go test`!
+		tr.ObserveToolCall(&acp.SessionUpdateToolCall{
+			ToolCallId: "tc-ls-ok", Name: acp.Ptr("run_command"), Status: acp.ToolCallStatusCompleted,
+			RawInput: json.RawMessage(`{"command":"ls -la"}`), RawOutput: json.RawMessage(`{"exit_code":0}`),
+		})
+		_, unres := tr.UnresolvedCounts()
+		if unres != 1 {
+			t.Fatalf("unrelated exit-0 command cleared failed go test! unresolvedNonZero=%d", unres)
+		}
+		// Matching `go test` exiting 0 clears it cleanly.
+		tr.ObserveToolCall(&acp.SessionUpdateToolCall{
+			ToolCallId: "tc-test-pass", Name: acp.Ptr("run_command"), Status: acp.ToolCallStatusCompleted,
+			RawInput: json.RawMessage(`{"command":"go test ./internal/runner"}`), RawOutput: json.RawMessage(`{"exit_code":0}`),
+		})
+		_, unres = tr.UnresolvedCounts()
+		if unres != 0 {
+			t.Fatalf("expected matching go test exit-0 to clear failure, got unresolvedNonZero=%d", unres)
+		}
+	})
+
+	t.Run("B10_CancelBeforeDispatchPreventsExecution", func(t *testing.T) {
+		env := newTestEnv(t)
+		drv := NewFakeAcpDriver()
+		var promptCalls atomic.Int32
+		drv.OnPrompt = func(ctx context.Context, d *FakeAcpDriver, sid acp.SessionId, promptText string) (acp.PromptResponse, error) {
+			promptCalls.Add(1)
+			return acp.PromptResponse{StopReason: acp.StopReasonEndTurn}, nil
+		}
+		r := env.startRunner("hub-node", "", "", drv, nil)
+		// Cancel arrives BEFORE dispatch for att_race_b10
+		r.HandleCancel(protocol.AttemptCancelFrame{AttemptID: "att_race_b10", LeaseToken: "lt_b10"})
+		r.HandleDispatch(protocol.AttemptDispatchFrame{
+			AttemptID: "att_race_b10", TaskID: "tsk_b10", ProjectID: protocol.ScratchProjectID,
+			LeaseToken: "lt_b10", Adapter: protocol.AdapterAgy, Prompt: "should never run",
+		})
+		time.Sleep(150 * time.Millisecond)
+		if promptCalls.Load() != 0 {
+			t.Fatalf("HandleDispatch ran cancelled attempt! promptCalls=%d", promptCalls.Load())
+		}
+	})
+
+	t.Run("B13_FailedFinalPushFollowedByEndTurnSucceedsOnBackgroundRetry", func(t *testing.T) {
+		env := newTestEnv(t)
+		drv := NewFakeAcpDriver()
+		var runRef *runner.Runner
+		var attID atomic.Value
+		pushFailedCh := make(chan struct{})
+
+		proj, _ := env.st.GetProject(context.Background(), "demo-app")
+		movedMirror := proj.MirrorBarePath + ".b13bak"
+		if err := os.Rename(proj.MirrorBarePath, movedMirror); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(proj.MirrorBarePath, []byte("blocked"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if _, err := os.Stat(movedMirror); err == nil {
+				_ = os.Remove(proj.MirrorBarePath)
+				_ = os.Rename(movedMirror, proj.MirrorBarePath)
+			}
+		})
+
+		drv.OnPrompt = func(ctx context.Context, d *FakeAcpDriver, sid acp.SessionId, promptText string) (acp.PromptResponse, error) {
+			eventually(t, 2*time.Second, func() bool {
+				id, _ := attID.Load().(string)
+				if id == "" {
+					return false
+				}
+				rec, err := env.st.GetAttemptRecord(context.Background(), id)
+				return err == nil && rec.WorktreePath != ""
+			}, "worktree not ready")
+			rec, _ := env.st.GetAttemptRecord(context.Background(), attID.Load().(string))
+			_ = os.WriteFile(filepath.Join(rec.WorktreePath, "app.go"), []byte("package main\n// b13 bg retry\nfunc main() {}\n"), 0o644)
+			// Mirror is currently blocked -> push fails, saved locally as IsFinal=true, Emitted=false!
+			_, err := runRef.HandleLocalDeliver(context.Background(), runner.LocalDeliverRequest{
+				AttemptID: rec.AttemptID, Summary: "b13 retry delivery", Final: true,
+			})
+			if err == nil {
+				t.Errorf("expected push failure while mirror blocked")
+			}
+			close(pushFailedCh)
+			// Agent IMMEDIATELY returns end_turn BEFORE mirror recovers!
+			return acp.PromptResponse{StopReason: acp.StopReasonEndTurn}, nil
+		}
+
+		runRef = env.startRunner("hub-node", "", "", drv, func(c *runner.Config) {
+			c.DeliveryRetryInterval = 80 * time.Millisecond
+		})
+		_, raw := env.apiReq(http.MethodPost, "/api/projects/demo-app/tasks", protocol.CreateTaskRequest{Goal: "b13 end_turn before recovery"}, nil)
+		var cr protocol.CreateTaskResponse
+		_ = json.Unmarshal(raw, &cr)
+		attID.Store(cr.Attempt.AttemptID)
+
+		<-pushFailedCh
+		// Give executeAttempt a moment after end_turn — it MUST NOT fail with NO_VERIFIED_DELIVERY!
+		time.Sleep(150 * time.Millisecond)
+		attMid, _ := env.st.GetAttemptRecord(context.Background(), cr.Attempt.AttemptID)
+		if attMid.State == protocol.AttemptFailed {
+			t.Fatalf("attempt prematurely failed before pending final delivery retry: %+v", attMid)
+		}
+
+		// Restore mirror -> background delivery retry MUST push, emit delivery, and succeed formally!
+		if err := os.Remove(proj.MirrorBarePath); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(movedMirror, proj.MirrorBarePath); err != nil {
+			t.Fatal(err)
+		}
+		eventually(t, 4*time.Second, func() bool {
+			rec, err := env.st.GetAttemptRecord(context.Background(), cr.Attempt.AttemptID)
+			return err == nil && rec.State == protocol.AttemptSucceeded && rec.OutputDeliveryID != ""
+		}, "attempt did not succeed via background retry after mirror recovered")
+	})
+
+	t.Run("B14_DriftedWorktreeCreatesCleanWorktreeAtInputDeliverySHA", func(t *testing.T) {
+		env := newTestEnv(t)
+		drv := NewFakeAcpDriver()
+		var runRef *runner.Runner
+		var curAttID atomic.Value
+		var turn int32
+
+		drv.OnPrompt = func(ctx context.Context, d *FakeAcpDriver, sid acp.SessionId, promptText string) (acp.PromptResponse, error) {
+			n := atomic.AddInt32(&turn, 1)
+			id := curAttID.Load().(string)
+			d.mu.Lock()
+			wtPath := d.sessionCWD[sid]
+			d.mu.Unlock()
+			if n == 1 {
+				_ = os.WriteFile(filepath.Join(wtPath, "app.go"), []byte("package main\n// turn1 frozen\nfunc main() {}\n"), 0o644)
+				_, _ = runRef.HandleLocalDeliver(context.Background(), runner.LocalDeliverRequest{
+					AttemptID: id, Summary: "T1", Final: true,
+				})
+				return acp.PromptResponse{StopReason: acp.StopReasonEndTurn}, nil
+			}
+			// Turn 2: verify app.go in the session's ACTUAL CWD matches frozen T1 (NOT drifted post-delivery edit!)
+			b, _ := os.ReadFile(filepath.Join(wtPath, "app.go"))
+			if !strings.Contains(string(b), "turn1 frozen") || strings.Contains(string(b), "DRIFTED_MUTATION") {
+				t.Errorf("Turn 2 saw drifted worktree instead of frozen InputDelivery! cwd=%s content=%q", wtPath, string(b))
+			}
+			_ = os.WriteFile(filepath.Join(wtPath, "app.go"), []byte("package main\n// turn2 clean\nfunc main() {}\n"), 0o644)
+			_, _ = runRef.HandleLocalDeliver(context.Background(), runner.LocalDeliverRequest{
+				AttemptID: id, Summary: "T2", Final: true,
+			})
+			return acp.PromptResponse{StopReason: acp.StopReasonEndTurn}, nil
+		}
+
+		runRef = env.startRunner("hub-node", "", "", drv, nil)
+		_, raw := env.apiReq(http.MethodPost, "/api/projects/demo-app/tasks", protocol.CreateTaskRequest{Goal: "b14 drift"}, nil)
+		var cr protocol.CreateTaskResponse
+		_ = json.Unmarshal(raw, &cr)
+		curAttID.Store(cr.Attempt.AttemptID)
+
+		eventually(t, 3*time.Second, func() bool {
+			rec, err := env.st.GetAttemptRecord(context.Background(), cr.Attempt.AttemptID)
+			return err == nil && rec.State == protocol.AttemptSucceeded
+		}, "turn 1 did not finish")
+		att1Rec, _ := env.st.GetAttemptRecord(context.Background(), cr.Attempt.AttemptID)
+
+		// Drift the old worktree AFTER Turn 1 froze its delivery!
+		if err := os.WriteFile(filepath.Join(att1Rec.WorktreePath, "app.go"), []byte("package main\n// DRIFTED_MUTATION\nfunc main() {}\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		// Trigger Turn 2 -> PrepareWorktree MUST preserve drifted dir AND spawn a fresh clean worktree at T1 SHA!
+		_, rawF2 := env.apiReq(http.MethodPost, "/api/tasks/"+cr.Task.TaskID+"/followup", protocol.FollowupTaskRequest{
+			Message: "continue cleanly", Mode: protocol.FollowupModeQueue,
+		}, nil)
+		var f2 protocol.FollowupTaskResponse
+		_ = json.Unmarshal(rawF2, &f2)
+		curAttID.Store(f2.Attempt.AttemptID)
+
+		eventually(t, 3*time.Second, func() bool {
+			rec, err := env.st.GetAttemptRecord(context.Background(), f2.Attempt.AttemptID)
+			return err == nil && rec.State == protocol.AttemptSucceeded
+		}, "turn 2 did not succeed")
+		att2Rec, _ := env.st.GetAttemptRecord(context.Background(), f2.Attempt.AttemptID)
+		if att2Rec.WorktreePath == att1Rec.WorktreePath {
+			t.Fatalf("expected fresh clean worktree on drifted reuse, got same path %s", att2Rec.WorktreePath)
+		}
+		// Original drifted directory must remain untouched!
+		origBytes, _ := os.ReadFile(filepath.Join(att1Rec.WorktreePath, "app.go"))
+		if !strings.Contains(string(origBytes), "DRIFTED_MUTATION") {
+			t.Fatalf("original drifted directory was unexpectedly modified")
+		}
+	})
+
+	t.Run("B16_B2_TwoConcurrentBoardMessagesBothDeliveredAndBoardFinalDeferred", func(t *testing.T) {
+		env := newTestEnv(t)
+		drv := NewFakeAcpDriver()
+		var runRef *runner.Runner
+		var attID atomic.Value
+		msg1Entered := make(chan struct{})
+		releaseMsg1 := make(chan struct{})
+		gotPrompts := make(chan string, 4)
+		var count atomic.Int32
+
+		drv.OnPrompt = func(ctx context.Context, d *FakeAcpDriver, sid acp.SessionId, promptText string) (acp.PromptResponse, error) {
+			n := count.Add(1)
+			if n == 1 {
+				_ = d.EmitUpdate(ctx, sid, acp.SessionUpdate{
+					ToolCall: &acp.SessionUpdateToolCall{
+						ToolCallId: "tc-b16-2", Name: acp.Ptr("swarm"), Status: acp.ToolCallStatusCompleted,
+						RawInput: json.RawMessage(`{"action":"add","name":"ui-coder"}`),
+					},
+				})
+				return acp.PromptResponse{StopReason: acp.StopReasonEndTurn}, nil
+			}
+			gotPrompts <- promptText
+			if n == 2 {
+				close(msg1Entered)
+				<-releaseMsg1
+				return acp.PromptResponse{StopReason: acp.StopReasonEndTurn}, nil
+			}
+			// On 2nd board message (n==3), run `orbit deliver --final` INSIDE the board prompt!
+			// B2: Must NOT finalize until this board prompt returns!
+			id := attID.Load().(string)
+			rec, _ := env.st.GetAttemptRecord(context.Background(), id)
+			_ = os.WriteFile(filepath.Join(rec.WorktreePath, "app.go"), []byte("package main\n// board final\nfunc main() {}\n"), 0o644)
+			dlvResp, err := runRef.HandleLocalDeliver(context.Background(), runner.LocalDeliverRequest{
+				AttemptID: id, Summary: "board final", Final: true,
+			})
+			if err != nil {
+				t.Errorf("board HandleLocalDeliver failed: %v", err)
+			}
+			if dlvResp.Finalized {
+				t.Errorf("B2 violation: HandleLocalDeliver finalized attempt WHILE board prompt was still in-flight!")
+			}
+			return acp.PromptResponse{StopReason: acp.StopReasonEndTurn}, nil
+		}
+
+		runRef = env.startRunner("hub-node", "", "", drv, nil)
+		_, raw := env.apiReq(http.MethodPost, "/api/projects/demo-app/tasks", protocol.CreateTaskRequest{Goal: "two board msgs"}, nil)
+		var cr protocol.CreateTaskResponse
+		_ = json.Unmarshal(raw, &cr)
+		attID.Store(cr.Attempt.AttemptID)
+
+		eventually(t, 3*time.Second, func() bool {
+			rec, err := env.st.GetAttemptRecord(context.Background(), cr.Attempt.AttemptID)
+			return err == nil && rec.State == protocol.AttemptSwarmMonitoring
+		}, "did not enter swarm_monitoring")
+
+		// Post message #1 -> enters board prompt and blocks on releaseMsg1
+		_, _ = env.apiReq(http.MethodPost, "/api/tasks/"+cr.Task.TaskID+"/board/messages", protocol.PostBoardMessageRequest{
+			AuthorName: "human", TargetMention: "@ui-coder", Body: "FIRST_BOARD_MSG",
+		}, nil)
+		<-msg1Entered
+
+		// While message #1 is STILL IN-FLIGHT, post message #2 -> MUST NOT BE DROPPED!
+		_, _ = env.apiReq(http.MethodPost, "/api/tasks/"+cr.Task.TaskID+"/board/messages", protocol.PostBoardMessageRequest{
+			AuthorName: "human", TargetMention: "@ui-coder", Body: "SECOND_BOARD_MSG",
+		}, nil)
+		time.Sleep(50 * time.Millisecond)
+		close(releaseMsg1)
+
+		var seen1, seen2 bool
+		for i := 0; i < 2; i++ {
+			select {
+			case p := <-gotPrompts:
+				if strings.Contains(p, "FIRST_BOARD_MSG") {
+					seen1 = true
+				}
+				if strings.Contains(p, "SECOND_BOARD_MSG") {
+					seen2 = true
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatalf("timed out waiting for both board messages (seen1=%v seen2=%v)", seen1, seen2)
+			}
+		}
+		if !seen1 || !seen2 {
+			t.Fatalf("expected both board messages delivered serially, got seen1=%v seen2=%v", seen1, seen2)
+		}
+
+		// After 2nd board prompt returned, deferred --final MUST finalize the attempt cleanly!
+		eventually(t, 3*time.Second, func() bool {
+			rec, err := env.st.GetAttemptRecord(context.Background(), cr.Attempt.AttemptID)
+			return err == nil && rec.State == protocol.AttemptSucceeded
+		}, "attempt did not finalize after deferred --final during board prompt")
+	})
+}

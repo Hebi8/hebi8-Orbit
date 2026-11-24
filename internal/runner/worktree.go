@@ -106,10 +106,39 @@ func PrepareWorktree(ctx context.Context, dispatch protocol.AttemptDispatchFrame
 	}
 
 	// B14: If absWorktree already exists, strictly verify repository identity, common git dir,
-	// HEAD SHA, and cleanliness BEFORE reusing. NEVER silently reuse a mismatched or foreign directory!
+	// HEAD SHA, and cleanliness/tree-equivalence BEFORE reusing. NEVER silently reuse a mismatched directory!
 	if _, err := os.Stat(absWorktree); err == nil {
 		if err := validateExistingWorktree(ctx, absWorktree, gitSource, baseSHA, dispatch); err != nil {
 			return "", "", err
+		}
+		sameSessionReuse := strings.TrimSpace(dispatch.ProviderSessionID) != "" &&
+			strings.TrimSpace(dispatch.ExpectedSessionCWD) != "" &&
+			canonicalPath(dispatch.ExpectedSessionCWD) == canonicalPath(absWorktree)
+		if sameSessionReuse && dispatch.InputDelivery != nil && dispatch.InputDelivery.HeadSHA != "" {
+			matchesTree, err := worktreeMatchesCommitTree(ctx, absWorktree, gitSource, dispatch.InputDelivery.HeadSHA)
+			if err != nil {
+				return "", "", fmt.Errorf("ERR_WORKTREE_TREE_VERIFY: %w", err)
+			}
+			if !matchesTree {
+				// B14: Worktree drifted after InputDelivery was frozen! Preserve the original directory
+				// untouched and create a clean worktree checked out at exact baseSHA (which also forces
+				// a fresh ACP session since CWD changed).
+				freshPath := filepath.Join(worktreeRoot, dispatch.TaskID, dispatch.AttemptID)
+				absFresh, err := filepath.Abs(protocol.ExpandPath(freshPath))
+				if err != nil {
+					return "", "", fmt.Errorf("resolve fresh worktree path: %w", err)
+				}
+				if canonicalPath(absFresh) == canonicalPath(absWorktree) {
+					absFresh = absFresh + "-clean"
+				}
+				if err := os.MkdirAll(filepath.Dir(absFresh), 0o755); err != nil {
+					return "", "", fmt.Errorf("mkdir fresh worktree parent: %w", err)
+				}
+				if _, err := runGitCmd(ctx, gitSource, "worktree", "add", "--detach", absFresh, baseSHA); err != nil {
+					return "", "", fmt.Errorf("git worktree add fresh %s at %s: %w", absFresh, baseSHA, err)
+				}
+				return absFresh, baseSHA, nil
+			}
 		}
 		return absWorktree, baseSHA, nil
 	} else if !os.IsNotExist(err) {
@@ -247,4 +276,42 @@ func runGitCmd(ctx context.Context, dir string, args ...string) (string, error) 
 func runGitCmdTrim(ctx context.Context, dir string, args ...string) (string, error) {
 	out, err := runGitCmd(ctx, dir, args...)
 	return strings.TrimSpace(out), err
+}
+
+// worktreeMatchesCommitTree compares absWorktree's current packable working tree (computed via
+// an isolated temporary GIT_INDEX_FILE, zero mutation to real index/files) against commitSHA^{tree} (B14).
+func worktreeMatchesCommitTree(ctx context.Context, absWorktree, gitSource, commitSHA string) (bool, error) {
+	expectedTree, err := runGitCmdTrim(ctx, gitSource, "rev-parse", "--verify", commitSHA+"^{tree}")
+	if err != nil {
+		return false, err
+	}
+	tmpDir, err := os.MkdirTemp("", "orbit-tree-*")
+	if err != nil {
+		return false, err
+	}
+	defer os.RemoveAll(tmpDir)
+
+	tmpIndex := filepath.Join(tmpDir, "index")
+	env := append(os.Environ(), "GIT_INDEX_FILE="+tmpIndex)
+
+	addCmd := exec.CommandContext(ctx, "git", "-c", "core.quotePath=false", "add", "-A")
+	addCmd.Dir = absWorktree
+	addCmd.Env = env
+	var addErr bytes.Buffer
+	addCmd.Stderr = &addErr
+	if err := addCmd.Run(); err != nil {
+		return false, fmt.Errorf("temp index add -A: %w: %s", err, strings.TrimSpace(addErr.String()))
+	}
+
+	treeCmd := exec.CommandContext(ctx, "git", "write-tree")
+	treeCmd.Dir = absWorktree
+	treeCmd.Env = env
+	var treeOut, treeErr bytes.Buffer
+	treeCmd.Stdout = &treeOut
+	treeCmd.Stderr = &treeErr
+	if err := treeCmd.Run(); err != nil {
+		return false, fmt.Errorf("temp index write-tree: %w: %s", err, strings.TrimSpace(treeErr.String()))
+	}
+	actualTree := strings.TrimSpace(treeOut.String())
+	return actualTree == expectedTree, nil
 }

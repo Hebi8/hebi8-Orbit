@@ -616,6 +616,7 @@ func applyStateFrameTx(
 		att.BaseSHA = baseSHA
 	}
 
+	var revertedDeliveryIDs []string
 	// Project onto tasks, annotations, and inbox_items inside the SAME transaction
 	switch newState {
 	case protocol.AttemptPreparing, protocol.AttemptRunning, protocol.AttemptSwarmMonitoring:
@@ -656,8 +657,13 @@ func applyStateFrameTx(
 	case protocol.AttemptSucceeded:
 		res.AttemptSucceeded = true
 		res.AutoConsumeQueue = true
+		// B9: Persist pending_queue_drain=1 inside the terminal transaction so Hub restarts
+		// between Outbox commit and queue consumption still deterministically drain the queue.
 		if _, err := tx.ExecContext(ctx, `
-			UPDATE tasks SET state = 'in_review', active_attempt_id = NULL, waiting_reason = NULL, version = version + 1, updated_at = ?
+			UPDATE tasks
+			SET state = 'in_review', active_attempt_id = NULL, waiting_reason = NULL,
+			    pending_queue_drain = 1, pending_steer_input_id = NULL,
+			    version = version + 1, updated_at = ?
 			WHERE task_id = ? AND active_attempt_id = ?
 		`, ts, att.TaskID, att.AttemptID); err != nil {
 			return err
@@ -717,7 +723,10 @@ func applyStateFrameTx(
 			reason = "运行静默超时或状态未知，请人工核对时间线与现场后再决定是否重跑"
 		}
 		if _, err := tx.ExecContext(ctx, `
-			UPDATE tasks SET state = 'in_review', active_attempt_id = NULL, waiting_reason = ?, version = version + 1, updated_at = ?
+			UPDATE tasks
+			SET state = 'in_review', active_attempt_id = NULL, waiting_reason = ?,
+			    pending_queue_drain = 0, pending_steer_input_id = NULL,
+			    version = version + 1, updated_at = ?
 			WHERE task_id = ? AND active_attempt_id = ?
 		`, reason, ts, att.TaskID, att.AttemptID); err != nil {
 			return err
@@ -732,10 +741,16 @@ func applyStateFrameTx(
 			reason = errCode
 		}
 		if _, err := tx.ExecContext(ctx, `
-			UPDATE tasks SET state = 'failed', active_attempt_id = NULL, waiting_reason = ?, version = version + 1, updated_at = ?
+			UPDATE tasks
+			SET state = 'failed', active_attempt_id = NULL, waiting_reason = ?,
+			    pending_queue_drain = 0, pending_steer_input_id = NULL,
+			    version = version + 1, updated_at = ?
 			WHERE task_id = ? AND active_attempt_id = ?
 		`, reason, ts, att.TaskID, att.AttemptID); err != nil {
 			return err
+		}
+		if ids, err := lookupQueuedAnnotationDeliveryIDsTx(ctx, tx, att.AttemptID); err == nil && len(ids) > 0 {
+			revertedDeliveryIDs = ids
 		}
 		if err := releaseQueuedAnnotationsTx(ctx, tx, att.AttemptID); err != nil {
 			return err
@@ -748,15 +763,27 @@ func applyStateFrameTx(
 		}
 
 	case protocol.AttemptCancelled:
+		drainFlag := 0
+		var steerVal any
 		if att.CancelReasonKind == "steer" {
 			res.AutoConsumeQueue = true
 			res.SteerInputID = att.SteerInputID
+			drainFlag = 1
+			if att.SteerInputID != "" {
+				steerVal = att.SteerInputID
+			}
 		}
 		if _, err := tx.ExecContext(ctx, `
-			UPDATE tasks SET state = 'cancelled', active_attempt_id = NULL, waiting_reason = NULL, version = version + 1, updated_at = ?
+			UPDATE tasks
+			SET state = 'cancelled', active_attempt_id = NULL, waiting_reason = NULL,
+			    pending_queue_drain = ?, pending_steer_input_id = ?,
+			    version = version + 1, updated_at = ?
 			WHERE task_id = ? AND active_attempt_id = ?
-		`, ts, att.TaskID, att.AttemptID); err != nil {
+		`, drainFlag, steerVal, ts, att.TaskID, att.AttemptID); err != nil {
 			return err
+		}
+		if ids, err := lookupQueuedAnnotationDeliveryIDsTx(ctx, tx, att.AttemptID); err == nil && len(ids) > 0 {
+			revertedDeliveryIDs = ids
 		}
 		if err := releaseQueuedAnnotationsTx(ctx, tx, att.AttemptID); err != nil {
 			return err
@@ -785,6 +812,10 @@ func applyStateFrameTx(
 	}
 	if errDetail != "" {
 		evPayload["errorDetail"] = errDetail
+	}
+	if len(revertedDeliveryIDs) > 0 {
+		evPayload["revertedDeliveryIds"] = revertedDeliveryIDs
+		evPayload["deliveryIds"] = revertedDeliveryIDs
 	}
 	ev, inserted, err := insertEventIdempotentTx(ctx, tx, eventInsert{
 		EventID:    item.EventID,
@@ -950,15 +981,23 @@ func applyDeliveryPublishedFrameTx(
 	summary := stringField(item.Payload, "summary")
 	manifest := extractDeliveryManifest(item.Payload)
 
-	// B13: Strictly idempotent handling for duplicate (delivery_id, head_sha) publication.
+	// B13 & NEW-4: Strictly idempotent handling ONLY for duplicate publication by the SAME attempt
+	// with identical immutable ownership (project_id, task_id, attempt_id, base_sha, head_sha, git_ref).
+	// A later attempt MUST NEVER bind an older attempt's deliveryId as its output_delivery_id.
 	if deliveryID != "" {
-		var exProjectID, exTaskID, exHeadSHA, exGitRef string
+		var exProjectID, exTaskID, exBaseSHA, exHeadSHA, exGitRef string
+		var exAttemptID sql.NullString
 		err := tx.QueryRowContext(ctx, `
-			SELECT project_id, task_id, head_sha, git_ref FROM deliveries WHERE delivery_id = ?
-		`, deliveryID).Scan(&exProjectID, &exTaskID, &exHeadSHA, &exGitRef)
+			SELECT project_id, task_id, attempt_id, base_sha, head_sha, git_ref FROM deliveries WHERE delivery_id = ?
+		`, deliveryID).Scan(&exProjectID, &exTaskID, &exAttemptID, &exBaseSHA, &exHeadSHA, &exGitRef)
 		if err == nil {
-			if exProjectID != att.ProjectID || exTaskID != att.TaskID || exHeadSHA != headSHA || (gitRef != "" && exGitRef != gitRef) {
-				return fmt.Errorf("%w: delivery %s already exists with conflicting metadata", ErrConflict, deliveryID)
+			if exProjectID != att.ProjectID ||
+				exTaskID != att.TaskID ||
+				!exAttemptID.Valid || exAttemptID.String != att.AttemptID ||
+				(baseSHA != "" && exBaseSHA != baseSHA) ||
+				exHeadSHA != headSHA ||
+				(gitRef != "" && exGitRef != gitRef) {
+				return fmt.Errorf("%w: delivery %s already exists with conflicting attempt/ownership metadata", ErrConflict, deliveryID)
 			}
 			att.OutputDeliveryID = deliveryID
 			if _, err := tx.ExecContext(ctx, `

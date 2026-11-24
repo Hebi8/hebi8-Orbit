@@ -81,7 +81,7 @@ export function BriefView({ brief, projects }: { brief: PABriefResponse; project
       )}
       {brief.activeTasks.length > 0 && (
         <>
-          <h5>正在跑 · {brief.activeTasks.length}</h5>
+          <h5>正在跑 · {brief.totalActiveTaskCount ?? brief.activeTasks.length}</h5>
           <ul>
             {brief.activeTasks.slice(0, 6).map((t) => (
               <li key={t.taskId}>
@@ -97,7 +97,7 @@ export function BriefView({ brief, projects }: { brief: PABriefResponse; project
       )}
       {brief.blockedTasks.length > 0 && (
         <>
-          <h5>阻塞 / 待核对 · {brief.blockedTasks.length}</h5>
+          <h5>阻塞 / 待核对 · {brief.totalBlockedTaskCount ?? brief.blockedTasks.length}</h5>
           <ul>
             {brief.blockedTasks.slice(0, 6).map((t) => (
               <li key={t.taskId}>
@@ -113,7 +113,7 @@ export function BriefView({ brief, projects }: { brief: PABriefResponse; project
       )}
       {brief.recentDeliveries.length > 0 && (
         <>
-          <h5>近期交付 · {brief.recentDeliveries.length}</h5>
+          <h5>近期交付 · {brief.totalRecentDeliveryCount ?? brief.recentDeliveries.length}</h5>
           <ul>
             {brief.recentDeliveries.slice(0, 5).map((d) => (
               <li key={d.deliveryId}>

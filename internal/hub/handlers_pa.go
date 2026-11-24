@@ -1,6 +1,8 @@
 package hub
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -58,6 +60,10 @@ func (s *Server) handleCreatePAThread(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// S5: Serialize thread creation/activation with handlePAChat and handlePAResetSession.
+	s.paMu.Lock()
+	defer s.paMu.Unlock()
+
 	thread, state, ev, err := s.store.CreatePAThread(r.Context(), "default", req.Title)
 	if err != nil {
 		writeAPIError(w, http.StatusInternalServerError, "ERR_PA_THREAD_CREATE", err.Error())
@@ -111,6 +117,26 @@ func isPAWriteAction(action string) bool {
 	default:
 		return false
 	}
+}
+
+func hashPAActionParams(act *protocol.PAChatActionRequest) string {
+	if act == nil {
+		return ""
+	}
+	canonical := map[string]any{
+		"action":             strings.TrimSpace(act.Action),
+		"projectId":          strings.TrimSpace(act.ProjectID),
+		"taskId":             strings.TrimSpace(act.TaskID),
+		"goal":               strings.TrimSpace(act.Goal),
+		"message":            strings.TrimSpace(act.Message),
+		"mode":               act.Mode,
+		"requiredCapability": strings.TrimSpace(act.RequiredCapability),
+		"adapter":            act.Adapter,
+		"config":             act.Config,
+	}
+	b, _ := json.Marshal(canonical)
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
 }
 
 // handlePAChat executes one serialized PA turn:
@@ -207,51 +233,46 @@ func (s *Server) handlePAChat(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		// S5: Enforce idempotency key on all PA write actions and replay cached receipts cleanly.
+		// S5 & NEW-3: Enforce idempotency key on all PA write actions; bind key + paramHash + state change
+		// + receipt persistence into ONE atomic SQLite transaction (no split save after commit!).
 		idempKey := strings.TrimSpace(act.IdempotencyKey)
 		if idempKey == "" {
 			idempKey = strings.TrimSpace(r.Header.Get("Idempotency-Key"))
 		}
-		replayed := false
+		var paIdemp *store.PAActionIdempotencySpec
 		if isPAWriteAction(actionName) {
 			if idempKey == "" {
 				writeAPIError(w, http.StatusBadRequest, "ERR_IDEMPOTENCY_KEY_REQUIRED", fmt.Sprintf("PA write action %q requires idempotencyKey or Idempotency-Key header", actionName))
 				return
 			}
-			prevAction, prevRes, found, err := s.store.GetPAActionReceipt(ctx, idempKey)
-			if err != nil {
-				writeAPIError(w, http.StatusInternalServerError, "ERR_PA_IDEMPOTENCY", err.Error())
-				return
-			}
-			if found {
-				if prevAction != actionName {
-					writeAPIError(w, http.StatusConflict, "ERR_IDEMPOTENCY_CONFLICT", fmt.Sprintf("idempotencyKey %q already bound to action %q", idempKey, prevAction))
-					return
-				}
-				actions = append(actions, prevRes)
-				replyParts = append(replyParts, prevRes.Summary+"（幂等回放）")
-				replayed = true
+			paIdemp = &store.PAActionIdempotencySpec{
+				Key:       idempKey,
+				Action:    actionName,
+				ParamHash: hashPAActionParams(act),
 			}
 		}
 
-		if !replayed {
-			switch actionName {
-			case "create_task":
-				pid := strings.TrimSpace(act.ProjectID)
-				if pid == "" {
-					pid = protocol.ScratchProjectID
-				}
-				createResp, status, code, err := s.createTaskInternal(ctx, pid, protocol.CreateTaskRequest{
-					Goal:               act.Goal,
-					RequiredCapability: act.RequiredCapability,
-					Adapter:            act.Adapter,
-					Config:             act.Config,
-					IdempotencyKey:     idempKey,
-				}, protocol.ActorPA, "pa:default", idempKey)
-				if err != nil {
-					writeAPIError(w, status, code, err.Error())
-					return
-				}
+		switch actionName {
+		case "create_task":
+			pid := strings.TrimSpace(act.ProjectID)
+			if pid == "" {
+				pid = protocol.ScratchProjectID
+			}
+			createResp, replayedReceipt, status, code, err := s.createTaskInternalWithPA(ctx, pid, protocol.CreateTaskRequest{
+				Goal:               act.Goal,
+				RequiredCapability: act.RequiredCapability,
+				Adapter:            act.Adapter,
+				Config:             act.Config,
+				IdempotencyKey:     idempKey,
+			}, protocol.ActorPA, "pa:default", idempKey, paIdemp)
+			if err != nil {
+				writeAPIError(w, status, code, err.Error())
+				return
+			}
+			if replayedReceipt != nil {
+				actions = append(actions, *replayedReceipt)
+				replyParts = append(replyParts, replayedReceipt.Summary+"（幂等回放）")
+			} else {
 				actRes := protocol.PAActionResult{
 					Action:  "create_task",
 					Status:  "ok",
@@ -262,22 +283,26 @@ func (s *Server) handlePAChat(w http.ResponseWriter, r *http.Request) {
 						"dispatched": createResp.Dispatched,
 					},
 				}
-				_ = s.store.SavePAActionReceipt(ctx, idempKey, actionName, actRes)
 				actions = append(actions, actRes)
 				replyParts = append(replyParts, fmt.Sprintf("已派发任务 `%s` 到项目 `%s`（目标：%s）。", createResp.Task.TaskID, createResp.Task.ProjectID, createResp.Task.Goal))
+			}
 
-			case "send_task_followup":
-				fResp, status, code, err := s.followupTaskInternal(ctx, act.TaskID, protocol.FollowupTaskRequest{
-					Message:            act.Message,
-					Mode:               act.Mode,
-					RequiredCapability: act.RequiredCapability,
-					Adapter:            act.Adapter,
-					Config:             act.Config,
-				}, protocol.ActorPA, "pa:default")
-				if err != nil {
-					writeAPIError(w, status, code, err.Error())
-					return
-				}
+		case "send_task_followup":
+			fResp, replayedReceipt, status, code, err := s.followupTaskInternalWithPA(ctx, act.TaskID, protocol.FollowupTaskRequest{
+				Message:            act.Message,
+				Mode:               act.Mode,
+				RequiredCapability: act.RequiredCapability,
+				Adapter:            act.Adapter,
+				Config:             act.Config,
+			}, protocol.ActorPA, "pa:default", nil, paIdemp)
+			if err != nil {
+				writeAPIError(w, status, code, err.Error())
+				return
+			}
+			if replayedReceipt != nil {
+				actions = append(actions, *replayedReceipt)
+				replyParts = append(replyParts, replayedReceipt.Summary+"（幂等回放）")
+			} else {
 				actRes := protocol.PAActionResult{
 					Action:  "send_task_followup",
 					Status:  "ok",
@@ -287,16 +312,20 @@ func (s *Server) handlePAChat(w http.ResponseWriter, r *http.Request) {
 						"mode":   fResp.Mode,
 					},
 				}
-				_ = s.store.SavePAActionReceipt(ctx, idempKey, actionName, actRes)
 				actions = append(actions, actRes)
 				replyParts = append(replyParts, fmt.Sprintf("已向任务 `%s` 发送追问（模式：%s）。", act.TaskID, fResp.Mode))
+			}
 
-			case "cancel_task":
-				cResp, status, code, err := s.cancelTaskInternal(ctx, act.TaskID, "pa:default", act.Message)
-				if err != nil {
-					writeAPIError(w, status, code, err.Error())
-					return
-				}
+		case "cancel_task":
+			cResp, replayedReceipt, status, code, err := s.cancelTaskInternalWithPA(ctx, act.TaskID, "pa:default", act.Message, paIdemp)
+			if err != nil {
+				writeAPIError(w, status, code, err.Error())
+				return
+			}
+			if replayedReceipt != nil {
+				actions = append(actions, *replayedReceipt)
+				replyParts = append(replyParts, replayedReceipt.Summary+"（幂等回放）")
+			} else {
 				actRes := protocol.PAActionResult{
 					Action:  "cancel_task",
 					Status:  "ok",
@@ -306,61 +335,60 @@ func (s *Server) handlePAChat(w http.ResponseWriter, r *http.Request) {
 						"attemptId": cResp.AttemptID,
 					},
 				}
-				_ = s.store.SavePAActionReceipt(ctx, idempKey, actionName, actRes)
 				actions = append(actions, actRes)
 				replyParts = append(replyParts, fmt.Sprintf("已取消任务 `%s` 的活跃尝试 `%s`。", cResp.TaskID, cResp.AttemptID))
+			}
 
-			case "list_projects_and_machines":
-				s.mu.RLock()
-				mm := s.machines.Machines
-				s.mu.RUnlock()
-				boot, err := s.store.Bootstrap(ctx, mm)
-				if err != nil {
-					writeAPIError(w, http.StatusInternalServerError, "ERR_PA_LIST", err.Error())
-					return
-				}
-				actions = append(actions, protocol.PAActionResult{
-					Action:  "list_projects_and_machines",
-					Status:  "ok",
-					Summary: fmt.Sprintf("%d 个项目，%d 台机器", len(boot.Projects), len(boot.Machines)),
-					Data: map[string]any{
-						"projects": len(boot.Projects),
-						"machines": len(boot.Machines),
-					},
-				})
-				replyParts = append(replyParts, fmt.Sprintf("当前共有 %d 个项目、%d 台机器、%d 项待拍板。", len(boot.Projects), len(boot.Machines), len(boot.OpenInboxItems)))
-
-			case "read_task_timeline":
-				tl, err := s.store.GetTaskTimeline(ctx, act.TaskID, 0, false)
-				if errors.Is(err, store.ErrNotFound) {
-					writeAPIError(w, http.StatusNotFound, "ERR_TASK_NOT_FOUND", err.Error())
-					return
-				}
-				if err != nil {
-					writeAPIError(w, http.StatusInternalServerError, "ERR_PA_TIMELINE", err.Error())
-					return
-				}
-				actions = append(actions, protocol.PAActionResult{
-					Action:  "read_task_timeline",
-					Status:  "ok",
-					Summary: fmt.Sprintf("任务 %s 当前状态 %s，%d 次尝试，%d 个交付", tl.Task.TaskID, tl.Task.State, len(tl.Attempts), len(tl.Deliveries)),
-					Data: map[string]any{
-						"taskId":     tl.Task.TaskID,
-						"state":      tl.Task.State,
-						"attempts":   len(tl.Attempts),
-						"deliveries": len(tl.Deliveries),
-					},
-				})
-				replyParts = append(replyParts, fmt.Sprintf("任务 `%s`（%s）当前状态为 `%s`，共 %d 次尝试、%d 个交付、%d 条未决批注。",
-					tl.Task.TaskID, tl.Task.Title, tl.Task.State, len(tl.Attempts), len(tl.Deliveries), tl.Task.OpenAnnotationCount))
-
-			case "brief", "":
-				// Handled below via stateless brief aggregation
-
-			default:
-				writeAPIError(w, http.StatusBadRequest, "ERR_UNKNOWN_PA_ACTION", fmt.Sprintf("unsupported PA action %q", act.Action))
+		case "list_projects_and_machines":
+			s.mu.RLock()
+			mm := s.machines.Machines
+			s.mu.RUnlock()
+			boot, err := s.store.Bootstrap(ctx, mm)
+			if err != nil {
+				writeAPIError(w, http.StatusInternalServerError, "ERR_PA_LIST", err.Error())
 				return
 			}
+			actions = append(actions, protocol.PAActionResult{
+				Action:  "list_projects_and_machines",
+				Status:  "ok",
+				Summary: fmt.Sprintf("%d 个项目，%d 台机器", len(boot.Projects), len(boot.Machines)),
+				Data: map[string]any{
+					"projects": len(boot.Projects),
+					"machines": len(boot.Machines),
+				},
+			})
+			replyParts = append(replyParts, fmt.Sprintf("当前共有 %d 个项目、%d 台机器、%d 项待拍板。", len(boot.Projects), len(boot.Machines), len(boot.OpenInboxItems)))
+
+		case "read_task_timeline":
+			tl, err := s.store.GetTaskTimeline(ctx, act.TaskID, 0, false)
+			if errors.Is(err, store.ErrNotFound) {
+				writeAPIError(w, http.StatusNotFound, "ERR_TASK_NOT_FOUND", err.Error())
+				return
+			}
+			if err != nil {
+				writeAPIError(w, http.StatusInternalServerError, "ERR_PA_TIMELINE", err.Error())
+				return
+			}
+			actions = append(actions, protocol.PAActionResult{
+				Action:  "read_task_timeline",
+				Status:  "ok",
+				Summary: fmt.Sprintf("任务 %s 当前状态 %s，%d 次尝试，%d 个交付", tl.Task.TaskID, tl.Task.State, len(tl.Attempts), len(tl.Deliveries)),
+				Data: map[string]any{
+					"taskId":     tl.Task.TaskID,
+					"state":      tl.Task.State,
+					"attempts":   len(tl.Attempts),
+					"deliveries": len(tl.Deliveries),
+				},
+			})
+			replyParts = append(replyParts, fmt.Sprintf("任务 `%s`（%s）当前状态为 `%s`，共 %d 次尝试、%d 个交付、%d 条未决批注。",
+				tl.Task.TaskID, tl.Task.Title, tl.Task.State, len(tl.Attempts), len(tl.Deliveries), tl.Task.OpenAnnotationCount))
+
+		case "brief", "":
+			// Handled below via stateless brief aggregation
+
+		default:
+			writeAPIError(w, http.StatusBadRequest, "ERR_UNKNOWN_PA_ACTION", fmt.Sprintf("unsupported PA action %q", act.Action))
+			return
 		}
 	}
 

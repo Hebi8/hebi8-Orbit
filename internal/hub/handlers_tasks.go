@@ -26,32 +26,45 @@ func (s *Server) createTaskInternal(
 	actorID string,
 	idempHeader string,
 ) (protocol.CreateTaskResponse, int, string, error) {
+	resp, _, status, code, err := s.createTaskInternalWithPA(ctx, projectID, req, actorKind, actorID, idempHeader, nil)
+	return resp, status, code, err
+}
+
+func (s *Server) createTaskInternalWithPA(
+	ctx context.Context,
+	projectID string,
+	req protocol.CreateTaskRequest,
+	actorKind protocol.ActorKind,
+	actorID string,
+	idempHeader string,
+	paIdemp *store.PAActionIdempotencySpec,
+) (protocol.CreateTaskResponse, *protocol.PAActionResult, int, string, error) {
 	var resp protocol.CreateTaskResponse
 	req.Goal = strings.TrimSpace(req.Goal)
 	if req.Goal == "" {
-		return resp, http.StatusBadRequest, "ERR_EMPTY_GOAL", errors.New("goal is required")
+		return resp, nil, http.StatusBadRequest, "ERR_EMPTY_GOAL", errors.New("goal is required")
 	}
 	if req.Adapter != "" && !req.Adapter.IsValid() {
-		return resp, http.StatusBadRequest, "ERR_INVALID_ADAPTER", fmt.Errorf("invalid adapter %q", req.Adapter)
+		return resp, nil, http.StatusBadRequest, "ERR_INVALID_ADAPTER", fmt.Errorf("invalid adapter %q", req.Adapter)
 	}
 
 	proj, err := s.store.GetProject(ctx, projectID)
 	if errors.Is(err, store.ErrNotFound) {
-		return resp, http.StatusNotFound, "ERR_PROJECT_NOT_FOUND", fmt.Errorf("project %s not found", projectID)
+		return resp, nil, http.StatusNotFound, "ERR_PROJECT_NOT_FOUND", fmt.Errorf("project %s not found", projectID)
 	}
 	if err != nil {
-		return resp, http.StatusInternalServerError, "ERR_PROJECT_LOOKUP", err
+		return resp, nil, http.StatusInternalServerError, "ERR_PROJECT_LOOKUP", err
 	}
 
 	route, err := s.resolveExecutionRoute(proj, req.RequiredCapability, req.Adapter)
 	if err != nil {
-		return resp, http.StatusBadRequest, "ERR_ROUTE_FAILED", err
+		return resp, nil, http.StatusBadRequest, "ERR_ROUTE_FAILED", err
 	}
 	if err := enforcePostRouteGuard(actorKind, route); err != nil {
-		return resp, http.StatusForbidden, "ERR_DEPLOY_FORBIDDEN", err
+		return resp, nil, http.StatusForbidden, "ERR_DEPLOY_FORBIDDEN", err
 	}
 	if st, code, err := s.validateAdapterSupport(route); err != nil {
-		return resp, st, code, err
+		return resp, nil, st, code, err
 	}
 
 	// Merge default project model config with request overrides
@@ -85,10 +98,10 @@ func (s *Server) createTaskInternal(
 			DeliveryID: snapID,
 		})
 		if err != nil {
-			return resp, http.StatusBadRequest, "ERR_DIRTY_IMPORT_FAILED", fmt.Errorf("import dirty workspace: %w", err)
+			return resp, nil, http.StatusBadRequest, "ERR_DIRTY_IMPORT_FAILED", fmt.Errorf("import dirty workspace: %w", err)
 		}
 		if err := gitops.PushDeliveryRef(ctx, pkg.RepoRoot, proj.MirrorBarePath, snapID, pkg.HeadSHA); err != nil {
-			return resp, http.StatusInternalServerError, "ERR_DIRTY_IMPORT_PUSH", fmt.Errorf("push workspace snapshot: %w", err)
+			return resp, nil, http.StatusInternalServerError, "ERR_DIRTY_IMPORT_PUSH", fmt.Errorf("push workspace snapshot: %w", err)
 		}
 		baseSHA = pkg.HeadSHA
 		triggerKind = protocol.TriggerWorkspaceImport
@@ -141,18 +154,22 @@ func (s *Server) createTaskInternal(
 		LeaseTTLMs:         s.leaseTTL.Milliseconds(),
 		ActorID:            actorID,
 		ActorKind:          actorKind,
+		PAIdempotency:      paIdemp,
 	})
 	if errors.Is(err, store.ErrNotFound) {
-		return resp, http.StatusNotFound, "ERR_NOT_FOUND", err
+		return resp, nil, http.StatusNotFound, "ERR_NOT_FOUND", err
 	}
 	if errors.Is(err, store.ErrConflict) {
-		return resp, http.StatusConflict, "ERR_CONFLICT", err
+		return resp, nil, http.StatusConflict, "ERR_CONFLICT", err
 	}
 	if errors.Is(err, store.ErrInvalidInput) {
-		return resp, http.StatusBadRequest, "ERR_INVALID_INPUT", err
+		return resp, nil, http.StatusBadRequest, "ERR_INVALID_INPUT", err
 	}
 	if err != nil {
-		return resp, http.StatusInternalServerError, "ERR_CREATE_TASK", err
+		return resp, nil, http.StatusInternalServerError, "ERR_CREATE_TASK", err
+	}
+	if res.ReplayedReceipt != nil {
+		return resp, res.ReplayedReceipt, http.StatusOK, "", nil
 	}
 
 	if len(res.Events) > 0 {
@@ -181,7 +198,7 @@ func (s *Server) createTaskInternal(
 	if res.Created {
 		status = http.StatusCreated
 	}
-	return resp, status, "", nil
+	return resp, nil, status, "", nil
 }
 
 func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
@@ -290,33 +307,46 @@ func (s *Server) followupTaskWithExtra(
 	actorID string,
 	payloadExtra map[string]any,
 ) (protocol.FollowupTaskResponse, int, string, error) {
+	resp, _, status, code, err := s.followupTaskInternalWithPA(ctx, taskID, req, actorKind, actorID, payloadExtra, nil)
+	return resp, status, code, err
+}
+
+func (s *Server) followupTaskInternalWithPA(
+	ctx context.Context,
+	taskID string,
+	req protocol.FollowupTaskRequest,
+	actorKind protocol.ActorKind,
+	actorID string,
+	payloadExtra map[string]any,
+	paIdemp *store.PAActionIdempotencySpec,
+) (protocol.FollowupTaskResponse, *protocol.PAActionResult, int, string, error) {
 	var resp protocol.FollowupTaskResponse
 	req.Message = strings.TrimSpace(req.Message)
 	if req.Message == "" {
-		return resp, http.StatusBadRequest, "ERR_EMPTY_MESSAGE", errors.New("message is required")
+		return resp, nil, http.StatusBadRequest, "ERR_EMPTY_MESSAGE", errors.New("message is required")
 	}
 	mode := req.Mode
 	if mode == "" {
 		mode = protocol.FollowupModeQueue
 	}
 	if !mode.IsValid() {
-		return resp, http.StatusBadRequest, "ERR_INVALID_MODE", fmt.Errorf("invalid followup mode %q", mode)
+		return resp, nil, http.StatusBadRequest, "ERR_INVALID_MODE", fmt.Errorf("invalid followup mode %q", mode)
 	}
 	if req.Adapter != "" && !req.Adapter.IsValid() {
-		return resp, http.StatusBadRequest, "ERR_INVALID_ADAPTER", fmt.Errorf("invalid adapter %q", req.Adapter)
+		return resp, nil, http.StatusBadRequest, "ERR_INVALID_ADAPTER", fmt.Errorf("invalid adapter %q", req.Adapter)
 	}
 
 	task, err := s.store.GetTask(ctx, taskID)
 	if errors.Is(err, store.ErrNotFound) {
-		return resp, http.StatusNotFound, "ERR_TASK_NOT_FOUND", err
+		return resp, nil, http.StatusNotFound, "ERR_TASK_NOT_FOUND", err
 	}
 	if err != nil {
-		return resp, http.StatusInternalServerError, "ERR_TASK_LOOKUP", err
+		return resp, nil, http.StatusInternalServerError, "ERR_TASK_LOOKUP", err
 	}
 
 	proj, err := s.store.GetProject(ctx, task.ProjectID)
 	if err != nil {
-		return resp, http.StatusInternalServerError, "ERR_PROJECT_LOOKUP", err
+		return resp, nil, http.StatusInternalServerError, "ERR_PROJECT_LOOKUP", err
 	}
 
 	reqCap := strings.TrimSpace(req.RequiredCapability)
@@ -329,13 +359,13 @@ func (s *Server) followupTaskWithExtra(
 	}
 	route, err := s.resolveExecutionRoute(proj, reqCap, reqAdapter)
 	if err != nil {
-		return resp, http.StatusBadRequest, "ERR_ROUTE_FAILED", err
+		return resp, nil, http.StatusBadRequest, "ERR_ROUTE_FAILED", err
 	}
 	if err := enforcePostRouteGuard(actorKind, route); err != nil {
-		return resp, http.StatusForbidden, "ERR_DEPLOY_FORBIDDEN", err
+		return resp, nil, http.StatusForbidden, "ERR_DEPLOY_FORBIDDEN", err
 	}
 	if st, code, err := s.validateAdapterSupport(route); err != nil {
-		return resp, st, code, err
+		return resp, nil, st, code, err
 	}
 
 	var anchorPtr *protocol.ProjectAnchorConfig
@@ -346,10 +376,25 @@ func (s *Server) followupTaskWithExtra(
 
 	// fork_new_session while task has an active attempt creates a linked child task immediately
 	// seeded from task.LatestDeliveryID so the active session remains undisturbed.
+	// S2: Inherit parent task's effective DesiredConfig and RequiredResources when not overridden.
 	if mode == protocol.FollowupModeForkNewSession && task.ActiveAttemptID != "" {
 		createdBy := protocol.TaskCreatedByHuman
 		if actorKind == protocol.ActorPA {
 			createdBy = protocol.TaskCreatedByPA
+		}
+		parentCfg, parentRes, _ := s.store.GetTaskExecutionDefaults(ctx, task.TaskID)
+		forkCfg := map[string]string{}
+		for k, v := range parentCfg {
+			forkCfg[k] = v
+		}
+		for k, v := range req.Config {
+			if strings.TrimSpace(v) != "" {
+				forkCfg[k] = v
+			}
+		}
+		forkResources := req.RequiredResources
+		if forkResources == nil {
+			forkResources = append([]string(nil), parentRes...)
 		}
 		forkRes, err := s.store.CreateTask(ctx, store.CreateTaskParams{
 			ProjectID:          task.ProjectID,
@@ -357,9 +402,9 @@ func (s *Server) followupTaskWithExtra(
 			Title:              task.Title + " (分支)",
 			Goal:               req.Message,
 			RequiredCapability: route.Capability,
-			RequiredResources:  req.RequiredResources,
+			RequiredResources:  forkResources,
 			Adapter:            route.Adapter,
-			DesiredConfig:      req.Config,
+			DesiredConfig:      forkCfg,
 			CreatedBy:          createdBy,
 			MachineID:          route.MachineID,
 			Anchor:             anchorPtr,
@@ -372,9 +417,16 @@ func (s *Server) followupTaskWithExtra(
 			LeaseTTLMs:         s.leaseTTL.Milliseconds(),
 			ActorID:            actorID,
 			ActorKind:          actorKind,
+			PAIdempotency:      paIdemp,
 		})
+		if errors.Is(err, store.ErrConflict) {
+			return resp, nil, http.StatusConflict, "ERR_IDEMPOTENCY_CONFLICT", err
+		}
 		if err != nil {
-			return resp, http.StatusInternalServerError, "ERR_FORK_TASK", err
+			return resp, nil, http.StatusInternalServerError, "ERR_FORK_TASK", err
+		}
+		if forkRes.ReplayedReceipt != nil {
+			return resp, forkRes.ReplayedReceipt, http.StatusOK, "", nil
 		}
 		if len(forkRes.Events) > 0 {
 			s.broker.Broadcast(forkRes.Events...)
@@ -393,11 +445,11 @@ func (s *Server) followupTaskWithExtra(
 			ForkedTaskID: forkRes.Task.TaskID,
 			Dispatched:   dispatched,
 		}
-		return resp, http.StatusCreated, "", nil
+		return resp, nil, http.StatusCreated, "", nil
 	}
 
-	// B9, B11, S2: Single BEGIN IMMEDIATE transaction decides busy vs idle, enforces needs_verification,
-	// persists steer cancellation intent, and freezes effective route/config/resources/anchor.
+	// B9, B11, S2, NEW-3: Single BEGIN IMMEDIATE transaction decides busy vs idle, enforces needs_verification,
+	// persists steer cancellation intent, stores server-only route_json, and commits PA idempotency receipt.
 	src := protocol.PendingSourceHuman
 	if actorKind == protocol.ActorPA {
 		src = protocol.PendingSourcePA
@@ -419,21 +471,25 @@ func (s *Server) followupTaskWithExtra(
 		ActorKind:         actorKind,
 		ActorID:           actorID,
 		PayloadExtra:      payloadExtra,
+		PAIdempotency:     paIdemp,
 	})
 	if errors.Is(err, store.ErrNotFound) {
-		return resp, http.StatusNotFound, "ERR_TASK_NOT_FOUND", err
+		return resp, nil, http.StatusNotFound, "ERR_TASK_NOT_FOUND", err
 	}
 	if errors.Is(err, store.ErrVerificationRequired) {
-		return resp, http.StatusConflict, "ERR_VERIFICATION_REQUIRED", err
+		return resp, nil, http.StatusConflict, "ERR_VERIFICATION_REQUIRED", err
 	}
 	if errors.Is(err, store.ErrConflict) {
-		return resp, http.StatusConflict, "ERR_TASK_BUSY", err
+		return resp, nil, http.StatusConflict, "ERR_CONFLICT", err
 	}
 	if errors.Is(err, store.ErrInvalidInput) {
-		return resp, http.StatusBadRequest, "ERR_INVALID_INPUT", err
+		return resp, nil, http.StatusBadRequest, "ERR_INVALID_INPUT", err
 	}
 	if err != nil {
-		return resp, http.StatusInternalServerError, "ERR_FOLLOWUP", err
+		return resp, nil, http.StatusInternalServerError, "ERR_FOLLOWUP", err
+	}
+	if subRes.ReplayedReceipt != nil {
+		return resp, subRes.ReplayedReceipt, http.StatusOK, "", nil
 	}
 
 	if len(subRes.Events) > 0 {
@@ -452,7 +508,7 @@ func (s *Server) followupTaskWithExtra(
 			Task:         subRes.Task,
 			PendingInput: subRes.PendingInput,
 		}
-		return resp, http.StatusAccepted, "", nil
+		return resp, nil, http.StatusAccepted, "", nil
 	}
 
 	if subRes.PendingInput != nil {
@@ -461,7 +517,7 @@ func (s *Server) followupTaskWithExtra(
 			Task:         subRes.Task,
 			PendingInput: subRes.PendingInput,
 		}
-		return resp, http.StatusAccepted, "", nil
+		return resp, nil, http.StatusAccepted, "", nil
 	}
 
 	dispatched := false
@@ -477,7 +533,7 @@ func (s *Server) followupTaskWithExtra(
 		Attempt:    attView,
 		Dispatched: dispatched,
 	}
-	return resp, http.StatusCreated, "", nil
+	return resp, nil, http.StatusCreated, "", nil
 }
 
 func (s *Server) handleFollowupTask(w http.ResponseWriter, r *http.Request) {
@@ -496,40 +552,33 @@ func (s *Server) handleFollowupTask(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) cancelTaskInternal(ctx context.Context, taskID, actorID, reason string) (protocol.CancelTaskResponse, int, string, error) {
+	resp, _, status, code, err := s.cancelTaskInternalWithPA(ctx, taskID, actorID, reason, nil)
+	return resp, status, code, err
+}
+
+func (s *Server) cancelTaskInternalWithPA(ctx context.Context, taskID, actorID, reason string, paIdemp *store.PAActionIdempotencySpec) (protocol.CancelTaskResponse, *protocol.PAActionResult, int, string, error) {
 	var resp protocol.CancelTaskResponse
-	task, err := s.store.GetTask(ctx, taskID)
+	// B10 & NEW-3: Perform idempotency check + cancel_requested=1 persistence + receipt storage in ONE tx!
+	// Calling CancelTaskActiveAttemptWithIdempotency directly ensures replays succeed even after active_attempt_id is cleared.
+	res, err := s.store.CancelTaskActiveAttemptWithIdempotency(ctx, taskID, actorID, reason, false, paIdemp)
 	if errors.Is(err, store.ErrNotFound) {
-		return resp, http.StatusNotFound, "ERR_TASK_NOT_FOUND", err
-	}
-	if err != nil {
-		return resp, http.StatusInternalServerError, "ERR_TASK_LOOKUP", err
-	}
-	if task.ActiveAttemptID == "" {
-		return resp, http.StatusConflict, "ERR_NO_ACTIVE_ATTEMPT", errors.New("task has no active attempt to cancel")
-	}
-	attRec, err := s.store.GetAttemptRecord(ctx, task.ActiveAttemptID)
-	if err != nil {
-		return resp, http.StatusInternalServerError, "ERR_ATTEMPT_LOOKUP", err
-	}
-	runnerConnected := s.runners.IsConnected(attRec.MachineID)
-	// B10: Never force-immediate cancel a dispatched attempt just because WS send might fail or runner is
-	// transiently disconnected; persist cancel_requested=1 so hello/heartbeat/outbox keep enforcing abort.
-	res, err := s.store.CancelTaskActiveAttempt(ctx, taskID, actorID, reason, false)
-	if errors.Is(err, store.ErrNotFound) {
-		return resp, http.StatusNotFound, "ERR_TASK_NOT_FOUND", err
+		return resp, nil, http.StatusNotFound, "ERR_TASK_NOT_FOUND", err
 	}
 	if errors.Is(err, store.ErrConflict) {
-		return resp, http.StatusConflict, "ERR_NO_ACTIVE_ATTEMPT", err
+		return resp, nil, http.StatusConflict, "ERR_CONFLICT", err
 	}
 	if err != nil {
-		return resp, http.StatusInternalServerError, "ERR_CANCEL_TASK", err
+		return resp, nil, http.StatusInternalServerError, "ERR_CANCEL_TASK", err
+	}
+	if res.ReplayedReceipt != nil {
+		return resp, res.ReplayedReceipt, http.StatusOK, "", nil
 	}
 	if len(res.Events) > 0 {
 		s.broker.Broadcast(res.Events...)
 	}
 
 	cancelSent := false
-	if res.NeedsRunnerSend && runnerConnected {
+	if res.NeedsRunnerSend && res.Attempt.MachineID != "" && s.runners.IsConnected(res.Attempt.MachineID) {
 		if err := s.runners.CancelAttempt(res.Attempt.MachineID, protocol.AttemptCancelFrame{
 			AttemptID:  res.Attempt.AttemptID,
 			LeaseToken: res.Attempt.LeaseToken,
@@ -548,7 +597,7 @@ func (s *Server) cancelTaskInternal(ctx context.Context, taskID, actorID, reason
 		CancelSent:     cancelSent,
 		ImmediateState: immState,
 	}
-	return resp, http.StatusOK, "", nil
+	return resp, nil, http.StatusOK, "", nil
 }
 
 func (s *Server) handleCancelTask(w http.ResponseWriter, r *http.Request) {

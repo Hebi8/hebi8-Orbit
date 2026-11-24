@@ -452,6 +452,61 @@ func (s *Store) CheckPAThreadExists(ctx context.Context, threadID string) error 
 	return err
 }
 
+// PAActionIdempotencySpec binds an idempotency key, action name, and canonical param hash
+// into the SAME BEGIN IMMEDIATE transaction as a PA write mutation (NEW-3).
+type PAActionIdempotencySpec struct {
+	Key       string
+	Action    string
+	ParamHash string
+}
+
+func lookupPAActionReceiptTx(ctx context.Context, tx *sql.Tx, spec *PAActionIdempotencySpec) (*protocol.PAActionResult, bool, error) {
+	if spec == nil || strings.TrimSpace(spec.Key) == "" {
+		return nil, false, nil
+	}
+	var action, paramHash, resultJSON string
+	err := tx.QueryRowContext(ctx, `
+		SELECT action, COALESCE(param_hash, ''), result_json
+		FROM pa_action_receipts
+		WHERE idempotency_key = ?
+	`, spec.Key).Scan(&action, &paramHash, &resultJSON)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	if action != spec.Action {
+		return nil, false, fmt.Errorf("%w: idempotencyKey %q already bound to action %q", ErrConflict, spec.Key, action)
+	}
+	if paramHash != "" && spec.ParamHash != "" && paramHash != spec.ParamHash {
+		return nil, false, fmt.Errorf("%w: idempotencyKey %q reused with different parameters", ErrConflict, spec.Key)
+	}
+	var out protocol.PAActionResult
+	if err := json.Unmarshal([]byte(resultJSON), &out); err != nil {
+		return nil, false, err
+	}
+	return &out, true, nil
+}
+
+func savePAActionReceiptTx(ctx context.Context, tx *sql.Tx, spec *PAActionIdempotencySpec, result protocol.PAActionResult, now int64) error {
+	if spec == nil || strings.TrimSpace(spec.Key) == "" {
+		return nil
+	}
+	b, err := json.Marshal(result)
+	if err != nil {
+		return err
+	}
+	if now == 0 {
+		now = time.Now().UnixMilli()
+	}
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO pa_action_receipts (idempotency_key, action, param_hash, result_json, created_at)
+		VALUES (?, ?, ?, ?, ?)
+	`, spec.Key, spec.Action, spec.ParamHash, string(b), now)
+	return err
+}
+
 // GetPAActionReceipt looks up a persisted PA write action receipt by idempotencyKey (S5).
 func (s *Store) GetPAActionReceipt(ctx context.Context, idempotencyKey string) (string, protocol.PAActionResult, bool, error) {
 	var action, resultJSON string
@@ -483,8 +538,8 @@ func (s *Store) SavePAActionReceipt(ctx context.Context, idempotencyKey, action 
 	now := time.Now().UnixMilli()
 	return s.WithWriteTx(ctx, func(tx *sql.Tx) error {
 		_, err := tx.ExecContext(ctx, `
-			INSERT OR IGNORE INTO pa_action_receipts (idempotency_key, action, result_json, created_at)
-			VALUES (?, ?, ?, ?)
+			INSERT OR IGNORE INTO pa_action_receipts (idempotency_key, action, param_hash, result_json, created_at)
+			VALUES (?, ?, '', ?, ?)
 		`, idempotencyKey, action, string(b), now)
 		return err
 	})
@@ -551,6 +606,12 @@ func (s *Store) BuildPABrief(
 				WHERE t.project_id = ? AND t.archived_at IS NULL AND `+blockedConditionSQL, projectID).Scan(&resp.TotalBlockedTaskCount); err != nil {
 				return err
 			}
+			if err := tx.QueryRowContext(ctx, `
+				SELECT COUNT(*) FROM deliveries
+				WHERE project_id = ? AND created_at >= ?
+			`, projectID, cutoff).Scan(&resp.TotalRecentDeliveryCount); err != nil {
+				return err
+			}
 		} else {
 			if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM inbox_items WHERE state = 'open'`).Scan(&resp.OpenInboxCount); err != nil {
 				return err
@@ -565,6 +626,12 @@ func (s *Store) BuildPABrief(
 			if err := tx.QueryRowContext(ctx, `
 				SELECT COUNT(*) FROM tasks t
 				WHERE t.archived_at IS NULL AND `+blockedConditionSQL).Scan(&resp.TotalBlockedTaskCount); err != nil {
+				return err
+			}
+			if err := tx.QueryRowContext(ctx, `
+				SELECT COUNT(*) FROM deliveries
+				WHERE created_at >= ?
+			`, cutoff).Scan(&resp.TotalRecentDeliveryCount); err != nil {
 				return err
 			}
 		}
@@ -804,8 +871,12 @@ func formatBriefSummary(b protocol.PABriefResponse) string {
 	}
 	parts = append(parts, fmt.Sprintf("事件水位 #%d · 在线节点 %d/%d", b.SnapshotSeq, onlineCount, len(b.Machines)))
 	parts = append(parts, fmt.Sprintf("待拍板 %d 项 · 活跃线程 %d 个 · 阻塞/待核对 %d 个", b.OpenInboxCount, b.TotalActiveTaskCount, b.TotalBlockedTaskCount))
-	if len(b.RecentDeliveries) > 0 {
-		parts = append(parts, fmt.Sprintf("近 %dh 产出 %d 个新交付", b.SinceHours, len(b.RecentDeliveries)))
+	dlvTotal := b.TotalRecentDeliveryCount
+	if dlvTotal == 0 {
+		dlvTotal = len(b.RecentDeliveries)
+	}
+	if dlvTotal > 0 {
+		parts = append(parts, fmt.Sprintf("近 %dh 产出 %d 个新交付", b.SinceHours, dlvTotal))
 	}
 	return strings.Join(parts, "；")
 }

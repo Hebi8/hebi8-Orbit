@@ -46,9 +46,10 @@ type ApprovalDecisionPayload struct {
 // HubWelcomeReconcile carries continuous outbox watermarks, stale attempt aborts,
 // and pending approval decisions to redeliver after a transient disconnect.
 type HubWelcomeReconcile struct {
-	AckedOutboxByAttempt map[string]int64          `json:"ackedOutboxByAttempt"`
-	AbortAttemptIDs      []string                  `json:"abortAttemptIds"`
-	RedeliverApprovals   []ApprovalDecisionPayload `json:"redeliverApprovals"`
+	AckedOutboxByAttempt map[string]int64            `json:"ackedOutboxByAttempt"`
+	AbortAttemptIDs      []string                    `json:"abortAttemptIds"`
+	RedeliverApprovals   []ApprovalDecisionPayload   `json:"redeliverApprovals"`
+	PendingBoardMessages []BoardMessageDispatchFrame `json:"pendingBoardMessages,omitempty"`
 }
 
 // HubWelcomeFrame is Hub's reconciliation response to runner.hello.

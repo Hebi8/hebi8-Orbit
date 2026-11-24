@@ -213,6 +213,15 @@ func applySchema(ctx context.Context, db *sql.DB) error {
 		if err := ensureColumnTx(ctx, tx, "approvals", "delivery_attempted", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 			return err
 		}
+		// B6: Legacy v1/v2 approved_pending_delivery rows lacked delivery_attempted tracking;
+		// conservatively backfill them to 1 so an upgrade + runner restart enters uncertain/needs_verification
+		// rather than silently marking potentially-executed approvals as expired.
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE approvals SET delivery_attempted = 1
+			WHERE state = 'approved_pending_delivery' AND delivery_attempted = 0
+		`); err != nil {
+			return fmt.Errorf("backfill legacy approval delivery_attempted: %w", err)
+		}
 		if err := ensureColumnTx(ctx, tx, "attempts", "cancel_requested", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 			return err
 		}
@@ -244,6 +253,34 @@ func applySchema(ctx context.Context, db *sql.DB) error {
 		}
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO schema_migrations (version, applied_at) VALUES (3, ?)
+		`, now); err != nil {
+			return err
+		}
+	}
+
+	// Smooth versioned migration v4 (Phase 1 round-2 hardening):
+	// - B9: durable tasks.pending_queue_drain + pending_steer_input_id across Hub restarts
+	// - NEW-1: server-only task_pending_inputs.route_json separated from user-editable payload_json
+	// - NEW-3: pa_action_receipts.param_hash for atomic PA write idempotency verification
+	var hasV4 int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version = 4`).Scan(&hasV4); err != nil {
+		return err
+	}
+	if hasV4 == 0 {
+		if err := ensureColumnTx(ctx, tx, "tasks", "pending_queue_drain", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+			return err
+		}
+		if err := ensureColumnTx(ctx, tx, "tasks", "pending_steer_input_id", "TEXT"); err != nil {
+			return err
+		}
+		if err := ensureColumnTx(ctx, tx, "task_pending_inputs", "route_json", "TEXT"); err != nil {
+			return err
+		}
+		if err := ensureColumnTx(ctx, tx, "pa_action_receipts", "param_hash", "TEXT NOT NULL DEFAULT ''"); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO schema_migrations (version, applied_at) VALUES (4, ?)
 		`, now); err != nil {
 			return err
 		}

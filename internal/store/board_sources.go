@@ -383,7 +383,9 @@ func listTaskBoardMembersTx(ctx context.Context, tx *sql.Tx, taskID string) ([]p
 		return nil, err
 	}
 
-	// Surface cross-machine child tasks (parent_task_id = taskID) as board members
+	// Surface cross-machine child tasks (parent_task_id = taskID) as board members.
+	// B16: If a persisted board_members row already exists under the child task's display title with empty worker_task_id,
+	// enrich that row with childID rather than allowing a NULL-worker_task_id row to shadow the child task!
 	cRows, err := tx.QueryContext(ctx, `
 		SELECT t.task_id, t.project_id, t.title, t.preferred_adapter, t.state, t.updated_at, a.machine_id
 		FROM tasks t
@@ -402,13 +404,31 @@ func listTaskBoardMembersTx(ctx context.Context, tx *sql.Tx, taskID string) ([]p
 		if err := cRows.Scan(&childID, &childProj, &title, &adapter, &tstate, &updatedAt, &mach); err != nil {
 			return nil, err
 		}
-		if seenWorkerTaskIDs[childID] || seenMembers[childID] {
+		if seenWorkerTaskIDs[childID] {
 			continue
 		}
 		mState := childTaskStateToMemberState(protocol.TaskState(tstate))
 		mid := ""
 		if mach.Valid {
 			mid = mach.String
+		}
+		merged := false
+		for i := range members {
+			if members[i].WorkerTaskID == "" && (strings.EqualFold(members[i].MemberName, title) || members[i].MemberName == childID) {
+				members[i].WorkerTaskID = childID
+				if members[i].MachineID == "" {
+					members[i].MachineID = mid
+				}
+				if members[i].Adapter == "" {
+					members[i].Adapter = protocol.Adapter(adapter)
+				}
+				seenWorkerTaskIDs[childID] = true
+				merged = true
+				break
+			}
+		}
+		if merged || seenMembers[childID] {
+			continue
 		}
 		members = append(members, protocol.BoardMemberCursor{
 			TaskID:       taskID,
@@ -542,9 +562,26 @@ func (s *Store) ResolveBoardTarget(ctx context.Context, taskID, targetMention st
 		if err != nil {
 			return err
 		}
+		// B16: Match exact WorkerTaskID first, then prefer a member bound to a child WorkerTaskID over an unbound name row.
 		for i := range members {
 			m := members[i]
-			if strings.EqualFold(m.MemberName, target) || (m.WorkerTaskID != "" && m.WorkerTaskID == target) {
+			if m.WorkerTaskID != "" && m.WorkerTaskID == target {
+				cp := m
+				matched = &cp
+				return nil
+			}
+		}
+		for i := range members {
+			m := members[i]
+			if m.WorkerTaskID != "" && strings.EqualFold(m.MemberName, target) {
+				cp := m
+				matched = &cp
+				return nil
+			}
+		}
+		for i := range members {
+			m := members[i]
+			if strings.EqualFold(m.MemberName, target) {
 				cp := m
 				matched = &cp
 				return nil
@@ -592,11 +629,23 @@ func markBoardMessageConsumedTx(ctx context.Context, tx *sql.Tx, taskID, message
 	}
 	member := strings.TrimPrefix(strings.TrimSpace(memberName), "@")
 	if member != "" && seq > 0 {
-		// Preserve existing worker_task_id/state if member already exists
+		// B16: Preserve existing worker_task_id/state, and if absent check whether this member corresponds
+		// to a virtual child task (parent_task_id = taskID) so worker_task_id is persisted permanently!
 		var existingState, existingWorker, existingMachine, existingAdapter sql.NullString
 		_ = tx.QueryRowContext(ctx, `
 			SELECT state, worker_task_id, machine_id, adapter FROM board_members WHERE task_id = ? AND member_name = ?
 		`, taskID, member).Scan(&existingState, &existingWorker, &existingMachine, &existingAdapter)
+		workerTaskID := existingWorker.String
+		if workerTaskID == "" {
+			var childTaskID string
+			if err := tx.QueryRowContext(ctx, `
+				SELECT task_id FROM tasks
+				WHERE parent_task_id = ? AND archived_at IS NULL AND (task_id = ? OR LOWER(title) = LOWER(?))
+				ORDER BY created_at ASC LIMIT 1
+			`, taskID, member, member).Scan(&childTaskID); err == nil && childTaskID != "" {
+				workerTaskID = childTaskID
+			}
+		}
 		st := protocol.BoardMemberWorking
 		if existingState.Valid && protocol.BoardMemberState(existingState.String).IsValid() {
 			st = protocol.BoardMemberState(existingState.String)
@@ -610,11 +659,64 @@ func markBoardMessageConsumedTx(ctx context.Context, tx *sql.Tx, taskID, message
 			State:           st,
 			LastConsumedSeq: seq,
 			CurrentStep:     fmt.Sprintf("consumed #%d", seq),
-			WorkerTaskID:    existingWorker.String,
+			WorkerTaskID:    workerTaskID,
 			UpdatedAt:       now,
 		})
 	}
 	return nil, nil
+}
+
+// listPendingNativeBoardMessagesTx returns posted @worker board messages for a live native swarm attempt
+// that have not yet been consumed and do not belong to a separate child worker task (B16).
+func listPendingNativeBoardMessagesTx(ctx context.Context, tx *sql.Tx, taskID, attemptID string) ([]protocol.BoardMessageDispatchFrame, error) {
+	members, err := listTaskBoardMembersTx(ctx, tx, taskID)
+	if err != nil {
+		return nil, err
+	}
+	childTargets := map[string]bool{}
+	for _, m := range members {
+		if m.WorkerTaskID != "" {
+			childTargets[strings.ToLower(m.MemberName)] = true
+			childTargets[strings.ToLower(m.WorkerTaskID)] = true
+		}
+	}
+
+	rows, err := tx.QueryContext(ctx, `
+		SELECT message_id, seq, author_name, target_mention, body
+		FROM board_messages
+		WHERE task_id = ? AND status = 'posted' AND target_mention IS NOT NULL AND target_mention != ''
+		ORDER BY seq ASC
+		LIMIT 50
+	`, taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []protocol.BoardMessageDispatchFrame
+	for rows.Next() {
+		var msgID, author, body string
+		var seq int64
+		var target sql.NullString
+		if err := rows.Scan(&msgID, &seq, &author, &target, &body); err != nil {
+			return nil, err
+		}
+		mention := strings.TrimPrefix(strings.TrimSpace(target.String), "@")
+		if mention == "" || childTargets[strings.ToLower(mention)] {
+			continue
+		}
+		out = append(out, protocol.BoardMessageDispatchFrame{
+			Type:          protocol.RunnerMsgBoardMessage,
+			TaskID:        taskID,
+			AttemptID:     attemptID,
+			MessageID:     msgID,
+			Seq:           seq,
+			AuthorName:    author,
+			TargetMention: mention,
+			Body:          body,
+		})
+	}
+	return out, rows.Err()
 }
 
 // PostBoardMessage inserts a human or agent message into a task's shared queue message board.

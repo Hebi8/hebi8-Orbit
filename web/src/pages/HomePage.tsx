@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { ArrowRight, ArrowUpRight, X, Zap } from 'lucide-react';
 import type {
@@ -237,9 +237,17 @@ function BlockedInboxRow({ item, projects }: { item: InboxItemView; projects: Pr
   const attempts = tl.data?.attempts ?? [];
   const latest = attempts[attempts.length - 1];
   const needsVerify = latest?.state === 'needs_verification';
+  const latestAttemptId = latest?.attemptId;
+  useEffect(() => {
+    setVerified(false);
+  }, [latestAttemptId]);
   const canRetry = !!latest && (latest.state === 'needs_verification' || latest.state === 'failed' || latest.state === 'expired');
   const retry = useMutation({
-    mutationFn: () => api.retryTask(item.taskId!, { verifiedSite: needsVerify ? verified : undefined }),
+    mutationFn: () =>
+      api.retryTask(item.taskId!, {
+        verifiedSite: needsVerify ? verified : undefined,
+        verifiedAttemptId: needsVerify ? latestAttemptId : undefined,
+      }),
     onSuccess: () => {
       toast('已发起重试');
       void qc.invalidateQueries({ queryKey: ['bootstrap'] });

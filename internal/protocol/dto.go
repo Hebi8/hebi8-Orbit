@@ -538,10 +538,11 @@ type PABriefResponse struct {
 	SinceHours            int             `json:"sinceHours"`
 	ProjectID             string          `json:"projectId,omitempty"`
 	Summary               string          `json:"summary"`
-	OpenInboxCount        int             `json:"openInboxCount"`
-	TotalActiveTaskCount  int             `json:"totalActiveTaskCount,omitempty"`
-	TotalBlockedTaskCount int             `json:"totalBlockedTaskCount,omitempty"`
-	OpenInboxItems        []InboxItemView `json:"openInboxItems"`
+	OpenInboxCount           int             `json:"openInboxCount"`
+	TotalActiveTaskCount     int             `json:"totalActiveTaskCount,omitempty"`
+	TotalBlockedTaskCount    int             `json:"totalBlockedTaskCount,omitempty"`
+	TotalRecentDeliveryCount int             `json:"totalRecentDeliveryCount,omitempty"`
+	OpenInboxItems           []InboxItemView `json:"openInboxItems"`
 	ActiveTasks           []TaskSummary   `json:"activeTasks"`
 	BlockedTasks          []TaskSummary   `json:"blockedTasks"`
 	RecentDeliveries      []DeliveryView  `json:"recentDeliveries"`

@@ -46,13 +46,15 @@ type ActiveSwarmTracker struct {
 	unresolvedRejectedToolCount int
 	nonZeroExitCount            int
 	unresolvedNonZeroExitCount  int
+	failedCommands              map[string]int
 }
 
 func NewActiveSwarmTracker(attemptID string) *ActiveSwarmTracker {
 	return &ActiveSwarmTracker{
-		attemptID:     attemptID,
-		calls:         map[string]*mergedToolCall{},
-		activeWorkers: map[string]bool{},
+		attemptID:      attemptID,
+		calls:          map[string]*mergedToolCall{},
+		activeWorkers:  map[string]bool{},
+		failedCommands: map[string]int{},
 	}
 }
 
@@ -188,16 +190,20 @@ func (t *ActiveSwarmTracker) evaluateCompletedLocked(rec *mergedToolCall) SwarmP
 		_ = json.Unmarshal(rec.RawOutput, &outMap)
 	}
 
-	// Boundary #5 & S3: track commands returning exit_code (even if rawOutput arrives on a later patch).
+	// Boundary #5, B1, S3: track commands returning exit_code (even if rawOutput arrives on a later patch).
+	// ONLY a subsequent exit-0 run of the SAME verification/command signature clears that failure —
+	// unrelated commands (e.g. `ls`, `echo ok`) exiting 0 MUST NOT clear a failed test run!
 	if !rec.ExitCodeTracked && outMap != nil {
 		if ec, ok := extractExitCode(outMap); ok {
 			rec.ExitCodeTracked = true
+			sig := extractCommandSignature(inMap, rec.ToolCallID)
 			if ec != 0 {
 				t.nonZeroExitCount++
-				t.unresolvedNonZeroExitCount++
-			} else if t.unresolvedNonZeroExitCount > 0 {
-				// Subsequent command exited cleanly -> clear unresolved flag while preserving historical total.
-				t.unresolvedNonZeroExitCount = 0
+				t.failedCommands[sig]++
+				t.recomputeUnresolvedNonZeroLocked()
+			} else if t.failedCommands[sig] > 0 {
+				delete(t.failedCommands, sig)
+				t.recomputeUnresolvedNonZeroLocked()
 			}
 		}
 	}
@@ -381,4 +387,29 @@ func getMapString(m map[string]any, key string) string {
 		return strings.TrimSpace(v)
 	}
 	return ""
+}
+
+func (t *ActiveSwarmTracker) recomputeUnresolvedNonZeroLocked() {
+	total := 0
+	for _, n := range t.failedCommands {
+		total += n
+	}
+	t.unresolvedNonZeroExitCount = total
+}
+
+func extractCommandSignature(inMap map[string]any, fallbackToolCallID string) string {
+	for _, k := range []string{"command", "cmd", "CommandLine"} {
+		if raw := getMapString(inMap, k); raw != "" {
+			fields := strings.Fields(raw)
+			if len(fields) == 0 {
+				break
+			}
+			// Normalize executable + subcommand (e.g., "go test", "pnpm build", "pytest")
+			if len(fields) >= 2 && !strings.HasPrefix(fields[1], "-") {
+				return strings.ToLower(fields[0] + " " + fields[1])
+			}
+			return strings.ToLower(fields[0])
+		}
+	}
+	return "call:" + fallbackToolCallID
 }

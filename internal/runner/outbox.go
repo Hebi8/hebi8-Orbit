@@ -125,6 +125,12 @@ CREATE TABLE IF NOT EXISTS pending_deliveries (
   emitted          INTEGER NOT NULL DEFAULT 0,
   created_at       INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS cancelled_attempts (
+  attempt_id  TEXT PRIMARY KEY,
+  lease_token TEXT NOT NULL DEFAULT '',
+  created_at  INTEGER NOT NULL
+);
 `
 	if _, err := db.ExecContext(ctx, ddl); err != nil {
 		_ = db.Close()
@@ -599,4 +605,42 @@ func (o *LocalOutbox) ListUnemittedDeliveries(ctx context.Context) ([]PendingDel
 		out = append(out, d)
 	}
 	return out, rows.Err()
+}
+
+// RecordCancelledAttempt durably remembers that attemptID was cancelled before or during dispatch (B10).
+func (o *LocalOutbox) RecordCancelledAttempt(ctx context.Context, attemptID, leaseToken string) error {
+	if strings.TrimSpace(attemptID) == "" {
+		return nil
+	}
+	_, err := o.db.ExecContext(ctx, `
+		INSERT INTO cancelled_attempts (attempt_id, lease_token, created_at)
+		VALUES (?, ?, ?)
+		ON CONFLICT(attempt_id) DO UPDATE SET lease_token = COALESCE(NULLIF(excluded.lease_token, ''), cancelled_attempts.lease_token)
+	`, attemptID, leaseToken, time.Now().UnixMilli())
+	return err
+}
+
+// IsAttemptCancelled reports whether attemptID was already cancelled on this runner (B10).
+func (o *LocalOutbox) IsAttemptCancelled(ctx context.Context, attemptID string) (bool, error) {
+	if strings.TrimSpace(attemptID) == "" {
+		return false, nil
+	}
+	var cnt int
+	if err := o.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM cancelled_attempts WHERE attempt_id = ?`, attemptID).Scan(&cnt); err != nil {
+		return false, err
+	}
+	return cnt > 0, nil
+}
+
+// HasUnemittedFinalDelivery reports whether attemptID has a locally persisted final delivery
+// still awaiting blob upload / mirror push retry (B13).
+func (o *LocalOutbox) HasUnemittedFinalDelivery(ctx context.Context, attemptID string) (bool, error) {
+	var cnt int
+	if err := o.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM pending_deliveries
+		WHERE attempt_id = ? AND is_final = 1 AND emitted = 0
+	`, attemptID).Scan(&cnt); err != nil {
+		return false, err
+	}
+	return cnt > 0, nil
 }

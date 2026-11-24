@@ -22,6 +22,8 @@ func TestB5_DefaultPermissionPolicyAllowlistMatrix(t *testing.T) {
 	_ = os.WriteFile(filepath.Join(wt, "app.go"), []byte("package main\n"), 0o644)
 	_ = os.WriteFile(filepath.Join(outside, "secret.txt"), []byte("secret"), 0o644)
 	_ = os.Symlink(filepath.Join(outside, "secret.txt"), filepath.Join(wt, "escape_link.txt"))
+	linkPath := filepath.Join(wt, "escape_dir")
+	_ = os.Symlink(outside, linkPath)
 	_ = os.MkdirAll(filepath.Join(wt, ".git"), 0o755)
 	_ = os.WriteFile(filepath.Join(wt, ".git", "config"), []byte("[core]\n"), 0o644)
 
@@ -170,6 +172,36 @@ func TestB5_DefaultPermissionPolicyAllowlistMatrix(t *testing.T) {
 			mode:      "auto",
 			req:       makeReq(&kExec, nil, `{"command":"orbit deliver --summary \"done\" --final"}`),
 			wantAllow: true,
+		},
+		{
+			name:      "deep nonexistent path under escaping symlink requires human approval",
+			mode:      "auto",
+			req:       makeReq(&kEdit, []acp.ToolCallLocation{{Path: filepath.Join(linkPath, "nested1", "nested2", "new.txt")}}, ""),
+			wantAllow: false,
+		},
+		{
+			name:      "relative trojan ./git status denied",
+			mode:      "auto",
+			req:       makeReq(&kExec, nil, `{"command":"./git status"}`),
+			wantAllow: false,
+		},
+		{
+			name:      "git -C /etc status denied",
+			mode:      "auto",
+			req:       makeReq(&kExec, nil, `{"command":"git -C /etc status"}`),
+			wantAllow: false,
+		},
+		{
+			name:      "go test -exec /bin/sh denied",
+			mode:      "auto",
+			req:       makeReq(&kExec, nil, `{"command":"go test -exec /bin/sh ./..."}`),
+			wantAllow: false,
+		},
+		{
+			name:      "execute with cwd outside worktree denied",
+			mode:      "auto",
+			req:       makeReq(&kExec, nil, `{"command":"git status","cwd":"/tmp"}`),
+			wantAllow: false,
 		},
 	}
 

@@ -84,15 +84,17 @@ type CreateTaskParams struct {
 	LeaseTTLMs         int64
 	ActorID            string
 	ActorKind          protocol.ActorKind
+	PAIdempotency      *PAActionIdempotencySpec
 }
 
 // CreateTaskResult returns created (or idempotently found) entities and events.
 type CreateTaskResult struct {
-	Task    protocol.TaskSummary
-	Attempt *AttemptRecord
-	Sources []protocol.TaskSource
-	Created bool
-	Events  []protocol.EventRecord
+	Task            protocol.TaskSummary
+	Attempt         *AttemptRecord
+	Sources         []protocol.TaskSource
+	Created         bool
+	ReplayedReceipt *protocol.PAActionResult
+	Events          []protocol.EventRecord
 }
 
 // CreateTask atomically inserts a new Task (including _scratch), optional TaskSources,
@@ -129,6 +131,15 @@ func (s *Store) CreateTask(ctx context.Context, p CreateTaskParams) (CreateTaskR
 	}
 
 	err := s.WithWriteTx(ctx, func(tx *sql.Tx) error {
+		// NEW-3: Atomic PA idempotency check inside the SAME write transaction.
+		if prevReceipt, found, err := lookupPAActionReceiptTx(ctx, tx, p.PAIdempotency); err != nil {
+			return err
+		} else if found {
+			res.ReplayedReceipt = prevReceipt
+			res.Created = false
+			return nil
+		}
+
 		// Verify project exists
 		var exists string
 		if err := tx.QueryRowContext(ctx, `SELECT project_id FROM projects WHERE project_id = ? AND archived = 0`, p.ProjectID).Scan(&exists); err != nil {
@@ -304,6 +315,23 @@ func (s *Store) CreateTask(ctx context.Context, p CreateTaskParams) (CreateTaskR
 		}
 		res.Task = task
 		res.Created = true
+		if p.PAIdempotency != nil && strings.TrimSpace(p.PAIdempotency.Key) != "" {
+			receipt := protocol.PAActionResult{
+				Action:  p.PAIdempotency.Action,
+				Status:  "ok",
+				Summary: fmt.Sprintf("已为 %s 创建任务 %s", task.ProjectID, task.TaskID),
+				Data: map[string]any{
+					"taskId":    task.TaskID,
+					"projectId": task.ProjectID,
+				},
+			}
+			if res.Attempt != nil {
+				receipt.Data["attemptId"] = res.Attempt.AttemptID
+			}
+			if err := savePAActionReceiptTx(ctx, tx, p.PAIdempotency, receipt, now); err != nil {
+				return err
+			}
+		}
 		return nil
 	})
 	return res, err
@@ -470,10 +498,10 @@ func checkNeedsVerificationTx(ctx context.Context, tx *sql.Tx, taskID string, ve
 		return nil, err
 	}
 	if lastAtt.State == protocol.AttemptNeedsVerification {
-		if !verifiedSite {
-			return &lastAtt, fmt.Errorf("%w: previous attempt %s is in needs_verification; pass verifiedSite=true after inspecting state", ErrVerificationRequired, lastAtt.AttemptID)
+		if !verifiedSite || strings.TrimSpace(verifiedAttemptID) == "" {
+			return &lastAtt, fmt.Errorf("%w: previous attempt %s is in needs_verification; pass verifiedSite=true and verifiedAttemptId=%s after inspecting state", ErrVerificationRequired, lastAtt.AttemptID, lastAtt.AttemptID)
 		}
-		if strings.TrimSpace(verifiedAttemptID) != "" && strings.TrimSpace(verifiedAttemptID) != lastAtt.AttemptID {
+		if strings.TrimSpace(verifiedAttemptID) != lastAtt.AttemptID {
 			return &lastAtt, fmt.Errorf("%w: verifiedAttemptId %q does not match needs_verification attempt %q", ErrVerificationRequired, verifiedAttemptID, lastAtt.AttemptID)
 		}
 	}
@@ -1013,6 +1041,33 @@ func loadAttemptRecordTx(ctx context.Context, tx *sql.Tx, attemptID string) (Att
 	return a, nil
 }
 
+// GetTaskExecutionDefaults returns the persisted desired_config_json and required_resources
+// on a task so fork_new_session inherits parent task execution defaults when not overridden (S2).
+func (s *Store) GetTaskExecutionDefaults(ctx context.Context, taskID string) (map[string]string, []string, error) {
+	cfg := map[string]string{}
+	res := []string{}
+	err := s.WithReadTx(ctx, func(tx *sql.Tx) error {
+		var cfgJSON, resJSON sql.NullString
+		err := tx.QueryRowContext(ctx, `
+			SELECT desired_config_json, required_resources FROM tasks WHERE task_id = ?
+		`, taskID).Scan(&cfgJSON, &resJSON)
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("%w: task %s", ErrNotFound, taskID)
+		}
+		if err != nil {
+			return err
+		}
+		if cfgJSON.Valid && cfgJSON.String != "" {
+			_ = json.Unmarshal([]byte(cfgJSON.String), &cfg)
+		}
+		if resJSON.Valid && resJSON.String != "" {
+			_ = json.Unmarshal([]byte(resJSON.String), &res)
+		}
+		return nil
+	})
+	return cfg, res, err
+}
+
 // ListLeasedAttemptsForMachine lists undispatched attempts currently in 'leased' state for machineID.
 func (s *Store) ListLeasedAttemptsForMachine(ctx context.Context, machineID string) ([]AttemptRecord, error) {
 	var out []AttemptRecord
@@ -1096,12 +1151,19 @@ type CancelTaskResult struct {
 	Attempt         AttemptRecord
 	CancelledNow    bool
 	NeedsRunnerSend bool
+	ReplayedReceipt *protocol.PAActionResult
 	Events          []protocol.EventRecord
 }
 
 // CancelTaskActiveAttempt either immediately cancels a never-dispatched leased attempt
 // or persists cancel_requested=1 so Hub sends attempt.cancel and retries across reconnects/frames.
 func (s *Store) CancelTaskActiveAttempt(ctx context.Context, taskID, actorID, reason string, forceImmediate bool) (CancelTaskResult, error) {
+	return s.CancelTaskActiveAttemptWithIdempotency(ctx, taskID, actorID, reason, forceImmediate, nil)
+}
+
+// CancelTaskActiveAttemptWithIdempotency performs cancel + PA idempotency receipt verification/storage
+// inside a single BEGIN IMMEDIATE transaction (NEW-3).
+func (s *Store) CancelTaskActiveAttemptWithIdempotency(ctx context.Context, taskID, actorID, reason string, forceImmediate bool, idemp *PAActionIdempotencySpec) (CancelTaskResult, error) {
 	var res CancelTaskResult
 	now := time.Now().UnixMilli()
 	if actorID == "" {
@@ -1109,6 +1171,13 @@ func (s *Store) CancelTaskActiveAttempt(ctx context.Context, taskID, actorID, re
 	}
 
 	err := s.WithWriteTx(ctx, func(tx *sql.Tx) error {
+		if prevReceipt, found, err := lookupPAActionReceiptTx(ctx, tx, idemp); err != nil {
+			return err
+		} else if found {
+			res.ReplayedReceipt = prevReceipt
+			return nil
+		}
+
 		var activeAttID sql.NullString
 		var projectID string
 		err := tx.QueryRowContext(ctx, `SELECT project_id, active_attempt_id FROM tasks WHERE task_id = ?`, taskID).Scan(&projectID, &activeAttID)
@@ -1145,14 +1214,28 @@ func (s *Store) CancelTaskActiveAttempt(ctx context.Context, taskID, actorID, re
 			res.Attempt.CancelReasonKind = "human"
 			res.Attempt.SteerInputID = ""
 			res.NeedsRunnerSend = true
-			return nil
+		} else {
+			if err := cancelAttemptTx(ctx, tx, att, actorID, reason, now, &res.Events); err != nil {
+				return err
+			}
+			res.CancelledNow = true
+			res.NeedsRunnerSend = !neverDispatched
 		}
 
-		if err := cancelAttemptTx(ctx, tx, att, actorID, reason, now, &res.Events); err != nil {
-			return err
+		if idemp != nil && strings.TrimSpace(idemp.Key) != "" {
+			receipt := protocol.PAActionResult{
+				Action:  idemp.Action,
+				Status:  "ok",
+				Summary: fmt.Sprintf("已请求取消任务 %s（attempt=%s）", taskID, att.AttemptID),
+				Data: map[string]any{
+					"taskId":    taskID,
+					"attemptId": att.AttemptID,
+				},
+			}
+			if err := savePAActionReceiptTx(ctx, tx, idemp, receipt, now); err != nil {
+				return err
+			}
 		}
-		res.CancelledNow = true
-		res.NeedsRunnerSend = !neverDispatched
 		return nil
 	})
 	return res, err
@@ -1168,12 +1251,15 @@ func cancelAttemptTx(ctx context.Context, tx *sql.Tx, att AttemptRecord, actorID
 	}
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE tasks
-		SET state = 'cancelled', active_attempt_id = NULL, waiting_reason = NULL, version = version + 1, updated_at = ?
+		SET state = 'cancelled', active_attempt_id = NULL, waiting_reason = NULL,
+		    pending_queue_drain = 0, pending_steer_input_id = NULL,
+		    version = version + 1, updated_at = ?
 		WHERE task_id = ? AND active_attempt_id = ?
 	`, now, att.TaskID, att.AttemptID); err != nil {
 		return err
 	}
-	// Release any queued annotations tied to this attempt back to 'open'
+	// Release any queued annotations tied to this attempt back to 'open' and report affected deliveries (S6)
+	revertedDeliveryIDs, _ := lookupQueuedAnnotationDeliveryIDsTx(ctx, tx, att.AttemptID)
 	if err := releaseQueuedAnnotationsTx(ctx, tx, att.AttemptID); err != nil {
 		return err
 	}
@@ -1186,6 +1272,14 @@ func cancelAttemptTx(ctx context.Context, tx *sql.Tx, att AttemptRecord, actorID
 		WHERE inbox_id = ? AND state = 'open'
 	`, now, now, "inb:blk:"+att.AttemptID)
 
+	ev1Payload := map[string]any{
+		"state":  protocol.AttemptCancelled,
+		"reason": reason,
+	}
+	if len(revertedDeliveryIDs) > 0 {
+		ev1Payload["revertedDeliveryIds"] = revertedDeliveryIDs
+		ev1Payload["deliveryIds"] = revertedDeliveryIDs
+	}
 	ev1, err := insertEventTx(ctx, tx, eventInsert{
 		StreamID:   "task:" + att.TaskID,
 		ProjectID:  att.ProjectID,
@@ -1195,11 +1289,8 @@ func cancelAttemptTx(ctx context.Context, tx *sql.Tx, att AttemptRecord, actorID
 		ActorID:    actorID,
 		Kind:       protocol.EventAttemptFinished,
 		Visibility: protocol.VisibilityTimeline,
-		Payload: map[string]any{
-			"state":  protocol.AttemptCancelled,
-			"reason": reason,
-		},
-		CreatedAt: now,
+		Payload:    ev1Payload,
+		CreatedAt:  now,
 	})
 	if err != nil {
 		return err
@@ -1267,7 +1358,9 @@ func expireAttemptInTx(ctx context.Context, tx *sql.Tx, att *AttemptRecord, nowM
 	}
 	att.State = newAttState
 
+	var revertedDeliveryIDs []string
 	if !hasUncertain {
+		revertedDeliveryIDs, _ = lookupQueuedAnnotationDeliveryIDsTx(ctx, tx, att.AttemptID)
 		if err := releaseQueuedAnnotationsTx(ctx, tx, att.AttemptID); err != nil {
 			return err
 		}
@@ -1275,7 +1368,9 @@ func expireAttemptInTx(ctx context.Context, tx *sql.Tx, att *AttemptRecord, nowM
 
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE tasks
-		SET state = ?, active_attempt_id = NULL, waiting_reason = ?, version = version + 1, updated_at = ?
+		SET state = ?, active_attempt_id = NULL, waiting_reason = ?,
+		    pending_queue_drain = 0, pending_steer_input_id = NULL,
+		    version = version + 1, updated_at = ?
 		WHERE task_id = ? AND active_attempt_id = ?
 	`, string(newTaskState), reason, nowMs, att.TaskID, att.AttemptID); err != nil {
 		return err
@@ -1285,6 +1380,15 @@ func expireAttemptInTx(ctx context.Context, tx *sql.Tx, att *AttemptRecord, nowM
 		return err
 	}
 
+	evPayload := map[string]any{
+		"state":     newAttState,
+		"errorCode": errCode,
+		"reason":    reason,
+	}
+	if len(revertedDeliveryIDs) > 0 {
+		evPayload["revertedDeliveryIds"] = revertedDeliveryIDs
+		evPayload["deliveryIds"] = revertedDeliveryIDs
+	}
 	ev, err := insertEventTx(ctx, tx, eventInsert{
 		StreamID:   "task:" + att.TaskID,
 		ProjectID:  att.ProjectID,
@@ -1294,12 +1398,8 @@ func expireAttemptInTx(ctx context.Context, tx *sql.Tx, att *AttemptRecord, nowM
 		ActorID:    actorID,
 		Kind:       protocol.EventAttemptFinished,
 		Visibility: protocol.VisibilityInbox,
-		Payload: map[string]any{
-			"state":     newAttState,
-			"errorCode": errCode,
-			"reason":    reason,
-		},
-		CreatedAt: nowMs,
+		Payload:    evPayload,
+		CreatedAt:  nowMs,
 	})
 	if err != nil {
 		return err

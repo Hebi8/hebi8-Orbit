@@ -627,6 +627,7 @@ export interface PABriefResponse {
   openInboxCount: number;
   totalActiveTaskCount?: number;
   totalBlockedTaskCount?: number;
+  totalRecentDeliveryCount?: number;
   openInboxItems: InboxItemView[];
   activeTasks: TaskSummary[];
   blockedTasks: TaskSummary[];
@@ -859,6 +860,7 @@ export interface HubWelcomeReconcile {
   ackedOutboxByAttempt: Record<string, number>;
   abortAttemptIds: string[];
   redeliverApprovals: ApprovalDecisionPayload[];
+  pendingBoardMessages?: BoardMessageDispatchFrame[];
 }
 
 export interface HubWelcomeFrame {

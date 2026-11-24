@@ -728,12 +728,21 @@ func TestRegression_R1_SwarmOwnershipQueueForkAndTimeout(t *testing.T) {
 			t.Fatalf("expected 409 Conflict retrying needs_verification without verifiedSite, got %d: %s", resp.StatusCode, string(raw))
 		}
 
-		// Retry WITH verifiedSite: true MUST succeed AND force a brand new provider session (never reusing locked old session!)
+		// Retry with verifiedSite=true but MISSING verifiedAttemptId MUST also return 409 Conflict (strict B11)!
 		resp, raw = env.apiReq(http.MethodPost, "/api/tasks/"+tid+"/retry", protocol.RetryTaskRequest{
 			VerifiedSite: true,
 		}, nil)
+		if resp.StatusCode != http.StatusConflict {
+			t.Fatalf("expected 409 Conflict retrying needs_verification without verifiedAttemptId, got %d: %s", resp.StatusCode, string(raw))
+		}
+
+		// Retry WITH verifiedSite: true AND matching verifiedAttemptId MUST succeed AND force a brand new provider session!
+		resp, raw = env.apiReq(http.MethodPost, "/api/tasks/"+tid+"/retry", protocol.RetryTaskRequest{
+			VerifiedSite:      true,
+			VerifiedAttemptID: att1ID,
+		}, nil)
 		if resp.StatusCode != http.StatusCreated {
-			t.Fatalf("expected 201 retrying with verifiedSite=true, got %d: %s", resp.StatusCode, string(raw))
+			t.Fatalf("expected 201 retrying with verifiedSite=true + verifiedAttemptId, got %d: %s", resp.StatusCode, string(raw))
 		}
 
 		eventually(t, 3*time.Second, func() bool {

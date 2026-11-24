@@ -907,3 +907,321 @@ func TestB14_S2_S4_S7_S8_StoreInvariants(t *testing.T) {
 		t.Fatalf("expected hub-node adapters=[agy] in PA brief, got %+v", brief.Machines)
 	}
 }
+
+func TestRound2StoreHardening(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("B6_LegacyV2ApprovedPendingDeliveryBackfillsDeliveryAttempted", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		dbPath := filepath.Join(tmpDir, "legacy-v2.sqlite")
+		rawDB, err := sql.Open("sqlite3", dbPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := rawDB.Exec(store.BuildSchemaDDL()); err != nil {
+			t.Fatal(err)
+		}
+		now := time.Now().UnixMilli()
+		_, err = rawDB.Exec(`INSERT INTO schema_migrations (version, applied_at) VALUES (1, ?)`, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = rawDB.Exec(`INSERT INTO machines (machine_id, transport_mode, status, capabilities_json, resources_json, updated_at) VALUES ('hub-node', 'local_ws', 'online', '[]', '{}', ?)`, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = rawDB.Exec(`INSERT INTO projects (project_id, display_name, repo_identity, default_branch, mirror_bare_path, config_json, archived, updated_at) VALUES ('proj-a', 'proj-a', 'github.com/org/a', 'main', '/tmp/m.git', '{}', 0, ?)`, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = rawDB.Exec(`INSERT INTO tasks (task_id, project_id, title, goal, state, required_capability, preferred_adapter, created_by, version, created_at, updated_at) VALUES ('tsk_v2', 'proj-a', 'v2', 'g', 'waiting_approval', 'primary-dev', 'agy', 'human', 1, ?, ?)`, now, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = rawDB.Exec(`INSERT INTO attempts (attempt_id, task_id, project_id, attempt_no, machine_id, adapter, trigger_kind, trigger_payload_json, state, lease_token, lease_expires_at, started_at) VALUES ('att_v2', 'tsk_v2', 'proj-a', 1, 'hub-node', 'agy', 'initial', '{}', 'waiting_approval', 'lt1', ?, ?)`, now+60000, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = rawDB.Exec(`UPDATE tasks SET active_attempt_id = 'att_v2' WHERE task_id = 'tsk_v2'`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = rawDB.Exec(`INSERT INTO approvals (approval_id, project_id, task_id, attempt_id, kind, action_name, target_env, input_sha, payload_json, payload_sha256, options_json, requested_by, state, decision_id, selected_option_id, decided_by, expires_at, created_at) VALUES ('apr_v2', 'proj-a', 'tsk_v2', 'att_v2', 'acp_tool_permission', 'run_command', '', '', '{}', 'sha1', '[]', 'agent', 'approved_pending_delivery', 'dec_v2', 'allow', 'human', ?, ?)`, now+60000, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = rawDB.Close()
+
+		// Open with upgraded store -> v3 migration MUST backfill delivery_attempted=1!
+		s, err := store.Open(ctx, dbPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close()
+
+		ap, err := s.GetApproval(ctx, "apr_v2")
+		if err != nil || !ap.DeliveryAttempted {
+			t.Fatalf("expected legacy v2 approved_pending_delivery backfilled with DeliveryAttempted=true, got %+v err=%v", ap, err)
+		}
+		// New runner instance reconnect -> MUST enter uncertain + needs_verification, NOT expired!
+		_, err = s.ReconcileRunnerHello(ctx, protocol.RunnerHelloFrame{
+			MachineID: "hub-node", RunnerInstanceID: "run_new",
+		}, 45000)
+		if err != nil {
+			t.Fatal(err)
+		}
+		apAfter, _ := s.GetApproval(ctx, "apr_v2")
+		attAfter, _ := s.GetAttemptRecord(ctx, "att_v2")
+		if apAfter.State != protocol.ApprovalUncertain || attAfter.State != protocol.AttemptNeedsVerification {
+			t.Fatalf("legacy v2 approval after runner restart must become uncertain/needs_verification, got ap=%s att=%s", apAfter.State, attAfter.State)
+		}
+	})
+
+	t.Run("NEW1_QueuePayloadCannotOverrideExecutionRouteAndValidatesFinalRoute", func(t *testing.T) {
+		s := openTestStore(t)
+		_, _, _ = setupRealMirror(t, s, "proj-a")
+		cr, err := s.CreateTask(ctx, store.CreateTaskParams{
+			ProjectID: "proj-a", Goal: "route trust", MachineID: "hub-node", Adapter: protocol.AdapterAgy,
+			CreateAttempt: false,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		tid := cr.Task.TaskID
+		pi, _, err := s.EnqueuePendingInput(ctx, tid, protocol.PendingInputFollowup, protocol.PendingSourceHuman, "normal text", map[string]any{
+			"machineId": "evil-node",
+			"adapter":   "ssh_deploy",
+			"worktreePath": "/etc",
+		}, "human")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, leaked := pi.Payload["machineId"]; leaked {
+			t.Fatalf("reserved routing key machineId was not stripped from user payload: %+v", pi.Payload)
+		}
+		// Even direct DB tampering of payload_json must be ignored by ConsumeNextPendingInput!
+		_ = s.WithWriteTx(ctx, func(tx *sql.Tx) error {
+			_, err := tx.Exec(`UPDATE task_pending_inputs SET payload_json = '{"prompt":"tampered","machineId":"evil-node","adapter":"claude","worktreePath":"/etc"}' WHERE input_id = ?`, pi.InputID)
+			return err
+		})
+		validatorCalled := false
+		_, att, _, err := s.ConsumeNextPendingInput(ctx, store.ConsumeNextPendingInputParams{
+			TaskID: tid, MachineID: "hub-node", Adapter: protocol.AdapterAgy, LeaseTTLMs: 45000,
+			ValidateRoute: func(machineID string, adapter protocol.Adapter, anchor *protocol.ProjectAnchorConfig, actorKind protocol.ActorKind) error {
+				validatorCalled = true
+				if machineID != "hub-node" || adapter != protocol.AdapterAgy {
+					t.Fatalf("tampered payload affected final route: machine=%s adapter=%s", machineID, adapter)
+				}
+				return nil
+			},
+		})
+		if err != nil || !validatorCalled || att == nil || att.MachineID != "hub-node" || att.Adapter != protocol.AdapterAgy || att.WorktreePath == "/etc" {
+			t.Fatalf("unexpected consume result: validator=%v att=%+v err=%v", validatorCalled, att, err)
+		}
+	})
+
+	t.Run("NEW2_NormalQueuedFollowupResolvesLatestD2AtConsumeTime", func(t *testing.T) {
+		s := openTestStore(t)
+		mirrorPath, workRepo, baseSHA := setupRealMirror(t, s, "proj-a")
+		head1 := pushMirrorCommit(t, mirrorPath, workRepo, "dlv_new2_d1", "package main\n// d1\nfunc main() {}\n")
+		head2 := pushMirrorCommit(t, mirrorPath, workRepo, "dlv_new2_d2", "package main\n// d2\nfunc main() {}\n")
+
+		cr, _ := s.CreateTask(ctx, store.CreateTaskParams{
+			ProjectID: "proj-a", Goal: "round 1", MachineID: "hub-node", Adapter: protocol.AdapterAgy,
+			BaseSHA: baseSHA, CreateAttempt: true, LeaseTTLMs: 45000,
+		})
+		tid := cr.Task.TaskID
+		att1 := cr.Attempt
+		_ = s.BindAttemptRunnerInstance(ctx, att1.AttemptID, "run_n2")
+		_, err := s.IngestOutboxBatch(ctx, "hub-node", "run_n2", protocol.AttemptOutboxBatchFrame{
+			AttemptID: att1.AttemptID, LeaseToken: att1.LeaseToken,
+			Items: []protocol.OutboxItem{
+				{OutboxSeq: 1, EventID: "n2_d1", FrameType: protocol.OutboxFrameDeliveryPublished, Payload: map[string]any{"deliveryId": "dlv_new2_d1", "baseSha": baseSHA, "headSha": head1, "gitRef": "refs/orbit/deliveries/dlv_new2_d1", "summary": "D1"}},
+				{OutboxSeq: 2, EventID: "n2_s1", FrameType: protocol.OutboxFrameState, Payload: map[string]any{"state": "succeeded"}},
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Start Round 2 (while latestDeliveryId == D1)
+		f2, err := s.SubmitFollowupAtomic(ctx, store.SubmitFollowupParams{
+			TaskID: tid, Body: "round 2", Mode: protocol.FollowupModeQueue,
+			MachineID: "hub-node", Adapter: protocol.AdapterAgy, LeaseTTLMs: 45000,
+		})
+		if err != nil || f2.Attempt == nil {
+			t.Fatalf("expected round 2 attempt: %+v err=%v", f2, err)
+		}
+		att2 := f2.Attempt
+		_ = s.BindAttemptRunnerInstance(ctx, att2.AttemptID, "run_n2")
+
+		// While Round 2 is RUNNING, user queues a normal followup (no pinned delivery)
+		f3, err := s.SubmitFollowupAtomic(ctx, store.SubmitFollowupParams{
+			TaskID: tid, Body: "round 3 queued", Mode: protocol.FollowupModeQueue,
+			MachineID: "hub-node", Adapter: protocol.AdapterAgy, LeaseTTLMs: 45000,
+		})
+		if err != nil || f3.PendingInput == nil {
+			t.Fatalf("expected queued f3: %+v err=%v", f3, err)
+		}
+		// Now Round 2 publishes D2 and succeeds!
+		_, err = s.IngestOutboxBatch(ctx, "hub-node", "run_n2", protocol.AttemptOutboxBatchFrame{
+			AttemptID: att2.AttemptID, LeaseToken: att2.LeaseToken,
+			Items: []protocol.OutboxItem{
+				{OutboxSeq: 1, EventID: "n2_d2", FrameType: protocol.OutboxFrameDeliveryPublished, Payload: map[string]any{"deliveryId": "dlv_new2_d2", "baseSha": head1, "headSha": head2, "gitRef": "refs/orbit/deliveries/dlv_new2_d2", "summary": "D2"}},
+				{OutboxSeq: 2, EventID: "n2_s2", FrameType: protocol.OutboxFrameState, Payload: map[string]any{"state": "succeeded"}},
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		// B9 check: durable pending_queue_drain=1 must be visible BEFORE consume!
+		drains, err := s.ListTasksPendingQueueDrain(ctx)
+		if err != nil || len(drains) != 1 || drains[0].TaskID != tid {
+			t.Fatalf("expected durable pending_queue_drain for %s, got %+v err=%v", tid, drains, err)
+		}
+		// Consume queued f3 -> MUST resolve InputDeliveryID == D2, NOT stale D1!
+		_, att3, _, err := s.ConsumeNextPendingInput(ctx, store.ConsumeNextPendingInputParams{
+			TaskID: tid, MachineID: "hub-node", Adapter: protocol.AdapterAgy, LeaseTTLMs: 45000,
+		})
+		if err != nil || att3 == nil || att3.InputDeliveryID != "dlv_new2_d2" {
+			t.Fatalf("expected round 3 InputDeliveryID=dlv_new2_d2, got %+v err=%v", att3, err)
+		}
+	})
+
+	t.Run("NEW4_CrossAttemptDeliveryReuseRejected", func(t *testing.T) {
+		s := openTestStore(t)
+		mirrorPath, workRepo, baseSHA := setupRealMirror(t, s, "proj-a")
+		head1 := pushMirrorCommit(t, mirrorPath, workRepo, "dlv_new4_d1", "package main\n// n4\nfunc main() {}\n")
+
+		cr, _ := s.CreateTask(ctx, store.CreateTaskParams{
+			ProjectID: "proj-a", Goal: "n4", MachineID: "hub-node", Adapter: protocol.AdapterAgy,
+			BaseSHA: baseSHA, CreateAttempt: true, LeaseTTLMs: 45000,
+		})
+		att1 := cr.Attempt
+		_ = s.BindAttemptRunnerInstance(ctx, att1.AttemptID, "run_n4")
+		_, err := s.IngestOutboxBatch(ctx, "hub-node", "run_n4", protocol.AttemptOutboxBatchFrame{
+			AttemptID: att1.AttemptID, LeaseToken: att1.LeaseToken,
+			Items: []protocol.OutboxItem{
+				{OutboxSeq: 1, EventID: "n4_d1", FrameType: protocol.OutboxFrameDeliveryPublished, Payload: map[string]any{"deliveryId": "dlv_new4_d1", "baseSha": baseSHA, "headSha": head1, "gitRef": "refs/orbit/deliveries/dlv_new4_d1", "summary": "D1"}},
+				{OutboxSeq: 2, EventID: "n4_s1", FrameType: protocol.OutboxFrameState, Payload: map[string]any{"state": "succeeded"}},
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Start Attempt 2 and try to re-publish Attempt 1's deliveryId -> MUST reject with ErrConflict!
+		f2, _ := s.SubmitFollowupAtomic(ctx, store.SubmitFollowupParams{
+			TaskID: cr.Task.TaskID, Body: "turn 2", MachineID: "hub-node", Adapter: protocol.AdapterAgy, LeaseTTLMs: 45000,
+		})
+		att2 := f2.Attempt
+		_ = s.BindAttemptRunnerInstance(ctx, att2.AttemptID, "run_n4")
+		_, err = s.IngestOutboxBatch(ctx, "hub-node", "run_n4", protocol.AttemptOutboxBatchFrame{
+			AttemptID: att2.AttemptID, LeaseToken: att2.LeaseToken,
+			Items: []protocol.OutboxItem{
+				{OutboxSeq: 1, EventID: "n4_hijack", FrameType: protocol.OutboxFrameDeliveryPublished, Payload: map[string]any{"deliveryId": "dlv_new4_d1", "baseSha": baseSHA, "headSha": head1, "gitRef": "refs/orbit/deliveries/dlv_new4_d1", "summary": "hijack"}},
+			},
+		})
+		if !errors.Is(err, store.ErrConflict) {
+			t.Fatalf("expected ErrConflict when Attempt 2 reuses Attempt 1 deliveryId, got %v", err)
+		}
+		att2Now, _ := s.GetAttemptRecord(ctx, att2.AttemptID)
+		if att2Now.OutputDeliveryID != "" {
+			t.Fatalf("Attempt 2 must not bind Attempt 1's deliveryId, got %q", att2Now.OutputDeliveryID)
+		}
+	})
+
+	t.Run("B7_ScanExpiredApprovalsAndReconcileExpiredLiveHandle", func(t *testing.T) {
+		s := openTestStore(t)
+		_, _, _ = setupRealMirror(t, s, "proj-a")
+		cr, _ := s.CreateTask(ctx, store.CreateTaskParams{
+			ProjectID: "proj-a", Goal: "b7 scan", MachineID: "hub-node", Adapter: protocol.AdapterAgy,
+			CreateAttempt: true, LeaseTTLMs: 60000,
+		})
+		att := cr.Attempt
+		_ = s.BindAttemptRunnerInstance(ctx, att.AttemptID, "run_b7")
+		pastExp := time.Now().Add(-5 * time.Second).UnixMilli()
+		_, err := s.IngestOutboxBatch(ctx, "hub-node", "run_b7", protocol.AttemptOutboxBatchFrame{
+			AttemptID: att.AttemptID, LeaseToken: att.LeaseToken,
+			Items: []protocol.OutboxItem{
+				{OutboxSeq: 1, EventID: "b7_req", FrameType: protocol.OutboxFrameApprovalRequest, Payload: map[string]any{
+					"approvalId": "apr_b7_scan", "actionName": "run_command", "payloadSha256": "sha_b7",
+					"expiresAt": pastExp, "options": []map[string]any{{"id": "allow", "label": "Allow", "kind": "allow_once"}},
+				}},
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		notices, evs, err := s.ScanExpiredApprovals(ctx, time.Now().UnixMilli())
+		if err != nil || len(notices) != 1 || notices[0].Decision.ApprovalID != "apr_b7_scan" || !notices[0].Decision.Expired || len(evs) == 0 {
+			t.Fatalf("expected ScanExpiredApprovals to expire apr_b7_scan, got notices=%+v evs=%d err=%v", notices, len(evs), err)
+		}
+		// If runner was offline during scan and reconnects still holding apr_b7_scan live -> ReconcileRunnerHello MUST redeliver Expired=true!
+		rec, err := s.ReconcileRunnerHello(ctx, protocol.RunnerHelloFrame{
+			MachineID: "hub-node", RunnerInstanceID: "run_b7",
+			LiveAttempts:           []protocol.LiveAttemptInfo{{AttemptID: att.AttemptID, LeaseToken: att.LeaseToken, State: protocol.AttemptWaitingApproval}},
+			LivePendingApprovalIDs: []string{"apr_b7_scan"},
+		}, 60000)
+		if err != nil || len(rec.Reconcile.RedeliverApprovals) != 1 || !rec.Reconcile.RedeliverApprovals[0].Expired {
+			t.Fatalf("expected Expired=true redeliver for live expired approval handle, got %+v err=%v", rec.Reconcile, err)
+		}
+	})
+
+	t.Run("B16_VirtualChildTaskPreservesWorkerTaskIDAcrossConsumes", func(t *testing.T) {
+		s := openTestStore(t)
+		_, _, _ = setupRealMirror(t, s, "proj-a")
+		parent, _ := s.CreateTask(ctx, store.CreateTaskParams{
+			ProjectID: "proj-a", Title: "Parent", Goal: "coord", MachineID: "hub-node", Adapter: protocol.AdapterAgy,
+		})
+		child, _ := s.CreateTask(ctx, store.CreateTaskParams{
+			ProjectID: "proj-a", ParentTaskID: parent.Task.TaskID, Title: "worker-alpha", Goal: "sub", MachineID: "hub-node", Adapter: protocol.AdapterAgy,
+		})
+		msg1, _, err := s.PostBoardMessage(ctx, parent.Task.TaskID, "human", "@worker-alpha", "first ping", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.MarkBoardMessageConsumed(ctx, parent.Task.TaskID, msg1.MessageID, msg1.Seq, "worker-alpha"); err != nil {
+			t.Fatal(err)
+		}
+		// Subsequent lookup by display name MUST still carry WorkerTaskID == child.Task.TaskID!
+		resolved, err := s.ResolveBoardTarget(ctx, parent.Task.TaskID, "@worker-alpha")
+		if err != nil || resolved == nil || resolved.WorkerTaskID != child.Task.TaskID {
+			t.Fatalf("expected persisted WorkerTaskID=%s after first consume, got %+v err=%v", child.Task.TaskID, resolved, err)
+		}
+	})
+
+	t.Run("NEW3_AtomicPAIdempotencyReplayAndParamConflict", func(t *testing.T) {
+		s := openTestStore(t)
+		_, _, _ = setupRealMirror(t, s, "proj-a")
+		cr, _ := s.CreateTask(ctx, store.CreateTaskParams{
+			ProjectID: "proj-a", Goal: "cancel me", MachineID: "hub-node", Adapter: protocol.AdapterAgy,
+			CreateAttempt: true, LeaseTTLMs: 45000,
+		})
+		spec := &store.PAActionIdempotencySpec{Key: "pa_k_cancel_1", Action: "cancel_task", ParamHash: "hash_a"}
+		c1, err := s.CancelTaskActiveAttemptWithIdempotency(ctx, cr.Task.TaskID, "pa:default", "stop", false, spec)
+		if err != nil || c1.ReplayedReceipt != nil || !c1.CancelledNow {
+			t.Fatalf("first atomic cancel failed: %+v err=%v", c1, err)
+		}
+		// Start a NEW attempt on the same task, then replay the SAME cancel key -> MUST replay old receipt and NOT cancel Attempt 2!
+		_, att2, _, err := s.CreateNextAttempt(ctx, store.CreateNextAttemptParams{
+			TaskID: cr.Task.TaskID, MachineID: "hub-node", Adapter: protocol.AdapterAgy, TriggerKind: protocol.TriggerFollowup, Prompt: "turn 2", LeaseTTLMs: 45000,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		c2, err := s.CancelTaskActiveAttemptWithIdempotency(ctx, cr.Task.TaskID, "pa:default", "stop", false, spec)
+		if err != nil || c2.ReplayedReceipt == nil {
+			t.Fatalf("expected atomic replay of first cancel receipt, got %+v err=%v", c2, err)
+		}
+		att2Now, _ := s.GetAttemptRecord(ctx, att2.AttemptID)
+		if att2Now.State != protocol.AttemptLeased || att2Now.CancelRequested {
+			t.Fatalf("replayed cancel_task MUST NOT touch Attempt 2! got state=%s cancelReq=%v", att2Now.State, att2Now.CancelRequested)
+		}
+		// Same key with DIFFERENT param hash -> ErrConflict!
+		_, err = s.CancelTaskActiveAttemptWithIdempotency(ctx, cr.Task.TaskID, "pa:default", "other", false, &store.PAActionIdempotencySpec{
+			Key: "pa_k_cancel_1", Action: "cancel_task", ParamHash: "hash_different",
+		})
+		if !errors.Is(err, store.ErrConflict) {
+			t.Fatalf("expected ErrConflict on idempotency param mismatch, got %v", err)
+		}
+	})
+}

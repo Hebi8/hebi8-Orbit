@@ -46,16 +46,12 @@ export function RightCard({
   const [uri, setUri] = useState('');
   const taskId = tl.task.taskId;
 
-  const codeDeliveries = tl.deliveries.filter((d) => CODE_KINDS.has(d.kind) && d.manifest.filesChanged > 0);
-  const formalCodeDeliveries = codeDeliveries.filter((d) => !d.lateArrival);
+  const formalDeliveries = tl.deliveries.filter((d) => !d.lateArrival);
+  const formalCodeDeliveries = formalDeliveries.filter((d) => CODE_KINDS.has(d.kind) && d.manifest.filesChanged > 0);
   const latestCode =
     formalCodeDeliveries.find((d) => d.deliveryId === tl.task.latestDeliveryId) ??
-    formalCodeDeliveries[formalCodeDeliveries.length - 1] ??
-    codeDeliveries[codeDeliveries.length - 1];
-  const formalDeliveries = tl.deliveries.filter((d) => !d.lateArrival);
-  const artDelivery =
-    [...formalDeliveries].reverse().find((d) => (d.ryugiBindings?.length ?? 0) > 0) ??
-    [...tl.deliveries].reverse().find((d) => (d.ryugiBindings?.length ?? 0) > 0);
+    formalCodeDeliveries[formalCodeDeliveries.length - 1];
+  const artDelivery = [...formalDeliveries].reverse().find((d) => (d.ryugiBindings?.length ?? 0) > 0);
   const members = board?.members ?? tl.boardMembers;
   const showWorkers = members.length > 0 || tl.task.workerCount > 0;
 
@@ -88,8 +84,8 @@ export function RightCard({
           <div className="fsec-h">
             Changes
             <span className="r mono">
-              v{codeDeliveries.length}
-              {codeDeliveries.length > 1 ? ` · 共 ${codeDeliveries.length} 版` : ''}
+              v{formalCodeDeliveries.length}
+              {formalCodeDeliveries.length > 1 ? ` · 共 ${formalCodeDeliveries.length} 版` : ''}
             </span>
           </div>
           <div className="frow" role="button" tabIndex={0} onClick={() => openWindow('cr', taskId, latestCode.deliveryId)} onKeyDown={(e) => e.key === 'Enter' && openWindow('cr', taskId, latestCode.deliveryId)} title="打开 Code Review 浮窗">

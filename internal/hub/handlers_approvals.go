@@ -1,7 +1,6 @@
 package hub
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -87,8 +86,10 @@ func (s *Server) handleDecideApproval(w http.ResponseWriter, r *http.Request) {
 
 	sentToRunner := false
 	if res.Approval.Kind == protocol.ApprovalACPToolPermission && res.MachineID != "" {
-		// B6: Mark delivery_attempted=1 ONLY when Hub actually begins writing the decision frame
-		// over a live Runner WebSocket connection, and clear it if an immediate write error occurs.
+		// B6: Mark delivery_attempted=1 ONLY right before writing over the live Runner WS socket.
+		// If onStart fails, writePump skips conn.Write so delivery_attempted stays 0.
+		// Once conn.Write is entered, NEVER clear delivery_attempted on write error because bytes may have
+		// partially reached the Runner/OS buffer — uncertainty MUST be preserved.
 		sendErr := s.runners.SendApprovalDecisionWithHooks(
 			res.MachineID,
 			protocol.ApprovalDecisionFrame{
@@ -103,11 +104,7 @@ func (s *Server) handleDecideApproval(w http.ResponseWriter, r *http.Request) {
 			func() error {
 				return s.store.MarkApprovalsDeliveryAttempted(r.Context(), []string{res.Approval.ApprovalID})
 			},
-			func(writeErr error) {
-				if !errors.Is(writeErr, context.DeadlineExceeded) {
-					_ = s.store.ClearApprovalsDeliveryAttempted(context.Background(), []string{res.Approval.ApprovalID})
-				}
-			},
+			nil,
 		)
 		if sendErr == nil {
 			sentToRunner = true

@@ -52,6 +52,8 @@ export function collectInvalidations(events: EventRecord[]): unknown[][] {
       add('attempt-raw', aid);
       add('project-tasks', pid);
       add('bootstrap');
+      for (const did of strListField(p, 'deliveryIds')) add('delivery', did);
+      for (const did of strListField(p, 'revertedDeliveryIds')) add('delivery', did);
       continue;
     }
     if (kind.startsWith('resource.')) {

@@ -42,6 +42,62 @@ func scanPendingInput(scanner interface{ Scan(...any) error }) (protocol.Pending
 	return pi, nil
 }
 
+func scanPendingInputWithRoute(scanner interface{ Scan(...any) error }) (protocol.PendingInput, sql.NullString, error) {
+	var pi protocol.PendingInput
+	var kind, source, payloadJSON, state string
+	var routeJSON, dispAtt sql.NullString
+	if err := scanner.Scan(
+		&pi.InputID, &pi.TaskID, &pi.ProjectID, &kind, &source,
+		&pi.Body, &payloadJSON, &routeJSON, &pi.Position, &state,
+		&pi.CreatedAt, &pi.UpdatedAt, &dispAtt,
+	); err != nil {
+		return pi, routeJSON, err
+	}
+	pi.Kind = protocol.PendingInputKind(kind)
+	pi.Source = protocol.PendingInputSource(source)
+	pi.State = protocol.PendingInputState(state)
+	if dispAtt.Valid {
+		pi.DispatchedAttemptID = dispAtt.String
+	}
+	pi.Payload = map[string]any{}
+	if payloadJSON != "" {
+		_ = json.Unmarshal([]byte(payloadJSON), &pi.Payload)
+	}
+	if strings.TrimSpace(pi.Body) == "" {
+		if prompt, ok := pi.Payload["prompt"].(string); ok && strings.TrimSpace(prompt) != "" {
+			pi.Body = strings.TrimSpace(prompt)
+		}
+	}
+	return pi, routeJSON, nil
+}
+
+// ListTasksPendingQueueDrain returns idle tasks with durable pending_queue_drain=1 so Hub startup
+// and maintenance loops recover queued/steered consumption across crashes (B9).
+func (s *Store) ListTasksPendingQueueDrain(ctx context.Context) ([]SteerConsumeNotice, error) {
+	var out []SteerConsumeNotice
+	err := s.WithReadTx(ctx, func(tx *sql.Tx) error {
+		rows, err := tx.QueryContext(ctx, `
+			SELECT task_id, COALESCE(pending_steer_input_id, '')
+			FROM tasks
+			WHERE pending_queue_drain = 1 AND active_attempt_id IS NULL AND archived_at IS NULL
+			ORDER BY updated_at ASC
+		`)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var n SteerConsumeNotice
+			if err := rows.Scan(&n.TaskID, &n.SteerInputID); err != nil {
+				return err
+			}
+			out = append(out, n)
+		}
+		return rows.Err()
+	})
+	return out, err
+}
+
 func lookupAnnotationDeliveryIDsTx(ctx context.Context, tx *sql.Tx, taskID string, annotationIDs []string) ([]string, error) {
 	if len(annotationIDs) == 0 {
 		return nil, nil
@@ -107,7 +163,73 @@ func (s *Store) ListPendingInputs(ctx context.Context, taskID string) ([]protoco
 	return out, err
 }
 
+// PendingInputRoute stores server-resolved, server-validated execution routing metadata
+// in task_pending_inputs.route_json, strictly isolated from user-editable payload_json (NEW-1).
+type PendingInputRoute struct {
+	MachineID         string                      `json:"machineId,omitempty"`
+	Adapter           protocol.Adapter            `json:"adapter,omitempty"`
+	DesiredConfig     map[string]string           `json:"desiredConfig,omitempty"`
+	RequiredResources []string                    `json:"requiredResources,omitempty"`
+	WorktreePath      string                      `json:"worktreePath,omitempty"`
+	BaseSHA           string                      `json:"baseSha,omitempty"`
+	InputDeliveryID   string                      `json:"inputDeliveryId,omitempty"`
+	AnchorCapability  string                      `json:"anchorCapability,omitempty"`
+	Anchor            *protocol.ProjectAnchorConfig `json:"anchor,omitempty"`
+	ForceNewSession   bool                        `json:"forceNewSession,omitempty"`
+	ActorKind         protocol.ActorKind          `json:"actorKind,omitempty"`
+	ActorID           string                      `json:"actorId,omitempty"`
+}
+
+var reservedQueuePayloadKeys = map[string]bool{
+	"machineId":         true,
+	"adapter":           true,
+	"desiredConfig":     true,
+	"requiredResources": true,
+	"worktreePath":      true,
+	"baseSha":           true,
+	"inputDeliveryId":   true,
+	"anchorCapability":  true,
+	"anchor":            true,
+	"forceNewSession":   true,
+	"actorKind":         true,
+	"actorId":           true,
+}
+
+func sanitizeUserPendingPayload(in map[string]any) map[string]any {
+	out := map[string]any{}
+	for k, v := range in {
+		if reservedQueuePayloadKeys[k] {
+			continue
+		}
+		out[k] = v
+	}
+	return out
+}
+
+func marshalPendingInputRoute(r *PendingInputRoute) (any, error) {
+	if r == nil {
+		return nil, nil
+	}
+	b, err := json.Marshal(r)
+	if err != nil {
+		return nil, err
+	}
+	return string(b), nil
+}
+
+func parsePendingInputRoute(raw sql.NullString) *PendingInputRoute {
+	if !raw.Valid || strings.TrimSpace(raw.String) == "" {
+		return nil
+	}
+	var r PendingInputRoute
+	if err := json.Unmarshal([]byte(raw.String), &r); err != nil {
+		return nil
+	}
+	return &r
+}
+
 // EnqueuePendingInput appends a follow-up or annotation batch to task_pending_inputs.
+// Public callers cannot inject server-only routing overrides via payload (NEW-1).
 func (s *Store) EnqueuePendingInput(
 	ctx context.Context,
 	taskID string,
@@ -132,9 +254,7 @@ func (s *Store) EnqueuePendingInput(
 	if !source.IsValid() {
 		return out, nil, fmt.Errorf("%w: invalid pending input source %q", ErrInvalidInput, source)
 	}
-	if payload == nil {
-		payload = map[string]any{}
-	}
+	payload = sanitizeUserPendingPayload(payload)
 	if actorID == "" {
 		actorID = "human"
 	}
@@ -241,7 +361,8 @@ func (s *Store) UpdatePendingInput(ctx context.Context, taskID, inputID, body st
 		if merged == nil {
 			merged = map[string]any{}
 		}
-		for k, v := range payload {
+		// NEW-1: Reject/strip server-only routing keys from user-editable payload updates.
+		for k, v := range sanitizeUserPendingPayload(payload) {
 			merged[k] = v
 		}
 		if body != "" {
@@ -496,21 +617,24 @@ type SubmitFollowupParams struct {
 	ActorKind         protocol.ActorKind
 	ActorID           string
 	PayloadExtra      map[string]any
+	PAIdempotency     *PAActionIdempotencySpec
 }
 
 // SubmitFollowupResult reports whether the follow-up started an Attempt directly, queued while busy,
 // or persisted a steer cancellation against an active attempt.
 type SubmitFollowupResult struct {
-	Task           protocol.TaskSummary
-	Attempt        *AttemptRecord
-	PendingInput   *protocol.PendingInput
-	ActiveToCancel *AttemptRecord
-	Events         []protocol.EventRecord
+	Task            protocol.TaskSummary
+	Attempt         *AttemptRecord
+	PendingInput    *protocol.PendingInput
+	ActiveToCancel  *AttemptRecord
+	ReplayedReceipt *protocol.PAActionResult
+	Events          []protocol.EventRecord
 }
 
 // SubmitFollowupAtomic eliminates the check-vs-enqueue race (B9) by checking active_attempt_id,
-// enforcing needs_verification (B11), freezing effective route/config/resources/anchor (S2),
-// and either creating a new Attempt, enqueuing, or persisting steer cancellation in ONE BEGIN IMMEDIATE tx.
+// enforcing needs_verification (B11), freezing server-validated route_json (NEW-1/S2),
+// deferring unpinned inputDeliveryId until consume time when busy (NEW-2),
+// and optionally committing PA idempotency receipts inside ONE BEGIN IMMEDIATE tx (NEW-3).
 func (s *Store) SubmitFollowupAtomic(ctx context.Context, p SubmitFollowupParams) (SubmitFollowupResult, error) {
 	var res SubmitFollowupResult
 	now := time.Now().UnixMilli()
@@ -534,6 +658,14 @@ func (s *Store) SubmitFollowupAtomic(ctx context.Context, p SubmitFollowupParams
 	}
 
 	err := s.WithWriteTx(ctx, func(tx *sql.Tx) error {
+		// NEW-3: Atomic PA idempotency check inside the SAME write transaction.
+		if prevReceipt, found, err := lookupPAActionReceiptTx(ctx, tx, p.PAIdempotency); err != nil {
+			return err
+		} else if found {
+			res.ReplayedReceipt = prevReceipt
+			return nil
+		}
+
 		var projectID, prefAdapter, desiredCfgJSON, reqResJSON string
 		var activeAtt, latestDlv sql.NullString
 		err := tx.QueryRowContext(ctx, `
@@ -565,41 +697,32 @@ func (s *Store) SubmitFollowupAtomic(ctx context.Context, p SubmitFollowupParams
 				_ = json.Unmarshal([]byte(reqResJSON), &reqResources)
 			}
 		}
-		inputDlv := p.InputDeliveryID
-		if inputDlv == "" && latestDlv.Valid {
-			inputDlv = latestDlv.String
-		}
 
-		frozenPayload := cloneMap(p.PayloadExtra)
-		frozenPayload["prompt"] = p.Body
-		frozenPayload["mode"] = p.Mode
-		if p.MachineID != "" {
-			frozenPayload["machineId"] = p.MachineID
+		// User-visible payload holds prompt/mode/board metadata only; server-validated routing lives in route_json (NEW-1).
+		userPayload := sanitizeUserPendingPayload(p.PayloadExtra)
+		userPayload["prompt"] = p.Body
+		userPayload["mode"] = p.Mode
+
+		// NEW-2: When queuing behind an active attempt without an explicitly pinned InputDeliveryID,
+		// leave route.InputDeliveryID empty so ConsumeNextPendingInput resolves the latest formal delivery
+		// AFTER the active attempt completes (avoiding stale D1 freeze when D2 is published!).
+		queuedRoute := &PendingInputRoute{
+			MachineID:         p.MachineID,
+			Adapter:           adapter,
+			DesiredConfig:     mergedCfg,
+			RequiredResources: reqResources,
+			WorktreePath:      p.WorktreePath,
+			BaseSHA:           p.BaseSHA,
+			InputDeliveryID:   p.InputDeliveryID, // Only set if caller explicitly pinned a delivery
+			AnchorCapability:  p.AnchorCapability,
+			Anchor:            p.Anchor,
+			ForceNewSession:   p.Mode == protocol.FollowupModeForkNewSession,
+			ActorKind:         p.ActorKind,
+			ActorID:           p.ActorID,
 		}
-		if adapter != "" {
-			frozenPayload["adapter"] = string(adapter)
-		}
-		if len(mergedCfg) > 0 {
-			frozenPayload["desiredConfig"] = mergedCfg
-		}
-		frozenPayload["requiredResources"] = reqResources
-		if p.WorktreePath != "" {
-			frozenPayload["worktreePath"] = p.WorktreePath
-		}
-		if p.BaseSHA != "" {
-			frozenPayload["baseSha"] = p.BaseSHA
-		}
-		if inputDlv != "" {
-			frozenPayload["inputDeliveryId"] = inputDlv
-		}
-		if p.AnchorCapability != "" {
-			frozenPayload["anchorCapability"] = p.AnchorCapability
-		}
-		if p.Anchor != nil {
-			frozenPayload["anchor"] = p.Anchor
-		}
-		if p.Mode == protocol.FollowupModeForkNewSession {
-			frozenPayload["forceNewSession"] = true
+		routeVal, err := marshalPendingInputRoute(queuedRoute)
+		if err != nil {
+			return err
 		}
 
 		if activeAtt.Valid && activeAtt.String != "" {
@@ -625,16 +748,16 @@ func (s *Store) SubmitFollowupAtomic(ctx context.Context, p SubmitFollowupParams
 					`, now, p.TaskID); err != nil {
 						return err
 					}
-					payloadBytes, err := json.Marshal(frozenPayload)
+					payloadBytes, err := json.Marshal(userPayload)
 					if err != nil {
 						return err
 					}
 					inputID := newID("inp")
 					if _, err := tx.ExecContext(ctx, `
 						INSERT INTO task_pending_inputs (
-							input_id, task_id, project_id, kind, source, body, payload_json, position, state, created_at, updated_at
-						) VALUES (?, ?, ?, 'followup', ?, ?, ?, 1, 'queued', ?, ?)
-					`, inputID, p.TaskID, projectID, string(p.Source), p.Body, string(payloadBytes), now, now); err != nil {
+							input_id, task_id, project_id, kind, source, body, payload_json, route_json, position, state, created_at, updated_at
+						) VALUES (?, ?, ?, 'followup', ?, ?, ?, ?, 1, 'queued', ?, ?)
+					`, inputID, p.TaskID, projectID, string(p.Source), p.Body, string(payloadBytes), routeVal, now, now); err != nil {
 						return err
 					}
 					// B9: Persist explicit steer cancellation intent on the active attempt.
@@ -676,7 +799,7 @@ func (s *Store) SubmitFollowupAtomic(ctx context.Context, p SubmitFollowupParams
 						Kind:      protocol.PendingInputFollowup,
 						Source:    p.Source,
 						Body:      p.Body,
-						Payload:   frozenPayload,
+						Payload:   userPayload,
 						Position:  1,
 						State:     protocol.PendingInputQueued,
 						CreatedAt: now,
@@ -684,7 +807,26 @@ func (s *Store) SubmitFollowupAtomic(ctx context.Context, p SubmitFollowupParams
 					}
 					res.ActiveToCancel = &actRec
 					res.Task, err = loadTaskSummaryTx(ctx, tx, p.TaskID)
-					return err
+					if err != nil {
+						return err
+					}
+					if p.PAIdempotency != nil && strings.TrimSpace(p.PAIdempotency.Key) != "" {
+						receipt := protocol.PAActionResult{
+							Action:  p.PAIdempotency.Action,
+							Status:  "ok",
+							Summary: fmt.Sprintf("已向任务 %s 发送追问（mode=%s）", p.TaskID, p.Mode),
+							Data: map[string]any{
+								"taskId":    p.TaskID,
+								"mode":      p.Mode,
+								"inputId":   inputID,
+								"attemptId": actRec.AttemptID,
+							},
+						}
+						if err := savePAActionReceiptTx(ctx, tx, p.PAIdempotency, receipt, now); err != nil {
+							return err
+						}
+					}
+					return nil
 				}
 			} else {
 				// Queue or fork_new_session while busy -> enqueue into task_pending_inputs
@@ -694,16 +836,16 @@ func (s *Store) SubmitFollowupAtomic(ctx context.Context, p SubmitFollowupParams
 				`, p.TaskID).Scan(&nextPos); err != nil {
 					return err
 				}
-				payloadBytes, err := json.Marshal(frozenPayload)
+				payloadBytes, err := json.Marshal(userPayload)
 				if err != nil {
 					return err
 				}
 				inputID := newID("inp")
 				if _, err := tx.ExecContext(ctx, `
 					INSERT INTO task_pending_inputs (
-						input_id, task_id, project_id, kind, source, body, payload_json, position, state, created_at, updated_at
-					) VALUES (?, ?, ?, 'followup', ?, ?, ?, ?, 'queued', ?, ?)
-				`, inputID, p.TaskID, projectID, string(p.Source), p.Body, string(payloadBytes), nextPos, now, now); err != nil {
+						input_id, task_id, project_id, kind, source, body, payload_json, route_json, position, state, created_at, updated_at
+					) VALUES (?, ?, ?, 'followup', ?, ?, ?, ?, ?, 'queued', ?, ?)
+				`, inputID, p.TaskID, projectID, string(p.Source), p.Body, string(payloadBytes), routeVal, nextPos, now, now); err != nil {
 					return err
 				}
 				ev, err := insertEventTx(ctx, tx, eventInsert{
@@ -733,18 +875,41 @@ func (s *Store) SubmitFollowupAtomic(ctx context.Context, p SubmitFollowupParams
 					Kind:      protocol.PendingInputFollowup,
 					Source:    p.Source,
 					Body:      p.Body,
-					Payload:   frozenPayload,
+					Payload:   userPayload,
 					Position:  nextPos,
 					State:     protocol.PendingInputQueued,
 					CreatedAt: now,
 					UpdatedAt: now,
 				}
 				res.Task, err = loadTaskSummaryTx(ctx, tx, p.TaskID)
-				return err
+				if err != nil {
+					return err
+				}
+				if p.PAIdempotency != nil && strings.TrimSpace(p.PAIdempotency.Key) != "" {
+					receipt := protocol.PAActionResult{
+						Action:  p.PAIdempotency.Action,
+						Status:  "ok",
+						Summary: fmt.Sprintf("已向任务 %s 发送追问（mode=%s）", p.TaskID, p.Mode),
+						Data: map[string]any{
+							"taskId":  p.TaskID,
+							"mode":    p.Mode,
+							"inputId": inputID,
+						},
+					}
+					if err := savePAActionReceiptTx(ctx, tx, p.PAIdempotency, receipt, now); err != nil {
+						return err
+					}
+				}
+				return nil
 			}
 		}
 
-		// Task is idle -> enforce B11 needs_verification gate before creating a new Attempt
+		// Task is idle -> resolve latest delivery NOW and enforce B11 needs_verification gate before creating Attempt
+		inputDlv := p.InputDeliveryID
+		if inputDlv == "" && latestDlv.Valid {
+			inputDlv = latestDlv.String
+		}
+
 		lastAtt, err := checkNeedsVerificationTx(ctx, tx, p.TaskID, p.VerifiedSite, p.VerifiedAttemptID)
 		if err != nil {
 			return err
@@ -758,7 +923,7 @@ func (s *Store) SubmitFollowupAtomic(ctx context.Context, p SubmitFollowupParams
 				if err := releaseQueuedAnnotationsTx(ctx, tx, lastAtt.AttemptID); err != nil {
 					return err
 				}
-				frozenPayload["verifiedAttemptId"] = lastAtt.AttemptID
+				userPayload["verifiedAttemptId"] = lastAtt.AttemptID
 			}
 		}
 
@@ -768,7 +933,7 @@ func (s *Store) SubmitFollowupAtomic(ctx context.Context, p SubmitFollowupParams
 			MachineID:         p.MachineID,
 			Adapter:           adapter,
 			TriggerKind:       protocol.TriggerFollowup,
-			TriggerPayload:    frozenPayload,
+			TriggerPayload:    userPayload,
 			Prompt:            p.Body,
 			WorktreePath:      p.WorktreePath,
 			BaseSHA:           p.BaseSHA,
@@ -803,7 +968,25 @@ func (s *Store) SubmitFollowupAtomic(ctx context.Context, p SubmitFollowupParams
 		}
 
 		res.Task, err = loadTaskSummaryTx(ctx, tx, p.TaskID)
-		return err
+		if err != nil {
+			return err
+		}
+		if p.PAIdempotency != nil && strings.TrimSpace(p.PAIdempotency.Key) != "" {
+			receipt := protocol.PAActionResult{
+				Action:  p.PAIdempotency.Action,
+				Status:  "ok",
+				Summary: fmt.Sprintf("已向任务 %s 发送追问（mode=%s）", p.TaskID, p.Mode),
+				Data: map[string]any{
+					"taskId":    p.TaskID,
+					"mode":      p.Mode,
+					"attemptId": att.AttemptID,
+				},
+			}
+			if err := savePAActionReceiptTx(ctx, tx, p.PAIdempotency, receipt, now); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 	return res, err
 }
@@ -883,6 +1066,12 @@ func (s *Store) SteerPendingInput(ctx context.Context, taskID, inputID, actorID 
 			}
 			if actRec.State == protocol.AttemptLeased && actRec.RunnerInstanceID == "" {
 				if err := cancelAttemptTx(ctx, tx, actRec, actorID, "steered before dispatch", now, &events); err != nil {
+					return err
+				}
+				if _, err := tx.ExecContext(ctx, `
+					UPDATE tasks SET pending_queue_drain = 1, pending_steer_input_id = ?
+					WHERE task_id = ?
+				`, inputID, taskID); err != nil {
 					return err
 				}
 			} else {
@@ -1088,38 +1277,28 @@ func (s *Store) DispatchAnnotations(ctx context.Context, p DispatchAnnotationsPa
 		}
 
 		payload := map[string]any{
-			"annotationIds":     uniqueIDs,
-			"deliveryIds":       deliveryIDs,
-			"prompt":            prompt,
-			"message":           p.Message,
-			"requiredResources": reqResources,
+			"annotationIds": uniqueIDs,
+			"deliveryIds":   deliveryIDs,
+			"prompt":        prompt,
+			"message":       p.Message,
 		}
-		if p.MachineID != "" {
-			payload["machineId"] = p.MachineID
+		annRoute := &PendingInputRoute{
+			MachineID:         p.MachineID,
+			Adapter:           adapter,
+			DesiredConfig:     desiredCfg,
+			RequiredResources: reqResources,
+			WorktreePath:      p.WorktreePath,
+			BaseSHA:           p.BaseSHA,
+			InputDeliveryID:   inputDlv,
+			AnchorCapability:  p.AnchorCapability,
+			Anchor:            p.Anchor,
+			ForceNewSession:   p.ForceNewSession,
+			ActorKind:         protocol.ActorHuman,
+			ActorID:           p.ActorID,
 		}
-		if adapter != "" {
-			payload["adapter"] = string(adapter)
-		}
-		if len(desiredCfg) > 0 {
-			payload["desiredConfig"] = desiredCfg
-		}
-		if p.WorktreePath != "" {
-			payload["worktreePath"] = p.WorktreePath
-		}
-		if p.BaseSHA != "" {
-			payload["baseSha"] = p.BaseSHA
-		}
-		if inputDlv != "" {
-			payload["inputDeliveryId"] = inputDlv
-		}
-		if p.AnchorCapability != "" {
-			payload["anchorCapability"] = p.AnchorCapability
-		}
-		if p.Anchor != nil {
-			payload["anchor"] = p.Anchor
-		}
-		if p.ForceNewSession {
-			payload["forceNewSession"] = true
+		annRouteVal, err := marshalPendingInputRoute(annRoute)
+		if err != nil {
+			return err
 		}
 
 		if activeAtt.Valid && activeAtt.String != "" {
@@ -1141,9 +1320,9 @@ func (s *Store) DispatchAnnotations(ctx context.Context, p DispatchAnnotationsPa
 			}
 			_, err = tx.ExecContext(ctx, `
 				INSERT INTO task_pending_inputs (
-					input_id, task_id, project_id, kind, source, body, payload_json, position, state, created_at, updated_at
-				) VALUES (?, ?, ?, 'annotation_batch', ?, ?, ?, ?, 'queued', ?, ?)
-			`, inputID, p.TaskID, projectID, string(source), bodySummary, string(payloadBytes), nextPos, now, now)
+					input_id, task_id, project_id, kind, source, body, payload_json, route_json, position, state, created_at, updated_at
+				) VALUES (?, ?, ?, 'annotation_batch', ?, ?, ?, ?, ?, 'queued', ?, ?)
+			`, inputID, p.TaskID, projectID, string(source), bodySummary, string(payloadBytes), annRouteVal, nextPos, now, now)
 			if err != nil {
 				return err
 			}
@@ -1274,6 +1453,9 @@ type ConsumeNextPendingInputParams struct {
 	Anchor            *protocol.ProjectAnchorConfig
 	AnchorCapability  string
 	LeaseTTLMs        int64
+	// ValidateRoute runs inside the BEGIN IMMEDIATE transaction against the FINAL resolved route
+	// (including any server-stored route_json overrides) before creating the Attempt (NEW-1).
+	ValidateRoute func(machineID string, adapter protocol.Adapter, anchor *protocol.ProjectAnchorConfig, actorKind protocol.ActorKind) error
 }
 
 // ConsumeNextPendingInput atomically pops the head (or preferred steered) queued item from task_pending_inputs,
@@ -1306,22 +1488,25 @@ func (s *Store) ConsumeNextPendingInput(ctx context.Context, p ConsumeNextPendin
 		// B11: NEVER auto-consume pending queue when previous attempt requires human site verification!
 		if _, err := checkNeedsVerificationTx(ctx, tx, p.TaskID, false, ""); err != nil {
 			if errors.Is(err, ErrVerificationRequired) {
+				_, _ = tx.ExecContext(ctx, `UPDATE tasks SET pending_queue_drain = 0, pending_steer_input_id = NULL WHERE task_id = ?`, p.TaskID)
 				return nil
 			}
 			return err
 		}
 
 		var pi protocol.PendingInput
+		var routeRaw sql.NullString
 		found := false
 		if strings.TrimSpace(p.PreferredInputID) != "" {
 			row := tx.QueryRowContext(ctx, `
-				SELECT input_id, task_id, project_id, kind, source, body, payload_json, position, state, created_at, updated_at, dispatched_attempt_id
+				SELECT input_id, task_id, project_id, kind, source, body, payload_json, route_json, position, state, created_at, updated_at, dispatched_attempt_id
 				FROM task_pending_inputs
 				WHERE task_id = ? AND input_id = ? AND state = 'queued'
 			`, p.TaskID, p.PreferredInputID)
-			cand, err := scanPendingInput(row)
+			cand, rr, err := scanPendingInputWithRoute(row)
 			if err == nil {
 				pi = cand
+				routeRaw = rr
 				found = true
 			} else if !errors.Is(err, sql.ErrNoRows) {
 				return err
@@ -1329,20 +1514,23 @@ func (s *Store) ConsumeNextPendingInput(ctx context.Context, p ConsumeNextPendin
 		}
 		if !found {
 			row := tx.QueryRowContext(ctx, `
-				SELECT input_id, task_id, project_id, kind, source, body, payload_json, position, state, created_at, updated_at, dispatched_attempt_id
+				SELECT input_id, task_id, project_id, kind, source, body, payload_json, route_json, position, state, created_at, updated_at, dispatched_attempt_id
 				FROM task_pending_inputs
 				WHERE task_id = ? AND state = 'queued'
 				ORDER BY position ASC, created_at ASC
 				LIMIT 1
 			`, p.TaskID)
-			cand, err := scanPendingInput(row)
+			cand, rr, err := scanPendingInputWithRoute(row)
 			if errors.Is(err, sql.ErrNoRows) {
+				// Queue is empty -> clear durable drain marker (B9)
+				_, _ = tx.ExecContext(ctx, `UPDATE tasks SET pending_queue_drain = 0, pending_steer_input_id = NULL WHERE task_id = ?`, p.TaskID)
 				return nil
 			}
 			if err != nil {
 				return err
 			}
 			pi = cand
+			routeRaw = rr
 		}
 
 		triggerKind := protocol.TriggerFollowup
@@ -1354,18 +1542,10 @@ func (s *Store) ConsumeNextPendingInput(ctx context.Context, p ConsumeNextPendin
 			prompt = rawPrompt
 		}
 
-		// S2: Honor frozen creation-time overrides stored inside pi.Payload.
-		machineID := stringField(pi.Payload, "machineId")
-		if machineID == "" {
-			machineID = p.MachineID
-		}
-		adapter := protocol.Adapter(stringField(pi.Payload, "adapter"))
-		if adapter == "" {
-			adapter = p.Adapter
-		}
-		if adapter == "" {
-			adapter = protocol.Adapter(prefAdapter)
-		}
+		// NEW-1: Read routing overrides STRICTLY from server-written route_json, NEVER from user-editable payload_json!
+		rt := parsePendingInputRoute(routeRaw)
+		machineID := p.MachineID
+		adapter := p.Adapter
 		desiredCfg := map[string]string{}
 		if desiredCfgJSON != "" {
 			_ = json.Unmarshal([]byte(desiredCfgJSON), &desiredCfg)
@@ -1373,52 +1553,75 @@ func (s *Store) ConsumeNextPendingInput(ctx context.Context, p ConsumeNextPendin
 		for k, v := range p.DesiredConfig {
 			desiredCfg[k] = v
 		}
-		if rawCfg, ok := pi.Payload["desiredConfig"].(map[string]any); ok {
-			for k, v := range rawCfg {
-				if sv, ok := v.(string); ok {
-					desiredCfg[k] = sv
-				}
-			}
-		}
-		reqResources := extractStringSlice(pi.Payload, "requiredResources")
-		if reqResources == nil {
-			reqResources = p.RequiredResources
-		}
+		reqResources := p.RequiredResources
 		if reqResources == nil {
 			reqResources = []string{}
 			if reqResJSON != "" {
 				_ = json.Unmarshal([]byte(reqResJSON), &reqResources)
 			}
 		}
-		worktreePath := stringField(pi.Payload, "worktreePath")
-		if worktreePath == "" {
-			worktreePath = p.WorktreePath
+		worktreePath := p.WorktreePath
+		baseSHA := p.BaseSHA
+		inputDlv := p.InputDeliveryID
+		anchorCap := p.AnchorCapability
+		anchor := p.Anchor
+		forceNewSession := false
+		actorKind := protocol.ActorHuman
+		if pi.Source == protocol.PendingSourcePA {
+			actorKind = protocol.ActorPA
 		}
-		baseSHA := stringField(pi.Payload, "baseSha")
-		if baseSHA == "" {
-			baseSHA = p.BaseSHA
+
+		if rt != nil {
+			if rt.MachineID != "" {
+				machineID = rt.MachineID
+			}
+			if rt.Adapter != "" {
+				adapter = rt.Adapter
+			}
+			for k, v := range rt.DesiredConfig {
+				desiredCfg[k] = v
+			}
+			if rt.RequiredResources != nil {
+				reqResources = rt.RequiredResources
+			}
+			if rt.WorktreePath != "" {
+				worktreePath = rt.WorktreePath
+			}
+			if rt.BaseSHA != "" {
+				baseSHA = rt.BaseSHA
+			}
+			if rt.InputDeliveryID != "" {
+				inputDlv = rt.InputDeliveryID
+			}
+			if rt.AnchorCapability != "" {
+				anchorCap = rt.AnchorCapability
+			}
+			if rt.Anchor != nil {
+				anchor = rt.Anchor
+			}
+			forceNewSession = rt.ForceNewSession
+			if rt.ActorKind != "" {
+				actorKind = rt.ActorKind
+			}
 		}
-		inputDlv := stringField(pi.Payload, "inputDeliveryId")
-		if inputDlv == "" {
-			inputDlv = p.InputDeliveryID
+		if adapter == "" {
+			adapter = protocol.Adapter(prefAdapter)
 		}
+		// NEW-2: Normal queued followups leave rt.InputDeliveryID empty so latest formal delivery (e.g. D2) is resolved HERE!
 		if inputDlv == "" && latestDlv.Valid {
 			inputDlv = latestDlv.String
 		}
-		anchorCap := stringField(pi.Payload, "anchorCapability")
-		if anchorCap == "" {
-			anchorCap = p.AnchorCapability
-		}
-		anchor := p.Anchor
-		if rawAnchor, ok := pi.Payload["anchor"]; ok && rawAnchor != nil {
-			if b, err := json.Marshal(rawAnchor); err == nil {
-				var parsed protocol.ProjectAnchorConfig
-				if err := json.Unmarshal(b, &parsed); err == nil && parsed.Machine != "" {
-					anchor = &parsed
-				}
+
+		// NEW-1: Re-validate FINAL resolved route (principal guard + implemented adapter + anchor/machine check).
+		if p.ValidateRoute != nil {
+			if err := p.ValidateRoute(machineID, adapter, anchor, actorKind); err != nil {
+				return err
 			}
 		}
-		forceNewSession := boolField(pi.Payload, "forceNewSession")
+
+		if _, err := tx.ExecContext(ctx, `UPDATE tasks SET pending_queue_drain = 0, pending_steer_input_id = NULL WHERE task_id = ?`, p.TaskID); err != nil {
+			return err
+		}
 
 		att, evAtt, err := createAttemptInTx(ctx, tx, createAttemptTxParams{
 			TaskID:            p.TaskID,
