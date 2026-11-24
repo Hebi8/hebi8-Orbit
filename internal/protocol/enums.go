@@ -570,8 +570,15 @@ const (
 	EventACPToolCall          EventKind = "acp.tool_call"
 	EventACPUnsolicitedUpdate EventKind = "acp.unsolicited_update"
 	EventACPUsage             EventKind = "acp.usage"
-	EventPATurn               EventKind = "pa.turn"
-	EventPAActionExecuted     EventKind = "pa.action_executed"
+	EventPATurn                  EventKind = "pa.turn"
+	EventPAActionExecuted        EventKind = "pa.action_executed"
+	EventPAThreadCreated         EventKind = "pa.thread_created"
+	EventBoardMessagePosted      EventKind = "board.message_posted"
+	EventBoardMemberUpdated      EventKind = "board.member_updated"
+	EventQueueUpdated            EventKind = "queue.updated"
+	EventTaskProjectBound        EventKind = "task.project_bound"
+	EventTaskSourceAdded         EventKind = "task.source_added"
+	EventTaskSourceRemoved       EventKind = "task.source_removed"
 )
 
 var AllEventKinds = []EventKind{
@@ -603,6 +610,13 @@ var AllEventKinds = []EventKind{
 	EventACPUsage,
 	EventPATurn,
 	EventPAActionExecuted,
+	EventPAThreadCreated,
+	EventBoardMessagePosted,
+	EventBoardMemberUpdated,
+	EventQueueUpdated,
+	EventTaskProjectBound,
+	EventTaskSourceAdded,
+	EventTaskSourceRemoved,
 }
 
 // IDEScheme defines supported URI schemes for one-click IDE jump.
@@ -639,6 +653,206 @@ var AllWSMessageTypes = []WSMessageType{
 	WSMessageReplayEnd,
 	WSMessageEvent,
 	WSMessagePing,
+}
+
+// Built-in virtual project identifiers for project-less free chat sessions.
+const (
+	ScratchProjectID           = "_scratch"
+	ScratchProjectDisplayName  = "自由 Chat"
+	ScratchProjectRepoIdentity = "scratch:local"
+)
+
+// RunnerWSMessageType identifies bidirectional Hub <-> Runner WebSocket frame kinds.
+type RunnerWSMessageType string
+
+const (
+	RunnerMsgHello           RunnerWSMessageType = "runner.hello"
+	RunnerMsgHubWelcome      RunnerWSMessageType = "hub.welcome"
+	RunnerMsgAttemptDispatch RunnerWSMessageType = "attempt.dispatch"
+	RunnerMsgAttemptCancel   RunnerWSMessageType = "attempt.cancel"
+	RunnerMsgApprovalDecide  RunnerWSMessageType = "approval.decision"
+	RunnerMsgSessionClose    RunnerWSMessageType = "session.close"
+	RunnerMsgHeartbeat       RunnerWSMessageType = "runner.heartbeat"
+	RunnerMsgOutboxBatch     RunnerWSMessageType = "attempt.outbox_batch"
+	RunnerMsgOutboxAck       RunnerWSMessageType = "hub.outbox_ack"
+)
+
+var AllRunnerWSMessageTypes = []RunnerWSMessageType{
+	RunnerMsgHello,
+	RunnerMsgHubWelcome,
+	RunnerMsgAttemptDispatch,
+	RunnerMsgAttemptCancel,
+	RunnerMsgApprovalDecide,
+	RunnerMsgSessionClose,
+	RunnerMsgHeartbeat,
+	RunnerMsgOutboxBatch,
+	RunnerMsgOutboxAck,
+}
+
+func (v RunnerWSMessageType) IsValid() bool { return slices.Contains(AllRunnerWSMessageTypes, v) }
+
+// OutboxFrameType classifies items carried in ordered attempt.outbox_batch frames.
+type OutboxFrameType string
+
+const (
+	OutboxFrameEvents            OutboxFrameType = "events"
+	OutboxFrameState             OutboxFrameType = "state"
+	OutboxFrameApprovalRequest   OutboxFrameType = "approval_request"
+	OutboxFrameApprovalAck       OutboxFrameType = "approval_ack"
+	OutboxFrameDeliveryPublished OutboxFrameType = "delivery_published"
+	OutboxFrameBoardMessage      OutboxFrameType = "board_message"
+	OutboxFrameBoardMember       OutboxFrameType = "board_member"
+)
+
+var AllOutboxFrameTypes = []OutboxFrameType{
+	OutboxFrameEvents,
+	OutboxFrameState,
+	OutboxFrameApprovalRequest,
+	OutboxFrameApprovalAck,
+	OutboxFrameDeliveryPublished,
+	OutboxFrameBoardMessage,
+	OutboxFrameBoardMember,
+}
+
+func (v OutboxFrameType) IsValid() bool { return slices.Contains(AllOutboxFrameTypes, v) }
+
+// OutboxAcceptedMode indicates whether an outbox batch updated active state or late history.
+type OutboxAcceptedMode string
+
+const (
+	OutboxModeActive      OutboxAcceptedMode = "active"
+	OutboxModeLateHistory OutboxAcceptedMode = "late_history"
+)
+
+var AllOutboxAcceptedModes = []OutboxAcceptedMode{
+	OutboxModeActive,
+	OutboxModeLateHistory,
+}
+
+// FollowupMode selects how follow-up instructions interact with an active attempt.
+type FollowupMode string
+
+const (
+	FollowupModeQueue          FollowupMode = "queue"
+	FollowupModeSteer          FollowupMode = "steer"
+	FollowupModeForkNewSession FollowupMode = "fork_new_session"
+)
+
+var AllFollowupModes = []FollowupMode{
+	FollowupModeQueue,
+	FollowupModeSteer,
+	FollowupModeForkNewSession,
+}
+
+func (v FollowupMode) IsValid() bool { return slices.Contains(AllFollowupModes, v) }
+
+// PendingInputSource identifies the origin of a queued pending input.
+type PendingInputSource string
+
+const (
+	PendingSourceHuman      PendingInputSource = "human"
+	PendingSourceDiffDrawer PendingInputSource = "diff_drawer"
+	PendingSourceRyugi      PendingInputSource = "ryugi"
+	PendingSourcePA         PendingInputSource = "pa"
+	PendingSourceSystem     PendingInputSource = "system"
+)
+
+var AllPendingInputSources = []PendingInputSource{
+	PendingSourceHuman,
+	PendingSourceDiffDrawer,
+	PendingSourceRyugi,
+	PendingSourcePA,
+	PendingSourceSystem,
+}
+
+func (v PendingInputSource) IsValid() bool { return slices.Contains(AllPendingInputSources, v) }
+
+// TaskSourceKind classifies context items attached to a session's Sources card.
+type TaskSourceKind string
+
+const (
+	TaskSourceFile TaskSourceKind = "file"
+	TaskSourceLink TaskSourceKind = "link"
+	TaskSourceNmem TaskSourceKind = "nmem"
+)
+
+var AllTaskSourceKinds = []TaskSourceKind{
+	TaskSourceFile,
+	TaskSourceLink,
+	TaskSourceNmem,
+}
+
+func (v TaskSourceKind) IsValid() bool { return slices.Contains(AllTaskSourceKinds, v) }
+
+// BoardMessageStatus tracks whether a shared board message has been consumed.
+type BoardMessageStatus string
+
+const (
+	BoardMessagePosted   BoardMessageStatus = "posted"
+	BoardMessageConsumed BoardMessageStatus = "consumed"
+)
+
+var AllBoardMessageStatuses = []BoardMessageStatus{
+	BoardMessagePosted,
+	BoardMessageConsumed,
+}
+
+func (v BoardMessageStatus) IsValid() bool { return slices.Contains(AllBoardMessageStatuses, v) }
+
+// BoardMemberState tracks a swarm or cross-machine worker's live state.
+type BoardMemberState string
+
+const (
+	BoardMemberWorking BoardMemberState = "working"
+	BoardMemberWaiting BoardMemberState = "waiting"
+	BoardMemberStopped BoardMemberState = "stopped"
+	BoardMemberKilled  BoardMemberState = "killed"
+)
+
+var AllBoardMemberStates = []BoardMemberState{
+	BoardMemberWorking,
+	BoardMemberWaiting,
+	BoardMemberStopped,
+	BoardMemberKilled,
+}
+
+func (v BoardMemberState) IsValid() bool { return slices.Contains(AllBoardMemberStates, v) }
+
+// PAThreadStatus tracks PA conversation lifecycle.
+type PAThreadStatus string
+
+const (
+	PAThreadActive   PAThreadStatus = "active"
+	PAThreadArchived PAThreadStatus = "archived"
+)
+
+var AllPAThreadStatuses = []PAThreadStatus{
+	PAThreadActive,
+	PAThreadArchived,
+}
+
+func (v PAThreadStatus) IsValid() bool { return slices.Contains(AllPAThreadStatuses, v) }
+
+// PAMessageRole identifies speaker roles in PA threads.
+type PAMessageRole string
+
+const (
+	PARoleUser      PAMessageRole = "user"
+	PARoleAssistant PAMessageRole = "assistant"
+	PARoleSystem    PAMessageRole = "system"
+)
+
+var AllPAMessageRoles = []PAMessageRole{
+	PARoleUser,
+	PARoleAssistant,
+	PARoleSystem,
+}
+
+func (v PAMessageRole) IsValid() bool { return slices.Contains(AllPAMessageRoles, v) }
+
+// IsActiveAttemptState reports whether st holds task/session exclusivity.
+func IsActiveAttemptState(st AttemptState) bool {
+	return slices.Contains(ActiveAttemptStates, st)
 }
 
 // SQLInClause formats a typed string enum slice as a SQL IN list: 'a', 'b', 'c'.

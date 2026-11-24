@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -12,13 +13,18 @@ import (
 
 	"github.com/ncruces/go-sqlite3/driver"
 	"github.com/oklog/ulid/v2"
+
+	"github.com/Hebi8/hebi8-Orbit/internal/protocol"
 )
 
 var (
-	ErrNotFound          = errors.New("not found")
-	ErrConflict          = errors.New("conflict")
-	ErrOwnershipMismatch = errors.New("ownership mismatch")
-	ErrBlobMismatch      = errors.New("blob missing or size mismatch")
+	ErrNotFound             = errors.New("not found")
+	ErrConflict             = errors.New("conflict")
+	ErrOwnershipMismatch    = errors.New("ownership mismatch")
+	ErrBlobMismatch         = errors.New("blob missing or size mismatch")
+	ErrForbidden            = errors.New("forbidden")
+	ErrVerificationRequired = errors.New("verification required")
+	ErrInvalidInput         = errors.New("invalid input")
 )
 
 // Store manages the single-writer SQLite WAL pool and a separate read-only query pool.
@@ -148,7 +154,122 @@ func applySchema(ctx context.Context, db *sql.DB) error {
 	`, now); err != nil {
 		return err
 	}
+
+	// Smooth versioned migration v2 (Phase 1): safe on both fresh DBs and existing Phase 0 DBs
+	var hasV2 int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version = 2`).Scan(&hasV2); err != nil {
+		return err
+	}
+	if hasV2 == 0 {
+		if _, err := tx.ExecContext(ctx, BuildMigrationV2DDL()); err != nil {
+			return fmt.Errorf("apply v2 ddl: %w", err)
+		}
+		if err := ensureColumnTx(ctx, tx, "pa_state", "active_pa_thread_id", "TEXT REFERENCES pa_threads(pa_thread_id)"); err != nil {
+			return err
+		}
+		if err := ensureColumnTx(ctx, tx, "task_pending_inputs", "position", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+			return err
+		}
+		if err := ensureColumnTx(ctx, tx, "task_pending_inputs", "source", "TEXT NOT NULL DEFAULT 'human'"); err != nil {
+			return err
+		}
+		if err := ensureColumnTx(ctx, tx, "task_pending_inputs", "body", "TEXT NOT NULL DEFAULT ''"); err != nil {
+			return err
+		}
+		if err := ensureColumnTx(ctx, tx, "task_pending_inputs", "updated_at", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+			return err
+		}
+		if err := ensureColumnTx(ctx, tx, "agent_sessions", "locked", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+			return err
+		}
+		if err := ensureColumnTx(ctx, tx, "attempts", "runner_instance_id", "TEXT"); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE task_pending_inputs SET updated_at = created_at WHERE updated_at = 0;
+			CREATE INDEX IF NOT EXISTS idx_task_pending_inputs_order
+				ON task_pending_inputs(task_id, position ASC, created_at ASC)
+				WHERE state = 'queued';
+		`); err != nil {
+			return fmt.Errorf("backfill task_pending_inputs: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO schema_migrations (version, applied_at) VALUES (2, ?)
+		`, now); err != nil {
+			return err
+		}
+	}
+
+	// Idempotently ensure the built-in virtual _scratch project exists on every startup.
+	if err := ensureScratchProjectTx(ctx, tx, now); err != nil {
+		return err
+	}
+
 	return tx.Commit()
+}
+
+func ensureColumnTx(ctx context.Context, tx *sql.Tx, table, column, colDef string) error {
+	rows, err := tx.QueryContext(ctx, fmt.Sprintf(`PRAGMA table_info(%s)`, table))
+	if err != nil {
+		return fmt.Errorf("pragma table_info(%s): %w", table, err)
+	}
+	found := false
+	for rows.Next() {
+		var cid int
+		var name, colType string
+		var notNull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &dflt, &pk); err != nil {
+			rows.Close()
+			return err
+		}
+		if name == column {
+			found = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+
+	if !found {
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s %s`, table, column, colDef)); err != nil {
+			return fmt.Errorf("alter table %s add column %s: %w", table, column, err)
+		}
+	}
+	return nil
+}
+
+func ensureScratchProjectTx(ctx context.Context, tx *sql.Tx, now int64) error {
+	cfg := protocol.ProjectConfig{
+		DisplayName:       protocol.ScratchProjectDisplayName,
+		RepoIdentity:      protocol.ScratchProjectRepoIdentity,
+		DefaultBranch:     "main",
+		DefaultCapability: "primary-dev",
+		DefaultAdapter:    protocol.AdapterAgy,
+		IDEScheme:         protocol.IDECursor,
+		Anchors:           map[string]protocol.ProjectAnchorConfig{},
+	}
+	cfgJSON, err := json.Marshal(cfg)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO projects (
+			project_id, display_name, repo_identity, default_branch,
+			mirror_bare_path, config_json, archived, updated_at
+		) VALUES (?, ?, ?, 'main', '', ?, 0, ?)
+		ON CONFLICT(project_id) DO UPDATE SET
+			display_name = excluded.display_name,
+			repo_identity = excluded.repo_identity,
+			archived = 0,
+			updated_at = excluded.updated_at
+	`, protocol.ScratchProjectID, protocol.ScratchProjectDisplayName, protocol.ScratchProjectRepoIdentity, string(cfgJSON), now)
+	if err != nil {
+		return fmt.Errorf("ensure _scratch project: %w", err)
+	}
+	return nil
 }
 
 // Close closes both read-only and read-write SQLite pools cleanly.

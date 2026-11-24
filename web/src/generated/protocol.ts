@@ -42,6 +42,12 @@ export type PendingInputKind = (typeof PendingInputKindValues)[number];
 export const PendingInputStateValues = ["queued", "dispatched", "cancelled"] as const;
 export type PendingInputState = (typeof PendingInputStateValues)[number];
 
+export const PendingInputSourceValues = ["human", "diff_drawer", "ryugi", "pa", "system"] as const;
+export type PendingInputSource = (typeof PendingInputSourceValues)[number];
+
+export const FollowupModeValues = ["queue", "steer", "fork_new_session"] as const;
+export type FollowupMode = (typeof FollowupModeValues)[number];
+
 export const DeliveryKindValues = ["code_diff", "ryugi_artifact", "mixed", "deploy_receipt", "workspace_snapshot"] as const;
 export type DeliveryKind = (typeof DeliveryKindValues)[number];
 
@@ -78,7 +84,7 @@ export type InboxCategory = (typeof InboxCategoryValues)[number];
 export const InboxStateValues = ["open", "resolved", "dismissed"] as const;
 export type InboxState = (typeof InboxStateValues)[number];
 
-export const EventKindValues = ["task.created", "task.state_changed", "task.cancelled", "attempt.started", "attempt.state_changed", "attempt.finished", "resource.waiting", "resource.acquired", "delivery.published", "delivery.verified", "delivery.ryugi_updated", "delivery.review_completed", "annotation.created", "annotation.addressed", "approval.requested", "approval.decided", "approval.expired", "approval.consumed", "deploy.started", "deploy.verified", "deploy.failed", "acp.message_batch", "acp.thought_batch", "acp.tool_call", "acp.unsolicited_update", "acp.usage", "pa.turn", "pa.action_executed"] as const;
+export const EventKindValues = ["task.created", "task.state_changed", "task.cancelled", "attempt.started", "attempt.state_changed", "attempt.finished", "resource.waiting", "resource.acquired", "delivery.published", "delivery.verified", "delivery.ryugi_updated", "delivery.review_completed", "annotation.created", "annotation.addressed", "approval.requested", "approval.decided", "approval.expired", "approval.consumed", "deploy.started", "deploy.verified", "deploy.failed", "acp.message_batch", "acp.thought_batch", "acp.tool_call", "acp.unsolicited_update", "acp.usage", "pa.turn", "pa.action_executed", "pa.thread_created", "board.message_posted", "board.member_updated", "queue.updated", "task.project_bound", "task.source_added", "task.source_removed"] as const;
 export type EventKind = (typeof EventKindValues)[number];
 
 export const IDESchemeValues = ["cursor", "vscode", "zed", "antigravity"] as const;
@@ -86,6 +92,30 @@ export type IDEScheme = (typeof IDESchemeValues)[number];
 
 export const WSMessageTypeValues = ["replay", "replay_end", "event", "ping"] as const;
 export type WSMessageType = (typeof WSMessageTypeValues)[number];
+
+export const RunnerWSMessageTypeValues = ["runner.hello", "hub.welcome", "attempt.dispatch", "attempt.cancel", "approval.decision", "session.close", "runner.heartbeat", "attempt.outbox_batch", "hub.outbox_ack"] as const;
+export type RunnerWSMessageType = (typeof RunnerWSMessageTypeValues)[number];
+
+export const OutboxFrameTypeValues = ["events", "state", "approval_request", "approval_ack", "delivery_published", "board_message", "board_member"] as const;
+export type OutboxFrameType = (typeof OutboxFrameTypeValues)[number];
+
+export const OutboxAcceptedModeValues = ["active", "late_history"] as const;
+export type OutboxAcceptedMode = (typeof OutboxAcceptedModeValues)[number];
+
+export const TaskSourceKindValues = ["file", "link", "nmem"] as const;
+export type TaskSourceKind = (typeof TaskSourceKindValues)[number];
+
+export const BoardMessageStatusValues = ["posted", "consumed"] as const;
+export type BoardMessageStatus = (typeof BoardMessageStatusValues)[number];
+
+export const BoardMemberStateValues = ["working", "waiting", "stopped", "killed"] as const;
+export type BoardMemberState = (typeof BoardMemberStateValues)[number];
+
+export const PAThreadStatusValues = ["active", "archived"] as const;
+export type PAThreadStatus = (typeof PAThreadStatusValues)[number];
+
+export const PAMessageRoleValues = ["user", "assistant", "system"] as const;
+export type PAMessageRole = (typeof PAMessageRoleValues)[number];
 
 export interface APIError {
   code: string;
@@ -161,10 +191,56 @@ export interface InboxItemView {
   resolvedAt?: number | null;
 }
 
+export interface PAFocusPointer {
+  kind: string;
+  id: string;
+  label: string;
+  pinnedAt: number;
+}
+
+export interface PAStateView {
+  paId: string;
+  activePaThreadId?: string;
+  activeWbSessionId?: string;
+  lastReadEventSeq: number;
+  focusPointers: PAFocusPointer[];
+  updatedAt: number;
+}
+
+export interface PAThread {
+  paThreadId: string;
+  title: string;
+  wbSessionId?: string;
+  status: PAThreadStatus;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface PAActionResult {
+  action: string;
+  status: string;
+  summary: string;
+  data?: Record<string, unknown>;
+}
+
+export interface PAMessage {
+  messageId: string;
+  paThreadId: string;
+  role: PAMessageRole;
+  content: string;
+  deltaFromSeq?: number;
+  deltaToSeq?: number;
+  actions?: PAActionResult[];
+  createdAt: number;
+}
+
 export interface BootstrapResponse {
   projects: ProjectView[];
   machines: MachineView[];
   openInboxItems: InboxItemView[];
+  activeTasks: TaskSummary[];
+  paThreads: PAThread[];
+  paState: PAStateView;
   snapshotSeq: number;
 }
 
@@ -292,6 +368,8 @@ export interface TaskSummary {
   latestDeliveryHead?: string;
   openAnnotationCount: number;
   deliveryCount: number;
+  queuedInputCount: number;
+  workerCount: number;
   createdBy: TaskCreatedBy;
   createdAt: number;
   updatedAt: number;
@@ -312,11 +390,112 @@ export interface EventRecord {
   createdAt: number;
 }
 
+export interface PendingInput {
+  inputId: string;
+  taskId: string;
+  projectId: string;
+  kind: PendingInputKind;
+  source: PendingInputSource;
+  body: string;
+  payload: Record<string, unknown>;
+  position: number;
+  state: PendingInputState;
+  createdAt: number;
+  updatedAt: number;
+  dispatchedAttemptId?: string;
+}
+
+export interface ApprovalOption {
+  id: string;
+  label: string;
+  kind: string;
+}
+
+export interface ApprovalView {
+  approvalId: string;
+  projectId: string;
+  taskId: string;
+  attemptId: string;
+  kind: ApprovalKind;
+  actionName: string;
+  targetEnv: string;
+  inputSha: string;
+  payload: Record<string, unknown>;
+  payloadSha256: string;
+  acpRpcId?: string;
+  runnerInstanceId?: string;
+  options: ApprovalOption[];
+  requestedBy: ApprovalRequestedBy;
+  state: ApprovalState;
+  decisionId?: string;
+  selectedOptionId?: string;
+  decidedBy?: ApprovalDecidedBy | null;
+  decisionNote?: string;
+  expiresAt: number;
+  createdAt: number;
+  decidedAt?: number | null;
+  consumedAt?: number | null;
+}
+
+export interface TaskSource {
+  sourceId: string;
+  taskId: string;
+  projectId: string;
+  kind: TaskSourceKind;
+  label: string;
+  uriOrRef: string;
+  createdAt: number;
+}
+
+export interface BoardMessage {
+  seq: number;
+  messageId: string;
+  taskId: string;
+  projectId: string;
+  authorName: string;
+  targetMention?: string;
+  body: string;
+  status: BoardMessageStatus;
+  externalKey?: string;
+  createdAt: number;
+}
+
+export interface BoardMemberCursor {
+  taskId: string;
+  projectId: string;
+  memberName: string;
+  machineId?: string;
+  adapter?: Adapter;
+  state: BoardMemberState;
+  lastConsumedSeq: number;
+  currentStep?: string;
+  workerTaskId?: string;
+  updatedAt: number;
+}
+
+export interface TaskBoardResponse {
+  taskId: string;
+  latestSeq: number;
+  members: BoardMemberCursor[];
+  messages: BoardMessage[];
+}
+
+export interface WorkerStreamResponse {
+  taskId: string;
+  workerName: string;
+  member?: BoardMemberCursor | null;
+  events: EventRecord[];
+}
+
 export interface TaskTimelineResponse {
   task: TaskSummary;
   attempts: AttemptView[];
   deliveries: DeliveryView[];
   annotations: AnnotationView[];
+  pendingInputs: PendingInput[];
+  approvals: ApprovalView[];
+  sources: TaskSource[];
+  boardMembers: BoardMemberCursor[];
   events: EventRecord[];
 }
 
@@ -426,5 +605,334 @@ export interface WSServerMessage {
   event?: EventRecord | null;
   replayHeadSeq?: number;
   serverTime?: number;
+}
+
+export interface PABriefRequest {
+  sinceHours?: number;
+  projectId?: string;
+}
+
+export interface PABriefResponse {
+  generatedAt: number;
+  snapshotSeq: number;
+  sinceHours: number;
+  projectId?: string;
+  summary: string;
+  openInboxCount: number;
+  openInboxItems: InboxItemView[];
+  activeTasks: TaskSummary[];
+  blockedTasks: TaskSummary[];
+  recentDeliveries: DeliveryView[];
+  machines: MachineView[];
+  recentEvents: EventRecord[];
+}
+
+export interface CreateTaskSourceInput {
+  kind: TaskSourceKind;
+  label: string;
+  uriOrRef: string;
+}
+
+export interface CreateTaskRequest {
+  title?: string;
+  goal: string;
+  parentTaskId?: string;
+  requiredCapability?: string;
+  requiredResources?: string[];
+  adapter?: Adapter;
+  config?: Record<string, string>;
+  importDirtyWorkspace?: boolean;
+  sources?: CreateTaskSourceInput[];
+  idempotencyKey?: string;
+  swarmIdleTimeoutMs?: number;
+}
+
+export interface CreateTaskResponse {
+  task: TaskSummary;
+  attempt?: AttemptView | null;
+  sources?: TaskSource[];
+  created: boolean;
+  dispatched: boolean;
+}
+
+export interface BindScratchTaskRequest {
+  projectId: string;
+}
+
+export interface BindScratchTaskResponse {
+  task: TaskSummary;
+  fromProjectId: string;
+  toProjectId: string;
+}
+
+export interface FollowupTaskRequest {
+  message: string;
+  mode?: FollowupMode;
+  requiredCapability?: string;
+  requiredResources?: string[];
+  adapter?: Adapter;
+  config?: Record<string, string>;
+}
+
+export interface FollowupTaskResponse {
+  mode: FollowupMode;
+  task: TaskSummary;
+  attempt?: AttemptView | null;
+  pendingInput?: PendingInput | null;
+  forkedTaskId?: string;
+  dispatched: boolean;
+}
+
+export interface RetryTaskRequest {
+  verifiedSite?: boolean;
+  note?: string;
+}
+
+export interface RetryTaskResponse {
+  task: TaskSummary;
+  attempt: AttemptView;
+  dispatched: boolean;
+}
+
+export interface CancelTaskRequest {
+  reason?: string;
+}
+
+export interface CancelTaskResponse {
+  taskId: string;
+  attemptId?: string;
+  cancelSent: boolean;
+  immediateState?: string;
+}
+
+export interface AttemptRawEventsResponse {
+  attemptId: string;
+  events: EventRecord[];
+}
+
+export interface CreatePendingInputRequest {
+  kind?: PendingInputKind;
+  source?: PendingInputSource;
+  body: string;
+  payload?: Record<string, unknown>;
+}
+
+export interface UpdatePendingInputRequest {
+  body: string;
+  payload?: Record<string, unknown>;
+}
+
+export interface ReorderPendingInputsRequest {
+  inputIds: string[];
+}
+
+export interface DispatchAnnotationsRequest {
+  annotationIds: string[];
+  mode?: FollowupMode;
+  message?: string;
+}
+
+export interface DispatchAnnotationsResponse {
+  taskId: string;
+  queuedCount: number;
+  attempt?: AttemptView | null;
+  pendingInput?: PendingInput | null;
+  forkedTaskId?: string;
+  dispatched: boolean;
+}
+
+export interface PostBoardMessageRequest {
+  authorName?: string;
+  targetMention?: string;
+  body: string;
+}
+
+export interface DecideApprovalRequest {
+  optionId: string;
+  expectedAttemptId: string;
+  expectedPayloadSha256: string;
+  note?: string;
+}
+
+export interface DecideApprovalResponse {
+  approval: ApprovalView;
+  sentToRunner: boolean;
+}
+
+export interface CreatePAThreadRequest {
+  title?: string;
+}
+
+export interface PAThreadDetailResponse {
+  thread: PAThread;
+  messages: PAMessage[];
+  paState: PAStateView;
+}
+
+export interface PAChatActionRequest {
+  action: string;
+  projectId?: string;
+  taskId?: string;
+  goal?: string;
+  message?: string;
+  mode?: FollowupMode;
+  requiredCapability?: string;
+  adapter?: Adapter;
+  config?: Record<string, string>;
+  idempotencyKey?: string;
+}
+
+export interface PAChatRequest {
+  threadId?: string;
+  message: string;
+  action?: PAChatActionRequest | null;
+}
+
+export interface PAChatResponse {
+  thread: PAThread;
+  userMessage: PAMessage;
+  assistantMessage: PAMessage;
+  deltaFromSeq: number;
+  deltaToSeq: number;
+  deltaEventCount: number;
+  foldedRange?: string;
+  actions?: PAActionResult[];
+  paState: PAStateView;
+}
+
+export interface LiveAttemptInfo {
+  attemptId: string;
+  leaseToken: string;
+  state: AttemptState;
+}
+
+export interface HandledApprovalDecision {
+  approvalId: string;
+  decisionId: string;
+  outcome: ApprovalState;
+}
+
+export interface RunnerHelloFrame {
+  type: RunnerWSMessageType;
+  protocolVersion: number;
+  machineId: string;
+  runnerInstanceId: string;
+  runnerVersion: string;
+  liveAttempts: LiveAttemptInfo[];
+  livePendingApprovalIds: string[];
+  handledApprovalDecisions: HandledApprovalDecision[];
+  resources: Record<string, ResourceState>;
+}
+
+export interface ApprovalDecisionPayload {
+  approvalId: string;
+  decisionId: string;
+  attemptId: string;
+  payloadSha256: string;
+  optionId: string;
+  decidedBy: ApprovalDecidedBy;
+}
+
+export interface HubWelcomeReconcile {
+  ackedOutboxByAttempt: Record<string, number>;
+  abortAttemptIds: string[];
+  redeliverApprovals: ApprovalDecisionPayload[];
+}
+
+export interface HubWelcomeFrame {
+  type: RunnerWSMessageType;
+  serverTime: number;
+  heartbeatIntervalMs: number;
+  leaseTtlMs: number;
+  reconcile: HubWelcomeReconcile;
+}
+
+export interface InputDeliveryRef {
+  deliveryId: string;
+  gitRef: string;
+  headSha: string;
+  blobs?: BlobManifestItem[];
+}
+
+export interface AttemptDispatchFrame {
+  type: RunnerWSMessageType;
+  attemptId: string;
+  taskId: string;
+  projectId: string;
+  leaseToken: string;
+  adapter: Adapter;
+  wbSessionId: string;
+  providerSessionId?: string;
+  expectedSessionCwd?: string;
+  repoPath?: string;
+  worktreeRoot?: string;
+  worktreePath?: string;
+  mirrorBarePath?: string;
+  baseSha?: string;
+  defaultBranch?: string;
+  desiredConfig?: Record<string, string>;
+  systemPromptAppend?: string;
+  inputDelivery?: InputDeliveryRef | null;
+  prompt: string;
+  requiredResources?: string[];
+  swarmIdleTimeoutMs?: number;
+}
+
+export interface AttemptCancelFrame {
+  type: RunnerWSMessageType;
+  attemptId: string;
+  leaseToken: string;
+}
+
+export interface ApprovalDecisionFrame {
+  type: RunnerWSMessageType;
+  approvalId: string;
+  decisionId: string;
+  attemptId: string;
+  payloadSha256: string;
+  optionId: string;
+  decidedBy: ApprovalDecidedBy;
+}
+
+export interface SessionCloseFrame {
+  type: RunnerWSMessageType;
+  wbSessionId: string;
+  providerSessionId: string;
+}
+
+export interface LiveAttemptLease {
+  attemptId: string;
+  leaseToken: string;
+}
+
+export interface RunnerHeartbeatFrame {
+  type: RunnerWSMessageType;
+  machineId: string;
+  runnerInstanceId: string;
+  liveAttemptLeaseTokens: LiveAttemptLease[];
+  resources: Record<string, ResourceState>;
+  workerRssMb: number;
+}
+
+export interface OutboxItem {
+  outboxSeq: number;
+  eventId: string;
+  frameType: OutboxFrameType;
+  payload: Record<string, unknown>;
+  ts: number;
+}
+
+export interface AttemptOutboxBatchFrame {
+  type: RunnerWSMessageType;
+  attemptId: string;
+  leaseToken: string;
+  items: OutboxItem[];
+}
+
+export interface HubOutboxAckFrame {
+  type: RunnerWSMessageType;
+  attemptId: string;
+  ackedOutboxSeq: number;
+  acceptedMode: OutboxAcceptedMode;
 }
 

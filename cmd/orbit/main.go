@@ -9,6 +9,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/Hebi8/hebi8-Orbit/internal/gitops"
 	"github.com/Hebi8/hebi8-Orbit/internal/protocol"
+	"github.com/Hebi8/hebi8-Orbit/internal/runner"
 )
 
 type stringListFlag []string
@@ -67,6 +69,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return runDeliver(ctx, args[1:], stdout, stderr)
 	case "status":
 		return runStatus(ctx, args[1:], stdout, stderr)
+	case "brief":
+		return runBrief(ctx, args[1:], stdout, stderr)
 	default:
 		printUsage(stderr)
 		return fmt.Errorf("unknown subcommand %q", args[0])
@@ -75,11 +79,16 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 
 func printUsage(w io.Writer) {
 	fmt.Fprintln(w, `Usage:
+  orbit deliver --summary "..." [--final] [--attach <file>...]                               (inside runner worktree via ORBIT_RUNNER_SOCK)
   orbit deliver --project <id> [--repo <dir>] [--base <sha>] [--task <id>] [--title "..."] [--summary "..."] [--attach <file>...]
   orbit deliver --resume <deliveryId> [--hub <url>] [--mirror <path>]
   orbit status [--hub <url>] [--json]
+  orbit brief [--hub <url>] [--since-hours 24] [--project <id>] [--json]
 
 Environment variables:
+  ORBIT_RUNNER_SOCK Local runner Unix domain socket (auto-injected for ACP agent deliveries)
+  ORBIT_ATTEMPT_ID  Optional active attempt ID override for runner socket delivery
+  ORBIT_TASK_ID     Optional active task ID override for runner socket delivery
   ORBIT_HUB_URL     Hub HTTP base URL (default from hub.yaml or http://127.0.0.1:4310)
   ORBIT_CONFIG_DIR  Config directory (default ~/.config/hebi8-orbit)
   ORBIT_DATA_DIR    Data directory (default from hub.yaml or ~/.local/share/hebi8-orbit)
@@ -260,6 +269,8 @@ func runDeliver(ctx context.Context, args []string, stdout, stderr io.Writer) er
 		configDir  = fs.String("config-dir", "", "orbit config directory")
 		dataDirFlg = fs.String("data-dir", "", "orbit data directory (stores cli-pending records)")
 		deliveryID = fs.String("delivery-id", "", "optional explicit delivery ID")
+		attemptID  = fs.String("attempt", "", "optional attempt ID override when delivering via ORBIT_RUNNER_SOCK")
+		finalFlag  = fs.Bool("final", false, "finalize the active runner attempt upon delivery (required to close swarm_monitoring)")
 		jsonOut    = fs.Bool("json", false, "output JSON response")
 		attaches   stringListFlag
 	)
@@ -267,6 +278,11 @@ func runDeliver(ctx context.Context, args []string, stdout, stderr io.Writer) er
 
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+
+	// Phase 1 Runner fast-path: if ORBIT_RUNNER_SOCK is set and not explicitly running Phase 0 --resume/--project manual import
+	if sock := strings.TrimSpace(os.Getenv("ORBIT_RUNNER_SOCK")); sock != "" && strings.TrimSpace(*resumeID) == "" && strings.TrimSpace(*projectID) == "" {
+		return runDeliverViaRunnerSocket(ctx, sock, *attemptID, *taskID, *repoDir, *summary, *finalFlag, attaches, *jsonOut, stdout)
 	}
 
 	hubURL, dataDir, devToken := resolveHubDefaults(*configDir, *dataDirFlg, *hubURLFlag, *tokenFlag)
@@ -609,4 +625,187 @@ func shortSHA(sha string) string {
 		return sha[:7]
 	}
 	return sha
+}
+
+func runDeliverViaRunnerSocket(
+	ctx context.Context,
+	sockPath, attemptFlag, taskFlag, repoFlag, summary string,
+	final bool,
+	attaches stringListFlag,
+	jsonOut bool,
+	stdout io.Writer,
+) error {
+	aid := strings.TrimSpace(attemptFlag)
+	if aid == "" {
+		aid = strings.TrimSpace(os.Getenv("ORBIT_ATTEMPT_ID"))
+	}
+	tid := strings.TrimSpace(taskFlag)
+	if tid == "" {
+		tid = strings.TrimSpace(os.Getenv("ORBIT_TASK_ID"))
+	}
+	cwd := strings.TrimSpace(repoFlag)
+	if cwd == "" {
+		if wd, err := os.Getwd(); err == nil {
+			cwd = wd
+		}
+	}
+
+	var attachInputs []gitops.AttachmentInput
+	for _, raw := range attaches {
+		localPath := raw
+		targetPath := ""
+		if idx := strings.Index(raw, ":"); idx > 0 {
+			candidateLocal := raw[:idx]
+			candidateTarget := raw[idx+1:]
+			if _, err := os.Stat(candidateLocal); err == nil {
+				localPath = candidateLocal
+				targetPath = candidateTarget
+			}
+		}
+		attachInputs = append(attachInputs, gitops.AttachmentInput{
+			LocalPath:  localPath,
+			TargetPath: targetPath,
+		})
+	}
+
+	reqBody := runner.LocalDeliverRequest{
+		AttemptID:   aid,
+		TaskID:      tid,
+		CWD:         cwd,
+		Summary:     strings.TrimSpace(summary),
+		Final:       final,
+		Attachments: attachInputs,
+	}
+	rawReq, err := json.Marshal(reqBody)
+	if err != nil {
+		return err
+	}
+
+	dialer := &net.Dialer{Timeout: 5 * time.Second}
+	client := &http.Client{
+		Timeout: 60 * time.Second,
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return dialer.DialContext(ctx, "unix", sockPath)
+			},
+		},
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://orbit-runner/deliver", bytes.NewReader(rawReq))
+	if err != nil {
+		return err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		return fmt.Errorf("connect runner socket %s: %w", sockPath, err)
+	}
+	defer resp.Body.Close()
+
+	respBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("runner deliver failed (%d): %s", resp.StatusCode, strings.TrimSpace(string(respBytes)))
+	}
+
+	if jsonOut {
+		_, err := stdout.Write(append(bytes.TrimSpace(respBytes), '\n'))
+		return err
+	}
+
+	var result runner.LocalDeliverResponse
+	if err := json.Unmarshal(respBytes, &result); err != nil {
+		return err
+	}
+	fmt.Fprintf(stdout, "Delivered %s via runner (project=%s task=%s attempt=%s finalized=%v)\n",
+		result.DeliveryID, result.ProjectID, result.TaskID, result.AttemptID, result.Finalized)
+	fmt.Fprintf(stdout, "  Range:   %s..%s (%d files, +%d -%d)\n",
+		shortSHA(result.BaseSHA), shortSHA(result.HeadSHA), result.FilesChanged, result.Insertions, result.Deletions)
+	return nil
+}
+
+func runBrief(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("brief", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+
+	var (
+		hubURLFlag = fs.String("hub", "", "orbit-hub base URL")
+		tokenFlag  = fs.String("token", "", "optional X-Orbit-Dev-Token")
+		configDir  = fs.String("config-dir", "", "orbit config directory")
+		dataDirFlg = fs.String("data-dir", "", "orbit data directory")
+		sinceHours = fs.Int("since-hours", 24, "lookback window in hours")
+		projectID  = fs.String("project", "", "optional project filter")
+		jsonOut    = fs.Bool("json", false, "output JSON response")
+	)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	hubURL, _, devToken := resolveHubDefaults(*configDir, *dataDirFlg, *hubURLFlag, *tokenFlag)
+	client := &http.Client{Timeout: 15 * time.Second}
+
+	body, err := json.Marshal(protocol.PABriefRequest{
+		SinceHours: *sinceHours,
+		ProjectID:  strings.TrimSpace(*projectID),
+	})
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, hubURL+"/api/pa/brief", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Orbit-Request", "1")
+	if devToken != "" {
+		req.Header.Set("X-Orbit-Dev-Token", devToken)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("fetch hub brief: %w", err)
+	}
+	defer resp.Body.Close()
+
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("hub brief failed (%d): %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+
+	if *jsonOut {
+		_, err := stdout.Write(append(bytes.TrimSpace(raw), '\n'))
+		return err
+	}
+
+	var brief protocol.PABriefResponse
+	if err := json.Unmarshal(raw, &brief); err != nil {
+		return err
+	}
+
+	fmt.Fprintf(stdout, "Brief Me (%s)\n", brief.Summary)
+	fmt.Fprintf(stdout, "\nOpen Inbox (%d):\n", brief.OpenInboxCount)
+	if len(brief.OpenInboxItems) == 0 {
+		fmt.Fprintln(stdout, "  (clear)")
+	}
+	for _, it := range brief.OpenInboxItems {
+		fmt.Fprintf(stdout, "  [%s] %s — %s (%s)\n", it.Category, it.Title, it.Summary, it.ProjectID)
+	}
+	fmt.Fprintf(stdout, "\nActive Tasks (%d):\n", len(brief.ActiveTasks))
+	if len(brief.ActiveTasks) == 0 {
+		fmt.Fprintln(stdout, "  (none)")
+	}
+	for _, t := range brief.ActiveTasks {
+		fmt.Fprintf(stdout, "  - %-14s %-16s %s (%s)\n", t.ProjectID, t.State, t.Title, t.TaskID)
+	}
+	fmt.Fprintf(stdout, "\nRecent Deliveries (%d in %dh):\n", len(brief.RecentDeliveries), brief.SinceHours)
+	for _, d := range brief.RecentDeliveries {
+		fmt.Fprintf(stdout, "  - %s (%s %s) %s\n", d.DeliveryID, d.ProjectID, shortSHA(d.HeadSHA), d.Summary)
+	}
+	return nil
 }

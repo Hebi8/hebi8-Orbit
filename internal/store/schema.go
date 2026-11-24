@@ -341,3 +341,85 @@ CREATE TABLE IF NOT EXISTS delivery_blobs (
 		protocol.SQLInClause(protocol.AllInboxStates),
 	)
 }
+
+// BuildMigrationV2DDL constructs the Phase 1 additive schema tables and indexes
+// using internal/protocol enum sets as the single source of truth.
+func BuildMigrationV2DDL() string {
+	return fmt.Sprintf(`
+CREATE TABLE IF NOT EXISTS pa_threads (
+  pa_thread_id  TEXT PRIMARY KEY,
+  title         TEXT NOT NULL,
+  wb_session_id TEXT,
+  status        TEXT NOT NULL DEFAULT 'active' CHECK (status IN (%s)),
+  created_at    INTEGER NOT NULL,
+  updated_at    INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_pa_threads_updated ON pa_threads(status, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS pa_messages (
+  message_id     TEXT PRIMARY KEY,
+  pa_thread_id   TEXT NOT NULL REFERENCES pa_threads(pa_thread_id),
+  role           TEXT NOT NULL CHECK (role IN (%s)),
+  content        TEXT NOT NULL,
+  delta_from_seq INTEGER NOT NULL DEFAULT 0,
+  delta_to_seq   INTEGER NOT NULL DEFAULT 0,
+  actions_json   TEXT NOT NULL DEFAULT '[]',
+  created_at     INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_pa_messages_thread ON pa_messages(pa_thread_id, created_at ASC);
+
+CREATE TABLE IF NOT EXISTS task_sources (
+  source_id   TEXT PRIMARY KEY,
+  task_id     TEXT NOT NULL,
+  project_id  TEXT NOT NULL,
+  kind        TEXT NOT NULL CHECK (kind IN (%s)),
+  label       TEXT NOT NULL,
+  uri_or_ref  TEXT NOT NULL,
+  created_at  INTEGER NOT NULL,
+  FOREIGN KEY (task_id, project_id) REFERENCES tasks(task_id, project_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_sources_task ON task_sources(task_id, created_at ASC);
+
+CREATE TABLE IF NOT EXISTS board_messages (
+  seq            INTEGER PRIMARY KEY AUTOINCREMENT,
+  message_id     TEXT NOT NULL UNIQUE,
+  task_id        TEXT NOT NULL,
+  project_id     TEXT NOT NULL,
+  author_name    TEXT NOT NULL,
+  target_mention TEXT,
+  body           TEXT NOT NULL,
+  status         TEXT NOT NULL DEFAULT 'posted' CHECK (status IN (%s)),
+  external_key   TEXT UNIQUE,
+  created_at     INTEGER NOT NULL,
+  FOREIGN KEY (task_id, project_id) REFERENCES tasks(task_id, project_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_board_messages_task_seq ON board_messages(task_id, seq ASC);
+
+CREATE TABLE IF NOT EXISTS board_members (
+  task_id           TEXT NOT NULL,
+  project_id        TEXT NOT NULL,
+  member_name       TEXT NOT NULL,
+  machine_id        TEXT,
+  adapter           TEXT,
+  state             TEXT NOT NULL DEFAULT 'working' CHECK (state IN (%s)),
+  last_consumed_seq INTEGER NOT NULL DEFAULT 0,
+  current_step      TEXT,
+  worker_task_id    TEXT REFERENCES tasks(task_id),
+  updated_at        INTEGER NOT NULL,
+  PRIMARY KEY (task_id, member_name),
+  FOREIGN KEY (task_id, project_id) REFERENCES tasks(task_id, project_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_board_members_task ON board_members(task_id, updated_at DESC);
+`,
+		protocol.SQLInClause(protocol.AllPAThreadStatuses),
+		protocol.SQLInClause(protocol.AllPAMessageRoles),
+		protocol.SQLInClause(protocol.AllTaskSourceKinds),
+		protocol.SQLInClause(protocol.AllBoardMessageStatuses),
+		protocol.SQLInClause(protocol.AllBoardMemberStates),
+	)
+}

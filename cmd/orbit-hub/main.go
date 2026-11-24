@@ -115,6 +115,7 @@ func main() {
 	if cfg.RyugiPollIntervalSeconds > 0 {
 		srv.RyugiBridge().StartPoller(pollerCtx, &pollerWG)
 	}
+	srv.StartMaintenance(pollerCtx, &pollerWG)
 
 	httpServer := &http.Server{
 		Addr:              cfg.ListenAddr,
@@ -137,12 +138,14 @@ func main() {
 	case err := <-errCh:
 		if err != nil {
 			cancelPoller()
+			srv.Shutdown()
 			pollerWG.Wait()
 			log.Fatalf("http server failed: %v", err)
 		}
 	}
 
 	cancelPoller()
+	srv.Shutdown()
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {

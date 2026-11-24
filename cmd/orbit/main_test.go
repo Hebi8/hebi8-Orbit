@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"net"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
@@ -13,6 +15,7 @@ import (
 
 	"github.com/Hebi8/hebi8-Orbit/internal/hub"
 	"github.com/Hebi8/hebi8-Orbit/internal/protocol"
+	"github.com/Hebi8/hebi8-Orbit/internal/runner"
 	"github.com/Hebi8/hebi8-Orbit/internal/store"
 )
 
@@ -224,5 +227,70 @@ func TestOrbitCLI_ResumeReusesExactFixedHeadSHA(t *testing.T) {
 	}
 	if _, err := os.Stat(stagedBlob); !os.IsNotExist(err) {
 		t.Fatalf("expected staged pending blob cleaned up after successful --resume")
+	}
+}
+
+func TestOrbitCLI_BriefAndRunnerSocketDeliver(t *testing.T) {
+	ctx := context.Background()
+	tmp, _, _, ts := setupCLITestEnv(t)
+
+	// 1. Test `orbit brief`
+	var out, errBuf bytes.Buffer
+	if err := run(ctx, []string{"brief", "--hub", ts.URL, "--json"}, &out, &errBuf); err != nil {
+		t.Fatalf("orbit brief failed: %v\nstderr=%s", err, errBuf.String())
+	}
+	var brief protocol.PABriefResponse
+	if err := json.Unmarshal(out.Bytes(), &brief); err != nil {
+		t.Fatalf("decode brief json: %v\nraw=%s", err, out.String())
+	}
+	if brief.Summary == "" {
+		t.Fatalf("expected non-empty brief summary: %+v", brief)
+	}
+
+	// 2. Test `orbit deliver --summary "..." --final` via ORBIT_RUNNER_SOCK
+	sockPath := filepath.Join(tmp, "runner.sock")
+	ln, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	var received runner.LocalDeliverRequest
+	mux := http.NewServeMux()
+	mux.HandleFunc("/deliver", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&received)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(runner.LocalDeliverResponse{
+			DeliveryID:   "dlv_sock_1",
+			AttemptID:    "att_sock_1",
+			TaskID:       "tsk_sock_1",
+			ProjectID:    "demo-app",
+			BaseSHA:      "1111111",
+			HeadSHA:      "2222222",
+			Finalized:    received.Final,
+			FilesChanged: 1,
+			Insertions:   5,
+		})
+	})
+	srv := &http.Server{Handler: mux}
+	go func() { _ = srv.Serve(ln) }()
+	defer srv.Close()
+
+	t.Setenv("ORBIT_RUNNER_SOCK", sockPath)
+	t.Setenv("ORBIT_ATTEMPT_ID", "att_sock_1")
+	out.Reset()
+	errBuf.Reset()
+	if err := run(ctx, []string{"deliver", "--summary", "runner socket delivery", "--final", "--json"}, &out, &errBuf); err != nil {
+		t.Fatalf("orbit deliver via socket failed: %v\nstderr=%s", err, errBuf.String())
+	}
+	if !received.Final || received.Summary != "runner socket delivery" || received.AttemptID != "att_sock_1" {
+		t.Fatalf("unexpected runner socket request: %+v", received)
+	}
+	var sockResp runner.LocalDeliverResponse
+	if err := json.Unmarshal(out.Bytes(), &sockResp); err != nil {
+		t.Fatalf("decode socket deliver response: %v", err)
+	}
+	if sockResp.DeliveryID != "dlv_sock_1" || !sockResp.Finalized {
+		t.Fatalf("unexpected socket deliver response: %+v", sockResp)
 	}
 }

@@ -48,6 +48,9 @@ func (s *Store) SyncRegistry(ctx context.Context, dataDir string, projects proto
 		}
 
 		for projectID, p := range projects.Projects {
+			if projectID == protocol.ScratchProjectID {
+				continue
+			}
 			branch := p.DefaultBranch
 			if branch == "" {
 				branch = "main"
@@ -73,17 +76,26 @@ func (s *Store) SyncRegistry(ctx context.Context, dataDir string, projects proto
 				return fmt.Errorf("upsert project %s: %w", projectID, err)
 			}
 		}
+		if err := ensureScratchProjectTx(ctx, tx, now); err != nil {
+			return err
+		}
 		return nil
 	})
 }
 
-// Bootstrap returns projects, machines, open inbox items, and snapshotSeq from
-// a single consistent read-only SQLite transaction.
+// Bootstrap returns projects, machines, open inbox items, active tasks, PA threads, PA state,
+// and snapshotSeq from a single consistent read-only SQLite transaction.
 func (s *Store) Bootstrap(ctx context.Context, machineMeta map[string]protocol.MachineConfig) (protocol.BootstrapResponse, error) {
 	resp := protocol.BootstrapResponse{
 		Projects:       []protocol.ProjectView{},
 		Machines:       []protocol.MachineView{},
 		OpenInboxItems: []protocol.InboxItemView{},
+		ActiveTasks:    []protocol.TaskSummary{},
+		PAThreads:      []protocol.PAThread{},
+		PAState: protocol.PAStateView{
+			PAID:          "default",
+			FocusPointers: []protocol.PAFocusPointer{},
+		},
 	}
 
 	err := s.WithReadTx(ctx, func(tx *sql.Tx) error {
@@ -91,7 +103,7 @@ func (s *Store) Bootstrap(ctx context.Context, machineMeta map[string]protocol.M
 			return fmt.Errorf("query snapshotSeq: %w", err)
 		}
 
-		// Projects with live active & blocked counts
+		// Projects with live active & blocked counts (real projects first, _scratch last)
 		rows, err := tx.QueryContext(ctx, `
 			SELECT p.project_id, p.display_name, p.repo_identity, p.default_branch,
 			       p.mirror_bare_path, p.config_json, p.archived, p.updated_at,
@@ -101,7 +113,7 @@ func (s *Store) Bootstrap(ctx context.Context, machineMeta map[string]protocol.M
 			LEFT JOIN tasks t ON t.project_id = p.project_id AND t.archived_at IS NULL
 			WHERE p.archived = 0
 			GROUP BY p.project_id
-			ORDER BY p.display_name ASC
+			ORDER BY CASE WHEN p.project_id = '_scratch' THEN 1 ELSE 0 END, p.display_name ASC
 		`)
 		if err != nil {
 			return fmt.Errorf("query projects: %w", err)
@@ -213,7 +225,62 @@ func (s *Store) Bootstrap(ctx context.Context, machineMeta map[string]protocol.M
 			}
 			resp.OpenInboxItems = append(resp.OpenInboxItems, item)
 		}
-		return iRows.Err()
+		if err := iRows.Err(); err != nil {
+			return err
+		}
+
+		// Active Tasks across all projects (for Home overview)
+		tRows, err := tx.QueryContext(ctx, taskSummarySelectSQL+`
+			WHERE t.archived_at IS NULL AND t.state NOT IN ('done', 'cancelled')
+			ORDER BY t.updated_at DESC
+			LIMIT 100
+		`)
+		if err != nil {
+			return fmt.Errorf("query active tasks: %w", err)
+		}
+		defer tRows.Close()
+		for tRows.Next() {
+			ts, err := scanTaskSummary(tRows)
+			if err != nil {
+				return err
+			}
+			resp.ActiveTasks = append(resp.ActiveTasks, ts)
+		}
+		if err := tRows.Err(); err != nil {
+			return err
+		}
+
+		// PA Threads
+		ptRows, err := tx.QueryContext(ctx, `
+			SELECT pa_thread_id, title, wb_session_id, status, created_at, updated_at
+			FROM pa_threads
+			WHERE status = 'active'
+			ORDER BY updated_at DESC
+			LIMIT 50
+		`)
+		if err != nil {
+			return fmt.Errorf("query pa_threads: %w", err)
+		}
+		defer ptRows.Close()
+		for ptRows.Next() {
+			pt, err := scanPAThread(ptRows)
+			if err != nil {
+				return err
+			}
+			resp.PAThreads = append(resp.PAThreads, pt)
+		}
+		if err := ptRows.Err(); err != nil {
+			return err
+		}
+
+		// PA State
+		paState, err := queryPAStateTx(ctx, tx, "default")
+		if err == nil {
+			resp.PAState = paState
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("query pa_state: %w", err)
+		}
+		return nil
 	})
 	return resp, err
 }
@@ -278,22 +345,27 @@ func (s *Store) GetProject(ctx context.Context, projectID string) (protocol.Proj
 	return pv, nil
 }
 
+const taskSummarySelectSQL = `
+		SELECT t.task_id, t.project_id, t.parent_task_id, t.title, t.goal,
+		       t.required_capability, t.preferred_adapter, t.state, t.waiting_reason,
+		       t.active_attempt_id, a.state, t.latest_delivery_id, d.head_sha,
+		       (SELECT COUNT(*) FROM annotations an WHERE an.task_id = t.task_id AND an.status = 'open') AS open_ann,
+		       (SELECT COUNT(*) FROM deliveries dl WHERE dl.task_id = t.task_id) AS dlv_count,
+		       (SELECT COUNT(*) FROM task_pending_inputs pi WHERE pi.task_id = t.task_id AND pi.state = 'queued') AS queued_inputs,
+		       (SELECT COUNT(*) FROM board_members bm WHERE bm.task_id = t.task_id AND bm.state IN ('working', 'waiting')) AS worker_count,
+		       t.created_by, t.created_at, t.updated_at
+		FROM tasks t
+		LEFT JOIN attempts a ON a.attempt_id = t.active_attempt_id
+		LEFT JOIN deliveries d ON d.delivery_id = t.latest_delivery_id
+`
+
 // ListProjectTasks returns tasks for a project ordered by recent updates.
 func (s *Store) ListProjectTasks(ctx context.Context, projectID string) ([]protocol.TaskSummary, error) {
 	if _, err := s.GetProject(ctx, projectID); err != nil {
 		return nil, err
 	}
 	tasks := []protocol.TaskSummary{}
-	rows, err := s.ro.QueryContext(ctx, `
-		SELECT t.task_id, t.project_id, t.parent_task_id, t.title, t.goal,
-		       t.required_capability, t.preferred_adapter, t.state, t.waiting_reason,
-		       t.active_attempt_id, a.state, t.latest_delivery_id, d.head_sha,
-		       (SELECT COUNT(*) FROM annotations an WHERE an.task_id = t.task_id AND an.status = 'open') AS open_ann,
-		       (SELECT COUNT(*) FROM deliveries dl WHERE dl.task_id = t.task_id) AS dlv_count,
-		       t.created_by, t.created_at, t.updated_at
-		FROM tasks t
-		LEFT JOIN attempts a ON a.attempt_id = t.active_attempt_id
-		LEFT JOIN deliveries d ON d.delivery_id = t.latest_delivery_id
+	rows, err := s.ro.QueryContext(ctx, taskSummarySelectSQL+`
 		WHERE t.project_id = ? AND t.archived_at IS NULL
 		ORDER BY t.updated_at DESC
 	`, projectID)
@@ -321,6 +393,7 @@ func scanTaskSummary(scanner interface{ Scan(...any) error }) (protocol.TaskSumm
 		&ts.RequiredCapability, &adapter, &state, &waitingReason,
 		&activeAttID, &activeAttState, &latestDlvID, &latestHead,
 		&ts.OpenAnnotationCount, &ts.DeliveryCount,
+		&ts.QueuedInputCount, &ts.WorkerCount,
 		&createdBy, &ts.CreatedAt, &ts.UpdatedAt,
 	); err != nil {
 		return ts, err
@@ -351,26 +424,22 @@ func scanTaskSummary(scanner interface{ Scan(...any) error }) (protocol.TaskSumm
 }
 
 // GetTaskTimeline loads a task with its attempts, immutable deliveries,
-// Ryugi bindings, annotations, and timeline events inside a read-only transaction.
+// Ryugi bindings, annotations, pending inputs, approvals, sources, board members,
+// and timeline events inside a read-only transaction.
 func (s *Store) GetTaskTimeline(ctx context.Context, taskID string, beforeSeq int64, includeRaw bool) (protocol.TaskTimelineResponse, error) {
 	resp := protocol.TaskTimelineResponse{
-		Attempts:    []protocol.AttemptView{},
-		Deliveries:  []protocol.DeliveryView{},
-		Annotations: []protocol.AnnotationView{},
-		Events:      []protocol.EventRecord{},
+		Attempts:      []protocol.AttemptView{},
+		Deliveries:    []protocol.DeliveryView{},
+		Annotations:   []protocol.AnnotationView{},
+		PendingInputs: []protocol.PendingInput{},
+		Approvals:     []protocol.ApprovalView{},
+		Sources:       []protocol.TaskSource{},
+		BoardMembers:  []protocol.BoardMemberCursor{},
+		Events:        []protocol.EventRecord{},
 	}
 
 	err := s.WithReadTx(ctx, func(tx *sql.Tx) error {
-		row := tx.QueryRowContext(ctx, `
-			SELECT t.task_id, t.project_id, t.parent_task_id, t.title, t.goal,
-			       t.required_capability, t.preferred_adapter, t.state, t.waiting_reason,
-			       t.active_attempt_id, a.state, t.latest_delivery_id, d.head_sha,
-			       (SELECT COUNT(*) FROM annotations an WHERE an.task_id = t.task_id AND an.status = 'open') AS open_ann,
-			       (SELECT COUNT(*) FROM deliveries dl WHERE dl.task_id = t.task_id) AS dlv_count,
-			       t.created_by, t.created_at, t.updated_at
-			FROM tasks t
-			LEFT JOIN attempts a ON a.attempt_id = t.active_attempt_id
-			LEFT JOIN deliveries d ON d.delivery_id = t.latest_delivery_id
+		row := tx.QueryRowContext(ctx, taskSummarySelectSQL+`
 			WHERE t.task_id = ?
 		`, taskID)
 		task, err := scanTaskSummary(row)
@@ -479,6 +548,92 @@ func (s *Store) GetTaskTimeline(ctx context.Context, taskID string, beforeSeq in
 			resp.Annotations = append(resp.Annotations, an)
 		}
 		if err := anRows.Err(); err != nil {
+			return err
+		}
+
+		// Pending Inputs (queued)
+		piRows, err := tx.QueryContext(ctx, `
+			SELECT input_id, task_id, project_id, kind, source, body, payload_json, position, state, created_at, updated_at, dispatched_attempt_id
+			FROM task_pending_inputs
+			WHERE task_id = ? AND state = 'queued'
+			ORDER BY position ASC, created_at ASC
+		`, taskID)
+		if err != nil {
+			return err
+		}
+		defer piRows.Close()
+		for piRows.Next() {
+			pi, err := scanPendingInput(piRows)
+			if err != nil {
+				return err
+			}
+			resp.PendingInputs = append(resp.PendingInputs, pi)
+		}
+		if err := piRows.Err(); err != nil {
+			return err
+		}
+
+		// Approvals
+		apRows, err := tx.QueryContext(ctx, approvalSelectSQL+`
+			WHERE task_id = ?
+			ORDER BY created_at DESC
+		`, taskID)
+		if err != nil {
+			return err
+		}
+		defer apRows.Close()
+		for apRows.Next() {
+			ap, err := scanApprovalView(apRows)
+			if err != nil {
+				return err
+			}
+			resp.Approvals = append(resp.Approvals, ap)
+		}
+		if err := apRows.Err(); err != nil {
+			return err
+		}
+
+		// Task Sources
+		srcRows, err := tx.QueryContext(ctx, `
+			SELECT source_id, task_id, project_id, kind, label, uri_or_ref, created_at
+			FROM task_sources
+			WHERE task_id = ?
+			ORDER BY created_at ASC
+		`, taskID)
+		if err != nil {
+			return err
+		}
+		defer srcRows.Close()
+		for srcRows.Next() {
+			src, err := scanTaskSource(srcRows)
+			if err != nil {
+				return err
+			}
+			resp.Sources = append(resp.Sources, src)
+		}
+		if err := srcRows.Err(); err != nil {
+			return err
+		}
+
+		// Board Members
+		bmRows, err := tx.QueryContext(ctx, `
+			SELECT task_id, project_id, member_name, machine_id, adapter, state, last_consumed_seq, current_step, worker_task_id, updated_at
+			FROM board_members
+			WHERE task_id = ?
+			ORDER BY member_name ASC
+		`, taskID)
+		if err != nil {
+			return err
+		}
+		defer bmRows.Close()
+		for bmRows.Next() {
+			bm, err := scanBoardMember(bmRows)
+			if err != nil {
+				return err
+			}
+			resp.BoardMembers = append(resp.BoardMembers, bm)
+		}
+		if err := bmRows.Err(); err != nil {
 			return err
 		}
 
@@ -992,16 +1147,7 @@ func (s *Store) CreateManualImportDelivery(ctx context.Context, p ManualImportPa
 }
 
 func loadManualImportExisting(ctx context.Context, tx *sql.Tx, taskID, attemptID, deliveryID string, res *ManualImportResult) error {
-	row := tx.QueryRowContext(ctx, `
-		SELECT t.task_id, t.project_id, t.parent_task_id, t.title, t.goal,
-		       t.required_capability, t.preferred_adapter, t.state, t.waiting_reason,
-		       t.active_attempt_id, a.state, t.latest_delivery_id, d.head_sha,
-		       (SELECT COUNT(*) FROM annotations an WHERE an.task_id = t.task_id AND an.status = 'open') AS open_ann,
-		       (SELECT COUNT(*) FROM deliveries dl WHERE dl.task_id = t.task_id) AS dlv_count,
-		       t.created_by, t.created_at, t.updated_at
-		FROM tasks t
-		LEFT JOIN attempts a ON a.attempt_id = t.active_attempt_id
-		LEFT JOIN deliveries d ON d.delivery_id = t.latest_delivery_id
+	row := tx.QueryRowContext(ctx, taskSummarySelectSQL+`
 		WHERE t.task_id = ?
 	`, taskID)
 	task, err := scanTaskSummary(row)

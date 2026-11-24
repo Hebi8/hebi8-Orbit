@@ -2,7 +2,9 @@ package hub
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"fmt"
 	"net"
 	"net/http"
@@ -13,6 +15,7 @@ import (
 )
 
 type actorContextKey struct{}
+type actorKindContextKey struct{}
 
 type authKind int
 
@@ -23,8 +26,9 @@ const (
 	authDevOpen
 )
 
-func withActor(ctx context.Context, actor string) context.Context {
-	return context.WithValue(ctx, actorContextKey{}, actor)
+func withActor(ctx context.Context, actor string, kind protocol.ActorKind) context.Context {
+	ctx = context.WithValue(ctx, actorContextKey{}, actor)
+	return context.WithValue(ctx, actorKindContextKey{}, kind)
 }
 
 func actorFromContext(ctx context.Context) string {
@@ -32,6 +36,13 @@ func actorFromContext(ctx context.Context) string {
 		return v
 	}
 	return "unknown"
+}
+
+func actorKindFromContext(ctx context.Context) protocol.ActorKind {
+	if v, ok := ctx.Value(actorKindContextKey{}).(protocol.ActorKind); ok && v != "" {
+		return v
+	}
+	return protocol.ActorHuman
 }
 
 // ValidateListenAddr unconditionally enforces that orbit-hub binds strictly to a loopback
@@ -111,7 +122,13 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 			}
 		}
 
-		next.ServeHTTP(w, r.WithContext(withActor(r.Context(), actor)))
+		actorKind := protocol.ActorHuman
+		// Allow explicit downward privilege scoping for PA-initiated calls (never upward!)
+		if strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Orbit-Actor-Kind")), "pa") {
+			actorKind = protocol.ActorPA
+		}
+
+		next.ServeHTTP(w, r.WithContext(withActor(r.Context(), actor, actorKind)))
 	})
 }
 
@@ -221,4 +238,61 @@ func isLoopbackAddr(remoteAddr string) bool {
 	}
 	ip := net.ParseIP(host)
 	return ip != nil && ip.IsLoopback()
+}
+
+// verifyRunnerAuth validates runner authentication for a machineId against machines.yaml:
+// - local_ws: requires loopback peer (and constant-time tokenHash match if tokenHash is configured).
+// - remote_ws: requires Authorization: Bearer <token> matching sha256(token) == tokenHash in constant time.
+func (s *Server) verifyRunnerAuth(r *http.Request, machineID string) (protocol.MachineConfig, int, string) {
+	s.mu.RLock()
+	mCfg, ok := s.machines.Machines[machineID]
+	s.mu.RUnlock()
+	if !ok {
+		return protocol.MachineConfig{}, http.StatusUnauthorized, "unknown machineId"
+	}
+
+	bearer := extractBearerToken(r.Header.Get("Authorization"))
+	switch mCfg.Transport {
+	case protocol.TransportLocalWS:
+		if !isLoopbackAddr(r.RemoteAddr) {
+			return protocol.MachineConfig{}, http.StatusForbidden, "local_ws runner must connect from loopback"
+		}
+		if strings.TrimSpace(mCfg.TokenHash) != "" {
+			if !matchTokenHash(bearer, mCfg.TokenHash) {
+				return protocol.MachineConfig{}, http.StatusUnauthorized, "invalid runner bearer token"
+			}
+		}
+		return mCfg, http.StatusOK, ""
+
+	case protocol.TransportRemoteWS:
+		if strings.TrimSpace(mCfg.TokenHash) == "" {
+			return protocol.MachineConfig{}, http.StatusForbidden, "remote_ws machine missing tokenHash in machines.yaml"
+		}
+		if !matchTokenHash(bearer, mCfg.TokenHash) {
+			return protocol.MachineConfig{}, http.StatusUnauthorized, "invalid runner bearer token"
+		}
+		return mCfg, http.StatusOK, ""
+
+	default:
+		return protocol.MachineConfig{}, http.StatusForbidden, "machine transport does not support runner websocket"
+	}
+}
+
+func extractBearerToken(authHeader string) string {
+	authHeader = strings.TrimSpace(authHeader)
+	if len(authHeader) < 7 || !strings.EqualFold(authHeader[:7], "Bearer ") {
+		return ""
+	}
+	return strings.TrimSpace(authHeader[7:])
+}
+
+func matchTokenHash(rawToken, expectedHash string) bool {
+	if rawToken == "" || expectedHash == "" {
+		return false
+	}
+	expected := strings.TrimSpace(expectedHash)
+	expected = strings.TrimPrefix(strings.ToLower(expected), "sha256:")
+	sum := sha256.Sum256([]byte(rawToken))
+	actual := hex.EncodeToString(sum[:])
+	return subtle.ConstantTimeCompare([]byte(actual), []byte(expected)) == 1
 }

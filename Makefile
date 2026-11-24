@@ -17,13 +17,16 @@ build-web: gen-types
 build: build-web
 	@mkdir -p $(BIN_DIR)
 	CGO_ENABLED=0 $(GO) build -trimpath -o $(BIN_DIR)/orbit-hub ./cmd/orbit-hub
+	CGO_ENABLED=0 $(GO) build -trimpath -o $(BIN_DIR)/orbit-runner ./cmd/orbit-runner
 	CGO_ENABLED=0 $(GO) build -trimpath -o $(BIN_DIR)/orbit ./cmd/orbit
 
 build-all: build-web
 	@mkdir -p $(BIN_DIR)/linux-amd64 $(BIN_DIR)/darwin-arm64
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build -trimpath -o $(BIN_DIR)/linux-amd64/orbit-hub ./cmd/orbit-hub
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build -trimpath -o $(BIN_DIR)/linux-amd64/orbit-runner ./cmd/orbit-runner
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build -trimpath -o $(BIN_DIR)/linux-amd64/orbit ./cmd/orbit
 	CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 $(GO) build -trimpath -o $(BIN_DIR)/darwin-arm64/orbit-hub ./cmd/orbit-hub
+	CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 $(GO) build -trimpath -o $(BIN_DIR)/darwin-arm64/orbit-runner ./cmd/orbit-runner
 	CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 $(GO) build -trimpath -o $(BIN_DIR)/darwin-arm64/orbit ./cmd/orbit
 
 test:

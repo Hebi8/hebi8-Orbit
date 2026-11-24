@@ -30,13 +30,16 @@ var sha256Regex = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 // ServerOptions configures an orbit-hub Server instance.
 type ServerOptions struct {
-	HubConfig   protocol.HubConfig
-	Store       *store.Store
-	WebFS       fs.FS
-	RyugiRunner RyugiRunner
+	HubConfig           protocol.HubConfig
+	Store               *store.Store
+	WebFS               fs.FS
+	RyugiRunner         RyugiRunner
+	HeartbeatInterval   time.Duration
+	LeaseTTL            time.Duration
+	MaintenanceInterval time.Duration
 }
 
-// Server serves the Phase 0 REST API, WebSocket event stream, blob storage, and embedded SPA.
+// Server serves the Orbit REST API, client/runner WebSockets, blob storage, and embedded SPA.
 type Server struct {
 	mu       sync.RWMutex
 	hubCfg   protocol.HubConfig
@@ -47,11 +50,20 @@ type Server struct {
 	gcReason    string
 	gcExpiresAt *int64
 
-	store  *store.Store
-	broker *EventBroker
-	ryugi  *RyugiBridge
-	webFS  fs.FS
-	router http.Handler
+	heartbeatInterval   time.Duration
+	leaseTTL            time.Duration
+	maintenanceInterval time.Duration
+
+	paMu               sync.Mutex
+	paBeforeCommitHook func(fromSeq, highSeq int64)
+
+	store   *store.Store
+	broker  *EventBroker
+	runners *RunnerGateway
+	ryugi   *RyugiBridge
+	webFS   fs.FS
+	router  http.Handler
+	bgWG    sync.WaitGroup
 }
 
 // NewServer creates and wires a new orbit-hub Server.
@@ -86,13 +98,30 @@ func NewServer(ctx context.Context, opts ServerOptions) (*Server, error) {
 		}
 	}
 
+	hbInterval := opts.HeartbeatInterval
+	if hbInterval <= 0 {
+		hbInterval = 10 * time.Second
+	}
+	leaseTTL := opts.LeaseTTL
+	if leaseTTL <= 0 {
+		leaseTTL = 45 * time.Second
+	}
+	maintInterval := opts.MaintenanceInterval
+	if maintInterval <= 0 {
+		maintInterval = 5 * time.Second
+	}
+
 	s := &Server{
-		hubCfg:   cfg,
-		projects: protocol.ProjectsConfig{SchemaVersion: 1, Projects: map[string]protocol.ProjectConfig{}},
-		machines: protocol.MachinesConfig{SchemaVersion: 1, Machines: map[string]protocol.MachineConfig{}},
-		store:    opts.Store,
-		broker:   broker,
-		webFS:    opts.WebFS,
+		hubCfg:              cfg,
+		projects:            protocol.ProjectsConfig{SchemaVersion: 1, Projects: map[string]protocol.ProjectConfig{}},
+		machines:            protocol.MachinesConfig{SchemaVersion: 1, Machines: map[string]protocol.MachineConfig{}},
+		heartbeatInterval:   hbInterval,
+		leaseTTL:            leaseTTL,
+		maintenanceInterval: maintInterval,
+		store:               opts.Store,
+		broker:              broker,
+		runners:             NewRunnerGateway(),
+		webFS:               opts.WebFS,
 	}
 	s.ryugi = NewRyugiBridge(RyugiBridgeConfig{
 		Store:        opts.Store,
@@ -131,6 +160,22 @@ func (s *Server) RyugiBridge() *RyugiBridge { return s.ryugi }
 
 // EventBroker returns the WebSocket event broker.
 func (s *Server) EventBroker() *EventBroker { return s.broker }
+
+// RunnerGateway returns the active Runner WebSocket gateway.
+func (s *Server) RunnerGateway() *RunnerGateway { return s.runners }
+
+// SetPABeforeCommitHook registers a test hook invoked after locking H and before committing a PA turn.
+func (s *Server) SetPABeforeCommitHook(fn func(fromSeq, highSeq int64)) {
+	s.paMu.Lock()
+	s.paBeforeCommitHook = fn
+	s.paMu.Unlock()
+}
+
+// Shutdown closes active runner WebSocket connections and waits for background tasks.
+func (s *Server) Shutdown() {
+	s.runners.CloseAll()
+	s.bgWG.Wait()
+}
 
 func (s *Server) hubConfigSnapshot() protocol.HubConfig {
 	s.mu.RLock()
@@ -197,12 +242,13 @@ func (s *Server) buildRouter() http.Handler {
 	r.Get("/api/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"ok":      true,
-			"version": "0.1.0-phase0",
+			"version": "0.2.0-phase1",
 		})
 	})
 
-	// WebSocket endpoint handles its own Origin + Auth check prior to upgrade
+	// WebSocket endpoints handle their own auth prior to upgrade
 	r.Get("/ws/client", s.handleClientWS)
+	r.Get("/ws/runner", s.handleRunnerWS)
 
 	// Authenticated REST API
 	r.Route("/api", func(api chi.Router) {
@@ -210,7 +256,42 @@ func (s *Server) buildRouter() http.Handler {
 
 		api.Get("/bootstrap", s.handleBootstrap)
 		api.Get("/projects/{projectId}/tasks", s.handleListProjectTasks)
+		api.Post("/projects/{projectId}/tasks", s.handleCreateTask)
+
+		api.Post("/tasks/{taskId}/bind-project", s.handleBindScratchTask)
 		api.Get("/tasks/{taskId}/timeline", s.handleGetTaskTimeline)
+		api.Post("/tasks/{taskId}/followup", s.handleFollowupTask)
+		api.Post("/tasks/{taskId}/cancel", s.handleCancelTask)
+		api.Post("/tasks/{taskId}/retry", s.handleRetryTask)
+
+		api.Get("/tasks/{taskId}/queue", s.handleListQueue)
+		api.Post("/tasks/{taskId}/queue", s.handleEnqueueInput)
+		api.Patch("/tasks/{taskId}/queue/{inputId}", s.handleUpdateQueueInput)
+		api.Delete("/tasks/{taskId}/queue/{inputId}", s.handleDeleteQueueInput)
+		api.Post("/tasks/{taskId}/queue/{inputId}/steer", s.handleSteerQueueInput)
+		api.Post("/tasks/{taskId}/queue/reorder", s.handleReorderQueue)
+
+		api.Post("/tasks/{taskId}/dispatch-annotations", s.handleDispatchAnnotations)
+
+		api.Get("/tasks/{taskId}/board", s.handleGetTaskBoard)
+		api.Post("/tasks/{taskId}/board/messages", s.handlePostBoardMessage)
+		api.Get("/tasks/{taskId}/workers/{workerName}/stream", s.handleGetWorkerStream)
+
+		api.Get("/tasks/{taskId}/sources", s.handleListTaskSources)
+		api.Post("/tasks/{taskId}/sources", s.handleAddTaskSource)
+		api.Delete("/tasks/{taskId}/sources/{sourceId}", s.handleDeleteTaskSource)
+
+		api.Get("/attempts/{attemptId}/raw", s.handleGetAttemptRaw)
+
+		api.Get("/approvals", s.handleListApprovals)
+		api.Post("/approvals/{approvalId}/decide", s.handleDecideApproval)
+
+		api.Post("/pa/brief", s.handlePABrief)
+		api.Get("/pa/threads", s.handleListPAThreads)
+		api.Post("/pa/threads", s.handleCreatePAThread)
+		api.Get("/pa/threads/{threadId}", s.handleGetPAThread)
+		api.Post("/pa/chat", s.handlePAChat)
+		api.Post("/pa/reset-session", s.handlePAResetSession)
 
 		api.Post("/deliveries/manual-import", s.handleManualImport)
 		api.Get("/deliveries/{deliveryId}", s.handleGetDelivery)

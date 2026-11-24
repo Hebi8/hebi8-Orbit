@@ -68,6 +68,9 @@ type BootstrapResponse struct {
 	Projects       []ProjectView   `json:"projects"`
 	Machines       []MachineView   `json:"machines"`
 	OpenInboxItems []InboxItemView `json:"openInboxItems"`
+	ActiveTasks    []TaskSummary   `json:"activeTasks"`
+	PAThreads      []PAThread      `json:"paThreads"`
+	PAState        PAStateView     `json:"paState"`
 	SnapshotSeq    int64           `json:"snapshotSeq"`
 }
 
@@ -205,6 +208,8 @@ type TaskSummary struct {
 	LatestDeliveryHead  string        `json:"latestDeliveryHead,omitempty"`
 	OpenAnnotationCount int           `json:"openAnnotationCount"`
 	DeliveryCount       int           `json:"deliveryCount"`
+	QueuedInputCount    int           `json:"queuedInputCount"`
+	WorkerCount         int           `json:"workerCount"`
 	CreatedBy           TaskCreatedBy `json:"createdBy"`
 	CreatedAt           int64         `json:"createdAt"`
 	UpdatedAt           int64         `json:"updatedAt"`
@@ -228,11 +233,15 @@ type EventRecord struct {
 
 // TaskTimelineResponse powers the center workbench timeline pane.
 type TaskTimelineResponse struct {
-	Task        TaskSummary      `json:"task"`
-	Attempts    []AttemptView    `json:"attempts"`
-	Deliveries  []DeliveryView   `json:"deliveries"`
-	Annotations []AnnotationView `json:"annotations"`
-	Events      []EventRecord    `json:"events"`
+	Task          TaskSummary         `json:"task"`
+	Attempts      []AttemptView       `json:"attempts"`
+	Deliveries    []DeliveryView      `json:"deliveries"`
+	Annotations   []AnnotationView    `json:"annotations"`
+	PendingInputs []PendingInput      `json:"pendingInputs"`
+	Approvals     []ApprovalView      `json:"approvals"`
+	Sources       []TaskSource        `json:"sources"`
+	BoardMembers  []BoardMemberCursor `json:"boardMembers"`
+	Events        []EventRecord       `json:"events"`
 }
 
 // DiffFileStat summarizes one changed file in a delivery diff.
@@ -354,4 +363,378 @@ type WSServerMessage struct {
 	Event         *EventRecord  `json:"event,omitempty"`
 	ReplayHeadSeq int64         `json:"replayHeadSeq,omitempty"`
 	ServerTime    int64         `json:"serverTime,omitempty"`
+}
+
+// PendingInput represents a queued follow-up message or annotation batch waiting
+// to be consumed by a task session (rendered as dashed bubbles at the tail of the chat stream).
+type PendingInput struct {
+	InputID             string             `json:"inputId"`
+	TaskID              string             `json:"taskId"`
+	ProjectID           string             `json:"projectId"`
+	Kind                PendingInputKind   `json:"kind"`
+	Source              PendingInputSource `json:"source"`
+	Body                string             `json:"body"`
+	Payload             map[string]any     `json:"payload"`
+	Position            int                `json:"position"`
+	State               PendingInputState  `json:"state"`
+	CreatedAt           int64              `json:"createdAt"`
+	UpdatedAt           int64              `json:"updatedAt"`
+	DispatchedAttemptID string             `json:"dispatchedAttemptId,omitempty"`
+}
+
+// BoardMessage is one monotonic #seq message on a task's shared queue message board.
+type BoardMessage struct {
+	Seq           int64              `json:"seq"`
+	MessageID     string             `json:"messageId"`
+	TaskID        string             `json:"taskId"`
+	ProjectID     string             `json:"projectId"`
+	AuthorName    string             `json:"authorName"`
+	TargetMention string             `json:"targetMention,omitempty"`
+	Body          string             `json:"body"`
+	Status        BoardMessageStatus `json:"status"`
+	ExternalKey   string             `json:"externalKey,omitempty"`
+	CreatedAt     int64              `json:"createdAt"`
+}
+
+// BoardMemberCursor tracks a native swarm or cross-machine worker on a task's board.
+type BoardMemberCursor struct {
+	TaskID          string           `json:"taskId"`
+	ProjectID       string           `json:"projectId"`
+	MemberName      string           `json:"memberName"`
+	MachineID       string           `json:"machineId,omitempty"`
+	Adapter         Adapter          `json:"adapter,omitempty"`
+	State           BoardMemberState `json:"state"`
+	LastConsumedSeq int64            `json:"lastConsumedSeq"`
+	CurrentStep     string           `json:"currentStep,omitempty"`
+	WorkerTaskID    string           `json:"workerTaskId,omitempty"`
+	UpdatedAt       int64            `json:"updatedAt"`
+}
+
+// TaskBoardResponse is returned by GET /api/tasks/:taskId/board.
+type TaskBoardResponse struct {
+	TaskID    string              `json:"taskId"`
+	LatestSeq int64               `json:"latestSeq"`
+	Members   []BoardMemberCursor `json:"members"`
+	Messages  []BoardMessage      `json:"messages"`
+}
+
+// WorkerStreamResponse is returned by GET /api/tasks/:taskId/workers/:workerName/stream.
+type WorkerStreamResponse struct {
+	TaskID     string             `json:"taskId"`
+	WorkerName string             `json:"workerName"`
+	Member     *BoardMemberCursor `json:"member,omitempty"`
+	Events     []EventRecord      `json:"events"`
+}
+
+// TaskSource is a file, link, or nmem reference attached to a session's Sources card.
+type TaskSource struct {
+	SourceID  string         `json:"sourceId"`
+	TaskID    string         `json:"taskId"`
+	ProjectID string         `json:"projectId"`
+	Kind      TaskSourceKind `json:"kind"`
+	Label     string         `json:"label"`
+	URIOrRef  string         `json:"uriOrRef"`
+	CreatedAt int64          `json:"createdAt"`
+}
+
+// ApprovalOption describes one selectable choice on an approval request.
+type ApprovalOption struct {
+	ID    string `json:"id"`
+	Label string `json:"label"`
+	Kind  string `json:"kind"`
+}
+
+// ApprovalView represents an approval record in the strict delivery/crash-window state machine.
+type ApprovalView struct {
+	ApprovalID       string              `json:"approvalId"`
+	ProjectID        string              `json:"projectId"`
+	TaskID           string              `json:"taskId"`
+	AttemptID        string              `json:"attemptId"`
+	Kind             ApprovalKind        `json:"kind"`
+	ActionName       string              `json:"actionName"`
+	TargetEnv        string              `json:"targetEnv"`
+	InputSHA         string              `json:"inputSha"`
+	Payload          map[string]any      `json:"payload"`
+	PayloadSHA256    string              `json:"payloadSha256"`
+	ACPRPCID         string              `json:"acpRpcId,omitempty"`
+	RunnerInstanceID string              `json:"runnerInstanceId,omitempty"`
+	Options          []ApprovalOption    `json:"options"`
+	RequestedBy      ApprovalRequestedBy `json:"requestedBy"`
+	State            ApprovalState       `json:"state"`
+	DecisionID       string              `json:"decisionId,omitempty"`
+	SelectedOptionID string              `json:"selectedOptionId,omitempty"`
+	DecidedBy        *ApprovalDecidedBy  `json:"decidedBy,omitempty"`
+	DecisionNote     string              `json:"decisionNote,omitempty"`
+	ExpiresAt        int64               `json:"expiresAt"`
+	CreatedAt        int64               `json:"createdAt"`
+	DecidedAt        *int64              `json:"decidedAt,omitempty"`
+	ConsumedAt       *int64              `json:"consumedAt,omitempty"`
+}
+
+// PAFocusPointer references a pinned project, task, or delivery tracked by the global PA.
+type PAFocusPointer struct {
+	Kind     string `json:"kind"`
+	ID       string `json:"id"`
+	Label    string `json:"label"`
+	PinnedAt int64  `json:"pinnedAt"`
+}
+
+// PAStateView exposes the global PA's attention pointers and event watermark (zero fact copies).
+type PAStateView struct {
+	PAID              string           `json:"paId"`
+	ActivePAThreadID  string           `json:"activePaThreadId,omitempty"`
+	ActiveWBSessionID string           `json:"activeWbSessionId,omitempty"`
+	LastReadEventSeq  int64            `json:"lastReadEventSeq"`
+	FocusPointers     []PAFocusPointer `json:"focusPointers"`
+	UpdatedAt         int64            `json:"updatedAt"`
+}
+
+// PAThread represents one conversation thread in PA Space.
+type PAThread struct {
+	PAThreadID  string         `json:"paThreadId"`
+	Title       string         `json:"title"`
+	WBSessionID string         `json:"wbSessionId,omitempty"`
+	Status      PAThreadStatus `json:"status"`
+	CreatedAt   int64          `json:"createdAt"`
+	UpdatedAt   int64          `json:"updatedAt"`
+}
+
+// PAActionResult summarizes one audited action executed during a PA turn.
+type PAActionResult struct {
+	Action  string         `json:"action"`
+	Status  string         `json:"status"`
+	Summary string         `json:"summary"`
+	Data    map[string]any `json:"data,omitempty"`
+}
+
+// PAMessage is one message row inside a PAThread.
+type PAMessage struct {
+	MessageID    string           `json:"messageId"`
+	PAThreadID   string           `json:"paThreadId"`
+	Role         PAMessageRole    `json:"role"`
+	Content      string           `json:"content"`
+	DeltaFromSeq int64            `json:"deltaFromSeq,omitempty"`
+	DeltaToSeq   int64            `json:"deltaToSeq,omitempty"`
+	Actions      []PAActionResult `json:"actions,omitempty"`
+	CreatedAt    int64            `json:"createdAt"`
+}
+
+// PABriefRequest filters a stateless Brief Me summary.
+type PABriefRequest struct {
+	SinceHours int    `json:"sinceHours,omitempty"`
+	ProjectID  string `json:"projectId,omitempty"`
+}
+
+// PABriefResponse is returned by POST /api/pa/brief (<1s stateless event/inbox/task aggregation).
+type PABriefResponse struct {
+	GeneratedAt      int64           `json:"generatedAt"`
+	SnapshotSeq      int64           `json:"snapshotSeq"`
+	SinceHours       int             `json:"sinceHours"`
+	ProjectID        string          `json:"projectId,omitempty"`
+	Summary          string          `json:"summary"`
+	OpenInboxCount   int             `json:"openInboxCount"`
+	OpenInboxItems   []InboxItemView `json:"openInboxItems"`
+	ActiveTasks      []TaskSummary   `json:"activeTasks"`
+	BlockedTasks     []TaskSummary   `json:"blockedTasks"`
+	RecentDeliveries []DeliveryView  `json:"recentDeliveries"`
+	Machines         []MachineView   `json:"machines"`
+	RecentEvents     []EventRecord   `json:"recentEvents"`
+}
+
+// CreateTaskSourceInput specifies a source to attach during task creation or POST /sources.
+type CreateTaskSourceInput struct {
+	Kind     TaskSourceKind `json:"kind"`
+	Label    string         `json:"label"`
+	URIOrRef string         `json:"uriOrRef"`
+}
+
+// CreateTaskRequest creates a new task under a real project or virtual _scratch project.
+type CreateTaskRequest struct {
+	Title                string                  `json:"title,omitempty"`
+	Goal                 string                  `json:"goal"`
+	ParentTaskID         string                  `json:"parentTaskId,omitempty"`
+	RequiredCapability   string                  `json:"requiredCapability,omitempty"`
+	RequiredResources    []string                `json:"requiredResources,omitempty"`
+	Adapter              Adapter                 `json:"adapter,omitempty"`
+	Config               map[string]string       `json:"config,omitempty"`
+	ImportDirtyWorkspace bool                    `json:"importDirtyWorkspace,omitempty"`
+	Sources              []CreateTaskSourceInput `json:"sources,omitempty"`
+	IdempotencyKey       string                  `json:"idempotencyKey,omitempty"`
+	SwarmIdleTimeoutMs   int64                   `json:"swarmIdleTimeoutMs,omitempty"`
+}
+
+// CreateTaskResponse returns the newly created (or idempotently matched) task and initial attempt.
+type CreateTaskResponse struct {
+	Task       TaskSummary  `json:"task"`
+	Attempt    *AttemptView `json:"attempt,omitempty"`
+	Sources    []TaskSource `json:"sources,omitempty"`
+	Created    bool         `json:"created"`
+	Dispatched bool         `json:"dispatched"`
+}
+
+// BindScratchTaskRequest migrates a _scratch free chat task to a real logical project.
+type BindScratchTaskRequest struct {
+	ProjectID string `json:"projectId"`
+}
+
+// BindScratchTaskResponse returns the rebound task summary.
+type BindScratchTaskResponse struct {
+	Task          TaskSummary `json:"task"`
+	FromProjectID string      `json:"fromProjectId"`
+	ToProjectID   string      `json:"toProjectId"`
+}
+
+// FollowupTaskRequest appends an instruction or switches capability/session for a task.
+type FollowupTaskRequest struct {
+	Message            string            `json:"message"`
+	Mode               FollowupMode      `json:"mode,omitempty"`
+	RequiredCapability string            `json:"requiredCapability,omitempty"`
+	RequiredResources  []string          `json:"requiredResources,omitempty"`
+	Adapter            Adapter           `json:"adapter,omitempty"`
+	Config             map[string]string `json:"config,omitempty"`
+}
+
+// FollowupTaskResponse reports whether the follow-up was queued, steered, dispatched, or forked.
+type FollowupTaskResponse struct {
+	Mode         FollowupMode  `json:"mode"`
+	Task         TaskSummary   `json:"task"`
+	Attempt      *AttemptView  `json:"attempt,omitempty"`
+	PendingInput *PendingInput `json:"pendingInput,omitempty"`
+	ForkedTaskID string        `json:"forkedTaskId,omitempty"`
+	Dispatched   bool          `json:"dispatched"`
+}
+
+// RetryTaskRequest retries a failed/expired/waiting_resource/needs_verification task.
+type RetryTaskRequest struct {
+	VerifiedSite bool   `json:"verifiedSite,omitempty"`
+	Note         string `json:"note,omitempty"`
+}
+
+// RetryTaskResponse returns the newly created retry attempt.
+type RetryTaskResponse struct {
+	Task       TaskSummary `json:"task"`
+	Attempt    AttemptView `json:"attempt"`
+	Dispatched bool        `json:"dispatched"`
+}
+
+// CancelTaskRequest cancels an active attempt on a task.
+type CancelTaskRequest struct {
+	Reason string `json:"reason,omitempty"`
+}
+
+// CancelTaskResponse reports the cancellation dispatch state.
+type CancelTaskResponse struct {
+	TaskID         string `json:"taskId"`
+	AttemptID      string `json:"attemptId,omitempty"`
+	CancelSent     bool   `json:"cancelSent"`
+	ImmediateState string `json:"immediateState,omitempty"`
+}
+
+// AttemptRawEventsResponse returns lazy-loaded raw_acp events for one attempt.
+type AttemptRawEventsResponse struct {
+	AttemptID string        `json:"attemptId"`
+	Events    []EventRecord `json:"events"`
+}
+
+// CreatePendingInputRequest adds a queued input item directly to a task's queue.
+type CreatePendingInputRequest struct {
+	Kind    PendingInputKind   `json:"kind,omitempty"`
+	Source  PendingInputSource `json:"source,omitempty"`
+	Body    string             `json:"body"`
+	Payload map[string]any     `json:"payload,omitempty"`
+}
+
+// UpdatePendingInputRequest edits the body/payload of a queued pending input.
+type UpdatePendingInputRequest struct {
+	Body    string         `json:"body"`
+	Payload map[string]any `json:"payload,omitempty"`
+}
+
+// ReorderPendingInputsRequest specifies the desired ordering of queued input IDs.
+type ReorderPendingInputsRequest struct {
+	InputIDs []string `json:"inputIds"`
+}
+
+// DispatchAnnotationsRequest atomically moves open annotations to queued and runs or queues them.
+type DispatchAnnotationsRequest struct {
+	AnnotationIDs []string     `json:"annotationIds"`
+	Mode          FollowupMode `json:"mode,omitempty"`
+	Message       string       `json:"message,omitempty"`
+}
+
+// DispatchAnnotationsResponse reports the resulting attempt or queued pending input.
+type DispatchAnnotationsResponse struct {
+	TaskID         string        `json:"taskId"`
+	QueuedCount    int           `json:"queuedCount"`
+	Attempt        *AttemptView  `json:"attempt,omitempty"`
+	PendingInput   *PendingInput `json:"pendingInput,omitempty"`
+	ForkedTaskID   string        `json:"forkedTaskId,omitempty"`
+	Dispatched     bool          `json:"dispatched"`
+}
+
+// PostBoardMessageRequest posts a message (optionally with @worker mention) to a task's board.
+type PostBoardMessageRequest struct {
+	AuthorName    string `json:"authorName,omitempty"`
+	TargetMention string `json:"targetMention,omitempty"`
+	Body          string `json:"body"`
+}
+
+// DecideApprovalRequest submits a human decision against a pending approval.
+type DecideApprovalRequest struct {
+	OptionID              string `json:"optionId"`
+	ExpectedAttemptID     string `json:"expectedAttemptId"`
+	ExpectedPayloadSHA256 string `json:"expectedPayloadSha256"`
+	Note                  string `json:"note,omitempty"`
+}
+
+// DecideApprovalResponse returns the updated approval and whether delivery to runner started.
+type DecideApprovalResponse struct {
+	Approval      ApprovalView `json:"approval"`
+	SentToRunner  bool         `json:"sentToRunner"`
+}
+
+// CreatePAThreadRequest starts a new PA conversation thread.
+type CreatePAThreadRequest struct {
+	Title string `json:"title,omitempty"`
+}
+
+// PAThreadDetailResponse returns one PA thread, its messages, and current PAState.
+type PAThreadDetailResponse struct {
+	Thread   PAThread    `json:"thread"`
+	Messages []PAMessage `json:"messages"`
+	PAState  PAStateView `json:"paState"`
+}
+
+// PAChatActionRequest optionally requests a structured deterministic PA control action.
+type PAChatActionRequest struct {
+	Action             string            `json:"action"` // brief | create_task | send_task_followup | cancel_task | list_projects_and_machines | read_task_timeline
+	ProjectID          string            `json:"projectId,omitempty"`
+	TaskID             string            `json:"taskId,omitempty"`
+	Goal               string            `json:"goal,omitempty"`
+	Message            string            `json:"message,omitempty"`
+	Mode               FollowupMode      `json:"mode,omitempty"`
+	RequiredCapability string            `json:"requiredCapability,omitempty"`
+	Adapter            Adapter           `json:"adapter,omitempty"`
+	Config             map[string]string `json:"config,omitempty"`
+	IdempotencyKey     string            `json:"idempotencyKey,omitempty"`
+}
+
+// PAChatRequest sends one user turn to the global PA.
+type PAChatRequest struct {
+	ThreadID string               `json:"threadId,omitempty"`
+	Message  string               `json:"message"`
+	Action   *PAChatActionRequest `json:"action,omitempty"`
+}
+
+// PAChatResponse returns the PA turn response, updated event watermark, and any executed actions.
+type PAChatResponse struct {
+	Thread           PAThread         `json:"thread"`
+	UserMessage      PAMessage        `json:"userMessage"`
+	AssistantMessage PAMessage        `json:"assistantMessage"`
+	DeltaFromSeq     int64            `json:"deltaFromSeq"`
+	DeltaToSeq       int64            `json:"deltaToSeq"`
+	DeltaEventCount  int              `json:"deltaEventCount"`
+	FoldedRange      string           `json:"foldedRange,omitempty"`
+	Actions          []PAActionResult `json:"actions,omitempty"`
+	PAState          PAStateView      `json:"paState"`
 }
