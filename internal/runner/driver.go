@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Hebi8/hebi8-Orbit/internal/protocol"
 	acp "github.com/coder/acp-go-sdk"
 )
 
@@ -253,8 +254,10 @@ type AcpAdapterDriver interface {
 	Cancel(ctx context.Context, sid acp.SessionId) error
 }
 
-// AgyDriverConfig configures launching `agy acp --stdio --process-per-session`.
+// AgyDriverConfig configures launching an upstream standard ACP process
+// (`agy acp --stdio --process-per-session`, `claude-agent-acp`, or `codex-acp`).
 type AgyDriverConfig struct {
+	Adapter       protocol.Adapter
 	Bin           string
 	Args          []string
 	RunnerSock    string
@@ -288,12 +291,26 @@ type AgyAcpDriver struct {
 	onPerm          PermissionHandler
 }
 
-func NewAgyAcpDriver(cfg AgyDriverConfig) *AgyAcpDriver {
-	if strings.TrimSpace(cfg.Bin) == "" {
-		cfg.Bin = "agy"
-	}
-	if len(cfg.Args) == 0 {
-		cfg.Args = []string{"acp", "--stdio", "--process-per-session"}
+// NewAdapterDriver constructs an ACP driver configured with sensible defaults for agy, claude, or codex.
+func NewAdapterDriver(adapter protocol.Adapter, cfg AgyDriverConfig) *AgyAcpDriver {
+	cfg.Adapter = adapter
+	switch adapter {
+	case protocol.AdapterClaude:
+		if strings.TrimSpace(cfg.Bin) == "" {
+			cfg.Bin = "claude-agent-acp"
+		}
+	case protocol.AdapterCodex:
+		if strings.TrimSpace(cfg.Bin) == "" {
+			cfg.Bin = "codex-acp"
+		}
+	default:
+		cfg.Adapter = protocol.AdapterAgy
+		if strings.TrimSpace(cfg.Bin) == "" {
+			cfg.Bin = "agy"
+		}
+		if len(cfg.Args) == 0 {
+			cfg.Args = []string{"acp", "--stdio", "--process-per-session"}
+		}
 	}
 	if cfg.RunnerVersion == "" {
 		cfg.RunnerVersion = "0.2.0"
@@ -303,6 +320,13 @@ func NewAgyAcpDriver(cfg AgyDriverConfig) *AgyAcpDriver {
 		liveSessions:    map[acp.SessionId]bool{},
 		loadingSessions: map[acp.SessionId]bool{},
 	}
+}
+
+func NewAgyAcpDriver(cfg AgyDriverConfig) *AgyAcpDriver {
+	if cfg.Adapter != "" {
+		return NewAdapterDriver(cfg.Adapter, cfg)
+	}
+	return NewAdapterDriver(protocol.AdapterAgy, cfg)
 }
 
 // NewStreamAcpDriver constructs an AgyAcpDriver bound to pre-existing peerInput/peerOutput streams
@@ -395,8 +419,24 @@ func (d *AgyAcpDriver) Start(ctx context.Context, onUpdate SessionUpdateHandler,
 	d.supportsResume = initResp.AgentCapabilities.SessionCapabilities.Resume != nil
 	d.supportsLoad = initResp.AgentCapabilities.LoadSession
 	d.supportsClose = initResp.AgentCapabilities.SessionCapabilities.Close != nil
-	d.supportsMetaSP = true // Verified on agy 1.5.14+ via _meta.antigravity.systemPrompt.append
+	d.supportsMetaSP = supportsAntigravityMetaSystemPrompt(d.cfg.Adapter, initResp.AgentCapabilities.Meta)
 	return nil
+}
+
+func supportsAntigravityMetaSystemPrompt(adapter protocol.Adapter, meta any) bool {
+	if metaMap, ok := meta.(map[string]any); ok {
+		if ag, ok := metaMap["antigravity"].(map[string]any); ok {
+			if sp, ok := ag["systemPrompt"].(map[string]any); ok {
+				if appendOK, ok := sp["append"].(bool); ok {
+					return appendOK
+				}
+			}
+		}
+		// Explicitly non-antigravity ACP servers (e.g. claude-agent-acp, codex-acp) don't advertise antigravity meta
+		return false
+	}
+	// Fallback for minimal mock agents in tests that omit _meta on agy
+	return adapter == "" || adapter == protocol.AdapterAgy
 }
 
 func (d *AgyAcpDriver) buildEnv() []string {

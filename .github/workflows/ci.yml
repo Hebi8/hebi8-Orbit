@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Build, Test & Cross-Compile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Privacy hygiene check
+        run: make check-privacy
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      - name: Install web dependencies
+        run: pnpm --dir web install --frozen-lockfile
+
+      - name: Verify generated protocol TypeScript types are up-to-date
+        run: |
+          make gen-types
+          git diff --exit-code web/src/generated/protocol.ts
+
+      - name: Build web UI & Go binaries
+        run: make build
+
+      - name: Run Go vet & race tests (core + CLI)
+        run: make test
+
+      - name: Cross-compile server & CLI (linux/amd64, darwin/arm64)
+        run: make build-all
+
+      - name: Verify Desktop Client tests & 3-OS pure-Go cross-compile
+        run: |
+          cd desktop
+          go vet ./...
+          go test -race -count=1 ./...
+          CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 go build -trimpath -o ../bin/linux-amd64/orbit-client .
+          CGO_ENABLED=0 GOOS=darwin  GOARCH=arm64 go build -trimpath -o ../bin/darwin-arm64/orbit-client .
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -o ../bin/windows-amd64/orbit-client.exe .

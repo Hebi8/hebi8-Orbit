@@ -46,6 +46,7 @@ type Config struct {
 	SupportedAdapters       []protocol.Adapter
 	MaxLiveWorkers          int
 	Driver                  AcpAdapterDriver
+	Drivers                 map[protocol.Adapter]AcpAdapterDriver
 	ConfigApplyTimeout      time.Duration
 	ChunkCoalesceWindow     time.Duration
 	DefaultSwarmIdleTimeout time.Duration
@@ -62,6 +63,7 @@ type Config struct {
 type sessionSlot struct {
 	mu                   sync.Mutex
 	wbSessionID          string
+	adapter              protocol.Adapter
 	providerSessionID    acp.SessionId
 	cwd                  string
 	runtimeState         protocol.SessionRuntimeState
@@ -115,16 +117,19 @@ type attemptContext struct {
 	doneCh                  chan struct{}
 }
 
-// Runner is the pure-Go thin ACP runner bridging Hub (/ws/runner) and AcpAdapterDriver.
+// Runner is the pure-Go thin ACP runner bridging Hub (/ws/runner) and AcpAdapterDriver(s).
 type Runner struct {
-	cfg        Config
-	instanceID string
-	outbox     *LocalOutbox
-	driver     AcpAdapterDriver
-	coalescer  *ChunkCoalescer
-	sockSrv    *localSocketServer
-	httpClient *http.Client
-	deliverMu  sync.Mutex
+	cfg           Config
+	instanceID    string
+	outbox        *LocalOutbox
+	driver        AcpAdapterDriver
+	drivers       map[protocol.Adapter]AcpAdapterDriver
+	driverMu      sync.Mutex
+	driverStarted map[protocol.Adapter]bool
+	coalescer     *ChunkCoalescer
+	sockSrv       *localSocketServer
+	httpClient    *http.Client
+	deliverMu     sync.Mutex
 
 	mu                sync.Mutex
 	sessions          map[string]*sessionSlot
@@ -151,8 +156,34 @@ func New(ctx context.Context, cfg Config) (*Runner, error) {
 	if strings.TrimSpace(cfg.MachineID) == "" {
 		return nil, errors.New("machineId is required")
 	}
-	if cfg.Driver == nil {
-		return nil, errors.New("acp driver is required")
+	drivers := make(map[protocol.Adapter]AcpAdapterDriver, len(cfg.Drivers)+1)
+	for adp, drv := range cfg.Drivers {
+		if drv != nil {
+			drivers[adp] = drv
+		}
+	}
+	if cfg.Driver != nil {
+		defaultAdp := protocol.AdapterAgy
+		if len(cfg.SupportedAdapters) == 1 {
+			defaultAdp = cfg.SupportedAdapters[0]
+		}
+		if _, exists := drivers[defaultAdp]; !exists {
+			drivers[defaultAdp] = cfg.Driver
+		}
+	}
+	if len(drivers) == 0 {
+		return nil, errors.New("at least one acp driver is required")
+	}
+	primaryDriver := cfg.Driver
+	if primaryDriver == nil {
+		if d, ok := drivers[protocol.AdapterAgy]; ok {
+			primaryDriver = d
+		} else {
+			for _, d := range drivers {
+				primaryDriver = d
+				break
+			}
+		}
 	}
 	if cfg.DataDir == "" {
 		cfg.DataDir = protocol.ExpandPath("~/.local/share/hebi8-orbit")
@@ -166,7 +197,7 @@ func New(ctx context.Context, cfg Config) (*Runner, error) {
 		cfg.SocketPath = filepath.Join(cfg.DataDir, fmt.Sprintf("runner-%s.sock", cfg.MachineID))
 	}
 	if cfg.RunnerVersion == "" {
-		cfg.RunnerVersion = "0.2.0-phase1"
+		cfg.RunnerVersion = "0.2.0"
 	}
 	if cfg.ConfigApplyTimeout <= 0 {
 		cfg.ConfigApplyTimeout = 10 * time.Second
@@ -190,7 +221,18 @@ func New(ctx context.Context, cfg Config) (*Runner, error) {
 		cfg.PermissionPolicy = defaultPermissionPolicy
 	}
 	if len(cfg.SupportedAdapters) == 0 {
-		cfg.SupportedAdapters = append([]protocol.Adapter(nil), protocol.Phase1ImplementedSessionAdapters...)
+		derived := make([]protocol.Adapter, 0, len(drivers))
+		for _, a := range []protocol.Adapter{protocol.AdapterAgy, protocol.AdapterClaude, protocol.AdapterCodex} {
+			if _, ok := drivers[a]; ok {
+				derived = append(derived, a)
+			}
+		}
+		for a := range drivers {
+			if !slices.Contains(derived, a) {
+				derived = append(derived, a)
+			}
+		}
+		cfg.SupportedAdapters = derived
 	}
 	if strings.TrimSpace(cfg.HubHTTPURL) == "" && strings.TrimSpace(cfg.HubWSURL) != "" {
 		cfg.HubHTTPURL = deriveHubHTTPURL(cfg.HubWSURL)
@@ -205,7 +247,9 @@ func New(ctx context.Context, cfg Config) (*Runner, error) {
 		cfg:               cfg,
 		instanceID:        "run_" + ulid.Make().String(),
 		outbox:            outbox,
-		driver:            cfg.Driver,
+		driver:            primaryDriver,
+		drivers:           drivers,
+		driverStarted:     map[protocol.Adapter]bool{},
 		httpClient:        &http.Client{Timeout: 30 * time.Second},
 		sessions:          map[string]*sessionSlot{},
 		attempts:          map[string]*attemptContext{},
@@ -244,18 +288,59 @@ func (r *Runner) SocketPath() string { return r.cfg.SocketPath }
 // Outbox exposes the local persistent outbox (primarily for tests/diagnostics).
 func (r *Runner) Outbox() *LocalOutbox { return r.outbox }
 
-// Start boots the ACP driver, opens the local Unix domain socket, and connects to Hub /ws/runner.
+func (r *Runner) driverFor(adapter protocol.Adapter) (AcpAdapterDriver, error) {
+	if adapter == "" {
+		adapter = protocol.AdapterAgy
+	}
+	if drv, ok := r.drivers[adapter]; ok && drv != nil {
+		return drv, nil
+	}
+	return nil, fmt.Errorf("adapter %q is not configured on runner %s", adapter, r.cfg.MachineID)
+}
+
+func (r *Runner) ensureDriverStarted(ctx context.Context, adapter protocol.Adapter) (AcpAdapterDriver, error) {
+	if adapter == "" {
+		adapter = protocol.AdapterAgy
+	}
+	drv, err := r.driverFor(adapter)
+	if err != nil {
+		return nil, err
+	}
+	r.driverMu.Lock()
+	defer r.driverMu.Unlock()
+	if r.driverStarted[adapter] {
+		return drv, nil
+	}
+	startCtx := r.runCtx
+	if startCtx == nil {
+		startCtx = ctx
+	}
+	if err := drv.Start(startCtx, r.handleSessionUpdate, r.handlePermissionRequest); err != nil {
+		return nil, fmt.Errorf("start %s acp driver: %w", adapter, err)
+	}
+	r.driverStarted[adapter] = true
+	return drv, nil
+}
+
+// Start boots the primary ACP driver, opens the local Unix domain socket, and connects to Hub /ws/runner.
+// Additional configured adapters (e.g. claude, codex) start lazily on first dispatch so idle memory stays minimal.
 func (r *Runner) Start(ctx context.Context) error {
 	r.runCtx, r.runCancel = context.WithCancel(ctx)
 
-	if err := r.driver.Start(r.runCtx, r.handleSessionUpdate, r.handlePermissionRequest); err != nil {
-		return fmt.Errorf("start acp driver: %w", err)
+	primaryAdapter := protocol.AdapterAgy
+	if _, ok := r.drivers[primaryAdapter]; !ok && len(r.cfg.SupportedAdapters) > 0 {
+		primaryAdapter = r.cfg.SupportedAdapters[0]
+	}
+	if _, ok := r.drivers[primaryAdapter]; ok {
+		if _, err := r.ensureDriverStarted(r.runCtx, primaryAdapter); err != nil {
+			return err
+		}
 	}
 
 	if r.cfg.SocketPath != "" && r.cfg.SocketPath != "none" {
 		sockSrv, err := startLocalSocketServer(r.cfg.SocketPath, r.HandleLocalDeliver)
 		if err != nil {
-			_ = r.driver.Close(ctx)
+			_ = r.closeAllDrivers(ctx)
 			return err
 		}
 		r.sockSrv = sockSrv
@@ -277,7 +362,32 @@ func (r *Runner) Start(ctx context.Context) error {
 	return nil
 }
 
-// Close gracefully terminates WS connections, active attempts, local socket, ACP subprocess, and SQLite outbox.
+func (r *Runner) closeAllDrivers(ctx context.Context) error {
+	r.driverMu.Lock()
+	toClose := make([]AcpAdapterDriver, 0, len(r.driverStarted))
+	seen := map[AcpAdapterDriver]bool{}
+	for adp, started := range r.driverStarted {
+		if !started {
+			continue
+		}
+		if drv := r.drivers[adp]; drv != nil && !seen[drv] {
+			seen[drv] = true
+			toClose = append(toClose, drv)
+		}
+		delete(r.driverStarted, adp)
+	}
+	r.driverMu.Unlock()
+
+	var errs []error
+	for _, drv := range toClose {
+		if err := drv.Close(ctx); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// Close gracefully terminates WS connections, active attempts, local socket, ACP subprocesses, and SQLite outbox.
 func (r *Runner) Close(ctx context.Context) error {
 	if r.runCancel != nil {
 		r.runCancel()
@@ -309,7 +419,7 @@ func (r *Runner) Close(ctx context.Context) error {
 	if r.sockSrv != nil {
 		err1 = r.sockSrv.Close()
 	}
-	err2 = r.driver.Close(ctx)
+	err2 = r.closeAllDrivers(ctx)
 	err3 = r.outbox.Close()
 	return errors.Join(err1, err2, err3)
 }
@@ -533,6 +643,10 @@ func (r *Runner) executeAttempt(ctx context.Context, att *attemptContext) {
 		return
 	}
 
+	slot.adapter = dispatch.Adapter
+	if slot.adapter == "" {
+		slot.adapter = protocol.AdapterAgy
+	}
 	slot.providerSessionID = sid
 	slot.cwd = worktreePath
 	slot.runtimeState = protocol.SessionLive
@@ -562,7 +676,14 @@ func (r *Runner) executeAttempt(ctx context.Context, att *attemptContext) {
 		"baseSha":           baseSHA,
 	})
 
-	promptResp, promptErr := r.driver.Prompt(ctx, sid, promptText)
+	drv, drvErr := r.driverFor(dispatch.Adapter)
+	var promptResp acp.PromptResponse
+	var promptErr error
+	if drvErr != nil {
+		promptErr = drvErr
+	} else {
+		promptResp, promptErr = drv.Prompt(ctx, sid, promptText)
+	}
 
 	// B2: Only clear slot.inFlightPrompt if THIS attempt still owns the in-flight prompt!
 	slot.mu.Lock()
@@ -773,19 +894,23 @@ func (r *Runner) executeAttempt(ctx context.Context, att *attemptContext) {
 }
 
 func (r *Runner) isolateAndCloseSession(slot *sessionSlot, sid acp.SessionId) {
+	var adapter protocol.Adapter
 	if slot != nil {
 		slot.mu.Lock()
 		slot.locked = true
 		slot.runtimeState = protocol.SessionDead
+		adapter = slot.adapter
 		if sid == "" {
 			sid = slot.providerSessionID
 		}
 		slot.mu.Unlock()
 	}
 	if sid != "" {
-		cctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		_ = r.driver.CloseSession(cctx, sid)
-		cancel()
+		if drv, err := r.driverFor(adapter); err == nil {
+			cctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			_ = drv.CloseSession(cctx, sid)
+			cancel()
+		}
 	}
 }
 
@@ -899,11 +1024,20 @@ func (r *Runner) reserveLiveWorkerSlot(ctx context.Context, att *attemptContext,
 }
 
 // ensureSessionReadyLocked implements Spike Boundary #2 verbatim:
-// - Hard check: reuse requires same machine, unlocked slot, and expectedSessionCwd == worktreePath.
+// - Hard check: reuse requires same machine, same adapter, unlocked slot, and expectedSessionCwd == worktreePath.
 // - On cold restore: ResumeSession (0 replay) -> LoadSession (swallow replay) -> NewSession.
 // - IRON LAW: Always calls SetConfigOption per desired option with 10s timeout and verifies currentValue!
 func (r *Runner) ensureSessionReadyLocked(ctx context.Context, att *attemptContext, slot *sessionSlot) (acp.SessionId, string, error) {
 	d := att.dispatch
+	adapter := d.Adapter
+	if adapter == "" {
+		adapter = protocol.AdapterAgy
+	}
+	drv, err := r.ensureDriverStarted(ctx, adapter)
+	if err != nil {
+		return "", "", err
+	}
+
 	att.mu.Lock()
 	worktreePath := att.worktreePath
 	att.mu.Unlock()
@@ -915,7 +1049,9 @@ func (r *Runner) ensureSessionReadyLocked(ctx context.Context, att *attemptConte
 		expectedCWD = slot.cwd
 	}
 
+	sameAdapter := slot.adapter == "" || slot.adapter == adapter
 	canReuse := !slot.locked &&
+		sameAdapter &&
 		expectedSID != "" &&
 		expectedCWD != "" &&
 		filepath.Clean(expectedCWD) == filepath.Clean(worktreePath)
@@ -924,44 +1060,49 @@ func (r *Runner) ensureSessionReadyLocked(ctx context.Context, att *attemptConte
 	prependContract := false
 
 	var sid acp.SessionId
+	var sessionOpts []acp.SessionConfigOption
 	switch {
 	case !canReuse:
 		sysAppend := d.SystemPromptAppend
-		if !r.driver.SupportsMetaSystemPrompt() && sysAppend != "" {
+		if !drv.SupportsMetaSystemPrompt() && sysAppend != "" {
 			prependContract = true
 			sysAppend = ""
 		}
-		resp, err := r.driver.NewSession(ctx, worktreePath, sysAppend)
+		resp, err := drv.NewSession(ctx, worktreePath, sysAppend)
 		if err != nil {
-			return "", "", fmt.Errorf("new session: %w", err)
+			return "", "", fmt.Errorf("new session (%s): %w", adapter, err)
 		}
 		sid = resp.SessionId
+		sessionOpts = resp.ConfigOptions
 
-	case !r.driver.IsSessionLiveInMemory(expectedSID):
+	case !drv.IsSessionLiveInMemory(expectedSID):
 		resumed := false
-		if r.driver.SupportsResume() {
-			if _, err := r.driver.ResumeSession(ctx, expectedSID, worktreePath); err == nil {
+		if drv.SupportsResume() {
+			if resp, err := drv.ResumeSession(ctx, expectedSID, worktreePath); err == nil {
 				sid = expectedSID
+				sessionOpts = resp.ConfigOptions
 				resumed = true
 			}
 		}
-		if !resumed && r.driver.SupportsLoad() {
-			if _, err := r.driver.LoadSession(ctx, expectedSID, worktreePath); err == nil {
+		if !resumed && drv.SupportsLoad() {
+			if resp, err := drv.LoadSession(ctx, expectedSID, worktreePath); err == nil {
 				sid = expectedSID
+				sessionOpts = resp.ConfigOptions
 				resumed = true
 			}
 		}
 		if !resumed {
 			sysAppend := d.SystemPromptAppend
-			if !r.driver.SupportsMetaSystemPrompt() && sysAppend != "" {
+			if !drv.SupportsMetaSystemPrompt() && sysAppend != "" {
 				prependContract = true
 				sysAppend = ""
 			}
-			resp, err := r.driver.NewSession(ctx, worktreePath, sysAppend)
+			resp, err := drv.NewSession(ctx, worktreePath, sysAppend)
 			if err != nil {
-				return "", "", fmt.Errorf("fallback new session: %w", err)
+				return "", "", fmt.Errorf("fallback new session (%s): %w", adapter, err)
 			}
 			sid = resp.SessionId
+			sessionOpts = resp.ConfigOptions
 		}
 
 	default:
@@ -969,10 +1110,10 @@ func (r *Runner) ensureSessionReadyLocked(ctx context.Context, att *attemptConte
 	}
 
 	// IRON LAW: Re-apply and strictly verify every desired config option before sending prompt
-	if err := r.applyAndVerifyConfig(ctx, sid, d.DesiredConfig); err != nil {
+	if err := r.applyAndVerifyConfig(ctx, drv, sid, d.DesiredConfig, sessionOpts); err != nil {
 		// S1: Close the leaked ACP session on config failure so workers don't accumulate.
 		cctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		_ = r.driver.CloseSession(cctx, sid)
+		_ = drv.CloseSession(cctx, sid)
 		cancel()
 		return "", "", fmt.Errorf("CONFIG_APPLY_FAILED: %w", err)
 	}
@@ -983,7 +1124,13 @@ func (r *Runner) ensureSessionReadyLocked(ctx context.Context, att *attemptConte
 	return sid, promptText, nil
 }
 
-func (r *Runner) applyAndVerifyConfig(ctx context.Context, sid acp.SessionId, desired map[string]string) error {
+func (r *Runner) applyAndVerifyConfig(
+	ctx context.Context,
+	drv AcpAdapterDriver,
+	sid acp.SessionId,
+	desired map[string]string,
+	sessionOpts []acp.SessionConfigOption,
+) error {
 	if len(desired) == 0 {
 		return nil
 	}
@@ -995,19 +1142,114 @@ func (r *Runner) applyAndVerifyConfig(ctx context.Context, sid acp.SessionId, de
 	}
 	sort.Strings(keys)
 
+	currentOpts := sessionOpts
 	for _, k := range keys {
 		want := desired[k]
+		resolvedID, resolvedVal := resolveConfigOptionTarget(currentOpts, k, want)
 		optCtx, cancel := context.WithTimeout(ctx, r.cfg.ConfigApplyTimeout)
-		resp, err := r.driver.SetConfigOption(optCtx, sid, k, want)
+		resp, err := drv.SetConfigOption(optCtx, sid, resolvedID, resolvedVal)
 		cancel()
 		if err != nil {
-			return fmt.Errorf("configId %q=%q failed: %w", k, want, err)
+			return fmt.Errorf("configId %q (resolved %q=%q) failed: %w", k, resolvedID, resolvedVal, err)
 		}
-		if !verifyConfigOptionApplied(resp.ConfigOptions, k, want) {
-			return fmt.Errorf("configId %q verification mismatch (expected %q)", k, want)
+		if len(resp.ConfigOptions) > 0 {
+			currentOpts = resp.ConfigOptions
+		}
+		if !verifyConfigOptionApplied(resp.ConfigOptions, resolvedID, resolvedVal) {
+			return fmt.Errorf("configId %q (resolved %q) verification mismatch (expected %q)", k, resolvedID, resolvedVal)
 		}
 	}
 	return nil
+}
+
+// resolveConfigOptionTarget maps logical Orbit config keys/values (e.g. thought_level, mode=auto/ask/full)
+// onto the active ACP server's advertised configOptions (e.g. Claude's `effort` / `bypassPermissions`,
+// Codex's `reasoning_effort` / `agent` / `agent-full-access`, Agy's `thought_level` / `accept-edits`).
+func resolveConfigOptionTarget(opts []acp.SessionConfigOption, desiredKey, desiredVal string) (string, string) {
+	if len(opts) == 0 {
+		return desiredKey, desiredVal
+	}
+	var matched *acp.SessionConfigOptionSelect
+	// 1. Exact ID match first
+	for _, o := range opts {
+		if o.Select != nil && string(o.Select.Id) == desiredKey {
+			matched = o.Select
+			break
+		}
+	}
+	// 2. Category match fallback (e.g. Orbit "thought_level" or "effort" -> category "thought_level")
+	if matched == nil {
+		wantCat := desiredKey
+		if wantCat == "effort" || wantCat == "reasoning_effort" {
+			wantCat = "thought_level"
+		}
+		for _, o := range opts {
+			if o.Select != nil && o.Select.Category != nil && configCategoryString(*o.Select.Category) == wantCat {
+				matched = o.Select
+				break
+			}
+		}
+	}
+	if matched == nil {
+		return desiredKey, desiredVal
+	}
+
+	allowed := collectSelectOptionValues(matched.Options)
+	if len(allowed) == 0 || slices.Contains(allowed, desiredVal) {
+		return string(matched.Id), desiredVal
+	}
+
+	// Normalized cross-adapter alias mapping ONLY when the option explicitly advertises the mapped value
+	cat := ""
+	if matched.Category != nil {
+		cat = configCategoryString(*matched.Category)
+	}
+	if cat == "mode" || string(matched.Id) == "mode" {
+		for _, cand := range normalizedModeCandidates(desiredVal) {
+			if slices.Contains(allowed, cand) {
+				return string(matched.Id), cand
+			}
+		}
+	}
+	return string(matched.Id), desiredVal
+}
+
+func configCategoryString(cat acp.SessionConfigOptionCategory) string {
+	return string(cat)
+}
+
+func collectSelectOptionValues(opts acp.SessionConfigSelectOptions) []string {
+	var out []string
+	if opts.Ungrouped != nil {
+		for _, v := range *opts.Ungrouped {
+			out = append(out, string(v.Value))
+		}
+	}
+	if opts.Grouped != nil {
+		for _, g := range *opts.Grouped {
+			for _, v := range g.Options {
+				out = append(out, string(v.Value))
+			}
+		}
+	}
+	return out
+}
+
+func normalizedModeCandidates(raw string) []string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "ask", "default":
+		return []string{"default", "workspace-write", "read-only"}
+	case "auto":
+		return []string{"auto", "agent", "acceptEdits", "accept-edits"}
+	case "full", "bypass", "bypasspermissions", "agent-full-access":
+		return []string{"bypassPermissions", "agent-full-access", "auto"}
+	case "accept-edits", "acceptedits":
+		return []string{"accept-edits", "acceptEdits", "workspace-write"}
+	case "plan":
+		return []string{"plan", "read-only"}
+	default:
+		return nil
+	}
 }
 
 func verifyConfigOptionApplied(opts []acp.SessionConfigOption, configID, want string) bool {
@@ -1062,7 +1304,12 @@ func (r *Runner) CloseSessionSafely(ctx context.Context, wbSessionID string) (bo
 
 	// Mark 'closing' INSIDE the per-session lock before calling CloseSession
 	slot.runtimeState = protocol.SessionClosing
-	err := r.driver.CloseSession(ctx, slot.providerSessionID)
+	drv, err := r.driverFor(slot.adapter)
+	if err != nil {
+		slot.runtimeState = protocol.SessionDead
+		return false, err
+	}
+	err = drv.CloseSession(ctx, slot.providerSessionID)
 	if err != nil {
 		slot.runtimeState = protocol.SessionDead
 		return false, err
@@ -1168,9 +1415,11 @@ func (r *Runner) HandleCancel(frame protocol.AttemptCancelFrame) {
 	att.mu.Unlock()
 
 	if sid != "" {
-		cctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		_ = r.driver.Cancel(cctx, sid)
-		cancel()
+		if drv, err := r.driverFor(att.dispatch.Adapter); err == nil {
+			cctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			_ = drv.Cancel(cctx, sid)
+			cancel()
+		}
 	}
 	if cancelFn != nil {
 		cancelFn()
@@ -2635,7 +2884,13 @@ func (r *Runner) drainBoardMessages(att *attemptContext) {
 
 		msgText := fmt.Sprintf("[Board Message #%d from %s targeting @%s]\n%s", frame.Seq, frame.AuthorName, frame.TargetMention, frame.Body)
 		pctx, cancel := context.WithTimeout(r.runCtx, 2*time.Minute)
-		resp, err := r.driver.Prompt(pctx, sid, msgText)
+		var resp acp.PromptResponse
+		var err error
+		if drv, drvErr := r.driverFor(att.dispatch.Adapter); drvErr != nil {
+			err = drvErr
+		} else {
+			resp, err = drv.Prompt(pctx, sid, msgText)
+		}
 		cancel()
 
 		slot.mu.Lock()

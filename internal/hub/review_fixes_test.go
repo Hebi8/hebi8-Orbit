@@ -177,18 +177,20 @@ func TestB5_RunnerWSAuthAndOriginRejection(t *testing.T) {
 func TestB18_HubRejectsUnimplementedAdapters(t *testing.T) {
 	_, _, ts, _ := setupSecuredHub(t, "")
 
+	// Target machine in setupSecuredHub only configures `agy`; requesting unconfigured adapters
+	// (`claude`/`codex`) MUST be rejected with 400 ERR_ADAPTER_UNSUPPORTED rather than silently running agy!
 	for _, adapter := range []protocol.Adapter{protocol.AdapterClaude, protocol.AdapterCodex} {
 		resp, raw := doHubJSON(t, ts, http.MethodPost, "/api/projects/demo-app/tasks", protocol.CreateTaskRequest{
 			Title:   "Try " + string(adapter),
 			Goal:    "noop",
 			Adapter: adapter,
 		}, nil)
-		if resp.StatusCode != http.StatusNotImplemented {
-			t.Fatalf("adapter=%s expected 501, got %d: %s", adapter, resp.StatusCode, string(raw))
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("adapter=%s expected 400 ERR_ADAPTER_UNSUPPORTED when machine lacks adapter, got %d: %s", adapter, resp.StatusCode, string(raw))
 		}
 	}
 
-	// PA create_task targeting unimplemented adapter MUST also return 501!
+	// PA create_task targeting unconfigured adapter MUST also return 400!
 	respTh, rawTh := doHubJSON(t, ts, http.MethodPost, "/api/pa/threads", protocol.CreatePAThreadRequest{Title: "PA"}, nil)
 	if respTh.StatusCode != http.StatusCreated {
 		t.Fatalf("create pa thread failed: %s", string(rawTh))
@@ -209,8 +211,8 @@ func TestB18_HubRejectsUnimplementedAdapters(t *testing.T) {
 			IdempotencyKey: "pa-b18-claude",
 		},
 	}, nil)
-	if resp.StatusCode != http.StatusNotImplemented {
-		t.Fatalf("PA create_task adapter=claude expected 501, got %d: %s", resp.StatusCode, string(raw))
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("PA create_task adapter=claude expected 400 when unconfigured, got %d: %s", resp.StatusCode, string(raw))
 	}
 }
 

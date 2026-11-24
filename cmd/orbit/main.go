@@ -51,6 +51,13 @@ type pendingDeliveryRecord struct {
 	CreatedAt      int64                        `json:"createdAt"`
 }
 
+// Version metadata injected via -ldflags at release time.
+var (
+	Version   = "0.2.0-dev"
+	Commit    = "none"
+	BuildDate = "unknown"
+)
+
 func main() {
 	if err := run(context.Background(), os.Args[1:], os.Stdout, os.Stderr); err != nil {
 		fmt.Fprintf(os.Stderr, "orbit: %v\n", err)
@@ -65,12 +72,27 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	}
 
 	switch args[0] {
+	case "version", "--version", "-v":
+		fmt.Fprintf(stdout, "orbit %s (commit=%s built=%s)\n", Version, Commit, BuildDate)
+		return nil
 	case "deliver":
 		return runDeliver(ctx, args[1:], stdout, stderr)
 	case "status":
 		return runStatus(ctx, args[1:], stdout, stderr)
 	case "brief":
 		return runBrief(ctx, args[1:], stdout, stderr)
+	case "tasks", "task", "ls":
+		return runTasks(ctx, args[1:], stdout, stderr)
+	case "approvals", "approval":
+		return runApprovals(ctx, args[1:], stdout, stderr)
+	case "pa":
+		return runPA(ctx, args[1:], stdout, stderr)
+	case "artifacts", "artifact":
+		return runArtifacts(ctx, args[1:], stdout, stderr)
+	case "doctor":
+		return runDoctor(ctx, args[1:], stdout, stderr)
+	case "open":
+		return runOpen(ctx, args[1:], stdout, stderr)
 	default:
 		printUsage(stderr)
 		return fmt.Errorf("unknown subcommand %q", args[0])
@@ -79,11 +101,18 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 
 func printUsage(w io.Writer) {
 	fmt.Fprintln(w, `Usage:
+  orbit status [--hub <url>] [--json]
+  orbit tasks [list|new|show|followup|cancel|retry] ...
+  orbit approvals [list|allow|reject] ...
+  orbit pa [--thread <id>] [--new] [--json] "<message>"
+  orbit artifacts [--project <id>] [--kind <type>] [--json]
+  orbit brief [--since-hours 24] [--project <id>] [--json]
   orbit deliver --summary "..." [--final] [--attach <file>...]                               (inside runner worktree via ORBIT_RUNNER_SOCK)
   orbit deliver --project <id> [--repo <dir>] [--base <sha>] [--task <id>] [--title "..."] [--summary "..."] [--attach <file>...]
   orbit deliver --resume <deliveryId> [--hub <url>] [--mirror <path>]
-  orbit status [--hub <url>] [--json]
-  orbit brief [--hub <url>] [--since-hours 24] [--project <id>] [--json]
+  orbit doctor [--hub <url>] [--json]
+  orbit open [--hub <url>]
+  orbit version
 
 Environment variables:
   ORBIT_RUNNER_SOCK Local runner Unix domain socket (auto-injected for ACP agent deliveries)

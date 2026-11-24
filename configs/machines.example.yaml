@@ -14,15 +14,14 @@ machines:
         defaultArgs: ["acp", "--stdio", "--process-per-session"]
         maxLiveWorkers: 8
         idleCloseSeconds: 1200
-      # Phase 3 adapters (not enabled in Phase 1):
-      # claude:
-      #   bin: "claude-agent-acp"
-      #   maxLiveWorkers: 4
-      #   idleCloseSeconds: 900
-      # codex:
-      #   bin: "codex-acp"
-      #   maxLiveWorkers: 4
-      #   idleCloseSeconds: 900
+      claude:
+        bin: "claude-agent-acp"
+        maxLiveWorkers: 4
+        idleCloseSeconds: 900
+      codex:
+        bin: "codex-acp"
+        maxLiveWorkers: 4
+        idleCloseSeconds: 900
     exclusiveResources: {}
 
   mac-node:

@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>连接 hebi8-Orbit Hub</title>
+  <style>
+    :root {
+      --bg: #0f0f11; --panel: #151518; --raised: #1c1c20; --line: rgba(255,255,255,.09);
+      --fg: #ececef; --muted: #8a8a93; --accent: #a3b8ff; --bad: #ef7f7f; --ok: #72cf98;
+      color-scheme: dark light;
+    }
+    @media (prefers-color-scheme: light) {
+      :root {
+        --bg: #fcfcfb; --panel: #ffffff; --raised: #f4f4f2; --line: rgba(0,0,0,.1);
+        --fg: #18181b; --muted: #6e6e77; --accent: #3555d0; --bad: #d24646; --ok: #177a41;
+      }
+    }
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0; height: 100%; background: var(--bg); color: var(--fg);
+      font: 13px/1.5 -apple-system, BlinkMacSystemFont, "Inter", "PingFang SC", sans-serif;
+      display: grid; place-items: center;
+    }
+    .card {
+      width: min(440px, calc(100vw - 32px)); background: var(--panel);
+      border: 1px solid var(--line); border-radius: 14px; padding: 24px 26px;
+    }
+    .brand { display: flex; align-items: center; gap: 9px; font-weight: 600; font-size: 14px; margin-bottom: 18px; }
+    .mark { width: 18px; height: 18px; border-radius: 50%; border: 1.5px solid var(--fg); position: relative; }
+    .mark::after { content: ""; position: absolute; width: 5px; height: 5px; border-radius: 50%; background: var(--accent); top: -2px; right: 0; }
+    h1 { font-size: 17px; font-weight: 600; margin: 0 0 6px; letter-spacing: -.01em; }
+    p { margin: 0 0 18px; color: var(--muted); font-size: 12.5px; }
+    label { display: block; font-size: 11.5px; color: var(--muted); margin-bottom: 6px; }
+    input {
+      width: 100%; height: 36px; border-radius: 8px; border: 1px solid var(--line);
+      background: var(--raised); color: var(--fg); padding: 0 11px; font: 13px ui-monospace, Menlo, monospace; outline: none;
+    }
+    input:focus { border-color: var(--accent); }
+    .row { display: flex; align-items: center; justify-content: flex-end; gap: 8px; margin-top: 14px; }
+    button {
+      height: 32px; padding: 0 14px; border-radius: 8px; border: 0; cursor: pointer;
+      font: 500 12.5px inherit; background: var(--fg); color: var(--bg);
+    }
+    button:disabled { opacity: .45; cursor: default; }
+    .msg { margin-top: 12px; font-size: 12px; min-height: 18px; color: var(--muted); }
+    .msg.err { color: var(--bad); }
+    .msg.ok { color: var(--ok); }
+  </style>
+</head>
+<body>
+  <form class="card" id="f">
+    <div class="brand"><span class="mark"></span>hebi8-Orbit</div>
+    <h1>连接到 Orbit Hub</h1>
+    <p>输入你的 Tailscale HTTPS 或本机 Hub 地址，配置将保存在 ~/.config/hebi8-orbit/client.yaml。</p>
+    <label for="u">Hub 地址</label>
+    <input id="u" type="url" placeholder="https://orbit.example.ts.net" autocomplete="off" spellcheck="false" required />
+    <div class="row">
+      <button type="submit" id="btn">连接</button>
+    </div>
+    <div class="msg" id="msg"></div>
+  </form>
+  <script>
+    const input = document.getElementById('u');
+    const btn = document.getElementById('btn');
+    const msg = document.getElementById('msg');
+    fetch('/api/current').then(r => r.json()).then(d => {
+      if (d.hubUrl) input.value = d.hubUrl;
+      input.focus();
+    }).catch(() => {});
+    document.getElementById('f').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const raw = input.value.trim();
+      if (!raw) return;
+      btn.disabled = true;
+      msg.className = 'msg';
+      msg.textContent = '检查 Hub 连通性…';
+      try {
+        const res = await fetch('/api/connect', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ hubUrl: raw }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
+        msg.className = 'msg ok';
+        msg.textContent = '已连接，正在进入工作台…';
+        window.location.href = data.hubUrl + '/';
+      } catch (err) {
+        msg.className = 'msg err';
+        msg.textContent = err.message || String(err);
+        btn.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>

@@ -19,6 +19,13 @@ import (
 	"github.com/Hebi8/hebi8-Orbit/web"
 )
 
+// Version metadata injected via -ldflags at release time.
+var (
+	Version   = "0.2.0-dev"
+	Commit    = "none"
+	BuildDate = "unknown"
+)
+
 func main() {
 	var (
 		configDir         = flag.String("config-dir", "~/.config/hebi8-orbit", "directory containing hub.yaml, machines.yaml, projects.yaml")
@@ -33,8 +40,14 @@ func main() {
 		ryugiPort         = flag.Int("ryugi-port", -1, "override ryugi server port (0 = default)")
 		ryugiPublicOrigin = flag.String("ryugi-public-origin", "", "override public origin for ryugi Open URLs")
 		ryugiPollSec      = flag.Int("ryugi-poll-seconds", -1, "override ryugi polling interval seconds (0 disables background poller)")
+		showVersion       = flag.Bool("version", false, "print orbit-hub version and exit")
 	)
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("orbit-hub %s (commit=%s built=%s)\n", Version, Commit, BuildDate)
+		return
+	}
 
 	expConfigDir := protocol.ExpandPath(*configDir)
 	cfgPath := *hubConfigPath

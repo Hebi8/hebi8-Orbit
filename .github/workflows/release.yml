@@ -1,0 +1,170 @@
+name: Release CLI & Client
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Optional version tag (e.g. v0.2.0)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    name: Pre-Release Checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: make check-privacy
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+      - run: pnpm --dir web install --frozen-lockfile
+      - run: make build && make test
+      - run: cd desktop && go vet ./... && go test -race -count=1 ./...
+
+  build-cli-and-server:
+    name: Build CLI, Hub & Runner
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      - name: Build embedded web UI
+        run: |
+          pnpm --dir web install --frozen-lockfile
+          make build-web
+
+      - name: Cross-compile & package CLI / Hub / Runner archives
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          VERSION="${INPUT_TAG:-${GITHUB_REF_NAME}}"
+          COMMIT="$(git rev-parse --short HEAD)"
+          BUILT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          LDFLAGS="-s -w -X main.Version=${VERSION} -X main.Commit=${COMMIT} -X main.BuildDate=${BUILT}"
+
+          mkdir -p dist/release
+
+          build_unix() {
+            local os="$1" arch="$2"
+            local stage="dist/stage/orbit-${VERSION}-${os}-${arch}"
+            mkdir -p "$stage"
+            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -trimpath -ldflags "$LDFLAGS" -o "$stage/orbit" ./cmd/orbit
+            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -trimpath -ldflags "$LDFLAGS" -o "$stage/orbit-hub" ./cmd/orbit-hub
+            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -trimpath -ldflags "$LDFLAGS" -o "$stage/orbit-runner" ./cmd/orbit-runner
+            cp README.md "$stage/"
+            tar -C dist/stage -czf "dist/release/hebi8-orbit-${VERSION}-${os}-${arch}.tar.gz" "orbit-${VERSION}-${os}-${arch}"
+          }
+
+          build_unix linux amd64
+          build_unix linux arm64
+          build_unix darwin arm64
+          build_unix darwin amd64
+
+          # Windows CLI + desktop client
+          mkdir -p "dist/stage/orbit-cli-${VERSION}-windows-amd64"
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "$LDFLAGS" \
+            -o "dist/stage/orbit-cli-${VERSION}-windows-amd64/orbit.exe" ./cmd/orbit
+          (cd dist/stage && zip -rq "../release/orbit-cli-${VERSION}-windows-amd64.zip" "orbit-cli-${VERSION}-windows-amd64")
+
+          # Linux & Windows pure-Go desktop client (mygo)
+          mkdir -p "dist/stage/orbit-client-${VERSION}-linux-amd64"
+          (cd desktop && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "$LDFLAGS" \
+            -o "../dist/stage/orbit-client-${VERSION}-linux-amd64/orbit-client" .)
+          tar -C dist/stage -czf "dist/release/orbit-client-${VERSION}-linux-amd64.tar.gz" "orbit-client-${VERSION}-linux-amd64"
+
+          mkdir -p "dist/stage/orbit-client-${VERSION}-windows-amd64"
+          (cd desktop && CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "$LDFLAGS -H=windowsgui" \
+            -o "../dist/stage/orbit-client-${VERSION}-windows-amd64/orbit-client.exe" .)
+          (cd dist/stage && zip -rq "../release/orbit-client-${VERSION}-windows-amd64.zip" "orbit-client-${VERSION}-windows-amd64")
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-core
+          path: dist/release/*
+
+  build-macos-client:
+    name: Package macOS Desktop Client (Orbit.app + DMG)
+    needs: verify
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build & package Orbit.app + DMG (darwin/arm64)
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_NOTARY_APPLE_ID: ${{ secrets.APPLE_NOTARY_APPLE_ID }}
+          APPLE_NOTARY_PASSWORD: ${{ secrets.APPLE_NOTARY_PASSWORD }}
+          APPLE_NOTARY_TEAM_ID: ${{ secrets.APPLE_NOTARY_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          VERSION="${INPUT_TAG:-${GITHUB_REF_NAME}}"
+          COMMIT="$(git rev-parse --short HEAD)"
+          BUILT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          bash scripts/package-mac-app.sh "$VERSION" "$COMMIT" "$BUILT" dist/macos
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-macos-client
+          path: |
+            dist/macos/*.dmg
+            dist/macos/*.zip
+
+  publish:
+    name: Publish GitHub Release
+    needs: [build-cli-and-server, build-macos-client]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist/all
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS.txt
+        run: |
+          cd dist/all
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: dist/all/*

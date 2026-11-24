@@ -26,9 +26,9 @@ const ADAPTER_LABELS: Record<string, string> = {
 };
 
 const MODEL_PRESETS: Record<string, string[]> = {
-  claude: ['opus', 'sonnet'],
-  codex: ['gpt-5.4', 'o3'],
-  agy: ['gemini-2.5-pro', 'gemini-2.5-flash'],
+  claude: ['opus', 'sonnet', 'haiku'],
+  codex: ['gpt-6.2-sol', 'gpt-6.2-astra', 'gpt-6.1-sol'],
+  agy: ['gemini-4-neon', 'gemini-4-carbon', 'gemini-4-argon'],
 };
 
 const EFFORT_OPTIONS = [

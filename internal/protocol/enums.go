@@ -77,12 +77,14 @@ var AllSessionAdapters = []SessionAdapter{
 
 func (v SessionAdapter) IsValid() bool { return slices.Contains(AllSessionAdapters, v) }
 
-// Phase1ImplementedSessionAdapters lists session adapters actually implemented in Phase 1.
+// Phase1ImplementedSessionAdapters lists session adapters with real runtime ACP drivers.
 var Phase1ImplementedSessionAdapters = []Adapter{
 	AdapterAgy,
+	AdapterClaude,
+	AdapterCodex,
 }
 
-// IsSessionAdapterImplemented reports whether a session adapter has a real runtime driver in Phase 1.
+// IsSessionAdapterImplemented reports whether a session adapter has a real runtime driver.
 func IsSessionAdapterImplemented(a Adapter) bool {
 	return slices.Contains(Phase1ImplementedSessionAdapters, a)
 }
