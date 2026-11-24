@@ -14,12 +14,15 @@ import type {
   CreateTaskSourceInput,
   DecideApprovalRequest,
   DecideApprovalResponse,
+  DeleteAnnotationResponse,
   DeliveryDetailResponse,
   DeliveryDiffResponse,
   DispatchAnnotationsRequest,
   DispatchAnnotationsResponse,
   FollowupTaskRequest,
   FollowupTaskResponse,
+  GlobalArtifactView,
+  ListArtifactsResponse,
   PABriefRequest,
   PABriefResponse,
   PAChatRequest,
@@ -317,6 +320,23 @@ export const api = {
     return apiFetch<CompleteReviewResponse>(`/api/deliveries/${enc(deliveryId)}/complete-review`, {
       method: 'POST',
     });
+  },
+
+  deleteAnnotation(annotationId: string): Promise<DeleteAnnotationResponse> {
+    return apiFetch<DeleteAnnotationResponse>(`/api/annotations/${enc(annotationId)}`, {
+      method: 'DELETE',
+    });
+  },
+
+  async listGlobalArtifacts(): Promise<GlobalArtifactView[]> {
+    const res = await apiFetch<ListArtifactsResponse>('/api/artifacts');
+    return res.artifacts ?? [];
+  },
+
+  blobUrl(sha256: string): string {
+    const devToken = getStoredDevToken();
+    const base = `/api/blobs/${enc(sha256)}`;
+    return devToken ? `${base}?token=${enc(devToken)}` : base;
   },
 };
 

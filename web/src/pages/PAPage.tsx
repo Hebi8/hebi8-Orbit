@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { ChevronDown, Plus, RotateCcw, Zap } from 'lucide-react';
 import type { BootstrapResponse, PAMessage } from '../generated/protocol';
+import { SendUpIcon } from '../components/Icons';
 import { Md } from '../components/Md';
 import { PageHeader } from '../components/PageHeader';
 import { ActionCards } from '../components/PAViews';
@@ -180,7 +181,7 @@ export function PAPage({ boot, threadId }: { boot: BootstrapResponse; threadId?:
               ref={ref}
               value={text}
               rows={2}
-              placeholder="和 PA 聊聊…"
+              placeholder=""
               onChange={(e) => {
                 setText(e.target.value);
                 grow();
@@ -194,8 +195,18 @@ export function PAPage({ boot, threadId }: { boot: BootstrapResponse; threadId?:
               aria-label="发给 PA"
             />
             <div className="cfoot">
-              <button type="button" className="cbtn pri" disabled={!text.trim() || chat.isPending} onClick={send}>
-                发送 <span className="kb">↵</span>
+              <span className="rt-pill" style={{ marginRight: 'auto', pointerEvents: 'none' }}>
+                PA
+              </span>
+              <button
+                type="button"
+                className={`send-icon-btn ${text.trim() && !chat.isPending ? 'is-ready' : 'is-idle'}`}
+                disabled={!text.trim() || chat.isPending}
+                title="发送 (Enter)"
+                aria-label="发送"
+                onClick={send}
+              >
+                {chat.isPending ? <span className="spin" /> : <SendUpIcon size={14} />}
               </button>
             </div>
           </div>

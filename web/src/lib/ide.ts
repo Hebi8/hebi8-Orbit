@@ -9,9 +9,42 @@ export interface IDEJumpResult {
   uri: string;
   mode: 'local' | 'ssh';
   targetMachine: string;
+  sshHost?: string;
   targetLabel: '只读快照' | '工作目录';
   resolvedPath: string;
   line?: number;
+}
+
+export const IDE_OPTIONS: { id: IDEScheme; label: string }[] = [
+  { id: 'cursor', label: 'Cursor' },
+  { id: 'vscode', label: 'VS Code' },
+  { id: 'antigravity', label: 'Antigravity' },
+  { id: 'zed', label: 'Zed' },
+];
+
+export function ideLabel(scheme: IDEScheme): string {
+  return IDE_OPTIONS.find((x) => x.id === scheme)?.label ?? scheme;
+}
+
+/**
+ * Best-effort local machine detection: if opened on localhost/127.0.0.1, matches the hub's local_ws machine;
+ * otherwise honours an explicit localMachineId override if set.
+ */
+export function resolveEffectiveLocalMachineId(machines: MachineView[], storedLocalId: string): string {
+  if (storedLocalId) return storedLocalId;
+  if (typeof window !== 'undefined') {
+    const h = window.location.hostname;
+    if (h === '127.0.0.1' || h === 'localhost' || h === '::1') {
+      const localWs = machines.find((m) => m.transportMode === 'local_ws');
+      if (localWs) return localWs.machineId;
+    }
+  }
+  return '';
+}
+
+export function resolveMachineSshAlias(machine?: MachineView | null, fallbackId = ''): string {
+  if (!machine) return fallbackId;
+  return machine.sshAlias || machine.machineId || machine.tailscaleHost || fallbackId;
 }
 
 /**
@@ -104,6 +137,7 @@ export function buildIDEJump(params: {
       uri: `zed://ssh/${encodeURIComponent(sshHost)}${encodedPath}${lineSuffix}`,
       mode: 'ssh',
       targetMachine,
+      sshHost,
       targetLabel,
       resolvedPath: fullPath,
       line: file && line && line > 0 ? line : undefined,
@@ -114,6 +148,7 @@ export function buildIDEJump(params: {
     uri: `${proto}://vscode-remote/ssh-remote+${encodeURIComponent(sshHost)}${encodedPath}${lineSuffix}`,
     mode: 'ssh',
     targetMachine,
+    sshHost,
     targetLabel,
     resolvedPath: fullPath,
     line: file && line && line > 0 ? line : undefined,
@@ -125,10 +160,11 @@ export function buildProjectIDEJump(params: {
   project: ProjectView;
   machines: MachineView[];
   localMachineId: string;
+  scheme?: IDEScheme;
   worktreePath?: string;
   worktreeMachineId?: string;
 }): IDEJumpResult | null {
-  const { project, machines, localMachineId, worktreePath, worktreeMachineId } = params;
+  const { project, machines, localMachineId, scheme, worktreePath, worktreeMachineId } = params;
   let basePath = '';
   let targetMachine = '';
   if (worktreePath && worktreeMachineId) {
@@ -140,10 +176,11 @@ export function buildProjectIDEJump(params: {
     basePath = anchor.repoPath;
     targetMachine = anchor.machine;
   }
-  const proto = project.ideScheme || 'cursor';
+  const proto = scheme || project.ideScheme || 'cursor';
   const fullPath = basePath.replace(/\/+$/, '');
   const encodedPath = encodeURIPathSegments(fullPath);
-  if (localMachineId && localMachineId === targetMachine) {
+  const effectiveLocal = resolveEffectiveLocalMachineId(machines, localMachineId);
+  if (effectiveLocal && effectiveLocal === targetMachine) {
     return { uri: `${proto}://file${encodedPath}`, mode: 'local', targetMachine, targetLabel: '工作目录', resolvedPath: fullPath };
   }
   const machineObj = machines.find((m) => m.machineId === targetMachine);
@@ -152,7 +189,7 @@ export function buildProjectIDEJump(params: {
     proto === 'zed'
       ? `zed://ssh/${encodeURIComponent(sshHost)}${encodedPath}`
       : `${proto}://vscode-remote/ssh-remote+${encodeURIComponent(sshHost)}${encodedPath}`;
-  return { uri, mode: 'ssh', targetMachine, targetLabel: '工作目录', resolvedPath: fullPath };
+  return { uri, mode: 'ssh', targetMachine, sshHost, targetLabel: '工作目录', resolvedPath: fullPath };
 }
 
 /** Hands a custom-scheme IDE URI to the OS without leaving the SPA. */

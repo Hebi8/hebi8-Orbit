@@ -63,6 +63,47 @@ export const CursorIcon = (p: P) => (
     <path d="M12 12l8-4.5M12 12v9M12 12L4 7.5" />
   </Svg>
 );
+export const VSCodeIcon = (p: P) => (
+  <Svg {...p}>
+    <path d="m17 3 4 2v14l-4 2-9-8.5L4 16l-1.5-1.2L6.5 12 2.5 9.2 4 8l4 3.5Z" />
+  </Svg>
+);
+export const AntigravityIcon = (p: P) => (
+  <Svg {...p}>
+    <path d="M12 3 4.5 20h3.2l1.8-4.2h5L16.3 20h3.2Z" />
+    <path d="M10.4 13 12 9.2 13.6 13Z" />
+  </Svg>
+);
+export const ZedIcon = (p: P) => (
+  <Svg {...p}>
+    <path d="M5 5h14L7 19h12" />
+    <path d="M15 5v4M9 15v4" />
+  </Svg>
+);
+export function IdeGlyph({ scheme, size = 14 }: { scheme: string; size?: number }) {
+  switch (scheme) {
+    case 'vscode':
+      return <VSCodeIcon size={size} />;
+    case 'antigravity':
+      return <AntigravityIcon size={size} />;
+    case 'zed':
+      return <ZedIcon size={size} />;
+    default:
+      return <CursorIcon size={size} />;
+  }
+}
+export const StopSquareIcon = (p: P) => (
+  <Svg {...p}>
+    <rect x="7" y="7" width="10" height="10" rx="1.8" fill="currentColor" stroke="none" />
+  </Svg>
+);
+export const QueueSendIcon = (p: P) => (
+  <Svg {...p} strokeWidth={1.8}>
+    <path d="M5 6h10M5 11h6" />
+    <path d="M15 19v-7" />
+    <path d="m11.5 15.5 3.5-3.5 3.5 3.5" />
+  </Svg>
+);
 export const CardIcon = (p: P) => (
   <Svg {...p}>
     <rect x="3.5" y="4.5" width="17" height="15" rx="2.5" />

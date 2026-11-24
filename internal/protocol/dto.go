@@ -66,6 +66,7 @@ type InboxItemView struct {
 
 // BootstrapResponse is captured in a single read-only SQLite transaction.
 type BootstrapResponse struct {
+	WorkspaceName  string          `json:"workspaceName,omitempty"`
 	Projects       []ProjectView   `json:"projects"`
 	Machines       []MachineView   `json:"machines"`
 	OpenInboxItems []InboxItemView `json:"openInboxItems"`
@@ -236,6 +237,7 @@ type EventRecord struct {
 // TaskTimelineResponse powers the center workbench timeline pane.
 type TaskTimelineResponse struct {
 	Task          TaskSummary         `json:"task"`
+	RuntimeConfig map[string]string   `json:"runtimeConfig,omitempty"`
 	Attempts      []AttemptView       `json:"attempts"`
 	Deliveries    []DeliveryView      `json:"deliveries"`
 	Annotations   []AnnotationView    `json:"annotations"`
@@ -325,6 +327,38 @@ type CreateAnnotationRequest struct {
 type CreateAnnotationResponse struct {
 	Annotation AnnotationView `json:"annotation"`
 	Created    bool           `json:"created"`
+}
+
+// DeleteAnnotationResponse confirms deletion of an open review annotation.
+type DeleteAnnotationResponse struct {
+	AnnotationID string `json:"annotationId"`
+	TaskID       string `json:"taskId"`
+	DeliveryID   string `json:"deliveryId"`
+	Deleted      bool   `json:"deleted"`
+}
+
+// GlobalArtifactView describes a reusable cross-session Artifact (Ryugi canvas or document blob).
+type GlobalArtifactView struct {
+	ArtifactID      string `json:"artifactId"`
+	Kind            string `json:"kind"`
+	Title           string `json:"title"`
+	ProjectID       string `json:"projectId"`
+	ProjectName     string `json:"projectName"`
+	TaskID          string `json:"taskId"`
+	TaskTitle       string `json:"taskTitle"`
+	DeliveryID      string `json:"deliveryId"`
+	Locator         string `json:"locator"`
+	OpenURL         string `json:"openUrl,omitempty"`
+	BlobSHA256      string `json:"blobSha256,omitempty"`
+	SizeBytes       int64  `json:"sizeBytes,omitempty"`
+	OpenAnnotations int    `json:"openAnnotations"`
+	CreatedAt       int64  `json:"createdAt"`
+	UpdatedAt       int64  `json:"updatedAt"`
+}
+
+// ListArtifactsResponse returns globally visible reusable Artifacts ordered by recency.
+type ListArtifactsResponse struct {
+	Artifacts []GlobalArtifactView `json:"artifacts"`
 }
 
 // RyugiSyncResponse summarizes a manual or scheduled Ryugi sync operation.

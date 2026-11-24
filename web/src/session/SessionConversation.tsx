@@ -1,5 +1,5 @@
-import { useEffect, useLayoutEffect, useRef, useState } from 'react';
-import type { BoardMemberCursor, PendingInput, TaskTimelineResponse } from '../generated/protocol';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import type { BoardMemberCursor, BootstrapResponse, PendingInput, TaskTimelineResponse } from '../generated/protocol';
 import { useWorkbenchStore } from '../store/useWorkbenchStore';
 import { Composer } from './Composer';
 import { Minimap } from './Minimap';
@@ -14,15 +14,19 @@ import { WorkerStream } from './WorkerStream';
 export function SessionConversation({
   taskId,
   tl,
+  boot,
   worker,
   drilledMember,
   compact = false,
+  onOpenReview,
 }: {
   taskId: string;
   tl: TaskTimelineResponse;
+  boot?: BootstrapResponse;
   worker?: string;
   drilledMember?: BoardMemberCursor;
   compact?: boolean;
+  onOpenReview?: () => void;
 }) {
   const remember = useWorkbenchStore((s) => s.rememberPrompt);
   const [editing, setEditing] = useState<PendingInput | null>(null);
@@ -61,6 +65,7 @@ export function SessionConversation({
   const lastAttempt = tl.attempts[tl.attempts.length - 1];
   const needsVerifyAttemptId = !task.activeAttemptId && lastAttempt?.state === 'needs_verification' ? lastAttempt.attemptId : undefined;
   const pendingInputs = [...tl.pendingInputs].sort((a, b) => a.position - b.position || a.createdAt - b.createdAt);
+  const openAnnotations = useMemo(() => tl.annotations.filter((a) => a.status === 'open'), [tl.annotations]);
 
   return (
     <div className={`sess-body ${compact ? 'compact' : ''}`}>
@@ -112,6 +117,11 @@ export function SessionConversation({
         editing={editing}
         needsVerifyAttemptId={needsVerifyAttemptId}
         onEditDone={() => setEditing(null)}
+        openAnnotations={openAnnotations}
+        runtimeConfig={tl.runtimeConfig}
+        machines={boot?.machines}
+        compact={compact}
+        onOpenReview={onOpenReview}
       />
     </div>
   );

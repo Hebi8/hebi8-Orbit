@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { ArrowUpRight, FolderGit2, LayoutGrid, MessageSquare, Plus, SunMoon, Zap } from 'lucide-react';
+import { ArrowUpRight, FolderGit2, Layers, LayoutGrid, MessageSquare, Plus, SunMoon, Zap } from 'lucide-react';
 import type { BootstrapResponse, PABriefResponse, PAChatResponse } from '../generated/protocol';
 import { useManyProjectTasks } from '../hooks/queries';
 import {
@@ -103,6 +103,7 @@ export function CommandPalette({ boot }: { boot: BootstrapResponse }) {
       { key: 'new', group: '动作', icon: <Plus size={14} strokeWidth={1.6} />, label: '新建线程', trail: <span className="d">⌘N</span>, run: () => go(paths.newThread()) },
       { key: 'home', group: '动作', icon: <LayoutGrid size={14} strokeWidth={1.6} />, label: '总览', run: () => go(paths.home()) },
       { key: 'pa', group: '动作', icon: <PAIcon />, label: 'PA', run: () => go(paths.pa()) },
+      { key: 'artifacts', group: '动作', icon: <Layers size={14} strokeWidth={1.6} />, label: 'Artifacts', run: () => go(paths.artifacts()) },
       { key: 'theme', group: '动作', icon: <SunMoon size={14} strokeWidth={1.6} />, label: '切换深 / 浅色', run: () => toggleTheme() },
     ];
     list.push(...actions.filter((a) => match(a.label)));

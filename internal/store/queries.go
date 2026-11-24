@@ -471,6 +471,14 @@ func (s *Store) GetTaskTimeline(ctx context.Context, taskID string, beforeSeq in
 		}
 		resp.Task = task
 
+		var cfgRaw sql.NullString
+		if err := tx.QueryRowContext(ctx, `SELECT desired_config_json FROM tasks WHERE task_id = ?`, taskID).Scan(&cfgRaw); err == nil && cfgRaw.Valid && cfgRaw.String != "" {
+			var m map[string]string
+			if json.Unmarshal([]byte(cfgRaw.String), &m) == nil && len(m) > 0 {
+				resp.RuntimeConfig = m
+			}
+		}
+
 		// Attempts
 		aRows, err := tx.QueryContext(ctx, `
 			SELECT attempt_id, task_id, project_id, attempt_no, machine_id, adapter,
@@ -2036,4 +2044,199 @@ func normalizeManifest(m protocol.DeliveryManifest) protocol.DeliveryManifest {
 func canonicalManifestJSON(m protocol.DeliveryManifest) string {
 	b, _ := json.Marshal(normalizeManifest(m))
 	return string(b)
+}
+
+func isImageFilePath(p string) bool {
+	ext := strings.ToLower(filepath.Ext(p))
+	switch ext {
+	case ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".avif", ".bmp":
+		return true
+	default:
+		return false
+	}
+}
+
+func classifyArtifactKind(pathOrLocator string) string {
+	low := strings.ToLower(strings.TrimSpace(pathOrLocator))
+	switch {
+	case strings.HasPrefix(low, "artboard/"), strings.HasPrefix(low, "html/"), strings.HasPrefix(low, "whiteboard/"):
+		return "design"
+	case strings.HasPrefix(low, "slides/"), strings.HasSuffix(low, ".pptx"), strings.HasSuffix(low, ".ppt"), strings.HasSuffix(low, ".key"):
+		return "pptx"
+	case strings.HasPrefix(low, "document/"), strings.HasSuffix(low, ".md"), strings.HasSuffix(low, ".markdown"):
+		return "markdown"
+	case strings.HasSuffix(low, ".docx"), strings.HasSuffix(low, ".doc"):
+		return "docx"
+	case strings.HasSuffix(low, ".xlsx"), strings.HasSuffix(low, ".xls"), strings.HasSuffix(low, ".csv"):
+		return "spreadsheet"
+	default:
+		return "file"
+	}
+}
+
+// ListGlobalArtifacts returns globally visible reusable Artifacts across all non-archived projects and tasks.
+func (s *Store) ListGlobalArtifacts(ctx context.Context) ([]protocol.GlobalArtifactView, error) {
+	out := []protocol.GlobalArtifactView{}
+	err := s.WithReadTx(ctx, func(tx *sql.Tx) error {
+		// 1. Ryugi bindings (active or latest per delivery/locator)
+		rows, err := tx.QueryContext(ctx, `
+			SELECT rb.binding_id, rb.delivery_id, rb.project_id, p.display_name,
+			       rb.task_id, COALESCE(NULLIF(t.title, ''), t.goal),
+			       rb.artifact_locator, rb.open_url, rb.created_at, rb.updated_at,
+			       COALESCE((SELECT COUNT(*) FROM annotations a WHERE a.delivery_id = rb.delivery_id AND a.source = 'ryugi' AND a.status = 'open'), 0)
+			FROM ryugi_bindings rb
+			JOIN tasks t ON t.task_id = rb.task_id AND t.archived_at IS NULL
+			JOIN projects p ON p.project_id = rb.project_id AND p.archived = 0
+			WHERE rb.active = 1
+			ORDER BY rb.updated_at DESC
+		`)
+		if err != nil {
+			return fmt.Errorf("query ryugi artifacts: %w", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var v protocol.GlobalArtifactView
+			var bindingID string
+			if err := rows.Scan(
+				&bindingID, &v.DeliveryID, &v.ProjectID, &v.ProjectName,
+				&v.TaskID, &v.TaskTitle,
+				&v.Locator, &v.OpenURL, &v.CreatedAt, &v.UpdatedAt, &v.OpenAnnotations,
+			); err != nil {
+				return err
+			}
+			v.ArtifactID = "ryugi:" + bindingID
+			v.Kind = classifyArtifactKind(v.Locator)
+			v.Title = filepath.Base(v.Locator)
+			if v.Title == "" || v.Title == "." || v.Title == "/" {
+				v.Title = v.Locator
+			}
+			out = append(out, v)
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+
+		// 2. Non-image document blobs from non-late deliveries
+		dRows, err := tx.QueryContext(ctx, `
+			SELECT d.delivery_id, d.project_id, p.display_name,
+			       d.task_id, COALESCE(NULLIF(t.title, ''), t.goal),
+			       d.manifest_json, d.created_at
+			FROM deliveries d
+			JOIN tasks t ON t.task_id = d.task_id AND t.archived_at IS NULL
+			JOIN projects p ON p.project_id = d.project_id AND p.archived = 0
+			WHERE d.late_arrival = 0
+			ORDER BY d.created_at DESC
+			LIMIT 200
+		`)
+		if err != nil {
+			return fmt.Errorf("query delivery blobs: %w", err)
+		}
+		defer dRows.Close()
+		seenBlobKey := map[string]bool{}
+		for dRows.Next() {
+			var deliveryID, projectID, projectName, taskID, taskTitle, manifestJSON string
+			var createdAt int64
+			if err := dRows.Scan(&deliveryID, &projectID, &projectName, &taskID, &taskTitle, &manifestJSON, &createdAt); err != nil {
+				return err
+			}
+			var m protocol.DeliveryManifest
+			if err := json.Unmarshal([]byte(manifestJSON), &m); err != nil {
+				continue
+			}
+			for _, b := range m.Blobs {
+				if b.Path == "" || isImageFilePath(b.Path) {
+					continue
+				}
+				dedup := taskID + "::" + b.Path
+				if seenBlobKey[dedup] {
+					continue
+				}
+				seenBlobKey[dedup] = true
+				out = append(out, protocol.GlobalArtifactView{
+					ArtifactID:  "blob:" + b.SHA256 + ":" + b.Path,
+					Kind:        classifyArtifactKind(b.Path),
+					Title:       filepath.Base(b.Path),
+					ProjectID:   projectID,
+					ProjectName: projectName,
+					TaskID:      taskID,
+					TaskTitle:   taskTitle,
+					DeliveryID:  deliveryID,
+					Locator:     b.Path,
+					BlobSHA256:  b.SHA256,
+					SizeBytes:   b.Size,
+					CreatedAt:   createdAt,
+					UpdatedAt:   createdAt,
+				})
+			}
+		}
+		return dRows.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].UpdatedAt != out[j].UpdatedAt {
+			return out[i].UpdatedAt > out[j].UpdatedAt
+		}
+		return out[i].ArtifactID < out[j].ArtifactID
+	})
+	return out, nil
+}
+
+// DeleteOpenAnnotation deletes a draft open review annotation so users can remove unsubmitted review comments.
+func (s *Store) DeleteOpenAnnotation(ctx context.Context, annotationID, actorID string) (protocol.DeleteAnnotationResponse, *protocol.EventRecord, error) {
+	var resp protocol.DeleteAnnotationResponse
+	var ev *protocol.EventRecord
+	err := s.WithWriteTx(ctx, func(tx *sql.Tx) error {
+		var projectID, taskID, deliveryID, status string
+		err := tx.QueryRowContext(ctx, `
+			SELECT project_id, task_id, delivery_id, status
+			FROM annotations
+			WHERE annotation_id = ?
+		`, annotationID).Scan(&projectID, &taskID, &deliveryID, &status)
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+		if status != string(protocol.AnnotationOpen) {
+			return fmt.Errorf("%w: annotation is %s, only open annotations can be deleted", ErrConflict, status)
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM annotations WHERE annotation_id = ?`, annotationID); err != nil {
+			return err
+		}
+		if actorID == "" {
+			actorID = "human"
+		}
+		rec, err := insertEventTx(ctx, tx, eventInsert{
+			StreamID:   "task:" + taskID,
+			ProjectID:  projectID,
+			TaskID:     taskID,
+			ActorKind:  protocol.ActorHuman,
+			ActorID:    actorID,
+			Kind:       protocol.EventAnnotationAddressed,
+			Visibility: protocol.VisibilityAudit,
+			Payload: map[string]any{
+				"annotationId": annotationID,
+				"deliveryId":   deliveryID,
+				"deleted":      true,
+			},
+		})
+		if err != nil {
+			return err
+		}
+		ev = &rec
+		resp = protocol.DeleteAnnotationResponse{
+			AnnotationID: annotationID,
+			TaskID:       taskID,
+			DeliveryID:   deliveryID,
+			Deleted:      true,
+		}
+		return nil
+	})
+	if err != nil {
+		return protocol.DeleteAnnotationResponse{}, nil, err
+	}
+	return resp, ev, nil
 }

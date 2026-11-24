@@ -1,12 +1,24 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { ArrowLeft, ChevronDown, Link2 } from 'lucide-react';
+import { ArrowLeft, Check, ChevronDown, Layers, Link2, MessageSquare } from 'lucide-react';
 import type { BootstrapResponse } from '../generated/protocol';
 import { CardIcon, DiffIcon } from '../components/Icons';
+import { IdeOpenButton } from '../components/IdeOpenButton';
 import { PageHeader } from '../components/PageHeader';
+import { StatusMark } from '../components/StatusMark';
 import { useBoard, useTimeline } from '../hooks/queries';
 import { api, errMsg } from '../lib/api';
-import { SCRATCH_PROJECT_ID, memberStateLabel, taskTitle } from '../lib/format';
+import { collectSessionArtifacts } from '../lib/artifacts';
+import {
+  SCRATCH_PROJECT_ID,
+  artifactShortLabel,
+  indexInboxByTask,
+  memberStateLabel,
+  sessionMark,
+  shortSha,
+  taskTitle,
+} from '../lib/format';
+import { resolveMachineSshAlias } from '../lib/ide';
 import { navigate, paths } from '../lib/router';
 import { toast, useWorkbenchStore } from '../store/useWorkbenchStore';
 import { BoardPanel } from './BoardPanel';
@@ -33,12 +45,12 @@ function BindMenu({ boot, taskId }: { boot: BootstrapResponse; taskId: string })
   return (
     <div className="relpos bind-wrap" style={{ flex: 'none' }}>
       <button type="button" className="bind-btn" onClick={() => setOpen(!open)}>
-        <Link2 size={12} strokeWidth={1.6} /> 绑定到项目 <ChevronDown size={11} strokeWidth={1.6} />
+        <Link2 size={11} strokeWidth={1.6} /> 绑定项目 <ChevronDown size={10} strokeWidth={1.6} />
       </button>
       {open && (
         <>
           <div className="scrim" style={{ background: 'transparent', backdropFilter: 'none', zIndex: 49 }} onClick={() => setOpen(false)} />
-          <div className="menu" style={{ top: 28, left: 0 }}>
+          <div className="menu" style={{ top: 24, left: 0 }}>
             <div className="mh">迁移为项目线程</div>
             {projects.map((p) => (
               <button type="button" key={p.projectId} disabled={bind.isPending} onClick={() => bind.mutate(p.projectId)}>
@@ -70,14 +82,19 @@ export function SessionPage({ boot, taskId, worker }: { boot: BootstrapResponse;
   const setProjectExpanded = useWorkbenchStore((s) => s.setProjectExpanded);
   const openReview = useWorkbenchStore((s) => s.openReview);
   const [manualCardOpen, setManualCardOpen] = useState(false);
+  const [artMenuOpen, setArtMenuOpen] = useState(false);
+  const artMenuRef = useRef<HTMLDivElement | null>(null);
 
   const members = tl?.boardMembers ?? [];
   const hasSwarm = members.length > 0 || (task?.workerCount ?? 0) > 0;
   const boardQ = useBoard(taskId, hasSwarm || boardOpen || !!worker);
+  const sessionArtifacts = useMemo(() => collectSessionArtifacts(tl), [tl]);
+  const inboxByTask = useMemo(() => indexInboxByTask(boot.openInboxItems), [boot.openInboxItems]);
 
   useEffect(() => {
     setMobileDock(false);
     setManualCardOpen(false);
+    setArtMenuOpen(false);
   }, [taskId, setMobileDock]);
 
   useEffect(() => {
@@ -87,6 +104,17 @@ export function SessionPage({ boot, taskId, worker }: { boot: BootstrapResponse;
   useEffect(() => {
     if (task && !isScratch && expandedProjects[task.projectId] === undefined) setProjectExpanded(task.projectId, true);
   }, [task, isScratch, expandedProjects, setProjectExpanded]);
+
+  useEffect(() => {
+    if (!artMenuOpen) return;
+    const onDown = (e: MouseEvent) => {
+      if (artMenuRef.current && !artMenuRef.current.contains(e.target as Node)) {
+        setArtMenuOpen(false);
+      }
+    };
+    window.addEventListener('mousedown', onDown);
+    return () => window.removeEventListener('mousedown', onDown);
+  }, [artMenuOpen]);
 
   if (tlq.isError) {
     return (
@@ -115,32 +143,63 @@ export function SessionPage({ boot, taskId, worker }: { boot: BootstrapResponse;
     formalCodeDeliveries.find((d) => d.deliveryId === task.latestDeliveryId) ??
     formalCodeDeliveries[formalCodeDeliveries.length - 1] ??
     codeDeliveries[codeDeliveries.length - 1];
-  const artDelivery = [...tl.deliveries].reverse().find((d) => (d.ryugiBindings?.length ?? 0) > 0);
-  const primaryReview = latestCode
-    ? { tab: 'code' as const, deliveryId: latestCode.deliveryId }
-    : artDelivery
-      ? { tab: 'art' as const, deliveryId: artDelivery.deliveryId }
-      : null;
 
-  const hasCardContent = formalCodeDeliveries.length > 0 || !!artDelivery || hasSwarm || tl.sources.length > 0;
+  const mark = sessionMark(task, inboxByTask.get(task.taskId) ?? []);
+  const lastAttempt = tl.attempts[tl.attempts.length - 1];
+  const machineId =
+    latestCode?.sourceMachineId ||
+    lastAttempt?.machineId ||
+    (project ? project.anchors[task.requiredCapability || project.defaultCapability]?.machine : '') ||
+    '';
+  const hostMachine = boot.machines.find((m) => m.machineId === machineId);
+  const hostLabel = machineId ? resolveMachineSshAlias(hostMachine, machineId) : '';
+  const gitMeta = latestCode?.headSha
+    ? shortSha(latestCode.headSha)
+    : project?.defaultBranch || '';
+
+  const hasCardContent = formalCodeDeliveries.length > 0 || sessionArtifacts.length > 0 || hasSwarm || tl.sources.length > 0;
   const cardVisible = hasCardContent ? cardOpen : manualCardOpen;
   const drilledMember = worker ? (boardQ.data?.members ?? members).find((m) => m.memberName === worker) : undefined;
   const dockMode: 'board' | 'card' | null = boardOpen ? 'board' : cardVisible ? 'card' : null;
+  const hasCodeDiff = !!latestCode && (latestCode.manifest.insertions > 0 || latestCode.manifest.deletions > 0 || latestCode.manifest.filesChanged > 0);
+  const openDiffComments = tl.annotations.filter((a) => a.status === 'open' && a.source !== 'ryugi').length;
 
   return (
     <main className="main">
       <PageHeader
+        className={!worker ? 'thead-session' : undefined}
         right={
           <>
-            {primaryReview && !worker && (
+            {!worker && project && (
+              <div className="no-mobile">
+                <IdeOpenButton project={project} delivery={latestCode} machines={boot.machines} />
+              </div>
+            )}
+            {!worker && latestCode && (
               <button
                 type="button"
-                className="hb"
-                title="审阅产出"
-                onClick={() => openReview(primaryReview.tab, taskId, primaryReview.deliveryId)}
+                className={`diff-entry-btn ${hasCodeDiff ? '' : 'is-clean'}`}
+                title="打开 Source Review"
+                onClick={() => openReview('code', taskId, latestCode.deliveryId)}
               >
-                <DiffIcon size={13} />
-                <span className="no-mobile">审阅</span>
+                {hasCodeDiff ? (
+                  <>
+                    <DiffIcon size={13} />
+                    <span className="add">+{latestCode.manifest.insertions}</span>
+                    <span className="del">−{latestCode.manifest.deletions}</span>
+                    {openDiffComments > 0 && (
+                      <span className="comment-count-badge">
+                        <MessageSquare size={10} strokeWidth={1.8} />
+                        {openDiffComments}
+                      </span>
+                    )}
+                  </>
+                ) : (
+                  <>
+                    <Check size={12} strokeWidth={2} />
+                    <span>Checkpoint</span>
+                  </>
+                )}
               </button>
             )}
             <button
@@ -183,26 +242,91 @@ export function SessionPage({ boot, taskId, worker }: { boot: BootstrapResponse;
             <div className="crumb">
               <span className="sep">/</span>
               <span className="c1">@{worker}</span>
-              {drilledMember && <span className="faint" style={{ fontSize: 11.5 }}>{memberStateLabel(drilledMember.state)}</span>}
+              {drilledMember && (
+                <span className="faint" style={{ fontSize: 11.5 }}>
+                  {memberStateLabel(drilledMember.state)}
+                </span>
+              )}
             </div>
           </>
         ) : (
-          <>
-            <div className="crumb">
-              {isScratch ? (
-                <span className="c0">自由 Chat</span>
-              ) : (
-                <button type="button" className="c0" onClick={() => project && navigate(paths.project(project.projectId))}>
-                  {project?.displayName ?? task.projectId}
-                </button>
-              )}
-              <span className="sep">/</span>
-              <span className="c1" title={task.goal}>
+          <div className="topbar-left">
+            <div className="topbar-title-row">
+              <span className="topbar-title" title={task.goal}>
                 {taskTitle(task)}
               </span>
+              {sessionArtifacts.length > 0 && (
+                <div className="topbar-art-wrap" ref={artMenuRef}>
+                  <button
+                    type="button"
+                    className={`topbar-art-icon ${artMenuOpen ? 'open' : ''}`}
+                    title="本会话 Artifacts"
+                    aria-label="本会话 Artifacts"
+                    aria-expanded={artMenuOpen}
+                    onClick={() => setArtMenuOpen((v) => !v)}
+                  >
+                    <Layers size={13} strokeWidth={1.7} />
+                    <span>{sessionArtifacts.length}</span>
+                  </button>
+                  {artMenuOpen && (
+                    <div className="topbar-art-menu" role="menu">
+                      <div className="ov-menu-sec">本会话 Artifacts</div>
+                      {sessionArtifacts.map((art) => (
+                        <button
+                          type="button"
+                          role="menuitem"
+                          key={art.artifactId}
+                          className="ov-menu-item"
+                          onClick={() => {
+                            setArtMenuOpen(false);
+                            openReview('art', taskId, art.deliveryId, art.artifactId);
+                          }}
+                        >
+                          <span className="dlv-kind-tag">{artifactShortLabel(art.kind)}</span>
+                          <span className="ell" style={{ flex: 1 }}>
+                            {art.title}
+                          </span>
+                          {art.openAnnotations > 0 && (
+                            <span className="ov-menu-badge">
+                              <MessageSquare size={10} strokeWidth={1.8} />
+                              {art.openAnnotations}
+                            </span>
+                          )}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+              {mark && <StatusMark mark={mark} />}
             </div>
-            {isScratch && <BindMenu boot={boot} taskId={taskId} />}
-          </>
+            <div className="topbar-meta">
+              {isScratch ? (
+                <>
+                  <span>对话</span>
+                  <BindMenu boot={boot} taskId={taskId} />
+                </>
+              ) : (
+                <>
+                  <button type="button" onClick={() => project && navigate(paths.project(project.projectId))}>
+                    {project?.displayName ?? task.projectId}
+                  </button>
+                  {hostLabel && (
+                    <>
+                      <span className="topbar-meta-dot">·</span>
+                      <span className="mono">{hostLabel}</span>
+                    </>
+                  )}
+                  {gitMeta && (
+                    <>
+                      <span className="topbar-meta-dot">·</span>
+                      <span className="mono">{gitMeta}</span>
+                    </>
+                  )}
+                </>
+              )}
+            </div>
+          </div>
         )}
       </PageHeader>
 
@@ -210,8 +334,13 @@ export function SessionPage({ boot, taskId, worker }: { boot: BootstrapResponse;
         <SessionConversation
           taskId={taskId}
           tl={tl}
+          boot={boot}
           worker={worker}
           drilledMember={drilledMember}
+          onOpenReview={() => {
+            if (latestCode) openReview('code', taskId, latestCode.deliveryId);
+            else if (sessionArtifacts[0]) openReview('art', taskId, sessionArtifacts[0].deliveryId, sessionArtifacts[0].artifactId);
+          }}
         />
         {(dockMode || mobileDock) && (
           <div

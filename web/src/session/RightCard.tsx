@@ -10,7 +10,8 @@ import type {
 } from '../generated/protocol';
 import { ArtIcon, CursorIcon, DiffIcon, SwarmIcon } from '../components/Icons';
 import { api, errMsg } from '../lib/api';
-import { basename, memberDot, memberStateLabel } from '../lib/format';
+import { collectSessionArtifacts } from '../lib/artifacts';
+import { artifactShortLabel, memberDot, memberStateLabel } from '../lib/format';
 import { buildIDEJump, launchIDE } from '../lib/ide';
 import { navigate, paths } from '../lib/router';
 import { toast, useWorkbenchStore } from '../store/useWorkbenchStore';
@@ -51,7 +52,7 @@ export function RightCard({
   const latestCode =
     formalCodeDeliveries.find((d) => d.deliveryId === tl.task.latestDeliveryId) ??
     formalCodeDeliveries[formalCodeDeliveries.length - 1];
-  const artDelivery = [...formalDeliveries].reverse().find((d) => (d.ryugiBindings?.length ?? 0) > 0);
+  const sessionArtifacts = collectSessionArtifacts(tl);
   const members = board?.members ?? tl.boardMembers;
   const showWorkers = members.length > 0 || tl.task.workerCount > 0;
 
@@ -114,21 +115,22 @@ export function RightCard({
         </div>
       )}
 
-      {artDelivery && (
+      {sessionArtifacts.length > 0 && (
         <div className="fsec">
-          <div className="fsec-h">设计稿</div>
-          {(artDelivery.ryugiBindings ?? []).map((b) => (
+          <div className="fsec-h">Artifacts</div>
+          {sessionArtifacts.map((art) => (
             <button
               type="button"
-              key={b.bindingId}
+              key={art.artifactId}
               className="frow"
-              onClick={() => openReview('art', taskId, artDelivery.deliveryId)}
-              title={b.artifactLocator}
+              onClick={() => openReview('art', taskId, art.deliveryId, art.artifactId)}
+              title={art.locator}
             >
               <ArtIcon size={13} />
               <span className="ell" style={{ flex: 1 }}>
-                {basename(b.artifactLocator) || b.artifactLocator}
+                {art.title}
               </span>
+              <span className="dlv-kind-tag">{artifactShortLabel(art.kind)}</span>
             </button>
           ))}
         </div>

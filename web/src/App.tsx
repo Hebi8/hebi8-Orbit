@@ -8,6 +8,7 @@ import { useRealtimeSync } from './hooks/useRealtimeSync';
 import { errMsg } from './lib/api';
 import { hasUrgentSession } from './lib/format';
 import { navigate, parseHash, paths, useRoute } from './lib/router';
+import { ArtifactsPage } from './pages/ArtifactsPage';
 import { HomePage } from './pages/HomePage';
 import { NewThreadPage } from './pages/NewThreadPage';
 import { PAPage } from './pages/PAPage';
@@ -128,6 +129,9 @@ export function App() {
     case 'pa':
       page = <PAPage boot={boot} threadId={route.threadId} />;
       break;
+    case 'artifacts':
+      page = <ArtifactsPage />;
+      break;
     case 'new':
       page = <NewThreadPage boot={boot} mode={route.mode} projectId={route.projectId} />;
       break;
@@ -153,7 +157,7 @@ export function App() {
       </div>
       <ReviewOverlay boot={boot} />
       {cmdkOpen && <CommandPalette boot={boot} />}
-      {machinesOpen && <MachinesPopover machines={boot.machines} />}
+      {machinesOpen && <MachinesPopover machines={boot.machines} defaultWorkspaceName={boot.workspaceName} />}
       <Toast />
     </>
   );

@@ -1,5 +1,5 @@
 import { useMemo } from 'react';
-import { LayoutGrid, PanelLeftClose, Plus } from 'lucide-react';
+import { Layers, LayoutGrid, PanelLeftClose, Plus, Search } from 'lucide-react';
 import type { BootstrapResponse, MachineView, ProjectView, TaskSummary } from '../generated/protocol';
 import { useManyProjectTasks } from '../hooks/queries';
 import { useHubLatency } from '../hooks/useHubLatency';
@@ -22,54 +22,46 @@ function mainThreads(tasks: TaskSummary[]): TaskSummary[] {
   return tasks.filter((t) => !t.parentTaskId).sort((a, b) => b.updatedAt - a.updatedAt);
 }
 
-/**
- * Single current-host footer indicator mirroring Lody LAN fork's sidebar footer +
- * `LanConnectionIndicator`: quiet ink latency on healthy connection (no bright dot);
- * color only surfaces when disconnected or reconnecting.
- */
-function CurrentHostFooterButton({
-  host,
+function WorkspaceFooterButton({
+  workspaceName,
+  machines,
   open,
   onClick,
 }: {
-  host?: MachineView;
+  workspaceName: string;
+  machines: MachineView[];
   open: boolean;
   onClick: () => void;
 }) {
   const wsStatus = useWorkbenchStore((s) => s.wsStatus);
   const latency = useHubLatency();
-  const hostName = host?.displayName || host?.machineId || window.location.hostname || 'Hub';
 
-  const unreachable = latency === null || host?.status === 'offline';
-  const degraded = !unreachable && (wsStatus === 'reconnecting' || host?.status === 'degraded');
+  const anyOnline = machines.length === 0 || machines.some((m) => m.status === 'online');
+  const unreachable = latency === null || !anyOnline;
+  const degraded = !unreachable && (wsStatus === 'reconnecting' || (typeof latency === 'number' && latency >= 80));
 
   const statusText = unreachable
-    ? '未连接'
-    : degraded
+    ? '离线'
+    : wsStatus === 'reconnecting'
       ? '重连中'
-      : latency !== undefined
-        ? `${latency} ms`
+      : typeof latency === 'number'
+        ? `${latency}ms`
         : '';
-  const tooltip = unreachable
-    ? `${hostName} · 未连接`
-    : degraded
-      ? `${hostName} · 重连中`
-      : latency !== undefined
-        ? `${hostName} · ${latency} ms`
-        : hostName;
+
+  const dotClass = unreachable ? 'off' : degraded ? 'mid' : 'good';
+  const latClass = unreachable ? 'off' : degraded ? 'mid' : 'good';
 
   return (
     <button
       type="button"
       className={`host-row ${open ? 'on' : ''}`}
-      title={tooltip}
-      aria-label={tooltip}
+      title={statusText ? `${workspaceName} · ${statusText}` : workspaceName}
+      aria-label={statusText ? `${workspaceName} · ${statusText}` : workspaceName}
       onClick={onClick}
     >
-      <span className="hn ell">{hostName}</span>
-      {statusText && (
-        <span className={`hl ${unreachable ? 'bad-t' : degraded ? 'warn-t' : ''}`}>{statusText}</span>
-      )}
+      <span className={`ws-dot ${dotClass}`} aria-hidden="true" />
+      <span className="hn ell">{workspaceName}</span>
+      {statusText && <span className={`hl mono ${latClass}`}>{statusText}</span>}
     </button>
   );
 }
@@ -82,7 +74,10 @@ export function Sidebar({ boot, route }: { boot: BootstrapResponse; route: Route
   const toggleTheme = useWorkbenchStore((s) => s.toggleTheme);
   const machinesOpen = useWorkbenchStore((s) => s.machinesOpen);
   const setMachinesOpen = useWorkbenchStore((s) => s.setMachinesOpen);
-  const localMachineId = useWorkbenchStore((s) => s.localMachineId);
+  const setCmdkOpen = useWorkbenchStore((s) => s.setCmdkOpen);
+  const workspaceNameOverride = useWorkbenchStore((s) => s.workspaceNameOverride);
+
+  const workspaceName = workspaceNameOverride || boot.workspaceName || 'Home LAN';
 
   const projects = boot.projects.filter((p) => p.projectId !== SCRATCH_PROJECT_ID && !p.archived);
   const scratch = boot.projects.find((p) => p.projectId === SCRATCH_PROJECT_ID);
@@ -96,27 +91,22 @@ export function Sidebar({ boot, route }: { boot: BootstrapResponse; route: Route
   const inboxByTask = useMemo(() => indexInboxByTask(boot.openInboxItems), [boot.openInboxItems]);
   const activeTaskId = route.name === 'session' ? route.taskId : '';
 
-  const currentHost =
-    boot.machines.find((m) => m.transportMode === 'local_ws') ??
-    boot.machines.find((m) => m.machineId === localMachineId) ??
-    boot.machines[0];
-
   return (
     <aside className="side">
       <div className="side-in">
         <div className="brand">
           <span className="brand-mark" />
-          <b>hebi8-Orbit</b>
-          <button type="button" className="ib" title="收起侧栏 (⌘\)" onClick={toggleSidebar}>
-            <PanelLeftClose size={14} strokeWidth={1.6} />
-          </button>
+          <b>Orbit</b>
+          <div className="brand-acts">
+            <button type="button" className="ib" title="快速跳转 (⌘K)" aria-label="搜索" onClick={() => setCmdkOpen(true)}>
+              <Search size={13.5} strokeWidth={1.6} />
+            </button>
+            <button type="button" className="ib" title="收起侧栏 (⌘\)" aria-label="收起侧栏" onClick={toggleSidebar}>
+              <PanelLeftClose size={14} strokeWidth={1.6} />
+            </button>
+          </div>
         </div>
         <div className="quick">
-          <button type="button" className={`qi ${route.name === 'new' ? 'on' : ''}`} onClick={() => navigate(paths.newThread())}>
-            <Plus size={14} strokeWidth={1.6} />
-            新建线程
-            <span className="kbd">⌘N</span>
-          </button>
           <button type="button" className={`qi ${route.name === 'home' ? 'on' : ''}`} onClick={() => navigate(paths.home())}>
             <LayoutGrid size={14} strokeWidth={1.6} />
             总览
@@ -125,9 +115,17 @@ export function Sidebar({ boot, route }: { boot: BootstrapResponse; route: Route
             <PAIcon />
             PA
           </button>
+          <button type="button" className={`qi ${route.name === 'artifacts' ? 'on' : ''}`} onClick={() => navigate(paths.artifacts())}>
+            <Layers size={14} strokeWidth={1.6} />
+            Artifacts
+          </button>
+          <button type="button" className={`qi ${route.name === 'new' ? 'on' : ''}`} onClick={() => navigate(paths.newThread())}>
+            <Plus size={14} strokeWidth={1.6} />
+            新建线程
+            <span className="kbd">⌘N</span>
+          </button>
         </div>
         <nav className="projects" aria-label="项目">
-          <div className="slabel">项目</div>
           {projects.length === 0 && <div className="quiet" style={{ padding: '4px 8px' }}>还没有注册项目</div>}
           {projects.map((p) => {
             const open = isOpen(p);
@@ -165,7 +163,7 @@ export function Sidebar({ boot, route }: { boot: BootstrapResponse; route: Route
                       <button
                         type="button"
                         key={t.taskId}
-                        className={`th ${activeTaskId === t.taskId ? 'on' : ''}`}
+                        className={`th ${activeTaskId === t.taskId ? 'on' : ''} ${!mark ? 'resting' : ''}`}
                         onClick={() => navigate(paths.session(t.taskId))}
                         title={hint ? `${taskTitle(t)} · ${hint}` : taskTitle(t)}
                       >
@@ -185,7 +183,7 @@ export function Sidebar({ boot, route }: { boot: BootstrapResponse; route: Route
           {scratchThreads.length > 0 && (
             <>
               <div className="slabel" style={{ marginTop: 10 }}>
-                自由 Chat
+                自由对话
               </div>
               {scratchThreads.slice(0, MAX_THREADS).map((t) => {
                 const mark = sessionMark(t, inboxByTask.get(t.taskId));
@@ -194,7 +192,7 @@ export function Sidebar({ boot, route }: { boot: BootstrapResponse; route: Route
                   <button
                     type="button"
                     key={t.taskId}
-                    className={`th flat ${activeTaskId === t.taskId ? 'on' : ''}`}
+                    className={`th flat ${activeTaskId === t.taskId ? 'on' : ''} ${!mark ? 'resting' : ''}`}
                     onClick={() => navigate(paths.session(t.taskId))}
                     title={hint ? `${taskTitle(t)} · ${hint}` : taskTitle(t)}
                   >
@@ -207,9 +205,14 @@ export function Sidebar({ boot, route }: { boot: BootstrapResponse; route: Route
           )}
         </nav>
         <div className="sfoot">
-          <CurrentHostFooterButton host={currentHost} open={machinesOpen} onClick={() => setMachinesOpen(!machinesOpen)} />
-          <button type="button" className="ib" title="切换深/浅色" onClick={toggleTheme}>
-            {theme === 'dark' ? <MoonIcon /> : <SunIcon />}
+          <WorkspaceFooterButton
+            workspaceName={workspaceName}
+            machines={boot.machines}
+            open={machinesOpen}
+            onClick={() => setMachinesOpen(!machinesOpen)}
+          />
+          <button type="button" className="ib" title="切换深 / 浅色" aria-label="切换深浅色" onClick={toggleTheme}>
+            {theme === 'dark' ? <SunIcon /> : <MoonIcon />}
           </button>
         </div>
       </div>

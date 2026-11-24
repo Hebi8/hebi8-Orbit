@@ -236,6 +236,7 @@ export interface PAMessage {
 }
 
 export interface BootstrapResponse {
+  workspaceName?: string;
   projects: ProjectView[];
   machines: MachineView[];
   openInboxItems: InboxItemView[];
@@ -495,6 +496,7 @@ export interface WorkerStreamResponse {
 
 export interface TaskTimelineResponse {
   task: TaskSummary;
+  runtimeConfig?: Record<string, string>;
   attempts: AttemptView[];
   deliveries: DeliveryView[];
   annotations: AnnotationView[];
@@ -576,6 +578,35 @@ export interface CreateAnnotationRequest {
 export interface CreateAnnotationResponse {
   annotation: AnnotationView;
   created: boolean;
+}
+
+export interface DeleteAnnotationResponse {
+  annotationId: string;
+  taskId: string;
+  deliveryId: string;
+  deleted: boolean;
+}
+
+export interface GlobalArtifactView {
+  artifactId: string;
+  kind: string;
+  title: string;
+  projectId: string;
+  projectName: string;
+  taskId: string;
+  taskTitle: string;
+  deliveryId: string;
+  locator: string;
+  openUrl?: string;
+  blobSha256?: string;
+  sizeBytes?: number;
+  openAnnotations: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface ListArtifactsResponse {
+  artifacts: GlobalArtifactView[];
 }
 
 export interface RyugiSyncResponse {

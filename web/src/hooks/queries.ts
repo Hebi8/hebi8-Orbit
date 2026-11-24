@@ -6,6 +6,15 @@ export function useBootstrap() {
   return useQuery({ queryKey: ['bootstrap'], queryFn: api.bootstrap, staleTime: 10_000 });
 }
 
+export function useGlobalArtifacts(enabled = true) {
+  return useQuery({
+    queryKey: ['global-artifacts'],
+    queryFn: api.listGlobalArtifacts,
+    enabled,
+    staleTime: 10_000,
+  });
+}
+
 export function useProjectTasks(projectId: string | undefined, enabled = true) {
   return useQuery({
     queryKey: ['project-tasks', projectId],

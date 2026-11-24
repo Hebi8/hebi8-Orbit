@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ReactNode } from 'react';
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   Diff,
@@ -15,28 +15,38 @@ import {
   type RenderToken,
   type ViewType,
 } from 'react-diff-view';
-import { Columns2, PanelLeft, Rows2 } from 'lucide-react';
+import { Check, ChevronUp, Columns2, MessageSquare, PanelLeft, Rows2, Trash2 } from 'lucide-react';
 import type { AnnotationView, BootstrapResponse, DiffFileStat, TaskTimelineResponse } from '../generated/protocol';
-import { CursorIcon } from '../components/Icons';
+import { IdeOpenButton } from '../components/IdeOpenButton';
 import { useDelivery } from '../hooks/queries';
 import { api, errMsg, makeIdempotencyKey } from '../lib/api';
 import { shortSha } from '../lib/format';
-import { buildIDEJump, launchIDE } from '../lib/ide';
 import { tokenizeHunksWithShiki } from '../lib/shikiDiff';
 import { toast, useWorkbenchStore } from '../store/useWorkbenchStore';
-import { ReviewFooter } from './ReviewFooter';
 
 const CODE_KINDS = new Set(['code_diff', 'mixed', 'workspace_snapshot']);
 
 interface LineDraft {
   deliveryId: string;
-  changeKey: string;
+  anchorChangeKey: string;
+  endChangeKey: string;
   path: string;
   side: 'old' | 'new';
-  line: number;
+  startLine: number;
+  endLine: number;
+  quote?: string;
   contextBefore: string;
   contextAfter: string;
   idempotencyKey: string;
+}
+
+interface TextSelPop {
+  x: number;
+  y: number;
+  quote: string;
+  side: 'old' | 'new';
+  line: number;
+  change: ChangeData;
 }
 
 /** Context lines strictly within the same hunk and the same side, so anchors never leak across hunks. */
@@ -68,6 +78,14 @@ function isDiffAnnotation(a: AnnotationView) {
   return a.source !== 'ryugi';
 }
 
+function formatLineAnchor(a: AnnotationView): string {
+  const path = a.anchor.path?.split('/').pop() || a.anchor.path || '';
+  const s = a.anchor.startLine ?? 0;
+  const e = a.anchor.endLine ?? s;
+  if (s <= 0) return path;
+  return e > s ? `${path} · L${s}–L${e}` : `${path} · L${s}`;
+}
+
 export function CodeReviewPane({
   taskId,
   deliveryId,
@@ -75,7 +93,7 @@ export function CodeReviewPane({
   tl,
   boot,
   onClose,
-  tabSwitch,
+  titleSwitcher,
   headerEnd,
 }: {
   taskId: string;
@@ -84,12 +102,11 @@ export function CodeReviewPane({
   tl?: TaskTimelineResponse;
   boot: BootstrapResponse;
   onClose: () => void;
-  tabSwitch?: ReactNode;
+  titleSwitcher?: ReactNode;
   headerEnd?: ReactNode;
 }) {
   const qc = useQueryClient();
   const theme = useWorkbenchStore((s) => s.theme);
-  const localMachineId = useWorkbenchStore((s) => s.localMachineId);
   const [file, setFile] = useState('');
   const [viewType, setViewType] = useState<ViewType>('unified');
   const [treeOverride, setTreeOverride] = useState<boolean | null>(null);
@@ -97,12 +114,17 @@ export function CodeReviewPane({
   const [body, setBody] = useState('');
   const [tokens, setTokens] = useState<HunkTokens | null>(null);
   const [lastLine, setLastLine] = useState<{ path: string; line?: number } | null>(null);
+  const [railPopOpen, setRailPopOpen] = useState(false);
+  const [textSel, setTextSel] = useState<TextSelPop | null>(null);
+  const diffPaneRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     setFile('');
     setDraft(null);
     setBody('');
     setTreeOverride(null);
+    setTextSel(null);
+    setRailPopOpen(false);
   }, [deliveryId]);
 
   const versions = (tl?.deliveries ?? []).filter((d) => CODE_KINDS.has(d.kind));
@@ -116,7 +138,7 @@ export function CodeReviewPane({
   const files = detail?.diffFiles ?? [];
   const activeFile = (file && files.some((f) => f.path === file) ? file : files[0]?.path) || '';
   const isNarrow = typeof window !== 'undefined' && window.innerWidth < 768;
-  const defaultTreeOpen = !isNarrow && files.length > 2;
+  const defaultTreeOpen = !isNarrow && files.length > 1;
   const treeOpen = treeOverride ?? defaultTreeOpen;
   const effectiveViewType: ViewType = isNarrow ? 'unified' : viewType;
 
@@ -147,12 +169,15 @@ export function CodeReviewPane({
     };
   }, [parsed, activeFile, theme]);
 
-  const annotations = (detail?.annotations ?? []).filter(isDiffAnnotation);
-  const fileAnns = annotations.filter((a) => a.anchor.path === activeFile);
+  const annotations = useMemo(() => (detail?.annotations ?? []).filter(isDiffAnnotation), [detail?.annotations]);
+  const openAnnotations = useMemo(() => annotations.filter((a) => a.status === 'open'), [annotations]);
+  const fileAnns = useMemo(() => annotations.filter((a) => a.anchor.path === activeFile), [annotations, activeFile]);
 
   const refresh = () => {
     void qc.invalidateQueries({ queryKey: ['delivery'] });
     void qc.invalidateQueries({ queryKey: ['task-timeline', taskId] });
+    void qc.invalidateQueries({ queryKey: ['project-tasks'] });
+    void qc.invalidateQueries({ queryKey: ['bootstrap'] });
   };
 
   const create = useMutation({
@@ -164,8 +189,9 @@ export function CodeReviewPane({
           anchor: {
             path: v.d.path,
             side: v.d.side,
-            startLine: v.d.line,
-            endLine: v.d.line,
+            startLine: v.d.startLine,
+            endLine: v.d.endLine,
+            quote: v.d.quote,
             contextBefore: v.d.contextBefore,
             contextAfter: v.d.contextAfter,
             baseSha: detail?.delivery.baseSha,
@@ -178,12 +204,53 @@ export function CodeReviewPane({
     onSuccess: () => {
       setDraft(null);
       setBody('');
+      setTextSel(null);
       refresh();
     },
     onError: (e) => toast(errMsg(e), 'err'),
   });
 
-  const openComposer = (change: ChangeData, clicked: 'old' | 'new') => {
+  const removeAnn = useMutation({
+    mutationFn: (annotationId: string) => api.deleteAnnotation(annotationId),
+    onSuccess: () => {
+      refresh();
+    },
+    onError: (e) => toast(errMsg(e), 'err'),
+  });
+
+  const checkpoint = useMutation({
+    mutationFn: () => api.completeDeliveryReview(effectiveDeliveryId),
+    onSuccess: () => {
+      toast('已确认 Checkpoint');
+      refresh();
+    },
+    onError: (e) => toast(errMsg(e), 'err'),
+  });
+
+  // Lookup maps for mapping line numbers <-> change keys
+  const lineIndex = useMemo(() => {
+    const keyBySideLine = new Map<string, string>();
+    const changeBySideLine = new Map<string, ChangeData>();
+    if (!parsed) return { keyBySideLine, changeBySideLine };
+    for (const h of parsed.hunks) {
+      for (const ch of h.changes) {
+        const ck = getChangeKey(ch);
+        const n = computeNewLineNumber(ch);
+        const o = computeOldLineNumber(ch);
+        if (n > 0) {
+          keyBySideLine.set(`new:${n}`, ck);
+          changeBySideLine.set(`new:${n}`, ch);
+        }
+        if (o > 0) {
+          keyBySideLine.set(`old:${o}`, ck);
+          changeBySideLine.set(`old:${o}`, ch);
+        }
+      }
+    }
+    return { keyBySideLine, changeBySideLine };
+  }, [parsed]);
+
+  const openComposer = (change: ChangeData, clicked: 'old' | 'new', extendRange: boolean, quote?: string) => {
     if (!parsed || !detail) return;
     const oldLn = computeOldLineNumber(change);
     const newLn = computeNewLineNumber(change);
@@ -194,87 +261,207 @@ export function CodeReviewPane({
       line = side === 'old' ? oldLn : newLn;
     }
     if (line <= 0) return;
-    const ctx = sameHunkSideContext(parsed.hunks, change, side);
+
     setLastLine({ path: activeFile, line: newLn > 0 ? newLn : undefined });
+    setTextSel(null);
+
+    // Shift+click extends current draft line range on the same file & side
+    if (extendRange && draft && draft.path === activeFile && draft.side === side && draft.deliveryId === detail.delivery.deliveryId) {
+      const startLine = Math.min(draft.startLine, line);
+      const endLine = Math.max(draft.startLine, line);
+      const endChange = lineIndex.changeBySideLine.get(`${side}:${endLine}`) ?? change;
+      const endKey = lineIndex.keyBySideLine.get(`${side}:${endLine}`) ?? getChangeKey(change);
+      const ctx = sameHunkSideContext(parsed.hunks, endChange, side);
+      setDraft({
+        ...draft,
+        startLine,
+        endLine,
+        endChangeKey: endKey,
+        quote: undefined,
+        ...ctx,
+        idempotencyKey: makeIdempotencyKey(),
+      });
+      return;
+    }
+
+    const ctx = sameHunkSideContext(parsed.hunks, change, side);
+    const ck = getChangeKey(change);
     setDraft({
       deliveryId: detail.delivery.deliveryId,
-      changeKey: getChangeKey(change),
+      anchorChangeKey: ck,
+      endChangeKey: ck,
       path: activeFile,
       side,
-      line,
+      startLine: line,
+      endLine: line,
+      quote,
       ...ctx,
       idempotencyKey: makeIdempotencyKey(),
     });
     setBody('');
   };
 
+  // Highlight selected line range for active draft AND for open range comments
+  const selectedChanges = useMemo<string[]>(() => {
+    if (!parsed) return [];
+    const keys = new Set<string>();
+    const addRange = (side: 'old' | 'new', start: number, end: number) => {
+      for (let ln = start; ln <= end; ln++) {
+        const ck = lineIndex.keyBySideLine.get(`${side}:${ln}`);
+        if (ck) keys.add(ck);
+      }
+    };
+    if (draft && draft.deliveryId === effectiveDeliveryId && draft.path === activeFile) {
+      addRange(draft.side, draft.startLine, draft.endLine);
+    }
+    for (const a of fileAnns) {
+      if (a.status !== 'open') continue;
+      const side = a.anchor.side === 'old' ? 'old' : 'new';
+      const s = a.anchor.startLine ?? 0;
+      const e = a.anchor.endLine ?? s;
+      if (s > 0) addRange(side, s, Math.max(s, e));
+    }
+    return [...keys];
+  }, [parsed, draft, effectiveDeliveryId, activeFile, fileAnns, lineIndex]);
+
+  // Handle mouseup text selection inside code cells for inline quote commenting
+  const handleCodeMouseUp = () => {
+    const sel = window.getSelection();
+    if (!sel || sel.isCollapsed || !diffPaneRef.current || !parsed) {
+      setTextSel(null);
+      return;
+    }
+    const rawQuote = sel.toString().trim();
+    if (!rawQuote || rawQuote.length > 240) {
+      setTextSel(null);
+      return;
+    }
+    const anchorEl =
+      sel.anchorNode instanceof HTMLElement ? sel.anchorNode : sel.anchorNode?.parentElement ?? null;
+    const rowEl = anchorEl?.closest('tr.diff-line') as HTMLElement | null;
+    const gutterBtn = rowEl?.querySelector('button[data-diff-line]') as HTMLButtonElement | null;
+    if (!rowEl || !gutterBtn) {
+      setTextSel(null);
+      return;
+    }
+    const side = (gutterBtn.dataset.diffSide === 'old' ? 'old' : 'new') as 'old' | 'new';
+    const line = Number(gutterBtn.dataset.diffLine || 0);
+    const change = lineIndex.changeBySideLine.get(`${side}:${line}`);
+    if (!change || line <= 0) {
+      setTextSel(null);
+      return;
+    }
+    const rangeRect = sel.getRangeAt(0).getBoundingClientRect();
+    const paneRect = diffPaneRef.current.getBoundingClientRect();
+    setTextSel({
+      x: Math.max(16, Math.min(rangeRect.left - paneRect.left + diffPaneRef.current.scrollLeft, paneRect.width - 150)),
+      y: Math.max(40, rangeRect.top - paneRect.top + diffPaneRef.current.scrollTop - 34),
+      quote: rawQuote,
+      side,
+      line,
+      change,
+    });
+  };
+
   const widgets = useMemo<Record<string, ReactNode>>(() => {
     if (!parsed) return {};
-    const keyBySideLine = new Map<string, string>();
-    for (const h of parsed.hunks) {
-      for (const ch of h.changes) {
-        const ck = getChangeKey(ch);
-        const n = computeNewLineNumber(ch);
-        const o = computeOldLineNumber(ch);
-        if (n > 0) keyBySideLine.set(`new:${n}`, ck);
-        if (o > 0) keyBySideLine.set(`old:${o}`, ck);
-      }
-    }
     const map: Record<string, ReactNode[]> = {};
     for (const a of fileAnns) {
       const side = a.anchor.side === 'old' ? 'old' : 'new';
-      const ck = keyBySideLine.get(`${side}:${a.anchor.startLine ?? 0}`);
+      const anchorLine = a.anchor.endLine && a.anchor.endLine > 0 ? a.anchor.endLine : a.anchor.startLine ?? 0;
+      const ck =
+        lineIndex.keyBySideLine.get(`${side}:${anchorLine}`) ??
+        lineIndex.keyBySideLine.get(`${side}:${a.anchor.startLine ?? 0}`);
       if (!ck) continue;
       (map[ck] ??= []).push(
-        <div className="cmsaved" key={a.annotationId}>
-          <span style={{ whiteSpace: 'pre-wrap', minWidth: 0 }}>{a.body}</span>
-          {a.status !== 'open' && <span className="stt">{a.status === 'queued' ? '待发出' : a.status}</span>}
-        </div>,
-      );
-    }
-    if (draft && draft.deliveryId === effectiveDeliveryId && draft.path === activeFile) {
-      (map[draft.changeKey] ??= []).push(
-        <div className="cmbox" key="__draft">
-          <div className="loc mono">
-            {draft.path}:{draft.line}
-          </div>
-          <textarea
-            autoFocus
-            value={body}
-            placeholder="写下修改意见…"
-            onChange={(e) => {
-              setBody(e.target.value);
-              setDraft((d) => (d ? { ...d, idempotencyKey: makeIdempotencyKey() } : d));
-            }}
-            onKeyDown={(e) => {
-              if (e.key === 'Escape') {
-                e.stopPropagation();
-                setDraft(null);
-              }
-              if (e.key === 'Enter' && (e.metaKey || e.ctrlKey) && body.trim()) {
-                e.preventDefault();
-                create.mutate({ d: draft, body: body.trim() });
-              }
-            }}
-          />
-          <div className="row">
-            <span className="faint" style={{ fontSize: 11, marginRight: 'auto' }}>
-              ⌘↵ 保存
+        <div className="gh-comment-wrap" key={a.annotationId}>
+          <div className="gh-comment-hd">
+            <span className="gh-comment-anchor">{formatLineAnchor(a)}</span>
+            <span className="gh-comment-hd-right">
+              {a.status === 'open' ? (
+                <span className="gh-pending-tag">Pending</span>
+              ) : (
+                <span className="stt">{a.status === 'queued' ? '待发出' : a.status}</span>
+              )}
+              {a.status === 'open' && (
+                <button
+                  type="button"
+                  className="gh-del-btn"
+                  title="删除这条批注"
+                  aria-label="删除批注"
+                  disabled={removeAnn.isPending}
+                  onClick={() => removeAnn.mutate(a.annotationId)}
+                >
+                  <Trash2 size={12} strokeWidth={1.7} />
+                </button>
+              )}
             </span>
-            <button type="button" className="btn ghost" onClick={() => setDraft(null)}>
-              取消
-            </button>
-            <button type="button" className="btn pri" disabled={!body.trim() || create.isPending} onClick={() => create.mutate({ d: draft, body: body.trim() })}>
-              保存
-            </button>
+          </div>
+          {a.anchor.quote && <div className="gh-comment-quote">“{a.anchor.quote}”</div>}
+          <div className="gh-comment-body">{a.body}</div>
+        </div>,
+      );
+    }
+
+    if (draft && draft.deliveryId === effectiveDeliveryId && draft.path === activeFile) {
+      const locLabel =
+        draft.endLine > draft.startLine
+          ? `${draft.path.split('/').pop()} · L${draft.startLine}–L${draft.endLine}`
+          : `${draft.path.split('/').pop()} · L${draft.startLine}`;
+      (map[draft.endChangeKey] ??= []).push(
+        <div className="gh-comment-wrap gh-comment-draft" key="__draft">
+          <div className="gh-comment-hd">
+            <span className="gh-comment-anchor">{locLabel}</span>
+            <span className="faint" style={{ fontSize: 10.5 }}>
+              Shift+点击行号可扩展行段
+            </span>
+          </div>
+          {draft.quote && <div className="gh-comment-quote">“{draft.quote}”</div>}
+          <div className="gh-draft-inner">
+            <textarea
+              autoFocus
+              value={body}
+              placeholder="写下修改意见…"
+              onChange={(e) => {
+                setBody(e.target.value);
+                setDraft((d) => (d ? { ...d, idempotencyKey: makeIdempotencyKey() } : d));
+              }}
+              onKeyDown={(e) => {
+                if (e.key === 'Escape') {
+                  e.stopPropagation();
+                  setDraft(null);
+                }
+                if (e.key === 'Enter' && (e.metaKey || e.ctrlKey) && body.trim()) {
+                  e.preventDefault();
+                  create.mutate({ d: draft, body: body.trim() });
+                }
+              }}
+            />
+            <div className="gh-draft-foot">
+              <span className="faint" style={{ fontSize: 11, marginRight: 'auto' }}>
+                ⌘↵ 添加到待发批注
+              </span>
+              <button type="button" className="btn ghost" onClick={() => setDraft(null)}>
+                取消
+              </button>
+              <button
+                type="button"
+                className="btn pri"
+                disabled={!body.trim() || create.isPending}
+                onClick={() => create.mutate({ d: draft, body: body.trim() })}
+              >
+                添加评论
+              </button>
+            </div>
           </div>
         </div>,
       );
     }
+
     const out: Record<string, ReactNode> = {};
     for (const [k, nodes] of Object.entries(map)) out[k] = <div className="cmrow">{nodes}</div>;
     return out;
-  }, [parsed, fileAnns, draft, body, effectiveDeliveryId, activeFile, create]);
+  }, [parsed, fileAnns, draft, body, effectiveDeliveryId, activeFile, create, removeAnn, lineIndex]);
 
   const renderGutter = ({ change, side, renderDefault }: GutterOptions) => {
     const ln = side === 'old' ? computeOldLineNumber(change) : computeNewLineNumber(change);
@@ -283,16 +470,19 @@ export function CodeReviewPane({
       <button
         type="button"
         className="gbtn"
-        title={`点击第 ${ln} 行留批注`}
+        data-diff-line={ln}
+        data-diff-side={side}
+        title={`点击第 ${ln} 行留批注（Shift+点击多行选区）`}
         onClick={(e) => {
           e.stopPropagation();
-          openComposer(change, side);
+          openComposer(change, side, e.shiftKey);
         }}
       >
         {renderDefault()}
       </button>
     );
   };
+
   const renderToken: RenderToken = (token, defaultRender, i) => {
     if (token.type === 'shiki') {
       return (
@@ -305,20 +495,8 @@ export function CodeReviewPane({
   };
 
   const project = boot.projects.find((p) => p.projectId === detail?.delivery.projectId) ?? detail?.project;
-  const ide =
-    detail && project
-      ? buildIDEJump({
-          scheme: project.ideScheme,
-          localMachineId,
-          delivery: detail.delivery,
-          project,
-          machines: boot.machines,
-          file: lastLine?.path ?? activeFile,
-          line: lastLine?.line,
-        })
-      : null;
   const d = detail?.delivery;
-  const annCount = (p: string) => annotations.filter((a) => a.anchor.path === p).length;
+  const openCountForFile = (p: string) => openAnnotations.filter((a) => a.anchor.path === p).length;
 
   return (
     <>
@@ -333,7 +511,7 @@ export function CodeReviewPane({
             <PanelLeft size={14} strokeWidth={1.6} />
           </button>
         )}
-        {tabSwitch}
+        {titleSwitcher}
         {versions.length >= 2 && (
           <select
             className="rev-ver mono"
@@ -362,9 +540,27 @@ export function CodeReviewPane({
           >
             {viewType === 'unified' ? <Columns2 size={14} strokeWidth={1.6} /> : <Rows2 size={14} strokeWidth={1.6} />}
           </button>
-          {ide && (
-            <button type="button" className="ib no-mobile" onClick={() => launchIDE(ide.uri)} title={`在 Cursor 打开 · ${ide.resolvedPath}`}>
-              <CursorIcon size={14} />
+          {project && d && (
+            <div className="no-mobile">
+              <IdeOpenButton
+                project={project}
+                delivery={d}
+                machines={boot.machines}
+                file={lastLine?.path ?? activeFile}
+                line={lastLine?.line}
+              />
+            </div>
+          )}
+          {d && (
+            <button
+              type="button"
+              className="btn-checkpoint"
+              disabled={checkpoint.isPending}
+              title="标记当前变更为已确认 Checkpoint"
+              onClick={() => checkpoint.mutate()}
+            >
+              <Check size={12} strokeWidth={2.2} />
+              <span>Checkpoint</span>
             </button>
           )}
           {headerEnd}
@@ -374,40 +570,100 @@ export function CodeReviewPane({
       <div className={`cr-body ${treeOpen ? '' : 'tree-collapsed'}`}>
         {treeOpen && (
           <div className="ftree">
-            {dq.isLoading && <div className="fdir">载入文件…</div>}
-            {groupByDir(files).map(([dir, fs]) => (
-              <div key={dir || '/'}>
-                {dir && <div className="fdir mono">{dir}/</div>}
-                {fs.map((f) => (
-                  <button
-                    type="button"
-                    key={f.path}
-                    className={`ff ${f.path === activeFile ? 'on' : ''}`}
-                    onClick={() => {
-                      setFile(f.path);
-                      setDraft(null);
-                      if (isNarrow) setTreeOverride(false);
-                    }}
-                    title={f.path}
-                  >
-                    <span className="fn">{f.path.split('/').pop()}</span>
-                    {annCount(f.path) > 0 && <span className="cc">●</span>}
-                    <span className="fs mono">
-                      {f.binary ? (
-                        <span className="faint">bin</span>
-                      ) : (
-                        <>
-                          <span className="add">+{f.insertions}</span> <span className="del">−{f.deletions}</span>
-                        </>
-                      )}
-                    </span>
-                  </button>
-                ))}
+            <div className="ftree-scroll">
+              {dq.isLoading && <div className="fdir">载入文件…</div>}
+              {groupByDir(files).map(([dir, fs]) => (
+                <div key={dir || '/'}>
+                  {dir && <div className="fdir mono">{dir}/</div>}
+                  {fs.map((f) => {
+                    const cnt = openCountForFile(f.path);
+                    return (
+                      <button
+                        type="button"
+                        key={f.path}
+                        className={`ff ${f.path === activeFile ? 'on' : ''}`}
+                        onClick={() => {
+                          setFile(f.path);
+                          setDraft(null);
+                          setTextSel(null);
+                          if (isNarrow) setTreeOverride(false);
+                        }}
+                        title={f.path}
+                      >
+                        <span className="fn">{f.path.split('/').pop()}</span>
+                        {cnt > 0 && (
+                          <span className="comment-count-badge">
+                            <MessageSquare size={10} strokeWidth={1.8} />
+                            {cnt}
+                          </span>
+                        )}
+                        <span className="fs mono">
+                          {f.binary ? (
+                            <span className="faint">bin</span>
+                          ) : (
+                            <>
+                              <span className="add">+{f.insertions}</span> <span className="del">−{f.deletions}</span>
+                            </>
+                          )}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+              ))}
+            </div>
+
+            {/* Quiet bottom-left collapsed jump drawer for pending comments (zero bottom bar!) */}
+            {openAnnotations.length > 0 && (
+              <div className="rail-cmt-foot">
+                {railPopOpen && (
+                  <div className="rail-cmt-pop">
+                    {openAnnotations.map((a) => (
+                      <button
+                        type="button"
+                        key={a.annotationId}
+                        className="rail-cmt-item"
+                        onClick={() => {
+                          if (a.anchor.path) setFile(a.anchor.path);
+                          setRailPopOpen(false);
+                        }}
+                      >
+                        <div className="gh-comment-anchor">{formatLineAnchor(a)}</div>
+                        <div className="ell" style={{ color: 'var(--fg2)', marginTop: 2 }}>
+                          {a.body}
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+                )}
+                <button
+                  type="button"
+                  className="rail-cmt-toggle"
+                  onClick={() => setRailPopOpen((v) => !v)}
+                >
+                  <MessageSquare size={12} strokeWidth={1.7} />
+                  <span>{openAnnotations.length} 条待发评论</span>
+                  <ChevronUp size={12} strokeWidth={1.7} style={{ marginLeft: 'auto', transform: railPopOpen ? 'rotate(180deg)' : undefined }} />
+                </button>
               </div>
-            ))}
+            )}
           </div>
         )}
-        <div className="diffpane orbit-diff">
+
+        <div className="diffpane orbit-diff" ref={diffPaneRef} onMouseUp={handleCodeMouseUp}>
+          {textSel && (
+            <button
+              type="button"
+              className="sel-pop"
+              style={{ left: textSel.x, top: textSel.y }}
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => openComposer(textSel.change, textSel.side, false, textSel.quote)}
+            >
+              <MessageSquare size={11} strokeWidth={1.9} />
+              评论选中内容
+            </button>
+          )}
+
           {dq.isError ? (
             <div className="empty bad-t">
               载入交付失败：{errMsg(dq.error)}{' '}
@@ -427,6 +683,7 @@ export function CodeReviewPane({
                     onChange={(e) => {
                       setFile(e.target.value);
                       setDraft(null);
+                      setTextSel(null);
                     }}
                     aria-label="切换文件"
                   >
@@ -450,6 +707,7 @@ export function CodeReviewPane({
                   diffType={parsed.type}
                   hunks={parsed.hunks}
                   tokens={tokens}
+                  selectedChanges={selectedChanges}
                   renderToken={renderToken}
                   renderGutter={renderGutter}
                   widgets={widgets}
@@ -461,13 +719,6 @@ export function CodeReviewPane({
           )}
         </div>
       </div>
-
-      <ReviewFooter
-        taskId={taskId}
-        deliveryId={d?.deliveryId}
-        tl={tl}
-        extraAnnotations={detail?.annotations}
-      />
     </>
   );
 }

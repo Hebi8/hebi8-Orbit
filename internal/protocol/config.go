@@ -13,6 +13,7 @@ import (
 // HubConfig holds runtime configuration loaded from hub.yaml.
 type HubConfig struct {
 	SchemaVersion            int      `yaml:"schemaVersion" json:"schemaVersion"`
+	WorkspaceName            string   `yaml:"workspaceName,omitempty" json:"workspaceName,omitempty"`
 	ListenAddr               string   `yaml:"listenAddr" json:"listenAddr"`
 	DataDir                  string   `yaml:"dataDir" json:"dataDir"`
 	ConfigDir                string   `yaml:"configDir" json:"configDir"`

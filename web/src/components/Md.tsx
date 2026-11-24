@@ -19,7 +19,7 @@ function inline(text: string, keyBase: string): ReactNode[] {
   return out;
 }
 
-/** Minimal, safe markdown: fenced code blocks, paragraphs, inline code / bold. */
+/** Minimal, safe markdown: headings, bullet/ordered lists, fenced code blocks, paragraphs, inline code & bold. */
 export function Md({ text, className }: { text: string; className?: string }) {
   const blocks: ReactNode[] = [];
   const parts = text.split(/```/);
@@ -29,9 +29,48 @@ export function Md({ text, className }: { text: string; className?: string }) {
       blocks.push(<pre key={`pre${idx}`}>{body.replace(/\n$/, '')}</pre>);
       return;
     }
-    const paras = part.split(/\n{2,}/).filter((p) => p.trim() !== '');
-    paras.forEach((p, j) => {
-      blocks.push(<p key={`p${idx}-${j}`}>{inline(p.replace(/^\n+|\n+$/g, ''), `${idx}-${j}`)}</p>);
+    const chunks = part.split(/\n{2,}/).filter((p) => p.trim() !== '');
+    chunks.forEach((chunk, j) => {
+      const lines = chunk
+        .replace(/^\n+|\n+$/g, '')
+        .split('\n')
+        .map((l) => l.trimEnd());
+      const k = `${idx}-${j}`;
+
+      if (lines.length === 1) {
+        const hm = /^(#{1,3})\s+(.+)$/.exec(lines[0]);
+        if (hm) {
+          const level = hm[1].length;
+          if (level === 1) blocks.push(<h1 key={`h${k}`}>{inline(hm[2], k)}</h1>);
+          else if (level === 2) blocks.push(<h2 key={`h${k}`}>{inline(hm[2], k)}</h2>);
+          else blocks.push(<h3 key={`h${k}`}>{inline(hm[2], k)}</h3>);
+          return;
+        }
+      }
+
+      if (lines.every((l) => /^[-*]\s+/.test(l))) {
+        blocks.push(
+          <ul key={`ul${k}`}>
+            {lines.map((l, li) => (
+              <li key={li}>{inline(l.replace(/^[-*]\s+/, ''), `${k}-u${li}`)}</li>
+            ))}
+          </ul>,
+        );
+        return;
+      }
+
+      if (lines.every((l) => /^\d+\.\s+/.test(l))) {
+        blocks.push(
+          <ol key={`ol${k}`}>
+            {lines.map((l, li) => (
+              <li key={li}>{inline(l.replace(/^\d+\.\s+/, ''), `${k}-o${li}`)}</li>
+            ))}
+          </ol>,
+        );
+        return;
+      }
+
+      blocks.push(<p key={`p${k}`}>{inline(lines.join('\n'), k)}</p>);
     });
   });
   return <div className={`md ${className ?? ''}`}>{blocks}</div>;

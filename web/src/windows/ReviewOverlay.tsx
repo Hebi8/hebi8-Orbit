@@ -1,8 +1,10 @@
-import { useEffect, useRef, useState } from 'react';
-import { ArrowUpRight, PanelRightClose, PanelRightOpen, X } from 'lucide-react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { ArrowUpRight, ChevronDown, Layers, MessageSquare, PanelRightClose, PanelRightOpen, X } from 'lucide-react';
 import type { BootstrapResponse } from '../generated/protocol';
+import { DiffIcon } from '../components/Icons';
 import { useTimeline } from '../hooks/queries';
-import { taskTitle } from '../lib/format';
+import { collectSessionArtifacts } from '../lib/artifacts';
+import { artifactShortLabel, taskTitle } from '../lib/format';
 import { navigate, paths, useRoute } from '../lib/router';
 import { SessionConversation } from '../session/SessionConversation';
 import { useWorkbenchStore } from '../store/useWorkbenchStore';
@@ -12,9 +14,9 @@ import { CodeReviewPane } from './CodeReviewPane';
 const CODE_KINDS = new Set(['code_diff', 'mixed', 'workspace_snapshot']);
 
 /**
- * Fixed centered split overlay mirroring Lody LAN fork's `BoardArticleDialog` + `WorktreeReviewDialog`:
- *   - Left pane: single merged 40px bar + Code Diff or Artifacts workspace
- *   - Right pane: compact live Session conversation (collapsible, per-tab resizable divider)
+ * Fixed centered split overlay:
+ *   - Left pane: Single-title dropdown switcher + Source Review or Artifact viewer (full vertical height, zero bottom bar)
+ *   - Right pane: Compact live Session conversation with pending Review comments pill in composer
  */
 export function ReviewOverlay({ boot }: { boot: BootstrapResponse }) {
   const review = useWorkbenchStore((s) => s.review);
@@ -23,26 +25,52 @@ export function ReviewOverlay({ boot }: { boot: BootstrapResponse }) {
   const sessionHidden = useWorkbenchStore((s) => s.reviewSessionHidden);
   const setSessionHidden = useWorkbenchStore((s) => s.setReviewSessionHidden);
   const close = useWorkbenchStore((s) => s.closeReview);
-  const setTab = useWorkbenchStore((s) => s.setReviewTab);
+  const openReview = useWorkbenchStore((s) => s.openReview);
   const setDelivery = useWorkbenchStore((s) => s.setReviewDelivery);
   const route = useRoute();
   const [mobilePane, setMobilePane] = useState<'artifact' | 'session'>('artifact');
+  const [switcherOpen, setSwitcherOpen] = useState(false);
+  const switcherRef = useRef<HTMLDivElement | null>(null);
   const bodyRef = useRef<HTMLDivElement | null>(null);
 
   const tlq = useTimeline(review?.taskId);
   const tl = tlq.data;
+  const sessionArtifacts = useMemo(() => collectSessionArtifacts(tl), [tl]);
 
   useEffect(() => {
     setMobilePane('artifact');
-  }, [review?.taskId, review?.tab]);
+    setSwitcherOpen(false);
+  }, [review?.taskId, review?.tab, review?.artifactId]);
+
+  useEffect(() => {
+    if (!switcherOpen) return;
+    const onDown = (e: MouseEvent) => {
+      if (switcherRef.current && !switcherRef.current.contains(e.target as Node)) {
+        setSwitcherOpen(false);
+      }
+    };
+    window.addEventListener('mousedown', onDown);
+    return () => window.removeEventListener('mousedown', onDown);
+  }, [switcherOpen]);
 
   if (!review) return null;
 
   const task = tl?.task;
   const deliveries = tl?.deliveries ?? [];
-  const hasCode = review.tab === 'code' || deliveries.some((d) => CODE_KINDS.has(d.kind));
-  const hasArt = review.tab === 'art' || deliveries.some((d) => (d.ryugiBindings?.length ?? 0) > 0);
-  const showTabs = hasCode && hasArt;
+  const formalCode = deliveries.filter((d) => !d.lateArrival && CODE_KINDS.has(d.kind));
+  const latestCode =
+    formalCode.find((d) => d.deliveryId === task?.latestDeliveryId) ??
+    formalCode[formalCode.length - 1] ??
+    deliveries.find((d) => CODE_KINDS.has(d.kind));
+
+  const openDiffComments = (tl?.annotations ?? []).filter((a) => a.status === 'open' && a.source !== 'ryugi').length;
+  const activeArtifact =
+    review.tab === 'art'
+      ? sessionArtifacts.find((a) => a.artifactId === review.artifactId) ??
+        sessionArtifacts.find((a) => a.deliveryId === review.deliveryId) ??
+        sessionArtifacts[0]
+      : undefined;
+
   const alreadyOnSession = route.name === 'session' && route.taskId === review.taskId && !route.worker;
   const ratio = reviewRatios[review.tab];
 
@@ -51,34 +79,97 @@ export function ReviewOverlay({ boot }: { boot: BootstrapResponse }) {
     if (rect && rect.width > 0) setRatio(review.tab, ((clientX - rect.left) / rect.width) * 100);
   };
 
-  const tabSwitch = showTabs ? (
-    <div className="seg" role="tablist" aria-label="产物类型">
+  const currentTitle = review.tab === 'code' ? 'Source Review' : activeArtifact?.title ?? 'Artifacts';
+  const canSwitch = (latestCode ? 1 : 0) + sessionArtifacts.length > 1 || (review.tab === 'art' && !!latestCode);
+
+  const titleSwitcher = (
+    <div className="ov-switcher-wrap" ref={switcherRef}>
       <button
         type="button"
-        role="tab"
-        aria-selected={review.tab === 'code'}
-        className={review.tab === 'code' ? 'on' : ''}
-        onClick={() => setTab('code')}
+        className={`ov-switcher-btn ${switcherOpen ? 'open' : ''}`}
+        aria-haspopup="menu"
+        aria-expanded={switcherOpen}
+        onClick={() => canSwitch && setSwitcherOpen((v) => !v)}
+        style={!canSwitch ? { cursor: 'default' } : undefined}
       >
-        代码
+        {review.tab === 'code' ? <DiffIcon size={14} /> : <Layers size={14} strokeWidth={1.7} />}
+        <span className="ov-switcher-title">{currentTitle}</span>
+        {canSwitch && <ChevronDown size={13} strokeWidth={1.7} className="faint" />}
       </button>
-      <button
-        type="button"
-        role="tab"
-        aria-selected={review.tab === 'art'}
-        className={review.tab === 'art' ? 'on' : ''}
-        onClick={() => setTab('art')}
-      >
-        设计稿
-      </button>
+
+      {switcherOpen && (
+        <div className="ov-switcher-menu" role="menu">
+          {latestCode && (
+            <>
+              <div className="ov-menu-sec">代码</div>
+              <button
+                type="button"
+                role="menuitem"
+                className={`ov-menu-item ${review.tab === 'code' ? 'active' : ''}`}
+                onClick={() => {
+                  setSwitcherOpen(false);
+                  openReview('code', review.taskId, latestCode.deliveryId);
+                }}
+              >
+                <DiffIcon size={13} />
+                <span className="ell" style={{ flex: 1 }}>
+                  Source Review
+                </span>
+                <span className="mono" style={{ fontSize: 11 }}>
+                  <span className="add">+{latestCode.manifest.insertions}</span>{' '}
+                  <span className="del">−{latestCode.manifest.deletions}</span>
+                </span>
+                {openDiffComments > 0 && (
+                  <span className="ov-menu-badge">
+                    <MessageSquare size={10} strokeWidth={1.8} />
+                    {openDiffComments}
+                  </span>
+                )}
+              </button>
+            </>
+          )}
+
+          {sessionArtifacts.length > 0 && (
+            <>
+              <div className="ov-menu-sec">Artifacts</div>
+              {sessionArtifacts.map((art) => {
+                const isOn = review.tab === 'art' && activeArtifact?.artifactId === art.artifactId;
+                return (
+                  <button
+                    type="button"
+                    role="menuitem"
+                    key={art.artifactId}
+                    className={`ov-menu-item ${isOn ? 'active' : ''}`}
+                    onClick={() => {
+                      setSwitcherOpen(false);
+                      openReview('art', review.taskId, art.deliveryId, art.artifactId);
+                    }}
+                  >
+                    <span className="dlv-kind-tag">{artifactShortLabel(art.kind)}</span>
+                    <span className="ell" style={{ flex: 1 }}>
+                      {art.title}
+                    </span>
+                    {art.openAnnotations > 0 && (
+                      <span className="ov-menu-badge">
+                        <MessageSquare size={10} strokeWidth={1.8} />
+                        {art.openAnnotations}
+                      </span>
+                    )}
+                  </button>
+                );
+              })}
+            </>
+          )}
+        </div>
+      )}
     </div>
-  ) : null;
+  );
 
   const leftHeaderEnd = (
     <>
       <div className="seg only-mobile">
         <button type="button" className={mobilePane === 'artifact' ? 'on' : ''} onClick={() => setMobilePane('artifact')}>
-          产物
+          审阅
         </button>
         <button type="button" className={mobilePane === 'session' ? 'on' : ''} onClick={() => setMobilePane('session')}>
           会话
@@ -108,7 +199,7 @@ export function ReviewOverlay({ boot }: { boot: BootstrapResponse }) {
   return (
     <div className="rev-layer" role="presentation">
       <div className="rev-scrim" onClick={close} />
-      <section className="rev-dialog" role="dialog" aria-modal="true" aria-label="产出审阅" data-review-overlay="true">
+      <section className="rev-dialog" role="dialog" aria-modal="true" aria-label="审阅浮层" data-review-overlay="true">
         <div
           ref={bodyRef}
           className={`rev-grid ${sessionHidden ? 'session-hidden' : ''} mobile-${mobilePane}`}
@@ -118,7 +209,7 @@ export function ReviewOverlay({ boot }: { boot: BootstrapResponse }) {
               : { gridTemplateColumns: `minmax(0, ${ratio}fr) 1px minmax(0, ${100 - ratio}fr)` }
           }
         >
-          {/* Left: Deliverable Review */}
+          {/* Left: Source Review or Artifacts */}
           <div className="rev-pane rev-left">
             {review.tab === 'code' ? (
               <CodeReviewPane
@@ -128,16 +219,17 @@ export function ReviewOverlay({ boot }: { boot: BootstrapResponse }) {
                 tl={tl}
                 boot={boot}
                 onClose={close}
-                tabSwitch={tabSwitch}
+                titleSwitcher={titleSwitcher}
                 headerEnd={leftHeaderEnd}
               />
             ) : (
               <ArtifactsPane
                 taskId={review.taskId}
                 deliveryId={review.deliveryId}
-                onSelectDelivery={setDelivery}
+                artifactId={activeArtifact?.artifactId ?? review.artifactId}
+                artifacts={sessionArtifacts}
                 tl={tl}
-                tabSwitch={tabSwitch}
+                titleSwitcher={titleSwitcher}
                 headerEnd={leftHeaderEnd}
               />
             )}
@@ -149,7 +241,7 @@ export function ReviewOverlay({ boot }: { boot: BootstrapResponse }) {
               <div
                 role="separator"
                 aria-orientation="vertical"
-                aria-label="调整产物与会话比例"
+                aria-label="调整审阅与会话比例"
                 aria-valuemin={36}
                 aria-valuemax={78}
                 aria-valuenow={Math.round(ratio)}
@@ -186,7 +278,7 @@ export function ReviewOverlay({ boot }: { boot: BootstrapResponse }) {
 
                 <div className="seg only-mobile" style={{ marginLeft: 'auto' }}>
                   <button type="button" className={mobilePane === 'artifact' ? 'on' : ''} onClick={() => setMobilePane('artifact')}>
-                    产物
+                    审阅
                   </button>
                   <button type="button" className={mobilePane === 'session' ? 'on' : ''} onClick={() => setMobilePane('session')}>
                     会话
@@ -223,7 +315,7 @@ export function ReviewOverlay({ boot }: { boot: BootstrapResponse }) {
               </div>
 
               {tl ? (
-                <SessionConversation taskId={review.taskId} tl={tl} compact />
+                <SessionConversation taskId={review.taskId} tl={tl} boot={boot} compact />
               ) : (
                 <div className="empty">载入会话…</div>
               )}

@@ -306,6 +306,8 @@ func (s *Server) buildRouter() http.Handler {
 		api.Post("/pa/reset-session", s.handlePAResetSession)
 
 		api.Post("/deliveries/manual-import", s.handleManualImport)
+		api.Get("/artifacts", s.handleListGlobalArtifacts)
+		api.Delete("/annotations/{annotationId}", s.handleDeleteAnnotation)
 		api.Get("/deliveries/{deliveryId}", s.handleGetDelivery)
 		api.Get("/deliveries/{deliveryId}/diff", s.handleGetDeliveryDiff)
 		api.Post("/deliveries/{deliveryId}/annotations", s.handleCreateAnnotation)
@@ -324,6 +326,7 @@ func (s *Server) buildRouter() http.Handler {
 func (s *Server) handleBootstrap(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
 	machineMeta := s.machines.Machines
+	wsName := strings.TrimSpace(s.hubCfg.WorkspaceName)
 	s.mu.RUnlock()
 
 	resp, err := s.store.Bootstrap(r.Context(), machineMeta)
@@ -331,7 +334,41 @@ func (s *Server) handleBootstrap(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusInternalServerError, "ERR_BOOTSTRAP_FAILED", err.Error())
 		return
 	}
+	if wsName == "" {
+		wsName = "Home LAN"
+	}
+	resp.WorkspaceName = wsName
 	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) handleListGlobalArtifacts(w http.ResponseWriter, r *http.Request) {
+	arts, err := s.store.ListGlobalArtifacts(r.Context())
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, "ERR_ARTIFACTS_LIST", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, protocol.ListArtifactsResponse{Artifacts: arts})
+}
+
+func (s *Server) handleDeleteAnnotation(w http.ResponseWriter, r *http.Request) {
+	annID := chi.URLParam(r, "annotationId")
+	res, ev, err := s.store.DeleteOpenAnnotation(r.Context(), annID, actorFromContext(r.Context()))
+	if errors.Is(err, store.ErrNotFound) {
+		writeAPIError(w, http.StatusNotFound, "ERR_ANNOTATION_NOT_FOUND", err.Error())
+		return
+	}
+	if errors.Is(err, store.ErrConflict) {
+		writeAPIError(w, http.StatusConflict, "ERR_ANNOTATION_CONFLICT", err.Error())
+		return
+	}
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, "ERR_ANNOTATION_DELETE", err.Error())
+		return
+	}
+	if ev != nil {
+		s.broker.Broadcast(*ev)
+	}
+	writeJSON(w, http.StatusOK, res)
 }
 
 func (s *Server) handleListProjectTasks(w http.ResponseWriter, r *http.Request) {

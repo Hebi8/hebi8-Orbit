@@ -1,16 +1,34 @@
 import { useMemo, useState } from 'react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
+import { FileSpreadsheet, FileText, Layers, Presentation, Table } from 'lucide-react';
 import type { AttemptView, TaskTimelineResponse } from '../generated/protocol';
 import { ApprovalNotice } from '../components/ApprovalNotice';
 import { CaretIcon } from '../components/Icons';
 import { useAttemptRaw } from '../hooks/queries';
 import { api, errMsg } from '../lib/api';
-import { attemptStateLabel, hhmm, isAttemptLive, shortSha, triggerLabel } from '../lib/format';
+import { deliveryInlineImages, deliveryReusableArtifacts } from '../lib/artifacts';
+import { artifactShortLabel, attemptStateLabel, basename, hhmm, isAttemptLive, shortSha, triggerLabel } from '../lib/format';
 import { buildSegments, lastLiveStep } from '../lib/segments';
 import { toast, useWorkbenchStore } from '../store/useWorkbenchStore';
 import { Segments } from './Segments';
 
 const CODE_KINDS = new Set(['code_diff', 'mixed', 'workspace_snapshot']);
+
+function ArtifactGlyph({ kind }: { kind: string }) {
+  switch (kind) {
+    case 'slides':
+      return <Presentation size={14} strokeWidth={1.6} />;
+    case 'sheet':
+      return <FileSpreadsheet size={14} strokeWidth={1.6} />;
+    case 'design':
+      return <Layers size={14} strokeWidth={1.6} />;
+    case 'word':
+    case 'pdf':
+      return <Table size={14} strokeWidth={1.6} />;
+    default:
+      return <FileText size={14} strokeWidth={1.6} />;
+  }
+}
 
 function usePromptFor(attempt: AttemptView, tl: TaskTimelineResponse): { text: string; placeholder: boolean; detail: string[] } {
   const cache = useWorkbenchStore((s) => s.promptCache);
@@ -24,10 +42,15 @@ function usePromptFor(attempt: AttemptView, tl: TaskTimelineResponse): { text: s
       case 'annotation_batch': {
         const anns = tl.annotations.filter((a) => a.triggeredAttemptId === attempt.attemptId);
         return {
-          text: `批注 · ${anns.length || '若干'} 条`,
+          text: serverPrompt || `Review 批注 · ${anns.length || '若干'} 条`,
           placeholder: false,
           detail: anns.map((a) => {
-            const loc = a.anchor.path ? `${a.anchor.path}${a.anchor.startLine ? `:${a.anchor.startLine}` : ''}` : a.anchor.artifact || a.source;
+            const lineRange = a.anchor.startLine
+              ? a.anchor.endLine && a.anchor.endLine !== a.anchor.startLine
+                ? `:${a.anchor.startLine}-${a.anchor.endLine}`
+                : `:${a.anchor.startLine}`
+              : '';
+            const loc = a.anchor.path ? `${a.anchor.path}${lineRange}` : a.anchor.artifact || a.source;
             return `${loc} — ${a.body}`;
           }),
         };
@@ -127,11 +150,9 @@ export function Turn({
   const step = live ? lastLiveStep(segs) : null;
   const hasActiveToolStep = !!step && (step.status === 'in_progress' || step.status === 'pending');
 
-  const deliveryTab = delivery
-    ? CODE_KINDS.has(delivery.kind)
-      ? ('code' as const)
-      : ('art' as const)
-    : ('code' as const);
+  const inlineImages = delivery ? deliveryInlineImages(delivery) : [];
+  const artifacts = delivery ? deliveryReusableArtifacts(delivery, tl.annotations) : [];
+  const hasCodeDiff = !!delivery && CODE_KINDS.has(delivery.kind) && delivery.manifest.filesChanged > 0;
 
   return (
     <div className="turn" id={`turn-${attempt.attemptId}`} data-turn={index}>
@@ -189,16 +210,60 @@ export function Turn({
         </div>
       )}
 
-      {delivery && (
+      {/* Conversation-inline images/diagrams render directly in flow (NOT forced into Artifacts) */}
+      {inlineImages.length > 0 && (
+        <div className="it inline-media-stack">
+          {inlineImages.map((img) => (
+            <figure className="inline-media-box" key={`${img.sha256}:${img.path}`}>
+              <img src={api.blobUrl(img.sha256)} alt={basename(img.path)} className="inline-media-img" loading="lazy" />
+              <figcaption className="inline-media-cap">
+                <span className="mono">{basename(img.path)}</span>
+                <a href={api.blobUrl(img.sha256)} target="_blank" rel="noopener noreferrer" className="lk">
+                  原图
+                </a>
+              </figcaption>
+            </figure>
+          ))}
+        </div>
+      )}
+
+      {/* Reusable Artifacts shelf below the reply turn */}
+      {!compact && artifacts.length > 0 && (
+        <div className="it dlv-section">
+          <div className="dlv-section-hd">
+            <span className="dlv-section-title">Artifacts</span>
+          </div>
+          <div className="dlv-grid">
+            {artifacts.map((art) => (
+              <button
+                type="button"
+                key={art.artifactId}
+                className="dlv-card"
+                onClick={() => openReview('art', delivery!.taskId, delivery!.deliveryId, art.artifactId)}
+              >
+                <span className="dlv-ico">
+                  <ArtifactGlyph kind={art.kind} />
+                </span>
+                <span className="dlv-info">
+                  <span className="dlv-title">{art.title}</span>
+                  <span className="dlv-meta mono">{art.locator}</span>
+                </span>
+                <span className="dlv-kind-tag">{artifactShortLabel(art.kind)}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Quiet Source Diff line when code changes were produced */}
+      {delivery && hasCodeDiff && (
         <div className="it dline" title={shortSha(delivery.headSha) || undefined}>
-          <span>{tl.deliveries.length >= 2 ? `产出 v${deliveryIdx + 1}` : '产出'}</span>
-          {delivery.manifest.filesChanged > 0 && (
-            <span className="mono">
-              <span className="add">+{delivery.manifest.insertions}</span> <span className="del">−{delivery.manifest.deletions}</span>
-            </span>
-          )}
-          <button type="button" className="lk" onClick={() => openReview(deliveryTab, delivery.taskId, delivery.deliveryId)}>
-            查看
+          <span>代码改动</span>
+          <span className="mono">
+            <span className="add">+{delivery.manifest.insertions}</span> <span className="del">−{delivery.manifest.deletions}</span>
+          </span>
+          <button type="button" className="lk" onClick={() => openReview('code', delivery.taskId, delivery.deliveryId)}>
+            Source Review
           </button>
         </div>
       )}

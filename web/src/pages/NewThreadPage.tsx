@@ -1,9 +1,15 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { FolderGit2, MessageCircle, Plus, Settings2, X } from 'lucide-react';
-import type { BootstrapResponse, CreateTaskRequest, CreateTaskSourceInput, SessionAdapter, TaskSourceKind } from '../generated/protocol';
+import { ArrowRight, Plus, Settings2, X } from 'lucide-react';
+import type {
+  BootstrapResponse,
+  CreateTaskRequest,
+  CreateTaskSourceInput,
+  SessionAdapter,
+  TaskSourceKind,
+} from '../generated/protocol';
 import { SessionAdapterValues } from '../generated/protocol';
-import { PAIcon } from '../components/Icons';
+import { SendUpIcon } from '../components/Icons';
 import { PageHeader } from '../components/PageHeader';
 import { api, errMsg } from '../lib/api';
 import { SCRATCH_PROJECT_ID } from '../lib/format';
@@ -15,6 +21,50 @@ interface SourceDraft extends CreateTaskSourceInput {
 }
 
 let srcKey = 0;
+
+interface ModeCopy {
+  tab: string;
+  heading: string;
+  hint: string;
+  placeholder: string;
+  starters: string[];
+}
+
+const MODE_COPY: Record<NewMode, ModeCopy> = {
+  project: {
+    tab: '任务',
+    heading: '给项目派一个任务',
+    hint: '绑定代码仓库并在隔离工作区里执行，完成后可在 Source Review 中检视代码变更与 Artifacts。',
+    placeholder: '描述你想让 Agent 完成的目标、范围或验收标准…',
+    starters: [
+      '排查最近的接口超时问题，补齐回归测试并整理改动说明',
+      '给核心接口加上边界校验与单元测试，保持向后兼容',
+      '梳理当前模块的架构方案文档，并列出分阶段改造清单',
+    ],
+  },
+  pa: {
+    tab: '问 PA',
+    heading: '问 PA 私人助手',
+    hint: '跨项目串联记忆、总结各线程进展，并按当前问题给出行动建议或直接帮你拉起新线程。',
+    placeholder: '问问今天的优先级、卡住的线程，或让 PA 帮你拆解计划…',
+    starters: [
+      '帮我看看现在哪些线程需要我处理，按紧急程度排一下',
+      '汇总本周各个项目的关键交付和还没合入的改动',
+      '帮我列一下今天最值得先推进的两件事',
+    ],
+  },
+  chat: {
+    tab: '对话',
+    heading: '自由对话',
+    hint: '不绑定代码仓库，适合构思方案、讨论技术选型或起草文档，需要时随时可以绑定到项目。',
+    placeholder: '直接开始聊，或贴一段背景材料…',
+    starters: [
+      '帮我对比一下这两种数据同步方案的利弊和风险',
+      '起草一份面向团队的架构评审提纲（Markdown 格式）',
+      '把下面这段零散笔记整理成清晰的需求与里程碑清单',
+    ],
+  },
+};
 
 export function NewThreadPage({ boot, mode, projectId }: { boot: BootstrapResponse; mode?: NewMode; projectId?: string }) {
   const qc = useQueryClient();
@@ -28,6 +78,7 @@ export function NewThreadPage({ boot, mode, projectId }: { boot: BootstrapRespon
   const [capability, setCapability] = useState('');
   const [importDirty, setImportDirty] = useState(false);
   const [sources, setSources] = useState<SourceDraft[]>([]);
+  const taRef = useRef<HTMLTextAreaElement | null>(null);
 
   useEffect(() => {
     if (mode) setM(mode);
@@ -101,7 +152,7 @@ export function NewThreadPage({ boot, mode, projectId }: { boot: BootstrapRespon
 
   const canSend = !!text.trim() && !submit.isPending && (m !== 'project' || !!pid);
   const send = () => canSend && submit.mutate();
-  const placeholder = m === 'pa' ? '问点什么…' : m === 'chat' ? '想聊什么…' : '要做什么…';
+  const copy = MODE_COPY[m];
 
   return (
     <main className="main">
@@ -110,30 +161,49 @@ export function NewThreadPage({ boot, mode, projectId }: { boot: BootstrapRespon
       </PageHeader>
       <div className="page-scroll">
         <div className="nt-wrap">
-          {/* Fixed labels & geometry: switching tabs never shifts button positions. */}
-          <div className="pills" role="tablist" aria-label="线程类型">
-            <button type="button" role="tab" aria-selected={m === 'pa'} className={`pill ${m === 'pa' ? 'on' : ''}`} onClick={() => setM('pa')}>
-              <PAIcon size={13} /> 和 PA 对话
-            </button>
-            <button type="button" role="tab" aria-selected={m === 'chat'} className={`pill ${m === 'chat' ? 'on' : ''}`} onClick={() => setM('chat')}>
-              <MessageCircle size={13} strokeWidth={1.6} /> 自由 Chat
-            </button>
-            <button
-              type="button"
-              role="tab"
-              aria-selected={m === 'project'}
-              className={`pill ${m === 'project' ? 'on' : ''}`}
-              onClick={() => setM('project')}
-              disabled={projects.length === 0}
-            >
-              <FolderGit2 size={13} strokeWidth={1.6} /> 项目线程
-            </button>
+          {/* Fixed-height header guarantees 0.0px vertical shift across tab switches */}
+          <div className="nt-head">
+            <div className="nt-tabs" role="tablist" aria-label="线程类型">
+              <button
+                type="button"
+                role="tab"
+                aria-selected={m === 'project'}
+                className={`nt-tab ${m === 'project' ? 'active' : ''}`}
+                disabled={projects.length === 0}
+                onClick={() => setM('project')}
+              >
+                {MODE_COPY.project.tab}
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={m === 'pa'}
+                className={`nt-tab ${m === 'pa' ? 'active' : ''}`}
+                onClick={() => setM('pa')}
+              >
+                {MODE_COPY.pa.tab}
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={m === 'chat'}
+                className={`nt-tab ${m === 'chat' ? 'active' : ''}`}
+                onClick={() => setM('chat')}
+              >
+                {MODE_COPY.chat.tab}
+              </button>
+            </div>
+            <h1 className="nt-heading">{copy.heading}</h1>
+            <p className="nt-hint">{copy.hint}</p>
           </div>
-          <div className="canvas">
+
+          <div className="composer-card">
             <textarea
+              ref={taRef}
+              className="composer-ta"
               value={text}
               autoFocus
-              placeholder={placeholder}
+              placeholder={copy.placeholder}
               onChange={(e) => setText(e.target.value)}
               onKeyDown={(e) => {
                 if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
@@ -143,33 +213,51 @@ export function NewThreadPage({ boot, mode, projectId }: { boot: BootstrapRespon
               }}
               aria-label="线程目标"
             />
-            <div className="cv-foot">
-              {m === 'project' && (
-                <select className="field" value={pid} onChange={(e) => setPid(e.target.value)} aria-label="项目">
-                  {projects.map((p) => (
-                    <option key={p.projectId} value={p.projectId}>
-                      {p.displayName}
-                    </option>
-                  ))}
-                </select>
-              )}
-              {m !== 'pa' && (
-                <button type="button" className={`btn ghost ${advOpen ? 'on' : ''}`} onClick={() => setAdvOpen(!advOpen)}>
-                  <Settings2 size={13} strokeWidth={1.6} /> 高级
-                </button>
-              )}
-              <span className="sp">
-                <button type="button" className="cbtn pri" disabled={!canSend} onClick={send}>
-                  {submit.isPending ? <span className="spin" /> : null}
-                  开始 <span className="kb">↵</span>
-                </button>
-              </span>
+
+            <div className="composer-bar">
+              <div className="composer-opts">
+                {m === 'project' && (
+                  <label className="pill-select">
+                    <select value={pid} onChange={(e) => setPid(e.target.value)} aria-label="项目">
+                      {projects.map((p) => (
+                        <option key={p.projectId} value={p.projectId}>
+                          {p.displayName}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                )}
+                {m !== 'pa' && (
+                  <button
+                    type="button"
+                    className={`pill-select ${advOpen ? 'on' : ''}`}
+                    onClick={() => setAdvOpen(!advOpen)}
+                  >
+                    <Settings2 size={12} strokeWidth={1.7} /> 高级
+                  </button>
+                )}
+                {m === 'pa' && <span className="pill-static">PA 助手</span>}
+              </div>
+
+              <button
+                type="button"
+                className={`send-icon-btn ${canSend ? 'is-ready' : 'is-idle'}`}
+                disabled={!canSend}
+                title="发送 (Enter)"
+                aria-label="发送"
+                onClick={send}
+              >
+                {submit.isPending ? <span className="spin" /> : <SendUpIcon size={14} />}
+              </button>
             </div>
+
             {m !== 'pa' && advOpen && (
               <div className="adv">
                 <span>Agent</span>
                 <select className="field" value={adapter} onChange={(e) => setAdapter(e.target.value)} aria-label="Agent">
-                  <option value="">{m === 'project' && project ? `默认 · ${project.defaultAdapter}` : `默认 · ${availableAdapters[0]}`}</option>
+                  <option value="">
+                    {m === 'project' && project ? `默认 · ${project.defaultAdapter}` : `默认 · ${availableAdapters[0]}`}
+                  </option>
                   {availableAdapters.map((a) => (
                     <option key={a} value={a}>
                       {a}
@@ -201,7 +289,9 @@ export function NewThreadPage({ boot, mode, projectId }: { boot: BootstrapRespon
                           <select
                             className="field"
                             value={s.kind}
-                            onChange={(e) => setSources((xs) => xs.map((x) => (x.key === s.key ? { ...x, kind: e.target.value as TaskSourceKind } : x)))}
+                            onChange={(e) =>
+                              setSources((xs) => xs.map((x) => (x.key === s.key ? { ...x, kind: e.target.value as TaskSourceKind } : x)))
+                            }
                           >
                             <option value="link">链接</option>
                             <option value="file">文件</option>
@@ -237,6 +327,26 @@ export function NewThreadPage({ boot, mode, projectId }: { boot: BootstrapRespon
                 )}
               </div>
             )}
+          </div>
+
+          <div className="nt-starters">
+            <div className="nt-starters-lbl">可以这样开场</div>
+            <div className="starter-list">
+              {copy.starters.map((s) => (
+                <button
+                  type="button"
+                  key={s}
+                  className="starter-btn"
+                  onClick={() => {
+                    setText(s);
+                    taRef.current?.focus();
+                  }}
+                >
+                  <span className="ell">{s}</span>
+                  <ArrowRight size={13} strokeWidth={1.6} className="arr" />
+                </button>
+              ))}
+            </div>
           </div>
         </div>
       </div>

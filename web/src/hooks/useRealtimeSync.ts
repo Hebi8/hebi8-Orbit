@@ -67,6 +67,7 @@ export function collectInvalidations(events: EventRecord[]): unknown[][] {
       add('delivery-diff', deliveryId);
       add('task-timeline', tid);
       add('project-tasks', pid);
+      add('global-artifacts');
       add('bootstrap');
       continue;
     }
@@ -80,6 +81,7 @@ export function collectInvalidations(events: EventRecord[]): unknown[][] {
       for (const did of strListField(p, 'deliveryIds')) add('delivery', did);
       add('task-timeline', tid);
       add('project-tasks', pid);
+      add('global-artifacts');
       add('bootstrap');
       continue;
     }

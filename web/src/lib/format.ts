@@ -331,3 +331,67 @@ export function toolVerb(name: string, title: string): string {
   if (/(post_message|board|spawn|swarm|invoke)/.test(s)) return '协作';
   return '工具';
 }
+
+/**
+ * Strips any parenthetical role/tag description from machine display names
+ * (e.g. "devNuc (Primary Hub & Dev)" -> "devNuc") so machine names stand cleanly on their own.
+ */
+export function cleanMachineName(m?: { displayName?: string; machineId: string } | null): string {
+  if (!m) return '';
+  const raw = (m.displayName || m.machineId || '').trim();
+  const stripped = raw.replace(/\s*[（(][^）)]*[）)]\s*$/g, '').trim();
+  return stripped || m.machineId;
+}
+
+export function isImagePath(p?: string | null): boolean {
+  if (!p) return false;
+  return /\.(png|jpe?g|gif|webp|svg|avif|bmp)$/i.test(p.trim());
+}
+
+export type ArtifactDisplayKind = 'design' | 'markdown' | 'docx' | 'pptx' | 'spreadsheet' | 'file';
+
+export function classifyArtifactKind(pathOrLocator?: string | null): ArtifactDisplayKind {
+  const low = (pathOrLocator || '').trim().toLowerCase();
+  if (low.startsWith('artboard/') || low.startsWith('html/') || low.startsWith('whiteboard/')) return 'design';
+  if (low.startsWith('slides/') || /\.(pptx?|key)$/.test(low)) return 'pptx';
+  if (low.startsWith('document/') || /\.(md|markdown)$/.test(low)) return 'markdown';
+  if (/\.(docx?)$/.test(low)) return 'docx';
+  if (/\.(xlsx?|csv)$/.test(low)) return 'spreadsheet';
+  return 'file';
+}
+
+export function artifactShortLabel(kind: string): string {
+  switch (kind) {
+    case 'design':
+      return 'Ryugi';
+    case 'markdown':
+      return 'MD';
+    case 'docx':
+      return 'DOCX';
+    case 'pptx':
+      return 'PPTX';
+    case 'spreadsheet':
+      return 'XLSX';
+    default:
+      return 'File';
+  }
+}
+
+export function artifactFilterLabel(kind: string): string {
+  switch (kind) {
+    case 'design':
+      return '设计画板';
+    case 'markdown':
+      return 'Markdown';
+    case 'pptx':
+      return 'PPT';
+    case 'docx':
+      return 'Word';
+    case 'spreadsheet':
+      return '表格';
+    case 'file':
+      return '文件';
+    default:
+      return '全部';
+  }
+}

@@ -2,7 +2,8 @@ import { useMemo, useState } from 'react';
 import { useQueries } from '@tanstack/react-query';
 import { ArrowUpRight, Plus } from 'lucide-react';
 import type { BootstrapResponse, DeliveryView, TaskSummary } from '../generated/protocol';
-import { ArtIcon, CursorIcon, DiffIcon } from '../components/Icons';
+import { ArtIcon, DiffIcon } from '../components/Icons';
+import { IdeOpenButton } from '../components/IdeOpenButton';
 import { PageHeader } from '../components/PageHeader';
 import { StatusMark } from '../components/StatusMark';
 import { useProjectTasks } from '../hooks/queries';
@@ -16,9 +17,9 @@ import {
   taskTitle,
   type SessionMark,
 } from '../lib/format';
-import { buildIDEJump, buildProjectIDEJump, launchIDE } from '../lib/ide';
+import { buildIDEJump, launchIDE } from '../lib/ide';
 import { navigate, paths, type ProjectTab } from '../lib/router';
-import { toast, useWorkbenchStore } from '../store/useWorkbenchStore';
+import { useWorkbenchStore } from '../store/useWorkbenchStore';
 
 function ThreadRow({ t, mark }: { t: TaskSummary; mark: SessionMark }) {
   return (
@@ -77,15 +78,6 @@ export function ProjectPage({ boot, projectId, tab }: { boot: BootstrapResponse;
     );
   }
 
-  const openRepo = () => {
-    const j = buildProjectIDEJump({ project, machines: boot.machines, localMachineId });
-    if (!j) {
-      toast('该项目没有可打开的仓库锚点', 'err');
-      return;
-    }
-    launchIDE(j.uri);
-  };
-
   const nonDefaultBranch = project.defaultBranch && project.defaultBranch !== 'main' && project.defaultBranch !== 'master';
 
   return (
@@ -115,9 +107,7 @@ export function ProjectPage({ boot, projectId, tab }: { boot: BootstrapResponse;
               <button type="button" className="btn ghost" onClick={() => navigate(paths.newThread('project', project.projectId))}>
                 <Plus size={13} strokeWidth={1.6} /> 新线程
               </button>
-              <button type="button" className="ib" title="在 Cursor 打开" onClick={openRepo}>
-                <CursorIcon size={14} />
-              </button>
+              <IdeOpenButton project={project} machines={boot.machines} />
             </div>
           </div>
 

@@ -9,6 +9,8 @@ export interface ReviewState {
   taskId: string;
   deliveryId: string;
   tab: ReviewTab;
+  /** Optional specific artifact locator/id (e.g. 'ryugi:<bindingId>' or 'blob:<sha>:<path>') when tab === 'art'. */
+  artifactId?: string;
 }
 
 export interface ToastState {
@@ -73,6 +75,7 @@ interface WorkbenchState {
   lastSeq: number;
   localMachineId: string;
   preferredIDE: IDEScheme;
+  workspaceNameOverride: string;
   expandedProjects: Record<string, boolean>;
   promptCache: Record<string, string>;
   deselectedAnnotations: Record<string, string[]>;
@@ -85,15 +88,17 @@ interface WorkbenchState {
   setMobileDockOpen: (open: boolean) => void;
   setCmdkOpen: (open: boolean) => void;
   setMachinesOpen: (open: boolean) => void;
-  openReview: (tab: ReviewTab, taskId: string, deliveryId: string) => void;
+  openReview: (tab: ReviewTab, taskId: string, deliveryId: string, artifactId?: string) => void;
   closeReview: () => void;
-  setReviewTab: (tab: ReviewTab) => void;
-  setReviewDelivery: (deliveryId: string) => void;
+  setReviewTab: (tab: ReviewTab, artifactId?: string) => void;
+  setReviewDelivery: (deliveryId: string, artifactId?: string) => void;
   setReviewRatio: (tab: ReviewTab, ratio: number) => void;
   setReviewSessionHidden: (hidden: boolean) => void;
   setWSStatus: (status: WSConnectionStatus) => void;
   setLastSeq: (seq: number) => void;
   setLocalMachineId: (machineId: string) => void;
+  setPreferredIDE: (scheme: IDEScheme) => void;
+  setWorkspaceNameOverride: (name: string) => void;
   setProjectExpanded: (projectId: string, open: boolean) => void;
   rememberPrompt: (key: string, body: string) => void;
   toggleAnnotationSelected: (taskId: string, annotationId: string, selected: boolean) => void;
@@ -122,6 +127,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
   lastSeq: 0,
   localMachineId: readLS('orbit.localMachineId', ''),
   preferredIDE: (readLS('orbit.preferredIDE', 'cursor') as IDEScheme) || 'cursor',
+  workspaceNameOverride: readLS('orbit.workspaceName', ''),
   expandedProjects: readJSON<Record<string, boolean>>('orbit.expandedProjects', {}),
   promptCache: readJSON<Record<string, string>>(PROMPT_CACHE_KEY, {}),
   deselectedAnnotations: {},
@@ -146,17 +152,17 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
   setMobileDockOpen: (open) => set({ mobileDockOpen: open }),
   setCmdkOpen: (open) => set({ cmdkOpen: open, machinesOpen: false }),
   setMachinesOpen: (open) => set({ machinesOpen: open }),
-  openReview: (tab, taskId, deliveryId) =>
+  openReview: (tab, taskId, deliveryId, artifactId) =>
     set({
-      review: { taskId, deliveryId, tab },
+      review: { taskId, deliveryId, tab, artifactId },
       cmdkOpen: false,
       machinesOpen: false,
     }),
   closeReview: () => set({ review: null }),
-  setReviewTab: (tab) =>
-    set((s) => (s.review ? { review: { ...s.review, tab } } : s)),
-  setReviewDelivery: (deliveryId) =>
-    set((s) => (s.review ? { review: { ...s.review, deliveryId } } : s)),
+  setReviewTab: (tab, artifactId) =>
+    set((s) => (s.review ? { review: { ...s.review, tab, artifactId } } : s)),
+  setReviewDelivery: (deliveryId, artifactId) =>
+    set((s) => (s.review ? { review: { ...s.review, deliveryId, artifactId: artifactId ?? s.review.artifactId } } : s)),
   setReviewRatio: (tab, ratio) => {
     const clamped = Math.min(REVIEW_RATIO_MAX, Math.max(REVIEW_RATIO_MIN, Math.round(ratio)));
     writeLS(`orbit.reviewRatio.${tab}`, String(clamped));
@@ -168,6 +174,15 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
   setLocalMachineId: (machineId) => {
     writeLS('orbit.localMachineId', machineId);
     set({ localMachineId: machineId });
+  },
+  setPreferredIDE: (scheme) => {
+    writeLS('orbit.preferredIDE', scheme);
+    set({ preferredIDE: scheme });
+  },
+  setWorkspaceNameOverride: (name) => {
+    const trimmed = name.trim();
+    writeLS('orbit.workspaceName', trimmed);
+    set({ workspaceNameOverride: trimmed });
   },
   setProjectExpanded: (projectId, open) => {
     const next = { ...get().expandedProjects, [projectId]: open };
