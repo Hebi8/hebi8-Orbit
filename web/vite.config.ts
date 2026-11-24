@@ -18,5 +18,17 @@ export default defineConfig({
     outDir: 'dist',
     emptyOutDir: true,
     sourcemap: false,
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (!id.includes('node_modules')) return undefined;
+          // Language grammars & themes stay as lazily-loaded per-language chunks.
+          if (/(shiki|@shikijs)[\\/].*(langs|themes)[\\/]/.test(id)) return undefined;
+          if (id.includes('shiki') || id.includes('@shikijs')) return 'shiki';
+          if (id.includes('react-diff-view') || id.includes('diff-match-patch') || id.includes('gitdiff-parser')) return 'diff';
+          return 'vendor';
+        },
+      },
+    },
   },
 });

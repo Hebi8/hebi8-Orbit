@@ -1,12 +1,132 @@
 import { useEffect, useRef } from 'react';
-import { useQueryClient } from '@tanstack/react-query';
+import { useQueryClient, type QueryClient } from '@tanstack/react-query';
 import type { EventRecord, WSServerMessage } from '../generated/protocol';
 import { useWorkbenchStore } from '../store/useWorkbenchStore';
+
+const strField = (payload: Record<string, unknown> | undefined, key: string): string => {
+  const v = payload?.[key];
+  return typeof v === 'string' ? v : '';
+};
+
+/**
+ * Maps a batch of committed events to the precise set of TanStack Query keys that must be refreshed.
+ * Exported separately so the mapping stays a pure function of the event list.
+ */
+export function collectInvalidations(events: EventRecord[]): unknown[][] {
+  const keys = new Map<string, unknown[]>();
+  const add = (...key: unknown[]) => {
+    if (key.some((k) => k === '' || k === undefined)) return;
+    keys.set(JSON.stringify(key), key);
+  };
+
+  for (const ev of events) {
+    const pid = ev.projectId ?? '';
+    const tid = ev.taskId ?? '';
+    const aid = ev.attemptId ?? '';
+    const p = ev.payload ?? {};
+    const deliveryId = strField(p, 'deliveryId');
+    const kind = ev.kind;
+
+    if (ev.visibility === 'inbox') add('bootstrap');
+
+    if (kind.startsWith('task.')) {
+      add('task-timeline', tid);
+      if (kind === 'task.source_added' || kind === 'task.source_removed') continue;
+      add('bootstrap');
+      add('project-tasks', pid);
+      if (kind === 'task.project_bound') {
+        add('project-tasks', strField(p, 'fromProjectId'));
+        add('project-tasks', strField(p, 'toProjectId'));
+      }
+      continue;
+    }
+    if (kind.startsWith('attempt.')) {
+      add('task-timeline', tid);
+      add('attempt-raw', aid);
+      add('project-tasks', pid);
+      add('bootstrap');
+      continue;
+    }
+    if (kind.startsWith('resource.')) {
+      add('bootstrap');
+      add('task-timeline', tid);
+      add('project-tasks', pid);
+      continue;
+    }
+    if (kind.startsWith('delivery.')) {
+      add('delivery', deliveryId);
+      add('delivery-diff', deliveryId);
+      add('task-timeline', tid);
+      add('project-tasks', pid);
+      add('bootstrap');
+      continue;
+    }
+    if (kind.startsWith('annotation.')) {
+      add('delivery', deliveryId);
+      add('task-timeline', tid);
+      add('project-tasks', pid);
+      continue;
+    }
+    if (kind.startsWith('approval.')) {
+      add('approvals');
+      add('task-timeline', tid);
+      add('project-tasks', pid);
+      add('bootstrap');
+      continue;
+    }
+    if (kind.startsWith('deploy.')) {
+      add('task-timeline', tid);
+      add('bootstrap');
+      continue;
+    }
+    if (kind.startsWith('acp.')) {
+      add('attempt-raw', aid);
+      add('worker-stream', tid);
+      continue;
+    }
+    if (kind === 'queue.updated') {
+      add('task-timeline', tid);
+      add('project-tasks', pid);
+      add('bootstrap');
+      const dispatchedAttempt = strField(p, 'dispatchedAttemptId');
+      if (dispatchedAttempt) add('attempt-raw', dispatchedAttempt);
+      continue;
+    }
+    if (kind === 'board.message_posted') {
+      add('task-board', tid);
+      add('worker-stream', tid);
+      continue;
+    }
+    if (kind === 'board.member_updated') {
+      add('task-board', tid);
+      add('task-timeline', tid);
+      add('worker-stream', tid);
+      add('project-tasks', pid);
+      add('bootstrap');
+      continue;
+    }
+    if (kind === 'pa.turn' || kind === 'pa.thread_created' || kind === 'pa.action_executed') {
+      add('pa-threads');
+      add('pa-thread');
+      add('bootstrap');
+      continue;
+    }
+  }
+  return [...keys.values()];
+}
+
+function applyInvalidations(queryClient: QueryClient, keys: unknown[][]) {
+  for (const key of keys) {
+    void queryClient.invalidateQueries({ queryKey: key });
+  }
+}
 
 /**
  * Maintains a persistent, gapless WebSocket stream seeded ONCE from the initial bootstrap snapshotSeq:
  * - The effect depends only on `bootstrapReady` (boolean), NOT on `snapshotSeq`, so subsequent
- *   bootstrap invalidations/refetches never disconnect WS or skip events (Item #3).
+ *   bootstrap invalidations/refetches never disconnect WS or skip events.
+ * - Replay frames are buffered until `replay_end`; live frames that race the replay are buffered and
+ *   de-duplicated by seq against `lastAppliedSeqRef`.
  * - Reconnects always carry `lastAppliedSeqRef.current`.
  */
 export function useRealtimeSync(snapshotSeq: number | undefined) {
@@ -39,46 +159,17 @@ export function useRealtimeSync(snapshotSeq: number | undefined) {
       if (events.length === 0) return;
 
       const sorted = [...events].sort((a, b) => a.seq - b.seq);
-      const affectedProjects = new Set<string>();
-      const affectedTasks = new Set<string>();
-      const affectedDeliveries = new Set<string>();
-      let needsBootstrap = false;
-
+      const fresh: EventRecord[] = [];
       for (const ev of sorted) {
         if (ev.seq <= lastAppliedSeqRef.current) {
           continue;
         }
         lastAppliedSeqRef.current = ev.seq;
-        setLastSeq(ev.seq);
-
-        if (ev.projectId) affectedProjects.add(ev.projectId);
-        if (ev.taskId) affectedTasks.add(ev.taskId);
-        const dlvId = typeof ev.payload?.deliveryId === 'string' ? ev.payload.deliveryId : '';
-        if (dlvId) affectedDeliveries.add(dlvId);
-
-        if (
-          ev.visibility === 'inbox' ||
-          ev.kind === 'delivery.published' ||
-          ev.kind === 'delivery.review_completed' ||
-          ev.kind === 'task.created' ||
-          ev.kind === 'task.state_changed'
-        ) {
-          needsBootstrap = true;
-        }
+        fresh.push(ev);
       }
-
-      if (needsBootstrap) {
-        void queryClient.invalidateQueries({ queryKey: ['bootstrap'] });
-      }
-      for (const pid of affectedProjects) {
-        void queryClient.invalidateQueries({ queryKey: ['project-tasks', pid] });
-      }
-      for (const tid of affectedTasks) {
-        void queryClient.invalidateQueries({ queryKey: ['task-timeline', tid] });
-      }
-      for (const did of affectedDeliveries) {
-        void queryClient.invalidateQueries({ queryKey: ['delivery', did] });
-      }
+      if (fresh.length === 0) return;
+      setLastSeq(lastAppliedSeqRef.current);
+      applyInvalidations(queryClient, collectInvalidations(fresh));
     };
 
     const connect = () => {
@@ -107,10 +198,7 @@ export function useRealtimeSync(snapshotSeq: number | undefined) {
           } else if (msg.type === 'replay_end') {
             replaying = false;
             applyEvents(replayBatch);
-            if (
-              typeof msg.replayHeadSeq === 'number' &&
-              msg.replayHeadSeq > lastAppliedSeqRef.current
-            ) {
+            if (typeof msg.replayHeadSeq === 'number' && msg.replayHeadSeq > lastAppliedSeqRef.current) {
               lastAppliedSeqRef.current = msg.replayHeadSeq;
               setLastSeq(msg.replayHeadSeq);
             }

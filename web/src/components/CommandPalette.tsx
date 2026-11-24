@@ -1,0 +1,195 @@
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { ArrowUpRight, FolderGit2, LayoutGrid, MessageSquare, Plus, Search, Zap } from 'lucide-react';
+import type { BootstrapResponse, PABriefResponse, PAChatResponse } from '../generated/protocol';
+import { useManyProjectTasks } from '../hooks/queries';
+import { SCRATCH_PROJECT_ID, taskDot, taskStateLabel, taskTitle } from '../lib/format';
+import { navigate, paths } from '../lib/router';
+import { useWorkbenchStore } from '../store/useWorkbenchStore';
+import { PAIcon } from './Icons';
+import { Md } from './Md';
+import { ActionCards, BriefView, usePABrief, usePAChat } from './PAViews';
+
+interface Item {
+  key: string;
+  group: string;
+  icon: ReactNode;
+  label: string;
+  detail?: string;
+  run: () => void;
+}
+
+type Out = { kind: 'chat'; res: PAChatResponse } | { kind: 'brief'; res: PABriefResponse } | null;
+
+export function CommandPalette({ boot }: { boot: BootstrapResponse }) {
+  const setOpen = useWorkbenchStore((s) => s.setCmdkOpen);
+  const toggleTheme = useWorkbenchStore((s) => s.toggleTheme);
+  const [q, setQ] = useState('');
+  const [act, setAct] = useState(0);
+  const [out, setOut] = useState<Out>(null);
+  const inputRef = useRef<HTMLInputElement | null>(null);
+  const tasksBy = useManyProjectTasks(boot.projects);
+  const chat = usePAChat((res) => setOut({ kind: 'chat', res }));
+  const brief = usePABrief((res) => setOut({ kind: 'brief', res }));
+
+  useEffect(() => inputRef.current?.focus(), []);
+
+  const go = (hash: string) => {
+    setOpen(false);
+    navigate(hash);
+  };
+
+  const items = useMemo<Item[]>(() => {
+    const k = q.trim().toLowerCase();
+    const match = (s: string) => !k || s.toLowerCase().includes(k);
+    const list: Item[] = [];
+    if (k) {
+      list.push({
+        key: 'ask',
+        group: 'PA',
+        icon: <PAIcon />,
+        label: `问 PA：${q.trim()}`,
+        detail: '↵ 原地回答',
+        run: () => chat.mutate({ message: q.trim(), threadId: boot.paState.activePaThreadId || undefined }),
+      });
+    }
+    const actions: Item[] = [
+      { key: 'brief', group: '动作', icon: <Zap size={14} strokeWidth={1.6} />, label: 'Brief Me · 过去 24 小时', run: () => brief.mutate() },
+      { key: 'new', group: '动作', icon: <Plus size={14} strokeWidth={1.6} />, label: '新建线程', detail: '⌘N', run: () => go(paths.newThread()) },
+      { key: 'home', group: '动作', icon: <LayoutGrid size={14} strokeWidth={1.6} />, label: '打开总览', run: () => go(paths.home()) },
+      { key: 'pa', group: '动作', icon: <PAIcon />, label: '打开 PA 专属页', run: () => go(paths.pa()) },
+      { key: 'theme', group: '动作', icon: <Search size={14} strokeWidth={1.6} />, label: '切换深 / 浅色', run: () => toggleTheme() },
+    ];
+    list.push(...actions.filter((a) => match(a.label)));
+    for (const p of boot.projects) {
+      if (p.projectId === SCRATCH_PROJECT_ID || p.archived) continue;
+      if (!match(`${p.displayName} ${p.repoIdentity}`)) continue;
+      list.push({
+        key: `p:${p.projectId}`,
+        group: '项目',
+        icon: <FolderGit2 size={14} strokeWidth={1.6} />,
+        label: p.displayName,
+        detail: p.activeTaskCount ? `${p.activeTaskCount} 活跃` : p.repoIdentity,
+        run: () => go(paths.project(p.projectId)),
+      });
+    }
+    const threads = Object.values(tasksBy)
+      .flat()
+      .filter((t) => !t.parentTaskId)
+      .filter((t) => (k ? match(`${t.title} ${t.goal}`) : t.state !== 'done' && t.state !== 'cancelled'))
+      .sort((a, b) => b.updatedAt - a.updatedAt)
+      .slice(0, k ? 10 : 6);
+    for (const t of threads) {
+      const pn = t.projectId === SCRATCH_PROJECT_ID ? '自由 Chat' : boot.projects.find((p) => p.projectId === t.projectId)?.displayName ?? t.projectId;
+      list.push({
+        key: `t:${t.taskId}`,
+        group: k ? '线程' : '最近线程',
+        icon: <span className={`sd ${taskDot(t.state, t.activeAttemptState)}`} style={{ margin: '0 4px' }} />,
+        label: `${pn} / ${taskTitle(t)}`,
+        detail: taskStateLabel(t),
+        run: () => go(paths.session(t.taskId)),
+      });
+    }
+    return list;
+    // chat/brief mutate fns are stable per hook instance
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [q, boot, tasksBy]);
+
+  useEffect(() => setAct(0), [q]);
+  const groups: string[] = [];
+  for (const it of items) if (!groups.includes(it.group)) groups.push(it.group);
+  const threadIdForPA = out?.kind === 'chat' ? out.res.thread.paThreadId : boot.paState.activePaThreadId;
+
+  return (
+    <>
+      <div className="scrim" onClick={() => setOpen(false)} />
+      <section className="cmdk" role="dialog" aria-label="全局快唤">
+        <div className="ck-in">
+          <PAIcon />
+          <input
+            ref={inputRef}
+            value={q}
+            placeholder="问 PA、跳线程，或输入一句话…"
+            onChange={(e) => setQ(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.nativeEvent.isComposing) return;
+              if (e.key === 'ArrowDown') {
+                e.preventDefault();
+                setAct((a) => Math.min(items.length - 1, a + 1));
+              } else if (e.key === 'ArrowUp') {
+                e.preventDefault();
+                setAct((a) => Math.max(0, a - 1));
+              } else if (e.key === 'Enter') {
+                e.preventDefault();
+                items[act]?.run();
+              }
+            }}
+            aria-label="搜索或提问"
+          />
+          <span className="kbd">esc</span>
+        </div>
+        <div className="ck-meta">
+          <span className="sd done" style={{ opacity: 1 }} />
+          <span className="mono">旁路只读 · 已同步至 event #{boot.paState.lastReadEventSeq}</span>
+          <span className="r no-mobile">可起草派活 · 不能审批 / 部署</span>
+        </div>
+        {(out || chat.isPending || brief.isPending) && (
+          <div className="ck-out">
+            {chat.isPending || brief.isPending ? (
+              <div className="running">
+                <span className="spin" />
+                <span className="shim">{brief.isPending ? '汇总态势…' : 'PA 正在读取增量事件…'}</span>
+              </div>
+            ) : out?.kind === 'chat' ? (
+              <>
+                <Md text={out.res.assistantMessage.content} />
+                <ActionCards actions={out.res.actions ?? out.res.assistantMessage.actions} />
+              </>
+            ) : out?.kind === 'brief' ? (
+              <BriefView brief={out.res} projects={boot.projects} />
+            ) : null}
+            {out && (
+              <div style={{ marginTop: 10 }}>
+                <button type="button" className="btn" onClick={() => go(paths.pa(threadIdForPA || undefined))}>
+                  在 PA 专属页继续 <ArrowUpRight size={12} strokeWidth={1.6} />
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+        <div className="ck-list">
+          {groups.map((g) => (
+            <div key={g}>
+              <div className="ck-g">{g}</div>
+              {items
+                .map((it, idx) => ({ it, idx }))
+                .filter(({ it }) => it.group === g)
+                .map(({ it, idx }) => (
+                  <button
+                    type="button"
+                    key={it.key}
+                    className={`ck-i ${idx === act ? 'act' : ''}`}
+                    onMouseEnter={() => setAct(idx)}
+                    onClick={() => it.run()}
+                  >
+                    {it.icon}
+                    <span className="ell">{it.label}</span>
+                    {it.detail && <span className="d">{it.detail}</span>}
+                  </button>
+                ))}
+            </div>
+          ))}
+          {items.length === 0 && (
+            <div className="empty">
+              <MessageSquare size={14} strokeWidth={1.6} /> 没有匹配项
+            </div>
+          )}
+        </div>
+        <div className="ck-foot no-mobile">
+          <span>↑↓ 选择</span>
+          <span>↵ 执行</span>
+          <span>esc 关闭</span>
+        </div>
+      </section>
+    </>
+  );
+}

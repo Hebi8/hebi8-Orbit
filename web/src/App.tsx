@@ -1,189 +1,161 @@
 import { useEffect, useState } from 'react';
-import { useQuery } from '@tanstack/react-query';
-import type { InboxItemView } from './generated/protocol';
-import { api } from './lib/api';
+import { CommandPalette } from './components/CommandPalette';
+import { MachinesPopover } from './components/MachinesPopover';
+import { MobileTabs } from './components/MobileTabs';
+import { Sidebar } from './components/Sidebar';
+import { useBootstrap } from './hooks/queries';
 import { useRealtimeSync } from './hooks/useRealtimeSync';
-import { useWorkbenchStore } from './store/useWorkbenchStore';
-import { TopBar } from './components/TopBar';
-import { LeftSidebar } from './components/LeftSidebar';
-import { TaskTimelinePane } from './components/TaskTimelinePane';
-import { ReviewDrawer } from './components/ReviewDrawer';
-import { MobileShell } from './components/MobileShell';
-import { PAPlaceholderModal } from './components/PAPlaceholderModal';
+import { errMsg } from './lib/api';
+import { navigate, parseHash, paths, useRoute } from './lib/router';
+import { HomePage } from './pages/HomePage';
+import { NewThreadPage } from './pages/NewThreadPage';
+import { PAPage } from './pages/PAPage';
+import { ProjectPage } from './pages/ProjectPage';
+import { ProjectsListPage } from './pages/ProjectsListPage';
+import { SessionPage } from './session/SessionPage';
+import { applyThemeToDocument, useWorkbenchStore } from './store/useWorkbenchStore';
+import { ArtifactsWindow } from './windows/ArtifactsWindow';
+import { CodeReviewWindow } from './windows/CodeReviewWindow';
 
-export function App() {
-  const {
-    selectedProjectId,
-    setSelectedProject,
-    selectedTaskId,
-    setSelectedTask,
-    selectedDeliveryId,
-    setSelectedDelivery,
-    theme,
-    setShowPAOverlay,
-  } = useWorkbenchStore();
-
-  const [isDark, setIsDark] = useState(true);
-
-  // Sync theme class with document root (dark by default, respecting system mode)
-  useEffect(() => {
-    const mq = window.matchMedia('(prefers-color-scheme: dark)');
-    const apply = () => {
-      const dark = theme === 'dark' || (theme === 'system' && mq.matches);
-      setIsDark(dark);
-      document.documentElement.classList.toggle('dark', dark);
-    };
-    apply();
-    mq.addEventListener('change', apply);
-    return () => mq.removeEventListener('change', apply);
-  }, [theme]);
-
-  // Global Cmd+K / Ctrl+K shortcut for PA control drawer
-  useEffect(() => {
-    const onKeyDown = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
-        e.preventDefault();
-        setShowPAOverlay(true);
-      }
-    };
-    window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
-  }, [setShowPAOverlay]);
-
-  // 1. Single-transaction bootstrap snapshot
-  const bootstrapQuery = useQuery({
-    queryKey: ['bootstrap'],
-    queryFn: api.bootstrap,
-    refetchOnWindowFocus: false,
-  });
-
-  // 2. Gapless /ws/client?sinceSeq=<snapshotSeq> realtime subscription
-  useRealtimeSync(bootstrapQuery.data?.snapshotSeq);
-
-  const projects = bootstrapQuery.data?.projects ?? [];
-  const machines = bootstrapQuery.data?.machines ?? [];
-  const inboxItems = bootstrapQuery.data?.openInboxItems ?? [];
-
-  // Auto-select first project once bootstrap loads
-  useEffect(() => {
-    if (!selectedProjectId && projects.length > 0) {
-      setSelectedProject(projects[0].projectId);
-    }
-  }, [projects, selectedProjectId, setSelectedProject]);
-
-  // 3. Project tasks
-  const tasksQuery = useQuery({
-    queryKey: ['project-tasks', selectedProjectId],
-    queryFn: () => api.listProjectTasks(selectedProjectId!),
-    enabled: !!selectedProjectId,
-  });
-  const tasks = tasksQuery.data ?? [];
-
-  // Auto-select first task when project changes
-  useEffect(() => {
-    if (selectedProjectId && !selectedTaskId && tasks.length > 0) {
-      setSelectedTask(tasks[0].taskId);
-    }
-  }, [selectedProjectId, selectedTaskId, tasks, setSelectedTask]);
-
-  // 4. Task timeline
-  const timelineQuery = useQuery({
-    queryKey: ['task-timeline', selectedTaskId],
-    queryFn: () => api.getTaskTimeline(selectedTaskId!),
-    enabled: !!selectedTaskId,
-  });
-
-  // Auto-select latest delivery when timeline loads
-  useEffect(() => {
-    const deliveries = timelineQuery.data?.deliveries ?? [];
-    if (!selectedDeliveryId && deliveries.length > 0) {
-      const latest = deliveries[deliveries.length - 1];
-      const hasRyugi = (latest.ryugiBindings?.length ?? 0) > 0;
-      setSelectedDelivery(latest.deliveryId, hasRyugi ? 'ryugi' : 'diff');
-    }
-  }, [timelineQuery.data?.deliveries, selectedDeliveryId, setSelectedDelivery]);
-
-  // 5. Selected delivery detail
-  const deliveryDetailQuery = useQuery({
-    queryKey: ['delivery', selectedDeliveryId],
-    queryFn: () => api.getDelivery(selectedDeliveryId!),
-    enabled: !!selectedDeliveryId,
-  });
-
-  const activeProject = projects.find((p) => p.projectId === selectedProjectId);
-
-  const handleSelectInboxItem = (item: InboxItemView) => {
-    setSelectedProject(item.projectId);
-    if (item.taskId) {
-      setSelectedTask(item.taskId);
-    }
-    if (item.category === 'delivery_review' && item.refId) {
-      setSelectedDelivery(item.refId, 'diff');
-    }
-  };
-
-  if (bootstrapQuery.isError) {
-    return (
-      <div className="flex h-full items-center justify-center p-6 text-center">
-        <div className="max-w-md rounded-lg border border-rose-500/30 bg-rose-500/10 p-5 text-sm text-rose-500">
-          <div className="font-semibold">无法连接 orbit-hub</div>
-          <p className="mt-1 text-xs opacity-80">
-            {(bootstrapQuery.error as Error).message}
-          </p>
-        </div>
-      </div>
-    );
-  }
-
+function Toast() {
+  const t = useWorkbenchStore((s) => s.toast);
+  if (!t) return null;
   return (
-    <div className="flex h-full flex-col overflow-hidden bg-zinc-50 text-zinc-900 dark:bg-zinc-950 dark:text-zinc-100">
-      <TopBar
-        activeProject={activeProject}
-        machines={machines}
-        openInboxCount={inboxItems.length}
-      />
-
-      {/* Desktop 3-Pane Industrial Workbench */}
-      <div className="hidden min-h-0 flex-1 overflow-hidden md:flex">
-        <LeftSidebar
-          projects={projects}
-          machines={machines}
-          inboxItems={inboxItems}
-          onSelectInboxItem={handleSelectInboxItem}
-        />
-
-        <TaskTimelinePane
-          project={activeProject}
-          machines={machines}
-          tasks={tasks}
-          inboxItems={inboxItems}
-          timeline={timelineQuery.data}
-          isLoadingTimeline={timelineQuery.isLoading}
-        />
-
-        <ReviewDrawer
-          key={selectedDeliveryId ?? 'none'}
-          detail={deliveryDetailQuery.data}
-          isLoading={deliveryDetailQuery.isLoading}
-          allTaskDeliveries={timelineQuery.data?.deliveries ?? []}
-          machines={machines}
-          isDark={isDark}
-        />
-      </div>
-
-      {/* Mobile 3-Tab Responsive Shell */}
-      <MobileShell
-        projects={projects}
-        inboxItems={inboxItems}
-        tasks={tasks}
-        timeline={timelineQuery.data}
-        deliveryDetail={deliveryDetailQuery.data}
-        onSelectInboxItem={handleSelectInboxItem}
-      />
-
-      <PAPlaceholderModal bootstrap={bootstrapQuery.data} />
+    <div className={`toast ${t.tone === 'err' ? 'err' : ''}`} role="status" key={t.id}>
+      {t.text}
     </div>
   );
 }
 
-export default App;
+/** Esc walks back one layer at a time: ⌘K → popover → top floating window → worker drill → board → mobile dock. */
+function useGlobalKeys() {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const s = useWorkbenchStore.getState();
+      const route = parseHash(window.location.hash);
+      const mod = e.metaKey || e.ctrlKey;
+      if (mod && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 'k') {
+        e.preventDefault();
+        s.setCmdkOpen(!s.cmdkOpen);
+        return;
+      }
+      if (mod && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 'n') {
+        e.preventDefault();
+        s.setCmdkOpen(false);
+        navigate(paths.newThread());
+        return;
+      }
+      if (mod && e.key === '\\') {
+        e.preventDefault();
+        s.toggleSidebar();
+        return;
+      }
+      if (e.key !== 'Escape' || e.isComposing) return;
+      if (s.cmdkOpen) {
+        s.setCmdkOpen(false);
+      } else if (s.machinesOpen) {
+        s.setMachinesOpen(false);
+      } else if (s.winOrder.length > 0) {
+        s.closeWindow(s.winOrder[s.winOrder.length - 1]);
+      } else if (route.name === 'session' && route.worker) {
+        navigate(paths.session(route.taskId));
+      } else if (s.boardOpen && route.name === 'session') {
+        s.setBoardOpen(false);
+        s.setMobileDockOpen(false);
+      } else if (s.mobileDockOpen) {
+        s.setMobileDockOpen(false);
+      } else {
+        return;
+      }
+      e.preventDefault();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
+}
+
+function BootError({ message, onRetry }: { message: string; onRetry: () => void }) {
+  const [token, setToken] = useState('');
+  return (
+    <div className="empty" style={{ maxWidth: 440, margin: '18vh auto 0' }}>
+      <div className="brand" style={{ justifyContent: 'center' }}>
+        <span className="brand-mark" />
+        <b>hebi8-Orbit</b>
+      </div>
+      <p>连接 Hub 失败：{message}</p>
+      <p className="faint">本机开发可填入 Hub 的 dev token（只存在本浏览器 localStorage）。</p>
+      <div style={{ display: 'flex', gap: 6 }}>
+        <input className="field" value={token} onChange={(e) => setToken(e.target.value)} placeholder="X-Orbit-Dev-Token" />
+        <button
+          type="button"
+          className="btn pri"
+          onClick={() => {
+            try {
+              localStorage.setItem('orbit.devToken', token.trim());
+            } catch {
+              // storage unavailable; retry will surface the same error
+            }
+            onRetry();
+          }}
+        >
+          重试
+        </button>
+      </div>
+    </div>
+  );
+}
+
+export function App() {
+  const theme = useWorkbenchStore((s) => s.theme);
+  const collapsed = useWorkbenchStore((s) => s.sidebarCollapsed);
+  const cmdkOpen = useWorkbenchStore((s) => s.cmdkOpen);
+  const machinesOpen = useWorkbenchStore((s) => s.machinesOpen);
+  const bootQ = useBootstrap();
+  const route = useRoute();
+  useRealtimeSync(bootQ.data?.snapshotSeq);
+  useGlobalKeys();
+
+  useEffect(() => applyThemeToDocument(theme), [theme]);
+
+  const boot = bootQ.data;
+  if (!boot) {
+    if (bootQ.isError) return <BootError message={errMsg(bootQ.error)} onRetry={() => void bootQ.refetch()} />;
+    return <div className="empty" style={{ marginTop: '30vh' }}>连接 Hub…</div>;
+  }
+
+  let page;
+  switch (route.name) {
+    case 'pa':
+      page = <PAPage boot={boot} threadId={route.threadId} />;
+      break;
+    case 'new':
+      page = <NewThreadPage boot={boot} mode={route.mode} projectId={route.projectId} />;
+      break;
+    case 'project':
+      page = <ProjectPage key={route.projectId} boot={boot} projectId={route.projectId} tab={route.tab} />;
+      break;
+    case 'projects':
+      page = <ProjectsListPage boot={boot} />;
+      break;
+    case 'session':
+      page = <SessionPage key={route.taskId} boot={boot} taskId={route.taskId} worker={route.worker} />;
+      break;
+    default:
+      page = <HomePage boot={boot} />;
+  }
+
+  return (
+    <>
+      <div className={`app ${collapsed ? 'side-collapsed' : ''}`}>
+        <Sidebar boot={boot} route={route} />
+        {page}
+        <MobileTabs route={route} inboxCount={boot.openInboxItems.length} />
+      </div>
+      <CodeReviewWindow boot={boot} />
+      <ArtifactsWindow />
+      {cmdkOpen && <CommandPalette boot={boot} />}
+      {machinesOpen && <MachinesPopover machines={boot.machines} />}
+      <Toast />
+    </>
+  );
+}

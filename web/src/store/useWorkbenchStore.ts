@@ -1,37 +1,21 @@
 import { create } from 'zustand';
 import type { IDEScheme } from '../generated/protocol';
 
-export type DrawerTab = 'ryugi' | 'diff';
-export type MobileTab = 'inbox' | 'projects' | 'pa';
-export type ThemeMode = 'system' | 'dark' | 'light';
+export type ThemeMode = 'dark' | 'light';
 export type WSConnectionStatus = 'connecting' | 'live' | 'reconnecting';
+export type WinKind = 'cr' | 'art';
 
-interface WorkbenchState {
-  selectedProjectId: string | null;
-  selectedTaskId: string | null;
-  selectedDeliveryId: string | null;
-  drawerTab: DrawerTab;
-  drawerWidth: number;
-  mobileTab: MobileTab;
-  theme: ThemeMode;
-  localMachineId: string;
-  preferredIDE: IDEScheme;
-  showPAOverlay: boolean;
-  wsStatus: WSConnectionStatus;
-  lastSeq: number;
+export interface WinState {
+  taskId: string;
+  deliveryId: string;
+  x: number;
+  y: number;
+}
 
-  setSelectedProject: (projectId: string | null) => void;
-  setSelectedTask: (taskId: string | null) => void;
-  setSelectedDelivery: (deliveryId: string | null, tab?: DrawerTab) => void;
-  setDrawerTab: (tab: DrawerTab) => void;
-  setDrawerWidth: (width: number) => void;
-  setMobileTab: (tab: MobileTab) => void;
-  setTheme: (theme: ThemeMode) => void;
-  setLocalMachineId: (machineId: string) => void;
-  setPreferredIDE: (ide: IDEScheme) => void;
-  setShowPAOverlay: (open: boolean) => void;
-  setWSStatus: (status: WSConnectionStatus) => void;
-  setLastSeq: (seq: number) => void;
+export interface ToastState {
+  id: number;
+  text: string;
+  tone: 'info' | 'err';
 }
 
 function readLS(key: string, fallback: string): string {
@@ -46,49 +30,163 @@ function writeLS(key: string, val: string) {
   try {
     localStorage.setItem(key, val);
   } catch {
-    // ignore storage errors
+    // storage may be unavailable (private mode); UI state simply won't persist
   }
 }
 
-export const useWorkbenchStore = create<WorkbenchState>((set) => ({
-  selectedProjectId: null,
-  selectedTaskId: null,
-  selectedDeliveryId: null,
-  drawerTab: 'diff',
-  drawerWidth: Math.min(760, Math.max(420, Number(readLS('orbit.drawerWidth', '560')) || 560)),
-  mobileTab: 'inbox',
-  theme: (readLS('orbit.theme', 'dark') as ThemeMode) || 'dark',
-  localMachineId: readLS('orbit.localMachineId', 'hub-node'),
-  preferredIDE: (readLS('orbit.preferredIDE', 'cursor') as IDEScheme) || 'cursor',
-  showPAOverlay: false,
+function readJSON<T>(key: string, fallback: T): T {
+  try {
+    const raw = localStorage.getItem(key);
+    return raw ? (JSON.parse(raw) as T) : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+const PROMPT_CACHE_KEY = 'orbit.promptCache';
+const PROMPT_CACHE_MAX = 400;
+
+export function applyThemeToDocument(mode: ThemeMode) {
+  document.documentElement.setAttribute('data-mode', mode);
+}
+
+const initialTheme: ThemeMode = readLS('orbit.theme', 'dark') === 'light' ? 'light' : 'dark';
+
+interface WorkbenchState {
+  theme: ThemeMode;
+  sidebarCollapsed: boolean;
+  rightCardOpen: boolean;
+  boardOpen: boolean;
+  mobileDockOpen: boolean;
+  cmdkOpen: boolean;
+  machinesOpen: boolean;
+  windows: Partial<Record<WinKind, WinState>>;
+  winOrder: WinKind[];
+  wsStatus: WSConnectionStatus;
+  lastSeq: number;
+  localMachineId: string;
+  preferredIDE: IDEScheme;
+  expandedProjects: Record<string, boolean>;
+  promptCache: Record<string, string>;
+  toast: ToastState | null;
+
+  toggleTheme: () => void;
+  toggleSidebar: () => void;
+  setRightCardOpen: (open: boolean) => void;
+  setBoardOpen: (open: boolean) => void;
+  setMobileDockOpen: (open: boolean) => void;
+  setCmdkOpen: (open: boolean) => void;
+  setMachinesOpen: (open: boolean) => void;
+  openWindow: (kind: WinKind, taskId: string, deliveryId: string) => void;
+  closeWindow: (kind: WinKind) => void;
+  focusWindow: (kind: WinKind) => void;
+  moveWindow: (kind: WinKind, x: number, y: number) => void;
+  setWSStatus: (status: WSConnectionStatus) => void;
+  setLastSeq: (seq: number) => void;
+  setLocalMachineId: (machineId: string) => void;
+  setProjectExpanded: (projectId: string, open: boolean) => void;
+  rememberPrompt: (key: string, body: string) => void;
+  showToast: (text: string, tone?: 'info' | 'err') => void;
+  clearToast: (id: number) => void;
+}
+
+let toastSeq = 0;
+
+export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
+  theme: initialTheme,
+  sidebarCollapsed: readLS('orbit.sidebarCollapsed', '0') === '1',
+  rightCardOpen: readLS('orbit.rightCard', '1') !== '0',
+  boardOpen: false,
+  mobileDockOpen: false,
+  cmdkOpen: false,
+  machinesOpen: false,
+  windows: {},
+  winOrder: [],
   wsStatus: 'connecting',
   lastSeq: 0,
+  localMachineId: readLS('orbit.localMachineId', ''),
+  preferredIDE: (readLS('orbit.preferredIDE', 'cursor') as IDEScheme) || 'cursor',
+  expandedProjects: readJSON<Record<string, boolean>>('orbit.expandedProjects', {}),
+  promptCache: readJSON<Record<string, string>>(PROMPT_CACHE_KEY, {}),
+  toast: null,
 
-  setSelectedProject: (projectId) =>
-    set({ selectedProjectId: projectId, selectedTaskId: null, selectedDeliveryId: null }),
-  setSelectedTask: (taskId) => set({ selectedTaskId: taskId, selectedDeliveryId: null }),
-  setSelectedDelivery: (deliveryId, tab) =>
-    set((s) => ({ selectedDeliveryId: deliveryId, drawerTab: tab ?? s.drawerTab })),
-  setDrawerTab: (tab) => set({ drawerTab: tab }),
-  setDrawerWidth: (width) => {
-    const clamped = Math.min(760, Math.max(400, Math.round(width)));
-    writeLS('orbit.drawerWidth', String(clamped));
-    set({ drawerWidth: clamped });
+  toggleTheme: () => {
+    const next: ThemeMode = get().theme === 'dark' ? 'light' : 'dark';
+    writeLS('orbit.theme', next);
+    applyThemeToDocument(next);
+    set({ theme: next });
   },
-  setMobileTab: (tab) => set({ mobileTab: tab }),
-  setTheme: (theme) => {
-    writeLS('orbit.theme', theme);
-    set({ theme });
+  toggleSidebar: () => {
+    const next = !get().sidebarCollapsed;
+    writeLS('orbit.sidebarCollapsed', next ? '1' : '0');
+    set({ sidebarCollapsed: next });
   },
+  setRightCardOpen: (open) => {
+    writeLS('orbit.rightCard', open ? '1' : '0');
+    set({ rightCardOpen: open });
+  },
+  setBoardOpen: (open) => set({ boardOpen: open }),
+  setMobileDockOpen: (open) => set({ mobileDockOpen: open }),
+  setCmdkOpen: (open) => set({ cmdkOpen: open, machinesOpen: false }),
+  setMachinesOpen: (open) => set({ machinesOpen: open }),
+  openWindow: (kind, taskId, deliveryId) =>
+    set((s) => {
+      const prev = s.windows[kind];
+      // Default to the left so the right-hand floating card stays reachable; the second window cascades.
+      const other = kind === 'cr' ? s.windows.art : s.windows.cr;
+      const base = kind === 'cr' ? { x: 24, y: 56 } : { x: 64, y: 96 };
+      const defaults = other && other.x === base.x && other.y === base.y ? { x: base.x + 40, y: base.y + 40 } : base;
+      return {
+        windows: { ...s.windows, [kind]: { taskId, deliveryId, x: prev?.x ?? defaults.x, y: prev?.y ?? defaults.y } },
+        winOrder: [...s.winOrder.filter((k) => k !== kind), kind],
+      };
+    }),
+  closeWindow: (kind) =>
+    set((s) => {
+      const next = { ...s.windows };
+      delete next[kind];
+      return { windows: next, winOrder: s.winOrder.filter((k) => k !== kind) };
+    }),
+  focusWindow: (kind) =>
+    set((s) => (s.winOrder[s.winOrder.length - 1] === kind ? s : { winOrder: [...s.winOrder.filter((k) => k !== kind), kind] })),
+  moveWindow: (kind, x, y) =>
+    set((s) => {
+      const w = s.windows[kind];
+      if (!w) return s;
+      return { windows: { ...s.windows, [kind]: { ...w, x, y } } };
+    }),
+  setWSStatus: (wsStatus) => set({ wsStatus }),
+  setLastSeq: (lastSeq) => set({ lastSeq }),
   setLocalMachineId: (machineId) => {
     writeLS('orbit.localMachineId', machineId);
     set({ localMachineId: machineId });
   },
-  setPreferredIDE: (ide) => {
-    writeLS('orbit.preferredIDE', ide);
-    set({ preferredIDE: ide });
+  setProjectExpanded: (projectId, open) => {
+    const next = { ...get().expandedProjects, [projectId]: open };
+    writeLS('orbit.expandedProjects', JSON.stringify(next));
+    set({ expandedProjects: next });
   },
-  setShowPAOverlay: (open) => set({ showPAOverlay: open }),
-  setWSStatus: (wsStatus) => set({ wsStatus }),
-  setLastSeq: (lastSeq) => set({ lastSeq }),
+  rememberPrompt: (key, body) => {
+    if (!key || !body) return;
+    const cur = get().promptCache;
+    if (cur[key] === body) return;
+    const next: Record<string, string> = { ...cur, [key]: body };
+    const keys = Object.keys(next);
+    if (keys.length > PROMPT_CACHE_MAX) {
+      for (const k of keys.slice(0, keys.length - PROMPT_CACHE_MAX)) delete next[k];
+    }
+    writeLS(PROMPT_CACHE_KEY, JSON.stringify(next));
+    set({ promptCache: next });
+  },
+  showToast: (text, tone = 'info') => {
+    toastSeq += 1;
+    const id = toastSeq;
+    set({ toast: { id, text, tone } });
+    window.setTimeout(() => get().clearToast(id), tone === 'err' ? 4200 : 2400);
+  },
+  clearToast: (id) => set((s) => (s.toast?.id === id ? { toast: null } : s)),
 }));
+
+export function toast(text: string, tone: 'info' | 'err' = 'info') {
+  useWorkbenchStore.getState().showToast(text, tone);
+}

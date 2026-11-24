@@ -1,0 +1,97 @@
+import type { ReactNode, SVGProps } from 'react';
+
+type P = SVGProps<SVGSVGElement> & { size?: number };
+
+function Svg({ size = 14, children, ...rest }: P & { children: ReactNode }) {
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.6}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className="i"
+      aria-hidden="true"
+      {...rest}
+    >
+      {children}
+    </svg>
+  );
+}
+
+export const PAIcon = (p: P) => (
+  <Svg {...p}>
+    <circle cx="12" cy="12" r="3.2" />
+    <path d="M12 3v2.5M12 18.5V21M3 12h2.5M18.5 12H21" />
+  </Svg>
+);
+export const SwarmIcon = (p: P) => (
+  <Svg {...p}>
+    <circle cx="12" cy="12" r="2.2" />
+    <circle cx="5" cy="7" r="1.6" />
+    <circle cx="19" cy="7" r="1.6" />
+    <circle cx="12" cy="20" r="1.6" />
+    <path d="M6.4 8l3.8 2.8M17.6 8l-3.8 2.8M12 14.2v4.2" />
+  </Svg>
+);
+export const DiffIcon = (p: P) => (
+  <Svg {...p}>
+    <path d="M8 4v10M3 9h10M14 18h7" />
+    <circle cx="17" cy="7" r="3" />
+  </Svg>
+);
+export const ArtIcon = (p: P) => (
+  <Svg {...p}>
+    <rect x="3.5" y="4.5" width="17" height="15" rx="2" />
+    <path d="M3.5 9h17M9 9v10.5" />
+  </Svg>
+);
+export const BranchIcon = (p: P) => (
+  <Svg {...p}>
+    <circle cx="6" cy="6" r="2" />
+    <circle cx="6" cy="18" r="2" />
+    <circle cx="18" cy="8" r="2" />
+    <path d="M6 8v8M18 10c0 4-6 3-10 6" />
+  </Svg>
+);
+export const CursorIcon = (p: P) => (
+  <Svg {...p}>
+    <path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z" />
+    <path d="M12 12l8-4.5M12 12v9M12 12L4 7.5" />
+  </Svg>
+);
+export const CardIcon = (p: P) => (
+  <Svg {...p}>
+    <rect x="3.5" y="4.5" width="17" height="15" rx="2.5" />
+    <path d="M14.5 4.5v15" />
+  </Svg>
+);
+export const SteerIcon = (p: P) => (
+  <Svg {...p}>
+    <path d="M13 3L5 14h6l-1 7 8-11h-6z" />
+  </Svg>
+);
+export const SendUpIcon = (p: P) => (
+  <Svg {...p} strokeWidth={2}>
+    <path d="M12 19V5M6 11l6-6 6 6" />
+  </Svg>
+);
+export const CaretIcon = (p: P) => (
+  <Svg size={12} {...p}>
+    <path d="M9 6l6 6-6 6" />
+  </Svg>
+);
+export const MoonIcon = (p: P) => (
+  <Svg {...p}>
+    <path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5z" />
+  </Svg>
+);
+export const SunIcon = (p: P) => (
+  <Svg {...p}>
+    <circle cx="12" cy="12" r="4" />
+    <path d="M12 2.5v2M12 19.5v2M2.5 12h2M19.5 12h2M5.3 5.3l1.4 1.4M17.3 17.3l1.4 1.4M5.3 18.7l1.4-1.4M17.3 6.7l1.4-1.4" />
+  </Svg>
+);

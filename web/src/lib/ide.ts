@@ -119,3 +119,49 @@ export function buildIDEJump(params: {
     line: file && line && line > 0 ? line : undefined,
   };
 }
+
+/** IDE jump to a project's main checkout (default-capability anchor), used where no delivery exists yet. */
+export function buildProjectIDEJump(params: {
+  project: ProjectView;
+  machines: MachineView[];
+  localMachineId: string;
+  worktreePath?: string;
+  worktreeMachineId?: string;
+}): IDEJumpResult | null {
+  const { project, machines, localMachineId, worktreePath, worktreeMachineId } = params;
+  let basePath = '';
+  let targetMachine = '';
+  if (worktreePath && worktreeMachineId) {
+    basePath = worktreePath;
+    targetMachine = worktreeMachineId;
+  } else {
+    const anchor = project.anchors[project.defaultCapability] ?? Object.values(project.anchors).find((a) => a.repoPath);
+    if (!anchor?.repoPath) return null;
+    basePath = anchor.repoPath;
+    targetMachine = anchor.machine;
+  }
+  const proto = project.ideScheme || 'cursor';
+  const fullPath = basePath.replace(/\/+$/, '');
+  const encodedPath = encodeURIPathSegments(fullPath);
+  if (localMachineId && localMachineId === targetMachine) {
+    return { uri: `${proto}://file${encodedPath}`, mode: 'local', targetMachine, targetLabel: '工作目录', resolvedPath: fullPath };
+  }
+  const machineObj = machines.find((m) => m.machineId === targetMachine);
+  const sshHost = machineObj?.sshAlias || machineObj?.tailscaleHost || targetMachine;
+  const uri =
+    proto === 'zed'
+      ? `zed://ssh/${encodeURIComponent(sshHost)}${encodedPath}`
+      : `${proto}://vscode-remote/ssh-remote+${encodeURIComponent(sshHost)}${encodedPath}`;
+  return { uri, mode: 'ssh', targetMachine, targetLabel: '工作目录', resolvedPath: fullPath };
+}
+
+/** Hands a custom-scheme IDE URI to the OS without leaving the SPA. */
+export function launchIDE(uri: string) {
+  const a = document.createElement('a');
+  a.href = uri;
+  a.rel = 'noopener noreferrer';
+  a.style.display = 'none';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
