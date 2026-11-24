@@ -16,15 +16,13 @@ import {
   type ViewType,
 } from 'react-diff-view';
 import { ArrowUpRight } from 'lucide-react';
-import type { AnnotationView, BootstrapResponse, DiffFileStat } from '../generated/protocol';
-import { DiffIcon } from '../components/Icons';
-import { useDelivery, useTimeline } from '../hooks/queries';
+import type { AnnotationView, BootstrapResponse, DiffFileStat, TaskTimelineResponse } from '../generated/protocol';
+import { useDelivery } from '../hooks/queries';
 import { api, errMsg, makeIdempotencyKey } from '../lib/api';
 import { shortSha } from '../lib/format';
 import { buildIDEJump, launchIDE } from '../lib/ide';
 import { tokenizeHunksWithShiki } from '../lib/shikiDiff';
-import { toast, useWorkbenchStore, type WinState } from '../store/useWorkbenchStore';
-import { FloatingWindow } from './FloatingWindow';
+import { toast, useWorkbenchStore } from '../store/useWorkbenchStore';
 
 const CODE_KINDS = new Set(['code_diff', 'mixed', 'workspace_snapshot']);
 
@@ -68,16 +66,28 @@ function isDiffAnnotation(a: AnnotationView) {
   return a.source !== 'ryugi';
 }
 
-function CodeReviewInner({ w, boot }: { w: WinState; boot: BootstrapResponse }) {
+export function CodeReviewPane({
+  taskId,
+  deliveryId,
+  onSelectDelivery,
+  tl,
+  boot,
+  onClose,
+}: {
+  taskId: string;
+  deliveryId: string;
+  onSelectDelivery: (id: string) => void;
+  tl?: TaskTimelineResponse;
+  boot: BootstrapResponse;
+  onClose: () => void;
+}) {
   const qc = useQueryClient();
   const theme = useWorkbenchStore((s) => s.theme);
   const localMachineId = useWorkbenchStore((s) => s.localMachineId);
-  const close = useWorkbenchStore((s) => s.closeWindow);
-  const deselectedArr = useWorkbenchStore((s) => s.deselectedAnnotations[w.taskId]);
+  const deselectedArr = useWorkbenchStore((s) => s.deselectedAnnotations[taskId]);
   const toggleAnnSelected = useWorkbenchStore((s) => s.toggleAnnotationSelected);
   const clearDeselected = useWorkbenchStore((s) => s.clearDeselectedAnnotations);
   const deselected = useMemo(() => new Set(deselectedArr ?? []), [deselectedArr]);
-  const [deliveryId, setDeliveryId] = useState(w.deliveryId);
   const [file, setFile] = useState('');
   const [viewType, setViewType] = useState<ViewType>('unified');
   const [draft, setDraft] = useState<LineDraft | null>(null);
@@ -86,27 +96,30 @@ function CodeReviewInner({ w, boot }: { w: WinState; boot: BootstrapResponse }) 
   const [verifiedSite, setVerifiedSite] = useState(false);
   const [lastLine, setLastLine] = useState<{ path: string; line?: number } | null>(null);
 
-  useEffect(() => setDeliveryId(w.deliveryId), [w.deliveryId]);
   useEffect(() => {
     setFile('');
     setDraft(null);
     setBody('');
   }, [deliveryId]);
 
-  const tl = useTimeline(w.taskId);
-  const versions = (tl.data?.deliveries ?? []).filter((d) => CODE_KINDS.has(d.kind));
-  const dq = useDelivery(deliveryId);
+  const versions = (tl?.deliveries ?? []).filter((d) => CODE_KINDS.has(d.kind));
+  const effectiveDeliveryId =
+    versions.some((v) => v.deliveryId === deliveryId)
+      ? deliveryId
+      : versions[versions.length - 1]?.deliveryId ?? deliveryId;
+
+  const dq = useDelivery(effectiveDeliveryId);
   const detail = dq.data;
   const files = detail?.diffFiles ?? [];
   const activeFile = (file && files.some((f) => f.path === file) ? file : files[0]?.path) || '';
-  const lastAtt = tl.data?.attempts?.[tl.data.attempts.length - 1];
-  const needsVerifyAttemptId = !tl.data?.task.activeAttemptId && lastAtt?.state === 'needs_verification' ? lastAtt.attemptId : undefined;
+  const lastAtt = tl?.attempts?.[tl.attempts.length - 1];
+  const needsVerifyAttemptId = !tl?.task.activeAttemptId && lastAtt?.state === 'needs_verification' ? lastAtt.attemptId : undefined;
   useEffect(() => setVerifiedSite(false), [needsVerifyAttemptId]);
 
   const diffQ = useQuery({
-    queryKey: ['delivery-diff', deliveryId, activeFile],
-    queryFn: () => api.getDeliveryDiff(deliveryId, activeFile || undefined),
-    enabled: !!deliveryId && !!activeFile,
+    queryKey: ['delivery-diff', effectiveDeliveryId, activeFile],
+    queryFn: () => api.getDeliveryDiff(effectiveDeliveryId, activeFile || undefined),
+    enabled: !!effectiveDeliveryId && !!activeFile,
   });
   const parsed = useMemo<FileData | null>(() => {
     const text = diffQ.data?.diffText ?? '';
@@ -133,9 +146,9 @@ function CodeReviewInner({ w, boot }: { w: WinState; boot: BootstrapResponse }) 
   const annotations = (detail?.annotations ?? []).filter(isDiffAnnotation);
   const openAnns = annotations.filter((a) => a.status === 'open');
   const localSelectedIds = openAnns.filter((a) => !deselected.has(a.annotationId)).map((a) => a.annotationId);
-  const { selDiffIds, selRyugiIds, combinedSelectedIds, allOpenDiffCount, allOpenRyugiCount } = useMemo(() => {
+  const { selDiffIds, selRyugiIds, combinedSelectedIds } = useMemo(() => {
     const byId = new Map<string, AnnotationView>();
-    for (const a of tl.data?.annotations ?? []) byId.set(a.annotationId, a);
+    for (const a of tl?.annotations ?? []) byId.set(a.annotationId, a);
     for (const a of detail?.annotations ?? []) byId.set(a.annotationId, a);
     const allOpen = [...byId.values()].filter((a) => a.status === 'open');
     const openDiff = allOpen.filter(isDiffAnnotation);
@@ -146,15 +159,13 @@ function CodeReviewInner({ w, boot }: { w: WinState; boot: BootstrapResponse }) 
       selDiffIds: diffIds,
       selRyugiIds: ryugiIds,
       combinedSelectedIds: [...diffIds, ...ryugiIds],
-      allOpenDiffCount: openDiff.length,
-      allOpenRyugiCount: openRyugi.length,
     };
-  }, [tl.data?.annotations, detail?.annotations, deselected]);
+  }, [tl?.annotations, detail?.annotations, deselected]);
   const fileAnns = annotations.filter((a) => a.anchor.path === activeFile);
 
   const refresh = () => {
     void qc.invalidateQueries({ queryKey: ['delivery'] });
-    void qc.invalidateQueries({ queryKey: ['task-timeline', w.taskId] });
+    void qc.invalidateQueries({ queryKey: ['task-timeline', taskId] });
   };
 
   const create = useMutation({
@@ -187,21 +198,15 @@ function CodeReviewInner({ w, boot }: { w: WinState; boot: BootstrapResponse }) 
 
   const dispatch = useMutation({
     mutationFn: (ids: string[]) =>
-      api.dispatchAnnotations(w.taskId, {
+      api.dispatchAnnotations(taskId, {
         annotationIds: ids,
         mode: 'queue',
         verifiedSite: needsVerifyAttemptId ? verifiedSite : undefined,
         verifiedAttemptId: needsVerifyAttemptId,
       }),
     onSuccess: (res) => {
-      toast(
-        res.pendingInput
-          ? `已打包 ${res.queuedCount} 条批注 → 待消费队列`
-          : res.attempt
-            ? `已打包 ${res.queuedCount} 条批注 → 会话空闲，直接开始新一轮`
-            : `已打包 ${res.queuedCount} 条批注`,
-      );
-      clearDeselected(w.taskId);
+      toast(res.pendingInput ? `已送入队列（${res.queuedCount} 条批注）` : `已发给会话（${res.queuedCount} 条批注）`);
+      clearDeselected(taskId);
       setVerifiedSite(false);
       refresh();
       void qc.invalidateQueries({ queryKey: ['bootstrap'] });
@@ -210,7 +215,7 @@ function CodeReviewInner({ w, boot }: { w: WinState; boot: BootstrapResponse }) 
   });
 
   const complete = useMutation({
-    mutationFn: () => api.completeDeliveryReview(deliveryId),
+    mutationFn: () => api.completeDeliveryReview(effectiveDeliveryId),
     onSuccess: () => {
       toast('已标记审阅完成');
       void qc.invalidateQueries({ queryKey: ['bootstrap'] });
@@ -265,11 +270,11 @@ function CodeReviewInner({ w, boot }: { w: WinState; boot: BootstrapResponse }) 
         <div className="cmsaved" key={a.annotationId}>
           <span className="who">行评</span>
           <span style={{ whiteSpace: 'pre-wrap', minWidth: 0 }}>{a.body}</span>
-          <span className="stt">{a.status === 'open' ? '未决' : a.status === 'queued' ? '已入队' : a.status}</span>
+          <span className="stt">{a.status === 'open' ? '未发' : a.status === 'queued' ? '已入队' : a.status}</span>
         </div>,
       );
     }
-    if (draft && draft.deliveryId === deliveryId && draft.path === activeFile) {
+    if (draft && draft.deliveryId === effectiveDeliveryId && draft.path === activeFile) {
       (map[draft.changeKey] ??= []).push(
         <div className="cmbox" key="__draft">
           <div className="loc mono">
@@ -302,7 +307,7 @@ function CodeReviewInner({ w, boot }: { w: WinState; boot: BootstrapResponse }) 
               取消
             </button>
             <button type="button" className="btn pri" disabled={!body.trim() || create.isPending} onClick={() => create.mutate({ d: draft, body: body.trim() })}>
-              保存行评
+              保存
             </button>
           </div>
         </div>,
@@ -311,7 +316,7 @@ function CodeReviewInner({ w, boot }: { w: WinState; boot: BootstrapResponse }) 
     const out: Record<string, ReactNode> = {};
     for (const [k, nodes] of Object.entries(map)) out[k] = <div className="cmrow">{nodes}</div>;
     return out;
-  }, [parsed, fileAnns, draft, body, deliveryId, activeFile, create]);
+  }, [parsed, fileAnns, draft, body, effectiveDeliveryId, activeFile, create]);
 
   const renderGutter = ({ change, side, renderDefault }: GutterOptions) => {
     const ln = side === 'old' ? computeOldLineNumber(change) : computeNewLineNumber(change);
@@ -354,89 +359,36 @@ function CodeReviewInner({ w, boot }: { w: WinState; boot: BootstrapResponse }) 
           line: lastLine?.line,
         })
       : null;
-  const vIdx = versions.findIndex((v) => v.deliveryId === deliveryId);
   const d = detail?.delivery;
   const annCount = (p: string) => annotations.filter((a) => a.anchor.path === p).length;
 
   return (
-    <FloatingWindow
-      kind="cr"
-      icon={<DiffIcon />}
-      title="Code Review"
-      width="min(920px, calc(100vw - 340px))"
-      height="min(640px, calc(100vh - 90px))"
-      subtitle={
-        d ? (
-          <span className="mono">
-            {shortSha(d.baseSha)} → {shortSha(d.headSha)} · {d.manifest.filesChanged} 文件 <span className="add">+{d.manifest.insertions}</span>{' '}
-            <span className="del">−{d.manifest.deletions}</span>
-          </span>
-        ) : (
-          '载入中…'
-        )
-      }
-      actions={
-        ide ? (
-          <button type="button" className="btn ghost" onClick={() => launchIDE(ide.uri)} title={ide.resolvedPath}>
-            <ArrowUpRight size={13} strokeWidth={1.6} /> 在 Cursor 打开
-          </button>
-        ) : null
-      }
-      footer={
-        <>
-          <span className="l">
-            {allOpenDiffCount + allOpenRyugiCount > 0
-              ? `任务已选 ${combinedSelectedIds.length} 条未决批注（Diff ${selDiffIds.length}/${allOpenDiffCount}${allOpenRyugiCount > 0 ? ` · Ryugi ${selRyugiIds.length}/${allOpenRyugiCount}` : ''}）`
-              : '点代码行号留行评；攒好后可与 Ryugi 画布批注合并送进会话'}
-          </span>
-          <span className="r">
-            {needsVerifyAttemptId && (
-              <label style={{ display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 12, color: 'var(--warn)', marginRight: 4, cursor: 'pointer' }}>
-                <input type="checkbox" checked={verifiedSite} onChange={(e) => setVerifiedSite(e.target.checked)} />
-                <span>已核对现场</span>
-              </label>
-            )}
-            <button type="button" className="btn" disabled={complete.isPending || !d} onClick={() => complete.mutate()}>
-              标记审阅完成
-            </button>
-            {selRyugiIds.length > 0 && localSelectedIds.length > 0 && (
-              <button
-                type="button"
-                className="btn ghost"
-                disabled={dispatch.isPending || (!!needsVerifyAttemptId && !verifiedSite)}
-                onClick={() => dispatch.mutate(localSelectedIds)}
-              >
-                仅发本窗 ({localSelectedIds.length})
-              </button>
-            )}
-            <button
-              type="button"
-              className="btn pri"
-              disabled={combinedSelectedIds.length === 0 || dispatch.isPending || (!!needsVerifyAttemptId && !verifiedSite)}
-              onClick={() => dispatch.mutate(combinedSelectedIds)}
-            >
-              {selDiffIds.length > 0 && selRyugiIds.length > 0
-                ? `合并打包 ${combinedSelectedIds.length} 条（Diff ${selDiffIds.length} + Ryugi ${selRyugiIds.length}）→ 入队`
-                : `打包 ${combinedSelectedIds.length} 条批注 → 送入待消费队列`}
-            </button>
-          </span>
-        </>
-      }
-    >
+    <>
       <div className="vtabs">
         {versions.map((v, i) => (
-          <button type="button" key={v.deliveryId} className={v.deliveryId === deliveryId ? 'on' : ''} onClick={() => setDeliveryId(v.deliveryId)}>
+          <button
+            type="button"
+            key={v.deliveryId}
+            className={v.deliveryId === effectiveDeliveryId ? 'on' : ''}
+            onClick={() => onSelectDelivery(v.deliveryId)}
+          >
             v{i + 1}
             <span className="mono faint">{shortSha(v.headSha)}</span>
-            {v.lateArrival && <span className="faint"> (迟到档案)</span>}
+            {v.lateArrival && <span className="faint"> (迟到)</span>}
           </button>
         ))}
-        {vIdx < 0 && d && (
-          <button type="button" className="on">
-            {d.kind} <span className="mono faint">{shortSha(d.headSha)}</span>
-          </button>
+        {d && (
+          <span className="mono faint" style={{ marginLeft: 4 }}>
+            {d.manifest.filesChanged} 文件 <span className="add">+{d.manifest.insertions}</span>{' '}
+            <span className="del">−{d.manifest.deletions}</span>
+          </span>
         )}
         <span className="sp" />
+        {ide && (
+          <button type="button" className="btn ghost" onClick={() => launchIDE(ide.uri)} title={ide.resolvedPath}>
+            <ArrowUpRight size={13} strokeWidth={1.6} /> Cursor
+          </button>
+        )}
         <div className="seg">
           <button type="button" className={viewType === 'unified' ? 'on' : ''} onClick={() => setViewType('unified')}>
             Unified
@@ -446,6 +398,7 @@ function CodeReviewInner({ w, boot }: { w: WinState; boot: BootstrapResponse }) 
           </button>
         </div>
       </div>
+
       <div className="cr-body">
         <div className="ftree">
           {dq.isLoading && <div className="fdir">载入文件…</div>}
@@ -464,7 +417,7 @@ function CodeReviewInner({ w, boot }: { w: WinState; boot: BootstrapResponse }) 
                   title={f.path}
                 >
                   <span className="fn">{f.path.split('/').pop()}</span>
-                  {annCount(f.path) > 0 && <span className="cc">●{annCount(f.path)}</span>}
+                  {annCount(f.path) > 0 && <span className="cc">●</span>}
                   <span className="fs mono">
                     {f.binary ? (
                       <span className="faint">bin</span>
@@ -480,13 +433,13 @@ function CodeReviewInner({ w, boot }: { w: WinState; boot: BootstrapResponse }) 
           ))}
           {openAnns.length > 0 && (
             <div className="pend">
-              <div className="fdir">未决行评 · 勾选后打包</div>
+              <div className="fdir">待发送行评</div>
               {openAnns.map((a) => (
                 <label className="pend-i" key={a.annotationId}>
                   <input
                     type="checkbox"
                     checked={!deselected.has(a.annotationId)}
-                    onChange={(e) => toggleAnnSelected(w.taskId, a.annotationId, e.target.checked)}
+                    onChange={(e) => toggleAnnSelected(taskId, a.annotationId, e.target.checked)}
                   />
                   <span style={{ minWidth: 0 }}>
                     <span className="loc mono">
@@ -500,7 +453,14 @@ function CodeReviewInner({ w, boot }: { w: WinState; boot: BootstrapResponse }) 
           )}
         </div>
         <div className="diffpane orbit-diff">
-          {files.length === 0 && !dq.isLoading ? (
+          {dq.isError ? (
+            <div className="empty bad-t">
+              载入交付失败：{errMsg(dq.error)}{' '}
+              <button type="button" className="btn ghost" onClick={onClose}>
+                关闭
+              </button>
+            </div>
+          ) : files.length === 0 && !dq.isLoading ? (
             <div className="empty">这次交付相对基线没有文本差异</div>
           ) : (
             <>
@@ -529,20 +489,45 @@ function CodeReviewInner({ w, boot }: { w: WinState; boot: BootstrapResponse }) 
           )}
         </div>
       </div>
-      {dq.isError && (
-        <div className="empty bad-t">
-          载入交付失败：{errMsg(dq.error)}{' '}
-          <button type="button" className="btn ghost" onClick={() => close('cr')}>
-            关闭
-          </button>
-        </div>
-      )}
-    </FloatingWindow>
-  );
-}
 
-export function CodeReviewWindow({ boot }: { boot: BootstrapResponse }) {
-  const w = useWorkbenchStore((s) => s.windows.cr);
-  if (!w) return null;
-  return <CodeReviewInner w={w} boot={boot} />;
+      <div className="wf">
+        <span className="l">
+          {combinedSelectedIds.length > 0
+            ? `已选 ${combinedSelectedIds.length} 条批注`
+            : '点行号留行评，攒好后一次送进右侧会话'}
+        </span>
+        <span className="r">
+          {needsVerifyAttemptId && (
+            <label className="chk" style={{ color: 'var(--warn)', marginRight: 4 }}>
+              <input type="checkbox" checked={verifiedSite} onChange={(e) => setVerifiedSite(e.target.checked)} />
+              已核对现场
+            </label>
+          )}
+          <button type="button" className="btn" disabled={complete.isPending || !d} onClick={() => complete.mutate()}>
+            审阅完成
+          </button>
+          {selRyugiIds.length > 0 && localSelectedIds.length > 0 && (
+            <button
+              type="button"
+              className="btn ghost"
+              disabled={dispatch.isPending || (!!needsVerifyAttemptId && !verifiedSite)}
+              onClick={() => dispatch.mutate(localSelectedIds)}
+            >
+              仅发代码 ({localSelectedIds.length})
+            </button>
+          )}
+          <button
+            type="button"
+            className="btn pri"
+            disabled={combinedSelectedIds.length === 0 || dispatch.isPending || (!!needsVerifyAttemptId && !verifiedSite)}
+            onClick={() => dispatch.mutate(combinedSelectedIds)}
+          >
+            {selDiffIds.length > 0 && selRyugiIds.length > 0
+              ? `合并发送 ${combinedSelectedIds.length} 条批注`
+              : `发送 ${combinedSelectedIds.length} 条批注`}
+          </button>
+        </span>
+      </div>
+    </>
+  );
 }

@@ -14,8 +14,7 @@ import { ProjectPage } from './pages/ProjectPage';
 import { ProjectsListPage } from './pages/ProjectsListPage';
 import { SessionPage } from './session/SessionPage';
 import { applyThemeToDocument, useWorkbenchStore } from './store/useWorkbenchStore';
-import { ArtifactsWindow } from './windows/ArtifactsWindow';
-import { CodeReviewWindow } from './windows/CodeReviewWindow';
+import { ReviewOverlay } from './windows/ReviewOverlay';
 
 function Toast() {
   const t = useWorkbenchStore((s) => s.toast);
@@ -27,7 +26,7 @@ function Toast() {
   );
 }
 
-/** Esc walks back one layer at a time: ⌘K → popover → top floating window → worker drill → board → mobile dock. */
+/** Esc walks back one layer at a time: ⌘K → popover → review overlay → worker drill → board → mobile dock. */
 function useGlobalKeys() {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -55,8 +54,8 @@ function useGlobalKeys() {
         s.setCmdkOpen(false);
       } else if (s.machinesOpen) {
         s.setMachinesOpen(false);
-      } else if (s.winOrder.length > 0) {
-        s.closeWindow(s.winOrder[s.winOrder.length - 1]);
+      } else if (s.review) {
+        s.closeReview();
       } else if (route.name === 'session' && route.worker) {
         navigate(paths.session(route.taskId));
       } else if (s.boardOpen && route.name === 'session') {
@@ -149,10 +148,9 @@ export function App() {
       <div className={`app ${collapsed ? 'side-collapsed' : ''}`}>
         <Sidebar boot={boot} route={route} />
         {page}
-        <MobileTabs route={route} inboxCount={boot.openInboxItems.length} />
+        <MobileTabs route={route} hasAttention={boot.openInboxItems.length > 0} />
       </div>
-      <CodeReviewWindow boot={boot} />
-      <ArtifactsWindow />
+      <ReviewOverlay boot={boot} />
       {cmdkOpen && <CommandPalette boot={boot} />}
       {machinesOpen && <MachinesPopover machines={boot.machines} />}
       <Toast />

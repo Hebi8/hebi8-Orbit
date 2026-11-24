@@ -3,13 +3,12 @@ import type { IDEScheme } from '../generated/protocol';
 
 export type ThemeMode = 'dark' | 'light';
 export type WSConnectionStatus = 'connecting' | 'live' | 'reconnecting';
-export type WinKind = 'cr' | 'art';
+export type ReviewTab = 'code' | 'art';
 
-export interface WinState {
+export interface ReviewState {
   taskId: string;
   deliveryId: string;
-  x: number;
-  y: number;
+  tab: ReviewTab;
 }
 
 export interface ToastState {
@@ -45,12 +44,18 @@ function readJSON<T>(key: string, fallback: T): T {
 
 const PROMPT_CACHE_KEY = 'orbit.promptCache';
 const PROMPT_CACHE_MAX = 400;
+const REVIEW_RATIO_MIN = 36;
+const REVIEW_RATIO_MAX = 78;
 
 export function applyThemeToDocument(mode: ThemeMode) {
   document.documentElement.setAttribute('data-mode', mode);
 }
 
 const initialTheme: ThemeMode = readLS('orbit.theme', 'dark') === 'light' ? 'light' : 'dark';
+const initialRatio = (() => {
+  const n = Number(readLS('orbit.reviewRatio', '64'));
+  return Number.isFinite(n) ? Math.min(REVIEW_RATIO_MAX, Math.max(REVIEW_RATIO_MIN, n)) : 64;
+})();
 
 interface WorkbenchState {
   theme: ThemeMode;
@@ -60,8 +65,9 @@ interface WorkbenchState {
   mobileDockOpen: boolean;
   cmdkOpen: boolean;
   machinesOpen: boolean;
-  windows: Partial<Record<WinKind, WinState>>;
-  winOrder: WinKind[];
+  review: ReviewState | null;
+  reviewRatio: number;
+  reviewSessionHidden: boolean;
   wsStatus: WSConnectionStatus;
   lastSeq: number;
   localMachineId: string;
@@ -78,10 +84,12 @@ interface WorkbenchState {
   setMobileDockOpen: (open: boolean) => void;
   setCmdkOpen: (open: boolean) => void;
   setMachinesOpen: (open: boolean) => void;
-  openWindow: (kind: WinKind, taskId: string, deliveryId: string) => void;
-  closeWindow: (kind: WinKind) => void;
-  focusWindow: (kind: WinKind) => void;
-  moveWindow: (kind: WinKind, x: number, y: number) => void;
+  openReview: (tab: ReviewTab, taskId: string, deliveryId: string) => void;
+  closeReview: () => void;
+  setReviewTab: (tab: ReviewTab) => void;
+  setReviewDelivery: (deliveryId: string) => void;
+  setReviewRatio: (ratio: number) => void;
+  setReviewSessionHidden: (hidden: boolean) => void;
   setWSStatus: (status: WSConnectionStatus) => void;
   setLastSeq: (seq: number) => void;
   setLocalMachineId: (machineId: string) => void;
@@ -103,8 +111,9 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
   mobileDockOpen: false,
   cmdkOpen: false,
   machinesOpen: false,
-  windows: {},
-  winOrder: [],
+  review: null,
+  reviewRatio: initialRatio,
+  reviewSessionHidden: false,
   wsStatus: 'connecting',
   lastSeq: 0,
   localMachineId: readLS('orbit.localMachineId', ''),
@@ -133,32 +142,23 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
   setMobileDockOpen: (open) => set({ mobileDockOpen: open }),
   setCmdkOpen: (open) => set({ cmdkOpen: open, machinesOpen: false }),
   setMachinesOpen: (open) => set({ machinesOpen: open }),
-  openWindow: (kind, taskId, deliveryId) =>
-    set((s) => {
-      const prev = s.windows[kind];
-      // Default to the left so the right-hand floating card stays reachable; the second window cascades.
-      const other = kind === 'cr' ? s.windows.art : s.windows.cr;
-      const base = kind === 'cr' ? { x: 24, y: 56 } : { x: 64, y: 96 };
-      const defaults = other && other.x === base.x && other.y === base.y ? { x: base.x + 40, y: base.y + 40 } : base;
-      return {
-        windows: { ...s.windows, [kind]: { taskId, deliveryId, x: prev?.x ?? defaults.x, y: prev?.y ?? defaults.y } },
-        winOrder: [...s.winOrder.filter((k) => k !== kind), kind],
-      };
+  openReview: (tab, taskId, deliveryId) =>
+    set({
+      review: { taskId, deliveryId, tab },
+      cmdkOpen: false,
+      machinesOpen: false,
     }),
-  closeWindow: (kind) =>
-    set((s) => {
-      const next = { ...s.windows };
-      delete next[kind];
-      return { windows: next, winOrder: s.winOrder.filter((k) => k !== kind) };
-    }),
-  focusWindow: (kind) =>
-    set((s) => (s.winOrder[s.winOrder.length - 1] === kind ? s : { winOrder: [...s.winOrder.filter((k) => k !== kind), kind] })),
-  moveWindow: (kind, x, y) =>
-    set((s) => {
-      const w = s.windows[kind];
-      if (!w) return s;
-      return { windows: { ...s.windows, [kind]: { ...w, x, y } } };
-    }),
+  closeReview: () => set({ review: null }),
+  setReviewTab: (tab) =>
+    set((s) => (s.review ? { review: { ...s.review, tab } } : s)),
+  setReviewDelivery: (deliveryId) =>
+    set((s) => (s.review ? { review: { ...s.review, deliveryId } } : s)),
+  setReviewRatio: (ratio) => {
+    const clamped = Math.min(REVIEW_RATIO_MAX, Math.max(REVIEW_RATIO_MIN, Math.round(ratio)));
+    writeLS('orbit.reviewRatio', String(clamped));
+    set({ reviewRatio: clamped });
+  },
+  setReviewSessionHidden: (hidden) => set({ reviewSessionHidden: hidden }),
   setWSStatus: (wsStatus) => set({ wsStatus }),
   setLastSeq: (lastSeq) => set({ lastSeq }),
   setLocalMachineId: (machineId) => {

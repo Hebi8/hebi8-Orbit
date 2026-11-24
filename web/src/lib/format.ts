@@ -2,6 +2,7 @@ import type {
   ApprovalState,
   AttemptState,
   BoardMemberState,
+  InboxItemView,
   PendingInputSource,
   ProjectView,
   TaskState,
@@ -45,50 +46,62 @@ export function todayLabel(): { greet: string; date: string } {
   return { greet, date };
 }
 
-export function taskDot(state: TaskState, attemptState?: AttemptState | null): string {
-  if (attemptState === 'needs_verification') return 'block';
-  switch (state) {
-    case 'running':
-      return 'run';
-    case 'queued':
-      return 'run';
-    case 'waiting_resource':
-    case 'waiting_approval':
-      return 'wait';
-    case 'in_review':
-      return 'rev';
-    case 'failed':
-      return 'block';
-    case 'done':
-    case 'cancelled':
-      return 'done';
-    default:
-      return '';
+export type SimpleSessionState = 'attention' | 'running' | 'finished';
+
+/**
+ * Low-stimulus 3-state session rollup:
+ *   attention (需要注意) > running (运行中) > finished (已结束).
+ * Mirrors Lody LAN fork's low-stimulus model: one row, one mark, no count bombardment.
+ */
+export function taskSimpleState(
+  t: Pick<TaskSummary, 'state' | 'activeAttemptState'>,
+  hasOpenInbox = false,
+): SimpleSessionState {
+  if (
+    hasOpenInbox ||
+    t.activeAttemptState === 'needs_verification' ||
+    t.state === 'waiting_approval' ||
+    t.state === 'waiting_resource' ||
+    t.state === 'in_review' ||
+    t.state === 'failed'
+  ) {
+    return 'attention';
   }
+  if (t.state === 'running' || t.state === 'queued') {
+    return 'running';
+  }
+  return 'finished';
 }
 
-export function taskStateLabel(t: Pick<TaskSummary, 'state' | 'activeAttemptState' | 'waitingReason'>): string {
-  if (t.activeAttemptState === 'needs_verification') return '待核对现场';
-  if (t.activeAttemptState === 'swarm_monitoring') return 'Swarm 协作中';
-  switch (t.state) {
-    case 'queued':
-      return '排队启动';
-    case 'running':
-      return '运行中';
-    case 'waiting_resource':
-      return t.waitingReason ? t.waitingReason : '等待资源';
-    case 'waiting_approval':
-      return t.waitingReason ? t.waitingReason : '等待审批';
-    case 'in_review':
-      return '待审阅';
-    case 'done':
-      return '已完成';
-    case 'failed':
-      return '失败';
-    case 'cancelled':
-      return '已取消';
+export function taskSimpleLabel(s: SimpleSessionState): string {
+  if (s === 'attention') return '需要注意';
+  if (s === 'running') return '运行中';
+  return '已结束';
+}
+
+export function taskSimpleDot(s: SimpleSessionState): string {
+  if (s === 'attention') return 'wait';
+  if (s === 'running') return 'run';
+  return 'done';
+}
+
+export function attentionTaskIds(items: InboxItemView[]): Set<string> {
+  const set = new Set<string>();
+  for (const it of items) {
+    if (it.taskId) set.add(it.taskId);
   }
-  return t.state;
+  return set;
+}
+
+export function taskDot(state: TaskState, attemptState?: AttemptState | null, hasOpenInbox = false): string {
+  return taskSimpleDot(taskSimpleState({ state, activeAttemptState: attemptState }, hasOpenInbox));
+}
+
+export function taskStateLabel(
+  t: Pick<TaskSummary, 'state' | 'activeAttemptState' | 'waitingReason'>,
+  hasOpenInbox = false,
+): string {
+  return taskSimpleLabel(taskSimpleState(t, hasOpenInbox));
 }
 
 export function isTaskActive(t: Pick<TaskSummary, 'state'>): boolean {

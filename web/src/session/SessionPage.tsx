@@ -1,22 +1,18 @@
-import { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { ArrowLeft, ChevronDown, Link2 } from 'lucide-react';
-import type { BootstrapResponse, PendingInput } from '../generated/protocol';
-import { BranchIcon, CardIcon, CursorIcon, SwarmIcon } from '../components/Icons';
+import type { BootstrapResponse } from '../generated/protocol';
+import { BranchIcon, CardIcon, CursorIcon, DiffIcon, SwarmIcon } from '../components/Icons';
 import { PageHeader } from '../components/PageHeader';
 import { useBoard, useTimeline } from '../hooks/queries';
 import { api, errMsg } from '../lib/api';
-import { SCRATCH_PROJECT_ID, basename, memberStateLabel, shortSha, taskStateLabel, taskTitle } from '../lib/format';
+import { SCRATCH_PROJECT_ID, attentionTaskIds, basename, memberStateLabel, shortSha, taskStateLabel, taskTitle } from '../lib/format';
 import { buildIDEJump, buildProjectIDEJump, launchIDE } from '../lib/ide';
 import { navigate, paths } from '../lib/router';
 import { toast, useWorkbenchStore } from '../store/useWorkbenchStore';
 import { BoardPanel } from './BoardPanel';
-import { Composer } from './Composer';
-import { Minimap } from './Minimap';
-import { QueueBubbles } from './QueueBubbles';
 import { RightCard } from './RightCard';
-import { Turn } from './Turn';
-import { WorkerStream } from './WorkerStream';
+import { SessionConversation } from './SessionConversation';
 
 const CODE_KINDS = new Set(['code_diff', 'mixed', 'workspace_snapshot']);
 
@@ -44,7 +40,7 @@ function BindMenu({ boot, taskId }: { boot: BootstrapResponse; taskId: string })
         <>
           <div className="scrim" style={{ background: 'transparent', backdropFilter: 'none', zIndex: 49 }} onClick={() => setOpen(false)} />
           <div className="menu" style={{ top: 28, left: 0 }}>
-            <div className="mh">把这个自由 Chat 迁移为项目线程</div>
+            <div className="mh">迁移为项目线程</div>
             {projects.map((p) => (
               <button type="button" key={p.projectId} disabled={bind.isPending} onClick={() => bind.mutate(p.projectId)}>
                 <span className="pl">{p.displayName.slice(0, 1)}</span>
@@ -72,27 +68,20 @@ export function SessionPage({ boot, taskId, worker }: { boot: BootstrapResponse;
   const setCardOpen = useWorkbenchStore((s) => s.setRightCardOpen);
   const mobileDock = useWorkbenchStore((s) => s.mobileDockOpen);
   const setMobileDock = useWorkbenchStore((s) => s.setMobileDockOpen);
-  const remember = useWorkbenchStore((s) => s.rememberPrompt);
   const expandedProjects = useWorkbenchStore((s) => s.expandedProjects);
   const setProjectExpanded = useWorkbenchStore((s) => s.setProjectExpanded);
   const localMachineId = useWorkbenchStore((s) => s.localMachineId);
+  const openReview = useWorkbenchStore((s) => s.openReview);
 
   const members = tl?.boardMembers ?? [];
   const hasSwarm = members.length > 0 || (task?.workerCount ?? 0) > 0;
   const boardQ = useBoard(taskId, hasSwarm || boardOpen || !!worker);
-  const [editing, setEditing] = useState<PendingInput | null>(null);
-  const stageRef = useRef<HTMLDivElement | null>(null);
-  const tlRef = useRef<HTMLDivElement | null>(null);
-  const stick = useRef(true);
+  const attentionSet = attentionTaskIds(boot.openInboxItems);
 
-  // Reset transient per-session UI when switching threads.
   useEffect(() => {
-    setEditing(null);
     setMobileDock(false);
-    stick.current = true;
   }, [taskId, setMobileDock]);
 
-  // Drilling into a worker keeps the shared board open for side-by-side comparison.
   useEffect(() => {
     if (worker) setBoardOpen(true);
   }, [worker, setBoardOpen]);
@@ -100,29 +89,6 @@ export function SessionPage({ boot, taskId, worker }: { boot: BootstrapResponse;
   useEffect(() => {
     if (task && !isScratch && expandedProjects[task.projectId] === undefined) setProjectExpanded(task.projectId, true);
   }, [task, isScratch, expandedProjects, setProjectExpanded]);
-
-  // Remember queued bodies so a dispatched follow-up can still show its text after it leaves the queue.
-  useEffect(() => {
-    for (const pi of tl?.pendingInputs ?? []) remember(`inp:${pi.inputId}`, pi.body);
-  }, [tl?.pendingInputs, remember]);
-
-  // Stick-to-bottom while new turns / raw frames stream in.
-  useLayoutEffect(() => {
-    const stage = stageRef.current;
-    const inner = tlRef.current;
-    if (!stage || !inner) return;
-    const ro = new ResizeObserver(() => {
-      if (stick.current) stage.scrollTop = stage.scrollHeight;
-    });
-    ro.observe(inner);
-    return () => ro.disconnect();
-  }, [taskId, worker, !!tl]);
-
-  const onScroll = () => {
-    const el = stageRef.current;
-    if (!el) return;
-    stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 140;
-  };
 
   if (tlq.isError) {
     return (
@@ -150,8 +116,10 @@ export function SessionPage({ boot, taskId, worker }: { boot: BootstrapResponse;
     formalCodeDeliveries.find((d) => d.deliveryId === task.latestDeliveryId) ??
     formalCodeDeliveries[formalCodeDeliveries.length - 1] ??
     codeDeliveries[codeDeliveries.length - 1];
+  const artDelivery = [...tl.deliveries].reverse().find((d) => (d.ryugiBindings?.length ?? 0) > 0);
+  const primaryReview = latestCode ? { tab: 'code' as const, deliveryId: latestCode.deliveryId } : artDelivery ? { tab: 'art' as const, deliveryId: artDelivery.deliveryId } : null;
+
   const lastAttempt = tl.attempts[tl.attempts.length - 1];
-  const needsVerifyAttemptId = !task.activeAttemptId && lastAttempt?.state === 'needs_verification' ? lastAttempt.attemptId : undefined;
   const branchText = latestCode
     ? `${basename(latestCode.manifest.worktreePath) || 'worktree'} · ${shortSha(latestCode.headSha)}`
     : lastAttempt?.worktreePath
@@ -171,13 +139,24 @@ export function SessionPage({ boot, taskId, worker }: { boot: BootstrapResponse;
   const drilledMember = worker ? (boardQ.data?.members ?? members).find((m) => m.memberName === worker) : undefined;
   const showBoardBtn = hasSwarm || boardOpen;
   const dockMode: 'board' | 'card' | null = boardOpen ? 'board' : cardOpen ? 'card' : null;
-  const pendingInputs = [...tl.pendingInputs].sort((a, b) => a.position - b.position || a.createdAt - b.createdAt);
+  const stateLabel = taskStateLabel(task, attentionSet.has(task.taskId));
 
   return (
     <main className="main">
       <PageHeader
         right={
           <>
+            {primaryReview && !worker && (
+              <button
+                type="button"
+                className="hb"
+                title="打开产出审阅（左产物 / 右会话）"
+                onClick={() => openReview(primaryReview.tab, taskId, primaryReview.deliveryId)}
+              >
+                <DiffIcon size={13} />
+                <span className="no-mobile">审阅</span>
+              </button>
+            )}
             {ide && !isScratch && (
               <button type="button" className="ib no-mobile" title={`在 Cursor 打开 · ${ide.targetLabel}`} onClick={() => launchIDE(ide.uri)}>
                 <CursorIcon />
@@ -187,16 +166,14 @@ export function SessionPage({ boot, taskId, worker }: { boot: BootstrapResponse;
               <button
                 type="button"
                 className={`hb ${boardOpen ? 'on' : ''}`}
-                title="共享消息板"
+                title="协作消息板"
                 onClick={() => {
                   setBoardOpen(!boardOpen);
                   setMobileDock(!boardOpen);
                 }}
               >
                 <SwarmIcon />
-                <span className="mono" style={{ fontSize: 11 }}>
-                  {members.length} · #{boardQ.data?.latestSeq ?? 0}
-                </span>
+                <span className="no-mobile">协作</span>
               </button>
             )}
             <button
@@ -263,65 +240,20 @@ export function SessionPage({ boot, taskId, worker }: { boot: BootstrapResponse;
               )
             )}
             <span className="faint no-mobile" style={{ fontSize: 11.5, whiteSpace: 'nowrap' }}>
-              {taskStateLabel(task)}
+              {stateLabel}
             </span>
           </>
         )}
       </PageHeader>
 
       <div className="sess">
-        <div className="sess-body">
-          <div className="stage" ref={stageRef} onScroll={onScroll}>
-            {worker ? (
-              <div ref={tlRef}>
-                <WorkerStream taskId={taskId} worker={worker} member={drilledMember} />
-              </div>
-            ) : (
-              <>
-                <Minimap tl={tl} stageRef={stageRef} />
-                <div className="tl" ref={tlRef}>
-                  {tl.attempts.length === 0 && (
-                    <>
-                      <div className="it u">
-                        <div className="ub">{task.goal}</div>
-                        <div className="umeta">初始目标</div>
-                      </div>
-                      <div className="it running">
-                        <span className="spin" />
-                        <span className="shim">{taskStateLabel(task)}</span>
-                      </div>
-                    </>
-                  )}
-                  {tl.attempts.map((a, i) => (
-                    <Turn
-                      key={a.attemptId}
-                      attempt={a}
-                      index={i}
-                      isLast={i === tl.attempts.length - 1}
-                      tl={tl}
-                      onOpenBoard={() => setBoardOpen(true)}
-                    />
-                  ))}
-                  <QueueBubbles
-                    taskId={taskId}
-                    items={pendingInputs}
-                    busy={!!task.activeAttemptId}
-                    editingId={editing?.inputId ?? null}
-                    onEdit={setEditing}
-                  />
-                </div>
-              </>
-            )}
-          </div>
-          <Composer
-            task={task}
-            worker={worker}
-            members={members}
-            editing={editing}
-            needsVerifyAttemptId={needsVerifyAttemptId}
-            onEditDone={() => setEditing(null)}
-          />
-        </div>
+        <SessionConversation
+          taskId={taskId}
+          tl={tl}
+          worker={worker}
+          drilledMember={drilledMember}
+          onOpenBoard={() => setBoardOpen(true)}
+        />
         {(dockMode || mobileDock) && (
           <div
             className={`dock ${dockMode === 'card' || (!dockMode && mobileDock) ? 'has-card' : ''} ${mobileDock ? 'mobile-open' : ''}`}

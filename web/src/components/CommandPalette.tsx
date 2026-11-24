@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { ArrowUpRight, FolderGit2, LayoutGrid, MessageSquare, Plus, Search, Zap } from 'lucide-react';
 import type { BootstrapResponse, PABriefResponse, PAChatResponse } from '../generated/protocol';
 import { useManyProjectTasks } from '../hooks/queries';
-import { SCRATCH_PROJECT_ID, taskDot, taskStateLabel, taskTitle } from '../lib/format';
+import { SCRATCH_PROJECT_ID, attentionTaskIds, taskDot, taskStateLabel, taskTitle } from '../lib/format';
 import { navigate, paths } from '../lib/router';
 import { useWorkbenchStore } from '../store/useWorkbenchStore';
 import { PAIcon } from './Icons';
@@ -30,6 +30,7 @@ export function CommandPalette({ boot }: { boot: BootstrapResponse }) {
   const tasksBy = useManyProjectTasks(boot.projects);
   const chat = usePAChat((res) => setOut({ kind: 'chat', res }));
   const brief = usePABrief((res) => setOut({ kind: 'brief', res }));
+  const attentionSet = useMemo(() => attentionTaskIds(boot.openInboxItems), [boot.openInboxItems]);
 
   useEffect(() => inputRef.current?.focus(), []);
 
@@ -48,15 +49,15 @@ export function CommandPalette({ boot }: { boot: BootstrapResponse }) {
         group: 'PA',
         icon: <PAIcon />,
         label: `问 PA：${q.trim()}`,
-        detail: '↵ 原地回答',
+        detail: '↵',
         run: () => chat.mutate({ message: q.trim(), threadId: boot.paState.activePaThreadId || undefined }),
       });
     }
     const actions: Item[] = [
-      { key: 'brief', group: '动作', icon: <Zap size={14} strokeWidth={1.6} />, label: 'Brief Me · 过去 24 小时', run: () => brief.mutate() },
+      { key: 'brief', group: '动作', icon: <Zap size={14} strokeWidth={1.6} />, label: 'Brief Me · 今日摘要', run: () => brief.mutate() },
       { key: 'new', group: '动作', icon: <Plus size={14} strokeWidth={1.6} />, label: '新建线程', detail: '⌘N', run: () => go(paths.newThread()) },
       { key: 'home', group: '动作', icon: <LayoutGrid size={14} strokeWidth={1.6} />, label: '打开总览', run: () => go(paths.home()) },
-      { key: 'pa', group: '动作', icon: <PAIcon />, label: '打开 PA 专属页', run: () => go(paths.pa()) },
+      { key: 'pa', group: '动作', icon: <PAIcon />, label: '打开 PA', run: () => go(paths.pa()) },
       { key: 'theme', group: '动作', icon: <Search size={14} strokeWidth={1.6} />, label: '切换深 / 浅色', run: () => toggleTheme() },
     ];
     list.push(...actions.filter((a) => match(a.label)));
@@ -68,7 +69,7 @@ export function CommandPalette({ boot }: { boot: BootstrapResponse }) {
         group: '项目',
         icon: <FolderGit2 size={14} strokeWidth={1.6} />,
         label: p.displayName,
-        detail: p.activeTaskCount ? `${p.activeTaskCount} 活跃` : p.repoIdentity,
+        detail: p.blockedTaskCount > 0 ? '需要注意' : p.activeTaskCount > 0 ? '运行中' : undefined,
         run: () => go(paths.project(p.projectId)),
       });
     }
@@ -80,19 +81,20 @@ export function CommandPalette({ boot }: { boot: BootstrapResponse }) {
       .slice(0, k ? 10 : 6);
     for (const t of threads) {
       const pn = t.projectId === SCRATCH_PROJECT_ID ? '自由 Chat' : boot.projects.find((p) => p.projectId === t.projectId)?.displayName ?? t.projectId;
+      const attn = attentionSet.has(t.taskId);
       list.push({
         key: `t:${t.taskId}`,
         group: k ? '线程' : '最近线程',
-        icon: <span className={`sd ${taskDot(t.state, t.activeAttemptState)}`} style={{ margin: '0 4px' }} />,
+        icon: <span className={`sd ${taskDot(t.state, t.activeAttemptState, attn)}`} style={{ margin: '0 4px' }} />,
         label: `${pn} / ${taskTitle(t)}`,
-        detail: taskStateLabel(t),
+        detail: taskStateLabel(t, attn),
         run: () => go(paths.session(t.taskId)),
       });
     }
     return list;
     // chat/brief mutate fns are stable per hook instance
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [q, boot, tasksBy]);
+  }, [q, boot, tasksBy, attentionSet]);
 
   useEffect(() => setAct(0), [q]);
   const groups: string[] = [];
@@ -108,7 +110,7 @@ export function CommandPalette({ boot }: { boot: BootstrapResponse }) {
           <input
             ref={inputRef}
             value={q}
-            placeholder="问 PA、跳线程，或输入一句话…"
+            placeholder="问 PA、跳线程，或搜索项目…"
             onChange={(e) => setQ(e.target.value)}
             onKeyDown={(e) => {
               if (e.nativeEvent.isComposing) return;
@@ -127,17 +129,12 @@ export function CommandPalette({ boot }: { boot: BootstrapResponse }) {
           />
           <span className="kbd">esc</span>
         </div>
-        <div className="ck-meta">
-          <span className="sd done" style={{ opacity: 1 }} />
-          <span className="mono">旁路只读 · 已同步至 event #{boot.paState.lastReadEventSeq}</span>
-          <span className="r no-mobile">可起草派活 · 不能审批 / 部署</span>
-        </div>
         {(out || chat.isPending || brief.isPending) && (
           <div className="ck-out">
             {chat.isPending || brief.isPending ? (
               <div className="running">
                 <span className="spin" />
-                <span className="shim">{brief.isPending ? '汇总态势…' : 'PA 正在读取增量事件…'}</span>
+                <span className="shim">{brief.isPending ? '汇总中…' : '思考中…'}</span>
               </div>
             ) : out?.kind === 'chat' ? (
               <>
@@ -150,7 +147,7 @@ export function CommandPalette({ boot }: { boot: BootstrapResponse }) {
             {out && (
               <div style={{ marginTop: 10 }}>
                 <button type="button" className="btn" onClick={() => go(paths.pa(threadIdForPA || undefined))}>
-                  在 PA 专属页继续 <ArrowUpRight size={12} strokeWidth={1.6} />
+                  在 PA 页继续 <ArrowUpRight size={12} strokeWidth={1.6} />
                 </button>
               </div>
             )}

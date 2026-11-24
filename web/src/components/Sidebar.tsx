@@ -1,7 +1,9 @@
+import { useMemo } from 'react';
 import { LayoutGrid, PanelLeftClose, Plus } from 'lucide-react';
-import type { BootstrapResponse, ProjectView, TaskSummary } from '../generated/protocol';
+import type { BootstrapResponse, MachineView, ProjectView, TaskSummary } from '../generated/protocol';
 import { useManyProjectTasks } from '../hooks/queries';
-import { SCRATCH_PROJECT_ID, projectInitial, taskDot, taskTitle } from '../lib/format';
+import { useHubLatency } from '../hooks/useHubLatency';
+import { SCRATCH_PROJECT_ID, attentionTaskIds, projectInitial, taskDot, taskStateLabel, taskTitle } from '../lib/format';
 import { navigate, paths, type Route } from '../lib/router';
 import { useWorkbenchStore } from '../store/useWorkbenchStore';
 import { CaretIcon, MoonIcon, PAIcon, SunIcon } from './Icons';
@@ -12,11 +14,54 @@ function mainThreads(tasks: TaskSummary[]): TaskSummary[] {
   return tasks.filter((t) => !t.parentTaskId).sort((a, b) => b.updatedAt - a.updatedAt);
 }
 
-function threadHint(t: TaskSummary): string {
-  if (t.queuedInputCount > 0) return `队列 ${t.queuedInputCount}`;
-  if (t.state === 'in_review') return '待审';
-  if (t.activeAttemptState === 'needs_verification') return '待核对';
-  return '';
+/**
+ * Single current-host footer indicator mirroring Lody LAN fork's sidebar footer +
+ * `LanConnectionIndicator`: shows only the connected host and its live round-trip
+ * latency (or offline/reconnecting), never a fleet strip of every machine on the network.
+ */
+function CurrentHostFooterButton({
+  host,
+  open,
+  onClick,
+}: {
+  host?: MachineView;
+  open: boolean;
+  onClick: () => void;
+}) {
+  const wsStatus = useWorkbenchStore((s) => s.wsStatus);
+  const latency = useHubLatency();
+  const hostName = host?.displayName || host?.machineId || window.location.hostname || 'Hub';
+
+  const unreachable = latency === null || host?.status === 'offline';
+  const degraded = !unreachable && (wsStatus === 'reconnecting' || host?.status === 'degraded');
+  const dotClass = unreachable ? 'block' : degraded ? 'wait' : wsStatus === 'live' ? 'on' : '';
+
+  const statusText = unreachable
+    ? '未连接'
+    : wsStatus === 'reconnecting'
+      ? '重连中'
+      : latency !== undefined
+        ? `${latency} ms`
+        : '';
+  const tooltip = unreachable
+    ? `${hostName} · 未连接`
+    : latency !== undefined
+      ? `${hostName} · ${latency} ms`
+      : hostName;
+
+  return (
+    <button
+      type="button"
+      className={`host-row ${open ? 'on' : ''}`}
+      title={tooltip}
+      aria-label={tooltip}
+      onClick={onClick}
+    >
+      <span className={`sd ${dotClass}`} />
+      <span className="hn ell">{hostName}</span>
+      {statusText && <span className={`hl ${unreachable ? 'bad-t' : degraded ? 'warn-t' : ''}`}>{statusText}</span>}
+    </button>
+  );
 }
 
 export function Sidebar({ boot, route }: { boot: BootstrapResponse; route: Route }) {
@@ -27,6 +72,7 @@ export function Sidebar({ boot, route }: { boot: BootstrapResponse; route: Route
   const toggleTheme = useWorkbenchStore((s) => s.toggleTheme);
   const machinesOpen = useWorkbenchStore((s) => s.machinesOpen);
   const setMachinesOpen = useWorkbenchStore((s) => s.setMachinesOpen);
+  const localMachineId = useWorkbenchStore((s) => s.localMachineId);
 
   const projects = boot.projects.filter((p) => p.projectId !== SCRATCH_PROJECT_ID && !p.archived);
   const scratch = boot.projects.find((p) => p.projectId === SCRATCH_PROJECT_ID);
@@ -37,8 +83,20 @@ export function Sidebar({ boot, route }: { boot: BootstrapResponse; route: Route
   const fetchList = [...projects.filter(isOpen), ...(scratch ? [scratch] : [])];
   const tasksByProject = useManyProjectTasks(fetchList);
   const scratchThreads = scratch ? mainThreads(tasksByProject[scratch.projectId] ?? []) : [];
-  const inboxCount = boot.openInboxItems.length;
+  const hasAttention = boot.openInboxItems.length > 0;
+  const attentionSet = useMemo(() => attentionTaskIds(boot.openInboxItems), [boot.openInboxItems]);
   const activeTaskId = route.name === 'session' ? route.taskId : '';
+
+  const currentHost =
+    boot.machines.find((m) => m.transportMode === 'local_ws') ??
+    boot.machines.find((m) => m.machineId === localMachineId) ??
+    boot.machines[0];
+
+  // Roll child-task attention up to its root thread so each root row draws one mark only.
+  const rootHasAttention = (root: TaskSummary, projectTasks: TaskSummary[]): boolean => {
+    if (attentionSet.has(root.taskId)) return true;
+    return projectTasks.some((c) => c.parentTaskId === root.taskId && attentionSet.has(c.taskId));
+  };
 
   return (
     <aside className="side">
@@ -59,7 +117,7 @@ export function Sidebar({ boot, route }: { boot: BootstrapResponse; route: Route
           <button type="button" className={`qi ${route.name === 'home' ? 'on' : ''}`} onClick={() => navigate(paths.home())}>
             <LayoutGrid size={14} strokeWidth={1.6} />
             总览
-            {inboxCount > 0 && <span className="badge" title="待拍板">{inboxCount}</span>}
+            {hasAttention && <span className="sd wait" style={{ marginLeft: 'auto' }} title="有需要注意的会话" />}
           </button>
           <button type="button" className={`qi ${route.name === 'pa' ? 'on' : ''}`} onClick={() => navigate(paths.pa())}>
             <PAIcon />
@@ -71,7 +129,8 @@ export function Sidebar({ boot, route }: { boot: BootstrapResponse; route: Route
           {projects.length === 0 && <div className="quiet" style={{ padding: '4px 8px' }}>还没有注册项目</div>}
           {projects.map((p) => {
             const open = isOpen(p);
-            const threads = open ? mainThreads(tasksByProject[p.projectId] ?? []) : [];
+            const allProjTasks = tasksByProject[p.projectId] ?? [];
+            const threads = open ? mainThreads(allProjTasks) : [];
             const onProject = route.name === 'project' && route.projectId === p.projectId;
             return (
               <div className="pgroup" key={p.projectId}>
@@ -98,22 +157,24 @@ export function Sidebar({ boot, route }: { boot: BootstrapResponse; route: Route
                   </button>
                 </div>
                 {open &&
-                  threads.slice(0, MAX_THREADS).map((t) => (
-                    <button
-                      type="button"
-                      key={t.taskId}
-                      className={`th ${activeTaskId === t.taskId ? 'on' : ''}`}
-                      onClick={() => navigate(paths.session(t.taskId))}
-                      title={taskTitle(t)}
-                    >
-                      <span className={`sd ${taskDot(t.state, t.activeAttemptState)}`} />
-                      <span className="tt">{taskTitle(t)}</span>
-                      {threadHint(t) && <span className="tm">{threadHint(t)}</span>}
-                    </button>
-                  ))}
+                  threads.slice(0, MAX_THREADS).map((t) => {
+                    const attn = rootHasAttention(t, allProjTasks);
+                    return (
+                      <button
+                        type="button"
+                        key={t.taskId}
+                        className={`th ${activeTaskId === t.taskId ? 'on' : ''}`}
+                        onClick={() => navigate(paths.session(t.taskId))}
+                        title={`${taskTitle(t)} · ${taskStateLabel(t, attn)}`}
+                      >
+                        <span className={`sd ${taskDot(t.state, t.activeAttemptState, attn)}`} />
+                        <span className="tt">{taskTitle(t)}</span>
+                      </button>
+                    );
+                  })}
                 {open && threads.length > MAX_THREADS && (
                   <button type="button" className="th-more" onClick={() => navigate(paths.project(p.projectId))}>
-                    全部 {threads.length} 个线程 →
+                    全部线程 →
                   </button>
                 )}
               </div>
@@ -124,38 +185,26 @@ export function Sidebar({ boot, route }: { boot: BootstrapResponse; route: Route
               <div className="slabel" style={{ marginTop: 10 }}>
                 自由 Chat
               </div>
-              {scratchThreads.slice(0, MAX_THREADS).map((t) => (
-                <button
-                  type="button"
-                  key={t.taskId}
-                  className={`th flat ${activeTaskId === t.taskId ? 'on' : ''}`}
-                  onClick={() => navigate(paths.session(t.taskId))}
-                  title={taskTitle(t)}
-                >
-                  <span className={`sd ${taskDot(t.state, t.activeAttemptState)}`} />
-                  <span className="tt">{taskTitle(t)}</span>
-                  {threadHint(t) && <span className="tm">{threadHint(t)}</span>}
-                </button>
-              ))}
+              {scratchThreads.slice(0, MAX_THREADS).map((t) => {
+                const attn = attentionSet.has(t.taskId);
+                return (
+                  <button
+                    type="button"
+                    key={t.taskId}
+                    className={`th flat ${activeTaskId === t.taskId ? 'on' : ''}`}
+                    onClick={() => navigate(paths.session(t.taskId))}
+                    title={`${taskTitle(t)} · ${taskStateLabel(t, attn)}`}
+                  >
+                    <span className={`sd ${taskDot(t.state, t.activeAttemptState, attn)}`} />
+                    <span className="tt">{taskTitle(t)}</span>
+                  </button>
+                );
+              })}
             </>
           )}
         </nav>
         <div className="sfoot">
-          <div className="machines" role="group" aria-label="机器">
-            {boot.machines.map((m) => (
-              <button
-                type="button"
-                key={m.machineId}
-                className={`mc ${machinesOpen ? 'on' : ''}`}
-                title={`${m.displayName} · ${m.status}`}
-                onClick={() => setMachinesOpen(!machinesOpen)}
-              >
-                <span className={`sd ${m.status === 'online' ? 'on' : m.status === 'degraded' ? 'wait' : ''}`} />
-                <span className="n">{m.machineId}</span>
-              </button>
-            ))}
-            {boot.machines.length === 0 && <span className="faint" style={{ fontSize: 11, padding: '0 6px' }}>无机器</span>}
-          </div>
+          <CurrentHostFooterButton host={currentHost} open={machinesOpen} onClick={() => setMachinesOpen(!machinesOpen)} />
           <button type="button" className="ib" title="切换深/浅色" onClick={toggleTheme}>
             {theme === 'dark' ? <MoonIcon /> : <SunIcon />}
           </button>

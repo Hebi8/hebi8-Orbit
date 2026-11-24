@@ -1,7 +1,7 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import type { ApprovalView } from '../generated/protocol';
 import { api, errMsg } from '../lib/api';
-import { approvalPreview, approvalStateLabel, hhmm, shortSha } from '../lib/format';
+import { approvalPreview, approvalStateLabel, hhmm } from '../lib/format';
 import { toast } from '../store/useWorkbenchStore';
 
 function isAllowKind(kind: string, label: string): boolean {
@@ -18,9 +18,9 @@ export function useDecideApproval() {
         expectedAttemptId: v.approval.attemptId,
         expectedPayloadSha256: v.approval.payloadSha256,
       }),
-    onSuccess: (res, v) => {
+    onSuccess: (_res, v) => {
       const opt = v.approval.options.find((o) => o.id === v.optionId);
-      toast(`已提交决定：${opt?.label ?? v.optionId}${res.sentToRunner ? ' · 已送达 Runner' : ''}`);
+      toast(`已提交：${opt?.label ?? v.optionId}`);
       void qc.invalidateQueries({ queryKey: ['approvals'] });
       void qc.invalidateQueries({ queryKey: ['task-timeline', v.approval.taskId] });
       void qc.invalidateQueries({ queryKey: ['bootstrap'] });
@@ -58,36 +58,6 @@ export function ApprovalButtons({ approval, big }: { approval: ApprovalView; big
   );
 }
 
-export function ApprovalFacts({ approval }: { approval: ApprovalView }) {
-  const cmd = approvalPreview(approval.payload);
-  return (
-    <div className="facts">
-      <span className="k">动作</span>
-      <span className="v">{approval.actionName}</span>
-      {approval.targetEnv && (
-        <>
-          <span className="k">目标环境</span>
-          <span className="v mono">{approval.targetEnv}</span>
-        </>
-      )}
-      {approval.inputSha && (
-        <>
-          <span className="k">SHA</span>
-          <span className="v mono">{shortSha(approval.inputSha)}</span>
-        </>
-      )}
-      {cmd && (
-        <>
-          <span className="k">命令</span>
-          <span className="v mono">{cmd}</span>
-        </>
-      )}
-      <span className="k">有效期至</span>
-      <span className="v">{hhmm(approval.expiresAt)}</span>
-    </div>
-  );
-}
-
 /** Left-2px-rule approval notice used inline in the Session timeline. */
 export function ApprovalNotice({ approval }: { approval: ApprovalView }) {
   if (approval.state !== 'pending') {
@@ -97,7 +67,6 @@ export function ApprovalNotice({ approval }: { approval: ApprovalView }) {
           <span>{approvalStateLabel(approval.state)}</span>
           <span>·</span>
           <span className="ell">{approval.actionName}</span>
-          {approval.decidedBy && <span>· {approval.decidedBy === 'human' ? '你' : '策略'}</span>}
           {approval.decidedAt ? <span>· {hhmm(approval.decidedAt)}</span> : null}
         </div>
       </div>
@@ -107,17 +76,13 @@ export function ApprovalNotice({ approval }: { approval: ApprovalView }) {
   return (
     <div className="nt ap">
       <div className="nt-h">
-        <span className="lbl">等待确认</span>
+        <span className="lbl">需确认</span>
         <span className="ell">{approval.actionName}</span>
         {approval.targetEnv && <span className="where mono">{approval.targetEnv}</span>}
-        {approval.inputSha && <span className="where mono">{shortSha(approval.inputSha)}</span>}
       </div>
       {cmd && <code className="nt-cmd mono">{cmd}</code>}
       <div className="nt-a">
         <ApprovalButtons approval={approval} />
-        <span className="faint" style={{ fontSize: 11 }}>
-          {approval.requestedBy === 'pa' ? 'PA 起草' : 'Agent 请求'} · {hhmm(approval.createdAt)} · 有效至 {hhmm(approval.expiresAt)}
-        </span>
       </div>
     </div>
   );

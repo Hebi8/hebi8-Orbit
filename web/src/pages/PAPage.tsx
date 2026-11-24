@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { ChevronDown, Plus, RotateCcw, ShieldCheck, Zap } from 'lucide-react';
+import { ChevronDown, Plus, RotateCcw, Zap } from 'lucide-react';
 import type { BootstrapResponse, PAFocusPointer, PAMessage } from '../generated/protocol';
 import { CardIcon } from '../components/Icons';
 import { Md } from '../components/Md';
@@ -42,11 +42,7 @@ function Message({ m }: { m: PAMessage }) {
       <div style={{ minWidth: 0 }}>
         <Md text={m.content} />
         <ActionCards actions={m.actions} />
-        {(m.deltaToSeq ?? 0) > 0 && (
-          <div className="pa-delta mono">
-            旁路增量 #{(m.deltaFromSeq ?? 0) + 1}..#{m.deltaToSeq} · {hhmm(m.createdAt)}
-          </div>
-        )}
+        {m.createdAt > 0 && <div className="pa-time">{hhmm(m.createdAt)}</div>}
       </div>
     </div>
   );
@@ -97,7 +93,8 @@ export function PAPage({ boot, threadId }: { boot: BootstrapResponse; threadId?:
   const create = useMutation({
     mutationFn: (cold: boolean) => (cold ? api.resetPASession() : api.createPAThread()),
     onSuccess: (res, cold) => {
-      toast(cold ? '已冷启动新 PA 会话（保留注意力指针）' : '已新建 PA 对话');
+      setMenuOpen(false);
+      toast(cold ? '已重置并开启新对话' : '已新建对话');
       afterTurn(res.thread.paThreadId);
       navigate(paths.pa(res.thread.paThreadId));
     },
@@ -111,16 +108,42 @@ export function PAPage({ boot, threadId }: { boot: BootstrapResponse; threadId?:
   };
 
   const card = (
-    <aside className="fcard" aria-label="PA 状态">
+    <aside className="fcard" aria-label="PA 对话与关注">
       <div className="fsec">
         <div className="fsec-h">
-          Focus
-          <span className="r mono">{state.focusPointers.length}/20</span>
+          历史对话
+          <span className="r">
+            <button type="button" className="ib" title="新建对话" disabled={create.isPending} onClick={() => create.mutate(false)}>
+              <Plus size={12} strokeWidth={1.6} />
+            </button>
+          </span>
         </div>
-        {state.focusPointers.length === 0 ? (
-          <div className="fsub">PA 暂未跟踪任何项目 / 任务指针</div>
+        {threads.length === 0 ? (
+          <div className="fsub">还没有历史对话</div>
         ) : (
-          state.focusPointers.map((p) => {
+          threads.slice(0, 20).map((t) => (
+            <button
+              type="button"
+              key={t.paThreadId}
+              className={`frow ${t.paThreadId === currentId ? 'on' : ''}`}
+              onClick={() => {
+                setMobileDock(false);
+                navigate(paths.pa(t.paThreadId));
+              }}
+              title={t.title || t.paThreadId}
+            >
+              <span className="ell" style={{ flex: 1 }}>
+                {t.title || '未命名对话'}
+              </span>
+              <span className="fx">{relTime(t.updatedAt)}</span>
+            </button>
+          ))
+        )}
+      </div>
+      {state.focusPointers.length > 0 && (
+        <div className="fsec">
+          <div className="fsec-h">当前关注</div>
+          {state.focusPointers.map((p) => {
             const target = focusTarget(p);
             return (
               <button
@@ -128,32 +151,20 @@ export function PAPage({ boot, threadId }: { boot: BootstrapResponse; threadId?:
                 className="frow"
                 key={`${p.kind}:${p.id}`}
                 disabled={!target}
-                onClick={() => target && navigate(target)}
-                title={`${p.kind} · ${p.id}`}
+                onClick={() => {
+                  setMobileDock(false);
+                  if (target) navigate(target);
+                }}
+                title={p.label || p.id}
               >
-                <span className="sd rev" />
-                <span className="ell">{p.label || p.id}</span>
-                <span className="fx">{p.kind}</span>
+                <span className="ell" style={{ flex: 1 }}>
+                  {p.label || p.id}
+                </span>
               </button>
             );
-          })
-        )}
-      </div>
-      <div className="fsec">
-        <div className="fsec-h">Sync</div>
-        <div className="fsub mono" style={{ color: 'var(--fg2)' }}>
-          已同步至 event #{state.lastReadEventSeq}
+          })}
         </div>
-        <div className="fsub">旁路读统一事件日志 · 零失忆</div>
-      </div>
-      <div className="fsec">
-        <div className="fsec-h">Guard</div>
-        <div className="guard">
-          <ShieldCheck size={13} strokeWidth={1.6} />
-          代码只读 · 零直接部署权
-        </div>
-        <div className="fsub">可派活与起草审批；审批与部署只认人类决定</div>
-      </div>
+      )}
     </aside>
   );
 
@@ -162,27 +173,24 @@ export function PAPage({ boot, threadId }: { boot: BootstrapResponse; threadId?:
       <PageHeader
         right={
           <>
-            <button type="button" className="hb" disabled={chat.isPending} onClick={() => chat.mutate({ message: '⚡ Brief Me', brief: true })}>
+            <button type="button" className="hb" disabled={chat.isPending} onClick={() => chat.mutate({ message: '今日摘要', brief: true })}>
               <Zap size={13} strokeWidth={1.6} />
               <span className="no-mobile">Brief Me</span>
             </button>
             <button type="button" className="hb" disabled={create.isPending} onClick={() => create.mutate(false)} title="新建 PA 对话">
               <Plus size={13} strokeWidth={1.6} />
-              <span className="no-mobile">新建 PA 对话</span>
-            </button>
-            <button type="button" className="ib" disabled={create.isPending} onClick={() => create.mutate(true)} title="冷启动：新会话只注入注意力指针与当前态势">
-              <RotateCcw size={13} strokeWidth={1.6} />
+              <span className="no-mobile">新建对话</span>
             </button>
             <div className="hsep no-mobile" />
             <button
               type="button"
               className={`ib ${cardOpen ? 'on' : ''} no-mobile`}
-              title="右侧浮卡"
+              title="历史对话"
               onClick={() => setCardOpen(!cardOpen)}
             >
               <CardIcon />
             </button>
-            <button type="button" className="ib only-mobile" title="PA 状态" onClick={() => setMobileDock(true)}>
+            <button type="button" className="ib only-mobile" title="历史对话" onClick={() => setMobileDock(true)}>
               <CardIcon />
             </button>
           </>
@@ -210,9 +218,8 @@ export function PAPage({ boot, threadId }: { boot: BootstrapResponse; threadId?:
                       navigate(paths.pa(t.paThreadId));
                     }}
                   >
-                    <span className={`sd ${t.paThreadId === paState.activePaThreadId ? 'on' : ''}`} />
                     <span className="ell" style={{ flex: 1 }}>
-                      {t.title || t.paThreadId}
+                      {t.title || '未命名对话'}
                     </span>
                     <span className="faint" style={{ fontSize: 11 }}>
                       {relTime(t.updatedAt)}
@@ -220,6 +227,12 @@ export function PAPage({ boot, threadId }: { boot: BootstrapResponse; threadId?:
                   </button>
                 ))}
                 {threads.length === 0 && <div className="mh">还没有 PA 对话</div>}
+                <div style={{ borderTop: '1px solid var(--line)', marginTop: 4, paddingTop: 4 }}>
+                  <button type="button" disabled={create.isPending} onClick={() => create.mutate(true)}>
+                    <RotateCcw size={12} strokeWidth={1.6} className="faint" />
+                    <span>重置上下文并新开对话</span>
+                  </button>
+                </div>
               </div>
             </>
           )}
@@ -229,10 +242,10 @@ export function PAPage({ boot, threadId }: { boot: BootstrapResponse; threadId?:
         <div className="sess-body">
           <div className="stage" ref={stageRef}>
             <div className="pa-msgs">
-              {!currentId && <div className="empty">还没有 PA 对话。直接在下方输入，或点「新建 PA 对话」。</div>}
+              {!currentId && <div className="empty">还没有 PA 对话，直接在下方输入即可开始。</div>}
               {detail.isLoading && <div className="empty">载入对话…</div>}
               {currentId && !detail.isLoading && messages.length === 0 && (
-                <div className="empty">这是一个新的 PA 对话。问问今天的态势、卡住的线程，或让它派一个活。</div>
+                <div className="empty">问问今天的安排、项目进展，或让 PA 帮你开一个新任务。</div>
               )}
               {messages.map((m) => (
                 <Message key={m.messageId} m={m} />
@@ -240,7 +253,7 @@ export function PAPage({ boot, threadId }: { boot: BootstrapResponse; threadId?:
               {chat.isPending && (
                 <div className="it running">
                   <span className="spin" />
-                  <span className="shim">PA 正在读取增量事件…</span>
+                  <span className="shim">思考中…</span>
                 </div>
               )}
             </div>
@@ -251,7 +264,7 @@ export function PAPage({ boot, threadId }: { boot: BootstrapResponse; threadId?:
                 ref={ref}
                 value={text}
                 rows={2}
-                placeholder="和 PA 聊：跨项目统筹、问态势、派活或起草审批…"
+                placeholder="和 PA 聊聊…"
                 onChange={(e) => {
                   setText(e.target.value);
                   grow();
@@ -265,9 +278,6 @@ export function PAPage({ boot, threadId }: { boot: BootstrapResponse; threadId?:
                 aria-label="发给 PA"
               />
               <div className="cfoot">
-                <span className="ctl">
-                  <ShieldCheck size={12} strokeWidth={1.6} /> 只读 · 可派活 · 不能审批 / 部署
-                </span>
                 <span className="hint no-mobile">↵ 发送 · ⇧↵ 换行</span>
                 <button type="button" className="cbtn pri" disabled={!text.trim() || chat.isPending} onClick={send}>
                   发送 <span className="kb">↵</span>
@@ -285,4 +295,3 @@ export function PAPage({ boot, threadId }: { boot: BootstrapResponse; threadId?:
     </main>
   );
 }
-

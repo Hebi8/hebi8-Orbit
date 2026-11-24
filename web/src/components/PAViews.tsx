@@ -48,7 +48,6 @@ export function ActionCards({ actions }: { actions?: PAActionResult[] }) {
           >
             {taskId ? <MessagesSquare size={13} strokeWidth={1.6} /> : <FolderGit2 size={13} strokeWidth={1.6} />}
             <span className="ell">{a.summary}</span>
-            <span className="sub">{a.status}</span>
             {target && <ArrowUpRight size={12} strokeWidth={1.6} />}
           </button>
         );
@@ -59,15 +58,19 @@ export function ActionCards({ actions }: { actions?: PAActionResult[] }) {
 
 export function BriefView({ brief, projects }: { brief: PABriefResponse; projects: ProjectView[] }) {
   const pname = (pid: string) => projects.find((p) => p.projectId === pid)?.displayName ?? pid;
-  const openWindow = useWorkbenchStore((s) => s.openWindow);
+  const openReview = useWorkbenchStore((s) => s.openReview);
+  const attentionItems = brief.openInboxItems.slice(0, 6);
+  const runningTasks = brief.activeTasks.slice(0, 6);
+  const blockedTasks = brief.blockedTasks.filter((t) => !attentionItems.some((it) => it.taskId === t.taskId)).slice(0, 6);
+
   return (
     <div className="brief">
       <Md text={brief.summary} />
-      {brief.openInboxItems.length > 0 && (
+      {(attentionItems.length > 0 || blockedTasks.length > 0) && (
         <>
-          <h5>待拍板 · {brief.openInboxCount}</h5>
+          <h5>需要注意</h5>
           <ul>
-            {brief.openInboxItems.slice(0, 6).map((it) => (
+            {attentionItems.map((it) => (
               <li key={it.inboxId}>
                 <span className="sd wait" />
                 <button type="button" className="lk" onClick={() => navigate(it.taskId ? paths.session(it.taskId) : paths.home())}>
@@ -76,14 +79,23 @@ export function BriefView({ brief, projects }: { brief: PABriefResponse; project
                 <span className="faint ell">{pname(it.projectId)}</span>
               </li>
             ))}
+            {blockedTasks.map((t) => (
+              <li key={t.taskId}>
+                <span className="sd wait" />
+                <button type="button" className="lk" onClick={() => navigate(paths.session(t.taskId))}>
+                  {taskTitle(t)}
+                </button>
+                <span className="faint ell">{pname(t.projectId)}</span>
+              </li>
+            ))}
           </ul>
         </>
       )}
-      {brief.activeTasks.length > 0 && (
+      {runningTasks.length > 0 && (
         <>
-          <h5>正在跑 · {brief.totalActiveTaskCount ?? brief.activeTasks.length}</h5>
+          <h5>运行中</h5>
           <ul>
-            {brief.activeTasks.slice(0, 6).map((t) => (
+            {runningTasks.map((t) => (
               <li key={t.taskId}>
                 <span className={`sd ${taskDot(t.state, t.activeAttemptState)}`} />
                 <button type="button" className="lk" onClick={() => navigate(paths.session(t.taskId))}>
@@ -95,35 +107,16 @@ export function BriefView({ brief, projects }: { brief: PABriefResponse; project
           </ul>
         </>
       )}
-      {brief.blockedTasks.length > 0 && (
-        <>
-          <h5>阻塞 / 待核对 · {brief.totalBlockedTaskCount ?? brief.blockedTasks.length}</h5>
-          <ul>
-            {brief.blockedTasks.slice(0, 6).map((t) => (
-              <li key={t.taskId}>
-                <span className="sd block" />
-                <button type="button" className="lk" onClick={() => navigate(paths.session(t.taskId))}>
-                  {taskTitle(t)}
-                </button>
-                <span className="faint ell">{t.waitingReason || taskStateLabel(t)}</span>
-              </li>
-            ))}
-          </ul>
-        </>
-      )}
       {brief.recentDeliveries.length > 0 && (
         <>
-          <h5>近期交付 · {brief.totalRecentDeliveryCount ?? brief.recentDeliveries.length}</h5>
+          <h5>近期产出</h5>
           <ul>
             {brief.recentDeliveries.slice(0, 5).map((d) => (
               <li key={d.deliveryId}>
-                <span className="sd rev" />
-                <button type="button" className="lk" onClick={() => openWindow('cr', d.taskId, d.deliveryId)}>
+                <span className="sd done" />
+                <button type="button" className="lk" onClick={() => openReview('code', d.taskId, d.deliveryId)}>
                   {d.summary || shortSha(d.headSha)}
                 </button>
-                <span className="faint mono">
-                  <span className="add">+{d.manifest.insertions}</span> <span className="del">−{d.manifest.deletions}</span>
-                </span>
                 <span className="faint">{relTime(d.createdAt)}</span>
               </li>
             ))}

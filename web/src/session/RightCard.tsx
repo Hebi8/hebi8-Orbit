@@ -38,7 +38,7 @@ export function RightCard({
   onOpenBoard: () => void;
 }) {
   const qc = useQueryClient();
-  const openWindow = useWorkbenchStore((s) => s.openWindow);
+  const openReview = useWorkbenchStore((s) => s.openReview);
   const localMachineId = useWorkbenchStore((s) => s.localMachineId);
   const [adding, setAdding] = useState(false);
   const [kind, setKind] = useState<TaskSourceKind>('link');
@@ -83,12 +83,16 @@ export function RightCard({
         <div className="fsec">
           <div className="fsec-h">
             Changes
-            <span className="r mono">
-              v{formalCodeDeliveries.length}
-              {formalCodeDeliveries.length > 1 ? ` · 共 ${formalCodeDeliveries.length} 版` : ''}
-            </span>
+            <span className="r mono">v{formalCodeDeliveries.length}</span>
           </div>
-          <div className="frow" role="button" tabIndex={0} onClick={() => openWindow('cr', taskId, latestCode.deliveryId)} onKeyDown={(e) => e.key === 'Enter' && openWindow('cr', taskId, latestCode.deliveryId)} title="打开 Code Review 浮窗">
+          <div
+            className="frow"
+            role="button"
+            tabIndex={0}
+            onClick={() => openReview('code', taskId, latestCode.deliveryId)}
+            onKeyDown={(e) => e.key === 'Enter' && openReview('code', taskId, latestCode.deliveryId)}
+            title="打开产出审阅"
+          >
             <BranchIcon size={13} />
             <span className="ell mono" style={{ flex: 1 }}>
               {branchLabel} · {shortSha(latestCode.headSha)}
@@ -110,37 +114,33 @@ export function RightCard({
               </button>
             )}
           </div>
-          <div className="fsub">
-            {latestCode.manifest.filesChanged} 个文件
-            {latestCode.openAnnotations > 0 ? ` · ${latestCode.openAnnotations} 条未决行评` : ''}
-          </div>
+          <div className="fsub">{latestCode.manifest.filesChanged} 个文件</div>
         </div>
       )}
 
       {artDelivery && (
         <div className="fsec">
           <div className="fsec-h">Artifacts</div>
-          {(artDelivery.ryugiBindings ?? []).map((b) => {
-            const openNotes = tl.annotations.filter((a) => a.deliveryId === artDelivery.deliveryId && a.source === 'ryugi' && a.status === 'open').length;
-            return (
-              <button type="button" key={b.bindingId} className="frow" onClick={() => openWindow('art', taskId, artDelivery.deliveryId)} title={b.artifactLocator}>
-                <ArtIcon size={13} />
-                <span className="ell" style={{ flex: 1 }}>
-                  {basename(b.artifactLocator) || b.artifactLocator}
-                </span>
-                <span className="fx">{openNotes > 0 ? `${openNotes} 未决` : '冻结'}</span>
-              </button>
-            );
-          })}
+          {(artDelivery.ryugiBindings ?? []).map((b) => (
+            <button
+              type="button"
+              key={b.bindingId}
+              className="frow"
+              onClick={() => openReview('art', taskId, artDelivery.deliveryId)}
+              title={b.artifactLocator}
+            >
+              <ArtIcon size={13} />
+              <span className="ell" style={{ flex: 1 }}>
+                {basename(b.artifactLocator) || b.artifactLocator}
+              </span>
+            </button>
+          ))}
         </div>
       )}
 
       {showWorkers && (
         <div className="fsec">
-          <div className="fsec-h">
-            Queue & Workers
-            <span className="r mono">{members.length || tl.task.workerCount}</span>
-          </div>
+          <div className="fsec-h">Workers</div>
           {members.map((m) => (
             <button
               type="button"
@@ -152,14 +152,12 @@ export function RightCard({
               <span className={`sd ${memberDot(m.state)}`} />
               <span className="ell" style={{ flex: 1 }}>
                 {m.memberName}
-                {m.currentStep && <span className="faint"> · {m.currentStep}</span>}
               </span>
-              <span className="fx mono">#{m.lastConsumedSeq}</span>
             </button>
           ))}
-          {members.length === 0 && <div className="fsub">{tl.task.workerCount} 个子任务 Worker</div>}
+          {members.length === 0 && <div className="fsub">有协作子任务</div>}
           <button type="button" className="flink" onClick={onOpenBoard}>
-            <SwarmIcon size={12} /> 打开消息板{board ? ` (#${board.latestSeq})` : ''} →
+            <SwarmIcon size={12} /> 打开消息板 →
           </button>
         </div>
       )}

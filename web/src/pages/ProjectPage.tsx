@@ -7,27 +7,32 @@ import { PageHeader } from '../components/PageHeader';
 import { useProjectTasks } from '../hooks/queries';
 import { api } from '../lib/api';
 import { buildIDEJump, buildProjectIDEJump, launchIDE } from '../lib/ide';
-import { projectInitial, relTime, shortSha, taskDot, taskStateLabel, taskTitle } from '../lib/format';
+import {
+  attentionTaskIds,
+  projectInitial,
+  relTime,
+  shortSha,
+  taskDot,
+  taskSimpleState,
+  taskStateLabel,
+  taskTitle,
+  type SimpleSessionState,
+} from '../lib/format';
 import { navigate, paths, type ProjectTab } from '../lib/router';
 import { toast, useWorkbenchStore } from '../store/useWorkbenchStore';
 
-const GROUPS: { key: string; label: string; match: (t: TaskSummary) => boolean }[] = [
-  { key: 'active', label: '活跃中', match: (t) => ['queued', 'running', 'waiting_resource', 'waiting_approval'].includes(t.state) },
-  { key: 'review', label: '待审阅', match: (t) => t.state === 'in_review' },
-  { key: 'closed', label: '已结束', match: (t) => ['done', 'failed', 'cancelled'].includes(t.state) },
+const GROUPS: { key: SimpleSessionState; label: string }[] = [
+  { key: 'attention', label: '需要注意' },
+  { key: 'running', label: '运行中' },
+  { key: 'finished', label: '已结束' },
 ];
 
-function ThreadRow({ t }: { t: TaskSummary }) {
-  const extras: string[] = [];
-  if (t.latestDeliveryHead) extras.push(shortSha(t.latestDeliveryHead));
-  if (t.queuedInputCount > 0) extras.push(`队列 ${t.queuedInputCount}`);
-  if (t.workerCount > 0) extras.push(`${t.workerCount}w`);
+function ThreadRow({ t, hasAttention }: { t: TaskSummary; hasAttention: boolean }) {
   return (
     <button type="button" className="srow" onClick={() => navigate(paths.session(t.taskId))}>
-      <span className={`sd ${taskDot(t.state, t.activeAttemptState)}`} />
+      <span className={`sd ${taskDot(t.state, t.activeAttemptState, hasAttention)}`} />
       <span className="t">{taskTitle(t)}</span>
-      <span className="st mono">{extras.join(' · ')}</span>
-      <span className="st">{taskStateLabel(t)}</span>
+      <span className="st">{taskStateLabel(t, hasAttention)}</span>
       <span className="st">{relTime(t.updatedAt)}</span>
     </button>
   );
@@ -39,10 +44,18 @@ export function ProjectPage({ boot, projectId, tab }: { boot: BootstrapResponse;
   const project = boot.projects.find((p) => p.projectId === projectId);
   const tasksQ = useProjectTasks(projectId);
   const [q, setQ] = useState('');
-  const openWindow = useWorkbenchStore((s) => s.openWindow);
+  const openReview = useWorkbenchStore((s) => s.openReview);
   const localMachineId = useWorkbenchStore((s) => s.localMachineId);
 
-  const threads = useMemo(() => (tasksQ.data ?? []).filter((t) => !t.parentTaskId), [tasksQ.data]);
+  const allTasks = useMemo(() => tasksQ.data ?? [], [tasksQ.data]);
+  const threads = useMemo(() => allTasks.filter((t) => !t.parentTaskId), [allTasks]);
+  const attentionSet = useMemo(() => attentionTaskIds(boot.openInboxItems), [boot.openInboxItems]);
+
+  const rootHasAttention = (root: TaskSummary): boolean => {
+    if (attentionSet.has(root.taskId)) return true;
+    return allTasks.some((c) => c.parentTaskId === root.taskId && attentionSet.has(c.taskId));
+  };
+
   const filtered = useMemo(() => {
     const k = q.trim().toLowerCase();
     if (!k) return threads;
@@ -81,7 +94,6 @@ export function ProjectPage({ boot, projectId, tab }: { boot: BootstrapResponse;
     }
     launchIDE(j.uri);
   };
-  const machineStatus = (id: string) => boot.machines.find((m) => m.machineId === id)?.status;
 
   return (
     <main className="main">
@@ -114,26 +126,13 @@ export function ProjectPage({ boot, projectId, tab }: { boot: BootstrapResponse;
               </button>
             </div>
           </div>
-          <div className="anchors-line">
-            {Object.entries(project.anchors).map(([cap, a]) => {
-              const st = machineStatus(a.machine);
-              return (
-                <span key={cap} title={a.repoPath || a.remoteDir || ''}>
-                  <span className={`sd ${st === 'online' ? 'on' : st === 'degraded' ? 'wait' : ''}`} />
-                  {a.machine} · {cap}
-                  {a.deployStrategy ? ' · 部署目标' : ''}
-                  {cap === project.defaultCapability ? ' · 默认' : ''}
-                </span>
-              );
-            })}
-          </div>
 
           <div className="tabs" role="tablist">
             <button type="button" className={tab === 'threads' ? 'on' : ''} onClick={() => navigate(paths.project(projectId, 'threads'))}>
-              线程 <span className="faint mono">{threads.length}</span>
+              线程
             </button>
             <button type="button" className={tab === 'deliveries' ? 'on' : ''} onClick={() => navigate(paths.project(projectId, 'deliveries'))}>
-              交付与部署
+              交付
             </button>
             {tab === 'threads' && (
               <span className="sp">
@@ -149,15 +148,15 @@ export function ProjectPage({ boot, projectId, tab }: { boot: BootstrapResponse;
               <div className="quiet">{q ? '没有匹配的线程' : '这个项目还没有线程'}</div>
             ) : (
               GROUPS.map((g) => {
-                const rows = filtered.filter(g.match).sort((a, b) => b.updatedAt - a.updatedAt);
+                const rows = filtered
+                  .filter((t) => taskSimpleState(t, rootHasAttention(t)) === g.key)
+                  .sort((a, b) => b.updatedAt - a.updatedAt);
                 if (!rows.length) return null;
                 return (
                   <div key={g.key}>
-                    <div className="grp-h">
-                      {g.label} · {rows.length}
-                    </div>
+                    <div className="grp-h">{g.label}</div>
                     {rows.map((t) => (
-                      <ThreadRow key={t.taskId} t={t} />
+                      <ThreadRow key={t.taskId} t={t} hasAttention={rootHasAttention(t)} />
                     ))}
                   </div>
                 );
@@ -187,16 +186,15 @@ export function ProjectPage({ boot, projectId, tab }: { boot: BootstrapResponse;
                     <span className="mono">
                       <span className="add">+{d.manifest.insertions}</span> <span className="del">−{d.manifest.deletions}</span>
                     </span>
-                    {d.openAnnotations > 0 && <span className="faint">{d.openAnnotations} 条未决</span>}
                     <span className="faint no-mobile">{relTime(d.createdAt)}</span>
                     <span className="acts">
                       {CODE_KINDS.has(d.kind) && (
-                        <button type="button" className="ib" title="Code Review" onClick={() => openWindow('cr', d.taskId, d.deliveryId)}>
+                        <button type="button" className="ib" title="审阅代码" onClick={() => openReview('code', d.taskId, d.deliveryId)}>
                           <DiffIcon size={13} />
                         </button>
                       )}
                       {(d.ryugiBindings?.length ?? 0) > 0 && (
-                        <button type="button" className="ib" title="Artifacts · Ryugi" onClick={() => openWindow('art', d.taskId, d.deliveryId)}>
+                        <button type="button" className="ib" title="审阅设计稿" onClick={() => openReview('art', d.taskId, d.deliveryId)}>
                           <ArtIcon size={13} />
                         </button>
                       )}
