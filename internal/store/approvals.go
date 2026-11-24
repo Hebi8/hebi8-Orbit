@@ -16,7 +16,7 @@ const approvalSelectSQL = `
 	SELECT approval_id, project_id, task_id, attempt_id, kind, action_name, target_env,
 	       input_sha, payload_json, payload_sha256, acp_rpc_id, runner_instance_id,
 	       options_json, requested_by, state, decision_id, selected_option_id,
-	       decided_by, decision_note, expires_at, created_at, decided_at, consumed_at
+	       decided_by, decision_note, delivery_attempted, expires_at, created_at, decided_at, consumed_at
 	FROM approvals
 `
 
@@ -24,16 +24,18 @@ func scanApprovalView(scanner interface{ Scan(...any) error }) (protocol.Approva
 	var a protocol.ApprovalView
 	var kind, payloadJSON, optionsJSON, reqBy, state string
 	var acpRPC, runnerInst, decID, selOpt, decBy, decNote sql.NullString
+	var deliveryAttempted int
 	var decAt, consAt sql.NullInt64
 	if err := scanner.Scan(
 		&a.ApprovalID, &a.ProjectID, &a.TaskID, &a.AttemptID,
 		&kind, &a.ActionName, &a.TargetEnv, &a.InputSHA,
 		&payloadJSON, &a.PayloadSHA256, &acpRPC, &runnerInst,
 		&optionsJSON, &reqBy, &state, &decID, &selOpt,
-		&decBy, &decNote, &a.ExpiresAt, &a.CreatedAt, &decAt, &consAt,
+		&decBy, &decNote, &deliveryAttempted, &a.ExpiresAt, &a.CreatedAt, &decAt, &consAt,
 	); err != nil {
 		return a, err
 	}
+	a.DeliveryAttempted = deliveryAttempted != 0
 	a.Kind = protocol.ApprovalKind(kind)
 	a.RequestedBy = protocol.ApprovalRequestedBy(reqBy)
 	a.State = protocol.ApprovalState(state)
@@ -127,12 +129,57 @@ type DecideApprovalResult struct {
 	Approval  protocol.ApprovalView
 	MachineID string
 	Decision  protocol.ApprovalDecisionPayload
+	Expired   bool
 	Events    []protocol.EventRecord
+}
+
+// MarkApprovalsDeliveryAttempted records that Hub actually began writing the approval decision frame
+// over a live Runner WebSocket connection (B6).
+func (s *Store) MarkApprovalsDeliveryAttempted(ctx context.Context, approvalIDs []string) error {
+	unique := dedupeStrings(approvalIDs)
+	if len(unique) == 0 {
+		return nil
+	}
+	return s.WithWriteTx(ctx, func(tx *sql.Tx) error {
+		for _, id := range unique {
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE approvals
+				SET delivery_attempted = 1
+				WHERE approval_id = ? AND state IN ('approved_pending_delivery', 'rejected_pending_delivery')
+			`, id); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// ClearApprovalsDeliveryAttempted reverts delivery_attempted back to 0 if an immediate WS write error
+// proved the frame was never transmitted over the wire (B6).
+func (s *Store) ClearApprovalsDeliveryAttempted(ctx context.Context, approvalIDs []string) error {
+	unique := dedupeStrings(approvalIDs)
+	if len(unique) == 0 {
+		return nil
+	}
+	return s.WithWriteTx(ctx, func(tx *sql.Tx) error {
+		for _, id := range unique {
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE approvals
+				SET delivery_attempted = 0
+				WHERE approval_id = ? AND state IN ('approved_pending_delivery', 'rejected_pending_delivery')
+			`, id); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 // DecideApproval enforces human identity, option membership, attempt & payload SHA binding,
 // expiration, and pending state; transitions to approved_pending_delivery or rejected_pending_delivery,
 // resolves the approval inbox card in the SAME transaction, and emits approval.decided.
+// B7: When an approval is already past expires_at, the 'expired' state transition, inbox resolution,
+// attempt resume_state restoration, and approval.expired event are COMMITTED before returning ErrConflict.
 func (s *Store) DecideApproval(ctx context.Context, p DecideApprovalParams) (DecideApprovalResult, error) {
 	var res DecideApprovalResult
 	now := time.Now().UnixMilli()
@@ -158,10 +205,54 @@ func (s *Store) DecideApproval(ctx context.Context, p DecideApprovalParams) (Dec
 			return fmt.Errorf("%w: approval %s is in state %s, expected pending", ErrConflict, ap.ApprovalID, ap.State)
 		}
 		if ap.ExpiresAt <= now {
-			// Lazily mark expired in DB so subsequent reads reflect truth
-			_, _ = tx.ExecContext(ctx, `UPDATE approvals SET state = 'expired' WHERE approval_id = ? AND state = 'pending'`, ap.ApprovalID)
-			_, _ = tx.ExecContext(ctx, `UPDATE inbox_items SET state = 'resolved', resolved_at = ?, updated_at = ? WHERE inbox_id = ? AND state = 'open'`, now, now, "inb:apr:"+ap.ApprovalID)
-			return fmt.Errorf("%w: approval %s has expired", ErrConflict, ap.ApprovalID)
+			// B7: Commit expired transition + resolve inbox + emit event + unblock runner, THEN return ErrConflict after commit!
+			if _, err := tx.ExecContext(ctx, `UPDATE approvals SET state = 'expired' WHERE approval_id = ? AND state = 'pending'`, ap.ApprovalID); err != nil {
+				return err
+			}
+			if _, err := tx.ExecContext(ctx, `UPDATE inbox_items SET state = 'resolved', resolved_at = ?, updated_at = ? WHERE inbox_id = ? AND state = 'open'`, now, now, "inb:apr:"+ap.ApprovalID); err != nil {
+				return err
+			}
+			var machineID string
+			_ = tx.QueryRowContext(ctx, `SELECT machine_id FROM attempts WHERE attempt_id = ?`, ap.AttemptID).Scan(&machineID)
+
+			ev, err := insertEventTx(ctx, tx, eventInsert{
+				StreamID:   "task:" + ap.TaskID,
+				ProjectID:  ap.ProjectID,
+				TaskID:     ap.TaskID,
+				AttemptID:  ap.AttemptID,
+				ActorKind:  protocol.ActorSystem,
+				ActorID:    "approval-expiry",
+				Kind:       protocol.EventApprovalExpired,
+				Visibility: protocol.VisibilityInbox,
+				Payload: map[string]any{
+					"approvalId": ap.ApprovalID,
+					"prevState":  ap.State,
+					"newState":   protocol.ApprovalExpired,
+				},
+				CreatedAt: now,
+			})
+			if err != nil {
+				return err
+			}
+			res.Events = append(res.Events, ev)
+
+			if err := restoreAttemptAfterApprovalSettledTx(ctx, tx, ap.TaskID, ap.AttemptID, now); err != nil {
+				return err
+			}
+
+			ap.State = protocol.ApprovalExpired
+			res.Approval = ap
+			res.MachineID = machineID
+			res.Expired = true
+			res.Decision = protocol.ApprovalDecisionPayload{
+				ApprovalID:    ap.ApprovalID,
+				DecisionID:    "exp_" + ap.ApprovalID,
+				AttemptID:     ap.AttemptID,
+				PayloadSHA256: ap.PayloadSHA256,
+				DecidedBy:     protocol.ApprovalDecidedByPolicy,
+				Expired:       true,
+			}
+			return nil
 		}
 		if p.ExpectedAttemptID == "" || ap.AttemptID != p.ExpectedAttemptID {
 			return fmt.Errorf("%w: expectedAttemptId %q does not match approval attempt %q", ErrConflict, p.ExpectedAttemptID, ap.AttemptID)
@@ -253,7 +344,13 @@ func (s *Store) DecideApproval(ctx context.Context, p DecideApprovalParams) (Dec
 		res.Events = append(res.Events, ev)
 		return nil
 	})
-	return res, err
+	if err != nil {
+		return res, err
+	}
+	if res.Expired {
+		return res, fmt.Errorf("%w: approval %s has expired", ErrConflict, res.Approval.ApprovalID)
+	}
+	return res, nil
 }
 
 func isRejectOption(opt protocol.ApprovalOption) bool {
@@ -262,17 +359,24 @@ func isRejectOption(opt protocol.ApprovalOption) bool {
 	return strings.HasPrefix(k, "reject") || strings.HasPrefix(k, "deny") || strings.HasPrefix(id, "reject") || strings.HasPrefix(id, "deny")
 }
 
+// SteerConsumeNotice identifies a task whose steered attempt ended during reconciliation.
+type SteerConsumeNotice struct {
+	TaskID       string
+	SteerInputID string
+}
+
 // ReconcileRunnerHelloResult holds the hub.welcome reconcile payload and any events emitted.
 type ReconcileRunnerHelloResult struct {
-	Reconcile protocol.HubWelcomeReconcile
-	Events    []protocol.EventRecord
+	Reconcile           protocol.HubWelcomeReconcile
+	Events              []protocol.EventRecord
+	SteerTasksToConsume []SteerConsumeNotice
 }
 
 // ReconcileRunnerHello performs liveness reconciliation when orbit-runner connects or reconnects:
-//  1. Updates machine liveness & resources.
-//  2. Absorbs handledApprovalDecisions (preserving allow vs reject).
-//  3. Distinguishes same-instance transient reconnect (renew lease, redeliver pending_delivery approvals)
-//     from changed runnerInstanceId process restart (pending/rejected -> expired; approved_pending_delivery -> uncertain + needs_verification).
+//  1. Updates machine liveness, resources, and adapters; emits machine.state_changed on transitions.
+//  2. Absorbs handledApprovalDecisions with strict machine/attempt/instance/decisionId verification (B8).
+//  3. Distinguishes same-instance transient reconnect (including locally finalized attempts with unacked
+//     outbox frames per B3) from lease expiration (B4) and changed runnerInstanceId process restart (B6).
 func (s *Store) ReconcileRunnerHello(ctx context.Context, hello protocol.RunnerHelloFrame, leaseTTLMs int64) (ReconcileRunnerHelloResult, error) {
 	var res ReconcileRunnerHelloResult
 	res.Reconcile = protocol.HubWelcomeReconcile{
@@ -293,11 +397,17 @@ func (s *Store) ReconcileRunnerHello(ctx context.Context, hello protocol.RunnerH
 	if err != nil {
 		return res, err
 	}
+	var adaptersVal any
+	if len(hello.Adapters) > 0 {
+		if b, err := json.Marshal(hello.Adapters); err == nil {
+			adaptersVal = string(b)
+		}
+	}
 
 	err = s.WithWriteTx(ctx, func(tx *sql.Tx) error {
 		// 1. Update machine status -> online
-		var exists string
-		if err := tx.QueryRowContext(ctx, `SELECT machine_id FROM machines WHERE machine_id = ?`, hello.MachineID).Scan(&exists); err != nil {
+		var prevStatus string
+		if err := tx.QueryRowContext(ctx, `SELECT status FROM machines WHERE machine_id = ?`, hello.MachineID).Scan(&prevStatus); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return fmt.Errorf("%w: machine %s", ErrNotFound, hello.MachineID)
 			}
@@ -305,18 +415,42 @@ func (s *Store) ReconcileRunnerHello(ctx context.Context, hello protocol.RunnerH
 		}
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE machines
-			SET status = 'online', runner_version = ?, resources_json = ?, last_seen_at = ?, updated_at = ?
+			SET status = 'online',
+			    runner_version = ?,
+			    resources_json = ?,
+			    adapters_json = COALESCE(?, adapters_json),
+			    last_seen_at = ?,
+			    updated_at = ?
 			WHERE machine_id = ?
-		`, hello.RunnerVersion, string(resJSON), now, now, hello.MachineID); err != nil {
+		`, hello.RunnerVersion, string(resJSON), adaptersVal, now, now, hello.MachineID); err != nil {
 			return err
 		}
+		if prevStatus != string(protocol.MachineOnline) {
+			ev, err := insertEventTx(ctx, tx, eventInsert{
+				StreamID:   "global",
+				ActorKind:  protocol.ActorSystem,
+				ActorID:    "runner-reconcile",
+				Kind:       protocol.EventMachineStateChanged,
+				Visibility: protocol.VisibilityTimeline,
+				Payload: map[string]any{
+					"machineId":  hello.MachineID,
+					"prevStatus": prevStatus,
+					"status":     protocol.MachineOnline,
+				},
+				CreatedAt: now,
+			})
+			if err != nil {
+				return err
+			}
+			res.Events = append(res.Events, ev)
+		}
 
-		// 2. Absorb handledApprovalDecisions BEFORE evaluating pending_delivery state
+		// 2. Absorb handledApprovalDecisions BEFORE evaluating pending_delivery state (B8 strict binding)
 		for _, hd := range hello.HandledApprovalDecisions {
-			if hd.ApprovalID == "" || hd.DecisionID == "" {
+			if hd.ApprovalID == "" || hd.DecisionID == "" || hd.AttemptID == "" {
 				continue
 			}
-			if err := consumeApprovalAckByDecisionTx(ctx, tx, hd.ApprovalID, hd.DecisionID, hd.Outcome, now, &res.Events); err != nil {
+			if err := consumeApprovalAckByDecisionTx(ctx, tx, hello.MachineID, hello.RunnerInstanceID, hd.AttemptID, hd.ApprovalID, hd.DecisionID, hd.Outcome, now, &res.Events); err != nil {
 				return err
 			}
 		}
@@ -368,15 +502,35 @@ func (s *Store) ReconcileRunnerHello(ctx context.Context, hello protocol.RunnerH
 			la, runnerHasLive := liveAttemptMap[aid]
 			sameInstance := (att.RunnerInstanceID == "" && runnerHasLive && la.LeaseToken == att.LeaseToken) ||
 				(att.RunnerInstanceID != "" && att.RunnerInstanceID == hello.RunnerInstanceID)
+			leaseValid := att.LeaseExpiresAt >= now
 
 			if att.State == protocol.AttemptLeased && att.RunnerInstanceID == "" && !runnerHasLive {
+				if att.CancelRequested {
+					if err := cancelAttemptTx(ctx, tx, att, "runner-reconcile", "取消请求在派发前生效", now, &res.Events); err != nil {
+						return err
+					}
+					if att.CancelReasonKind == "steer" {
+						res.SteerTasksToConsume = append(res.SteerTasksToConsume, SteerConsumeNotice{
+							TaskID:       att.TaskID,
+							SteerInputID: att.SteerInputID,
+						})
+					}
+					continue
+				}
+				if !leaseValid {
+					if err := expireAttemptInTx(ctx, tx, &att, now, "runner-reconcile", &res.Events); err != nil {
+						return err
+					}
+					continue
+				}
 				// Not dispatched yet — Hub will dispatch it after welcome; keep leased and bind nothing yet
 				knownActive[aid] = true
 				continue
 			}
 
-			if sameInstance && runnerHasLive && la.LeaseToken == att.LeaseToken {
-				// Transient disconnect & reconnect of the SAME runner process!
+			// B3 & B4: Same runner process reconnecting BEFORE lease expiry, including attempts that
+			// finished locally during the short disconnect and still have unacked outbox frames (la.PendingFinal).
+			if sameInstance && runnerHasLive && la.LeaseToken == att.LeaseToken && leaseValid {
 				knownActive[aid] = true
 				if _, err := tx.ExecContext(ctx, `
 					UPDATE attempts
@@ -386,6 +540,17 @@ func (s *Store) ReconcileRunnerHello(ctx context.Context, hello protocol.RunnerH
 					return err
 				}
 				res.Reconcile.AckedOutboxByAttempt[aid] = att.LastAckedOutbox
+
+				// B10: Re-issue abort for active attempts with persisted cancel_requested=1.
+				if att.CancelRequested && !la.PendingFinal {
+					res.Reconcile.AbortAttemptIDs = append(res.Reconcile.AbortAttemptIDs, aid)
+					continue
+				}
+
+				if la.PendingFinal {
+					// Already finalized locally on Runner — let Runner drain its outbox frames cleanly.
+					continue
+				}
 
 				// Redeliver any *_pending_delivery approvals whose ACP handle is still live in memory
 				apRows, err := tx.QueryContext(ctx, approvalSelectSQL+`
@@ -420,10 +585,31 @@ func (s *Store) ReconcileRunnerHello(ctx context.Context, hello protocol.RunnerH
 				continue
 			}
 
+			// B4: Lease already expired before reconnect — expire immediately rather than renewing.
+			if !leaseValid {
+				if err := expireAttemptInTx(ctx, tx, &att, now, "runner-reconcile", &res.Events); err != nil {
+					return err
+				}
+				continue
+			}
+
 			// Different runnerInstanceId (Runner process restarted!) OR live attempt vanished
 			hasUncertain, err := expireOrMarkUncertainApprovalsTx(ctx, tx, aid, now, &res.Events)
 			if err != nil {
 				return err
+			}
+
+			if att.CancelRequested && !hasUncertain {
+				if err := cancelAttemptTx(ctx, tx, att, "runner-reconcile", "已请求取消且 Runner 未继续持有该尝试", now, &res.Events); err != nil {
+					return err
+				}
+				if att.CancelReasonKind == "steer" {
+					res.SteerTasksToConsume = append(res.SteerTasksToConsume, SteerConsumeNotice{
+						TaskID:       att.TaskID,
+						SteerInputID: att.SteerInputID,
+					})
+				}
+				continue
 			}
 
 			if hasUncertain {
@@ -694,15 +880,19 @@ func createApprovalTx(ctx context.Context, tx *sql.Tx, att AttemptRecord, runner
 }
 
 // consumeApprovalAckByDecisionTx records runner ACK for a decided approval while strictly
-// preserving reject vs allow semantics and restoring attempt.resume_state once all approvals settle.
+// verifying non-empty decisionId + machine + attempt + runnerInstanceId bindings (B8),
+// preserving reject vs allow semantics, and restoring attempt.resume_state once all approvals settle.
 func consumeApprovalAckByDecisionTx(
 	ctx context.Context,
 	tx *sql.Tx,
-	approvalID, decisionID string,
+	machineID, runnerInstanceID, attemptID, approvalID, decisionID string,
 	reportedOutcome protocol.ApprovalState,
 	now int64,
 	events *[]protocol.EventRecord,
 ) error {
+	if strings.TrimSpace(approvalID) == "" || strings.TrimSpace(decisionID) == "" || strings.TrimSpace(attemptID) == "" {
+		return nil
+	}
 	row := tx.QueryRowContext(ctx, approvalSelectSQL+` WHERE approval_id = ?`, approvalID)
 	ap, err := scanApprovalView(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -711,7 +901,28 @@ func consumeApprovalAckByDecisionTx(
 	if err != nil {
 		return err
 	}
-	if decisionID != "" && ap.DecisionID != "" && ap.DecisionID != decisionID {
+	// B8: Strict ownership and non-empty decisionId verification — never allow cross-attempt/cross-machine consumption.
+	if ap.AttemptID != attemptID {
+		return nil
+	}
+	if ap.DecisionID == "" || ap.DecisionID != decisionID {
+		return nil
+	}
+	var attMachineID string
+	var attRunnerInst sql.NullString
+	if err := tx.QueryRowContext(ctx, `SELECT machine_id, runner_instance_id FROM attempts WHERE attempt_id = ?`, ap.AttemptID).Scan(&attMachineID, &attRunnerInst); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		return err
+	}
+	if machineID == "" || attMachineID != machineID {
+		return nil
+	}
+	if ap.RunnerInstanceID != "" && (runnerInstanceID == "" || ap.RunnerInstanceID != runnerInstanceID) {
+		return nil
+	}
+	if attRunnerInst.Valid && attRunnerInst.String != "" && (runnerInstanceID == "" || attRunnerInst.String != runnerInstanceID) {
 		return nil
 	}
 
@@ -752,7 +963,7 @@ func consumeApprovalAckByDecisionTx(
 		TaskID:     ap.TaskID,
 		AttemptID:  ap.AttemptID,
 		ActorKind:  protocol.ActorRunner,
-		ActorID:    "runner",
+		ActorID:    machineID,
 		Kind:       protocol.EventApprovalConsumed,
 		Visibility: protocol.VisibilityAudit,
 		Payload: map[string]any{
@@ -767,34 +978,38 @@ func consumeApprovalAckByDecisionTx(
 	}
 	*events = append(*events, ev)
 
-	// Check if any unresolved approvals remain for this attempt; if none, restore attempt resume_state!
+	return restoreAttemptAfterApprovalSettledTx(ctx, tx, ap.TaskID, ap.AttemptID, now)
+}
+
+func restoreAttemptAfterApprovalSettledTx(ctx context.Context, tx *sql.Tx, taskID, attemptID string, now int64) error {
 	var remaining int
 	if err := tx.QueryRowContext(ctx, `
 		SELECT COUNT(*) FROM approvals
 		WHERE attempt_id = ? AND state IN ('pending', 'approved_pending_delivery', 'rejected_pending_delivery')
-	`, ap.AttemptID).Scan(&remaining); err != nil {
+	`, attemptID).Scan(&remaining); err != nil {
 		return err
 	}
-	if remaining == 0 {
-		var curState string
-		var resumeState sql.NullString
-		if err := tx.QueryRowContext(ctx, `SELECT state, resume_state FROM attempts WHERE attempt_id = ?`, ap.AttemptID).Scan(&curState, &resumeState); err == nil {
-			if curState == string(protocol.AttemptWaitingApproval) {
-				target := string(protocol.AttemptRunning)
-				if resumeState.Valid && resumeState.String == string(protocol.ResumeStateSwarmMonitoring) {
-					target = string(protocol.AttemptSwarmMonitoring)
-				}
-				if _, err := tx.ExecContext(ctx, `
-					UPDATE attempts SET state = ?, resume_state = NULL WHERE attempt_id = ?
-				`, target, ap.AttemptID); err != nil {
-					return err
-				}
-				if _, err := tx.ExecContext(ctx, `
-					UPDATE tasks SET state = 'running', waiting_reason = NULL, version = version + 1, updated_at = ?
-					WHERE task_id = ? AND active_attempt_id = ?
-				`, now, ap.TaskID, ap.AttemptID); err != nil {
-					return err
-				}
+	if remaining != 0 {
+		return nil
+	}
+	var curState string
+	var resumeState sql.NullString
+	if err := tx.QueryRowContext(ctx, `SELECT state, resume_state FROM attempts WHERE attempt_id = ?`, attemptID).Scan(&curState, &resumeState); err == nil {
+		if curState == string(protocol.AttemptWaitingApproval) {
+			target := string(protocol.AttemptRunning)
+			if resumeState.Valid && resumeState.String == string(protocol.ResumeStateSwarmMonitoring) {
+				target = string(protocol.AttemptSwarmMonitoring)
+			}
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE attempts SET state = ?, resume_state = NULL WHERE attempt_id = ?
+			`, target, attemptID); err != nil {
+				return err
+			}
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE tasks SET state = 'running', waiting_reason = NULL, version = version + 1, updated_at = ?
+				WHERE task_id = ? AND active_attempt_id = ?
+			`, now, taskID, attemptID); err != nil {
+				return err
 			}
 		}
 	}
@@ -830,9 +1045,10 @@ func expirePendingApprovalsForAttemptTx(ctx context.Context, tx *sql.Tx, attempt
 	return nil
 }
 
-// expireOrMarkUncertainApprovalsTx marks pending/rejected_pending_delivery approvals as 'expired'
-// and approved_pending_delivery approvals as 'uncertain', resolving old inbox cards and returning
-// true if ANY approval entered 'uncertain'.
+// expireOrMarkUncertainApprovalsTx marks pending/rejected_pending_delivery (or never-sent
+// approved_pending_delivery per B6) approvals as 'expired', and approved_pending_delivery approvals
+// whose WS transmission was actually attempted as 'uncertain', resolving old inbox cards and
+// returning true if ANY approval entered 'uncertain'.
 func expireOrMarkUncertainApprovalsTx(ctx context.Context, tx *sql.Tx, attemptID string, now int64, events *[]protocol.EventRecord) (bool, error) {
 	rows, err := tx.QueryContext(ctx, approvalSelectSQL+`
 		WHERE attempt_id = ? AND state IN ('pending', 'approved_pending_delivery', 'rejected_pending_delivery')
@@ -854,7 +1070,8 @@ func expireOrMarkUncertainApprovalsTx(ctx context.Context, tx *sql.Tx, attemptID
 	hasUncertain := false
 	for _, ap := range list {
 		nextState := protocol.ApprovalExpired
-		if ap.State == protocol.ApprovalApprovedPendingDelivery {
+		// B6: Only enter uncertain + needs_verification when Hub actually started sending the approval decision to Runner.
+		if ap.State == protocol.ApprovalApprovedPendingDelivery && ap.DeliveryAttempted {
 			nextState = protocol.ApprovalUncertain
 			hasUncertain = true
 		}

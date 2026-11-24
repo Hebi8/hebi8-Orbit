@@ -93,10 +93,11 @@ func main() {
 		}
 	}
 
-	// Resolve agy binary, args, and idleCloseSeconds from machines.yaml when not overridden
+	// Resolve agy binary, args, idleCloseSeconds, and maxLiveWorkers from machines.yaml when not overridden
 	bin := strings.TrimSpace(*agyBin)
 	var args []string
 	idleSec := 1200
+	maxLiveWorkers := 0
 	if mCfg, ok := machinesCfg.Machines[mid]; ok {
 		if agyCfg, ok := mCfg.Adapters["agy"]; ok {
 			if bin == "" && agyCfg.Bin != "" {
@@ -107,6 +108,9 @@ func main() {
 			}
 			if agyCfg.IdleCloseSeconds > 0 {
 				idleSec = agyCfg.IdleCloseSeconds
+			}
+			if agyCfg.MaxLiveWorkers > 0 {
+				maxLiveWorkers = agyCfg.MaxLiveWorkers
 			}
 		}
 	}
@@ -141,14 +145,16 @@ func main() {
 	defer stop()
 
 	r, err := runner.New(ctx, runner.Config{
-		MachineID:        mid,
-		HubWSURL:         wsURL,
-		HubHTTPURL:       httpURL,
-		BearerToken:      bearer,
-		DataDir:          expDataDir,
-		SocketPath:       sock,
-		Driver:           drv,
-		IdleCloseSeconds: idleSec,
+		MachineID:         mid,
+		HubWSURL:          wsURL,
+		HubHTTPURL:        httpURL,
+		BearerToken:       bearer,
+		DataDir:           expDataDir,
+		SocketPath:        sock,
+		Driver:            drv,
+		SupportedAdapters: append([]protocol.Adapter(nil), protocol.Phase1ImplementedSessionAdapters...),
+		MaxLiveWorkers:    maxLiveWorkers,
+		IdleCloseSeconds:  idleSec,
 	})
 	if err != nil {
 		log.Fatalf("init orbit-runner: %v", err)

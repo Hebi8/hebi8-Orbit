@@ -68,6 +68,7 @@ interface WorkbenchState {
   preferredIDE: IDEScheme;
   expandedProjects: Record<string, boolean>;
   promptCache: Record<string, string>;
+  deselectedAnnotations: Record<string, string[]>;
   toast: ToastState | null;
 
   toggleTheme: () => void;
@@ -86,6 +87,8 @@ interface WorkbenchState {
   setLocalMachineId: (machineId: string) => void;
   setProjectExpanded: (projectId: string, open: boolean) => void;
   rememberPrompt: (key: string, body: string) => void;
+  toggleAnnotationSelected: (taskId: string, annotationId: string, selected: boolean) => void;
+  clearDeselectedAnnotations: (taskId: string) => void;
   showToast: (text: string, tone?: 'info' | 'err') => void;
   clearToast: (id: number) => void;
 }
@@ -108,6 +111,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
   preferredIDE: (readLS('orbit.preferredIDE', 'cursor') as IDEScheme) || 'cursor',
   expandedProjects: readJSON<Record<string, boolean>>('orbit.expandedProjects', {}),
   promptCache: readJSON<Record<string, string>>(PROMPT_CACHE_KEY, {}),
+  deselectedAnnotations: {},
   toast: null,
 
   toggleTheme: () => {
@@ -178,6 +182,20 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
     writeLS(PROMPT_CACHE_KEY, JSON.stringify(next));
     set({ promptCache: next });
   },
+  toggleAnnotationSelected: (taskId, annotationId, selected) =>
+    set((s) => {
+      const prev = new Set(s.deselectedAnnotations[taskId] ?? []);
+      if (selected) prev.delete(annotationId);
+      else prev.add(annotationId);
+      return { deselectedAnnotations: { ...s.deselectedAnnotations, [taskId]: [...prev] } };
+    }),
+  clearDeselectedAnnotations: (taskId) =>
+    set((s) => {
+      if (!s.deselectedAnnotations[taskId]) return s;
+      const next = { ...s.deselectedAnnotations };
+      delete next[taskId];
+      return { deselectedAnnotations: next };
+    }),
   showToast: (text, tone = 'info') => {
     toastSeq += 1;
     const id = toastSeq;

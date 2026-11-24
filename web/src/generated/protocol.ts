@@ -84,7 +84,7 @@ export type InboxCategory = (typeof InboxCategoryValues)[number];
 export const InboxStateValues = ["open", "resolved", "dismissed"] as const;
 export type InboxState = (typeof InboxStateValues)[number];
 
-export const EventKindValues = ["task.created", "task.state_changed", "task.cancelled", "attempt.started", "attempt.state_changed", "attempt.finished", "resource.waiting", "resource.acquired", "delivery.published", "delivery.verified", "delivery.ryugi_updated", "delivery.review_completed", "annotation.created", "annotation.addressed", "approval.requested", "approval.decided", "approval.expired", "approval.consumed", "deploy.started", "deploy.verified", "deploy.failed", "acp.message_batch", "acp.thought_batch", "acp.tool_call", "acp.unsolicited_update", "acp.usage", "pa.turn", "pa.action_executed", "pa.thread_created", "board.message_posted", "board.member_updated", "queue.updated", "task.project_bound", "task.source_added", "task.source_removed"] as const;
+export const EventKindValues = ["task.created", "task.state_changed", "task.cancelled", "attempt.started", "attempt.state_changed", "attempt.finished", "resource.waiting", "resource.acquired", "delivery.published", "delivery.verified", "delivery.ryugi_updated", "delivery.review_completed", "annotation.created", "annotation.addressed", "approval.requested", "approval.decided", "approval.expired", "approval.consumed", "deploy.started", "deploy.verified", "deploy.failed", "acp.message_batch", "acp.thought_batch", "acp.tool_call", "acp.unsolicited_update", "acp.usage", "pa.turn", "pa.action_executed", "pa.thread_created", "board.message_posted", "board.member_updated", "queue.updated", "task.project_bound", "task.source_added", "task.source_removed", "machine.state_changed"] as const;
 export type EventKind = (typeof EventKindValues)[number];
 
 export const IDESchemeValues = ["cursor", "vscode", "zed", "antigravity"] as const;
@@ -93,10 +93,10 @@ export type IDEScheme = (typeof IDESchemeValues)[number];
 export const WSMessageTypeValues = ["replay", "replay_end", "event", "ping"] as const;
 export type WSMessageType = (typeof WSMessageTypeValues)[number];
 
-export const RunnerWSMessageTypeValues = ["runner.hello", "hub.welcome", "attempt.dispatch", "attempt.cancel", "approval.decision", "session.close", "runner.heartbeat", "attempt.outbox_batch", "hub.outbox_ack"] as const;
+export const RunnerWSMessageTypeValues = ["runner.hello", "hub.welcome", "attempt.dispatch", "attempt.cancel", "approval.decision", "session.close", "runner.heartbeat", "attempt.outbox_batch", "hub.outbox_ack", "board.message"] as const;
 export type RunnerWSMessageType = (typeof RunnerWSMessageTypeValues)[number];
 
-export const OutboxFrameTypeValues = ["events", "state", "approval_request", "approval_ack", "delivery_published", "board_message", "board_member"] as const;
+export const OutboxFrameTypeValues = ["events", "state", "approval_request", "approval_ack", "delivery_published", "board_message", "board_member", "board_message_ack"] as const;
 export type OutboxFrameType = (typeof OutboxFrameTypeValues)[number];
 
 export const OutboxAcceptedModeValues = ["active", "late_history"] as const;
@@ -170,6 +170,7 @@ export interface MachineView {
   sshAlias?: string;
   status: MachineStatus;
   capabilities: string[];
+  adapters?: Adapter[];
   resources: Record<string, ResourceState>;
   runnerVersion?: string;
   lastSeenAt?: number | null;
@@ -341,6 +342,7 @@ export interface AttemptView {
   machineId: string;
   adapter: Adapter;
   triggerKind: TriggerKind;
+  promptText?: string;
   worktreePath?: string;
   baseSha?: string;
   outputDeliveryId?: string;
@@ -427,6 +429,7 @@ export interface ApprovalView {
   options: ApprovalOption[];
   requestedBy: ApprovalRequestedBy;
   state: ApprovalState;
+  deliveryAttempted?: boolean;
   decisionId?: string;
   selectedOptionId?: string;
   decidedBy?: ApprovalDecidedBy | null;
@@ -476,6 +479,7 @@ export interface BoardMemberCursor {
 export interface TaskBoardResponse {
   taskId: string;
   latestSeq: number;
+  hasMore?: boolean;
   members: BoardMemberCursor[];
   messages: BoardMessage[];
 }
@@ -484,6 +488,8 @@ export interface WorkerStreamResponse {
   taskId: string;
   workerName: string;
   member?: BoardMemberCursor | null;
+  privateStreamAvailable: boolean;
+  streamNotice?: string;
   events: EventRecord[];
 }
 
@@ -619,12 +625,19 @@ export interface PABriefResponse {
   projectId?: string;
   summary: string;
   openInboxCount: number;
+  totalActiveTaskCount?: number;
+  totalBlockedTaskCount?: number;
   openInboxItems: InboxItemView[];
   activeTasks: TaskSummary[];
   blockedTasks: TaskSummary[];
   recentDeliveries: DeliveryView[];
   machines: MachineView[];
   recentEvents: EventRecord[];
+}
+
+export interface WSTicketResponse {
+  ticket: string;
+  expiresAt: number;
 }
 
 export interface CreateTaskSourceInput {
@@ -672,6 +685,8 @@ export interface FollowupTaskRequest {
   requiredResources?: string[];
   adapter?: Adapter;
   config?: Record<string, string>;
+  verifiedSite?: boolean;
+  verifiedAttemptId?: string;
 }
 
 export interface FollowupTaskResponse {
@@ -685,6 +700,7 @@ export interface FollowupTaskResponse {
 
 export interface RetryTaskRequest {
   verifiedSite?: boolean;
+  verifiedAttemptId?: string;
   note?: string;
 }
 
@@ -730,6 +746,8 @@ export interface DispatchAnnotationsRequest {
   annotationIds: string[];
   mode?: FollowupMode;
   message?: string;
+  verifiedSite?: boolean;
+  verifiedAttemptId?: string;
 }
 
 export interface DispatchAnnotationsResponse {
@@ -804,11 +822,13 @@ export interface LiveAttemptInfo {
   attemptId: string;
   leaseToken: string;
   state: AttemptState;
+  pendingFinal?: boolean;
 }
 
 export interface HandledApprovalDecision {
   approvalId: string;
   decisionId: string;
+  attemptId?: string;
   outcome: ApprovalState;
 }
 
@@ -818,6 +838,7 @@ export interface RunnerHelloFrame {
   machineId: string;
   runnerInstanceId: string;
   runnerVersion: string;
+  adapters?: Adapter[];
   liveAttempts: LiveAttemptInfo[];
   livePendingApprovalIds: string[];
   handledApprovalDecisions: HandledApprovalDecision[];
@@ -831,6 +852,7 @@ export interface ApprovalDecisionPayload {
   payloadSha256: string;
   optionId: string;
   decidedBy: ApprovalDecidedBy;
+  expired?: boolean;
 }
 
 export interface HubWelcomeReconcile {
@@ -868,6 +890,7 @@ export interface AttemptDispatchFrame {
   worktreeRoot?: string;
   worktreePath?: string;
   mirrorBarePath?: string;
+  repoIdentity?: string;
   baseSha?: string;
   defaultBranch?: string;
   desiredConfig?: Record<string, string>;
@@ -892,6 +915,18 @@ export interface ApprovalDecisionFrame {
   payloadSha256: string;
   optionId: string;
   decidedBy: ApprovalDecidedBy;
+  expired?: boolean;
+}
+
+export interface BoardMessageDispatchFrame {
+  type: RunnerWSMessageType;
+  taskId: string;
+  attemptId: string;
+  messageId: string;
+  seq: number;
+  authorName: string;
+  targetMention?: string;
+  body: string;
 }
 
 export interface SessionCloseFrame {
@@ -909,6 +944,7 @@ export interface RunnerHeartbeatFrame {
   type: RunnerWSMessageType;
   machineId: string;
   runnerInstanceId: string;
+  adapters?: Adapter[];
   liveAttemptLeaseTokens: LiveAttemptLease[];
   resources: Record<string, ResourceState>;
   workerRssMb: number;

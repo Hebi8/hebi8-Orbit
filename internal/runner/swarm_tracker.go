@@ -19,26 +19,33 @@ type SwarmProjection struct {
 }
 
 type mergedToolCall struct {
-	ToolCallID string
-	Name       string
-	Title      string
-	Status     string
-	RawInput   json.RawMessage
-	RawOutput  json.RawMessage
-	Processed  bool
+	ToolCallID       string
+	Name             string
+	Title            string
+	Status           string
+	RawInput         json.RawMessage
+	RawOutput        json.RawMessage
+	WorkerTracked    bool
+	ExitCodeTracked  bool
+	BoardMsgEmitted  bool
+	ReadBoardTracked bool
+	WorkerName       string
 }
 
 // ActiveSwarmTracker merges tool_call and tool_call_update notifications by toolCallId.
 // Only status == "completed" calls update activeWorkers or emit board projections,
 // preventing failed calls or streamed argument fragments from corrupting worker accounting.
+// Separate per-aspect flags ensure late rawInput/rawOutput updates after completed are still observed (S3).
 type ActiveSwarmTracker struct {
-	mu                sync.Mutex
-	attemptID         string
-	calls             map[string]*mergedToolCall
-	activeWorkers     map[string]bool
-	usedSwarm         bool
-	rejectedToolCount int
-	nonZeroExitCount  int
+	mu                          sync.Mutex
+	attemptID                   string
+	calls                       map[string]*mergedToolCall
+	activeWorkers               map[string]bool
+	usedSwarm                   bool
+	rejectedToolCount           int
+	unresolvedRejectedToolCount int
+	nonZeroExitCount            int
+	unresolvedNonZeroExitCount  int
 }
 
 func NewActiveSwarmTracker(attemptID string) *ActiveSwarmTracker {
@@ -108,6 +115,7 @@ func (t *ActiveSwarmTracker) ObserveToolCallUpdate(tu *acp.SessionToolCallUpdate
 func (t *ActiveSwarmTracker) RecordToolRejection() {
 	t.mu.Lock()
 	t.rejectedToolCount++
+	t.unresolvedRejectedToolCount++
 	t.mu.Unlock()
 }
 
@@ -115,6 +123,22 @@ func (t *ActiveSwarmTracker) Stats() (activeWorkers int, usedSwarm bool, rejecte
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return len(t.activeWorkers), t.usedSwarm, t.rejectedToolCount, t.nonZeroExitCount
+}
+
+func (t *ActiveSwarmTracker) UnresolvedCounts() (unresolvedRejected int, unresolvedNonZero int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.unresolvedRejectedToolCount, t.unresolvedNonZeroExitCount
+}
+
+// WorkerNameForToolCall returns the verifiable workerName associated with toolCallID, if known.
+func (t *ActiveSwarmTracker) WorkerNameForToolCall(toolCallID string) string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if rec, ok := t.calls[toolCallID]; ok {
+		return rec.WorkerName
+	}
+	return ""
 }
 
 func (t *ActiveSwarmTracker) HasActiveWorkers() bool {
@@ -152,10 +176,9 @@ func (t *ActiveSwarmTracker) getOrCreateLocked(id string) *mergedToolCall {
 func (t *ActiveSwarmTracker) evaluateCompletedLocked(rec *mergedToolCall) SwarmProjection {
 	var proj SwarmProjection
 	// Hard invariant: ONLY status == "completed" transitions worker accounting / board state!
-	if rec.Processed || rec.Status != string(acp.ToolCallStatusCompleted) {
+	if rec.Status != string(acp.ToolCallStatusCompleted) {
 		return proj
 	}
-	rec.Processed = true
 
 	var inMap, outMap map[string]any
 	if len(rec.RawInput) > 0 {
@@ -165,12 +188,17 @@ func (t *ActiveSwarmTracker) evaluateCompletedLocked(rec *mergedToolCall) SwarmP
 		_ = json.Unmarshal(rec.RawOutput, &outMap)
 	}
 
-	// Boundary #5: track commands returning exit_code != 0
-	if outMap != nil {
-		if ec, ok := outMap["exit_code"].(float64); ok && int(ec) != 0 {
-			t.nonZeroExitCount++
-		} else if ec, ok := outMap["exitCode"].(float64); ok && int(ec) != 0 {
-			t.nonZeroExitCount++
+	// Boundary #5 & S3: track commands returning exit_code (even if rawOutput arrives on a later patch).
+	if !rec.ExitCodeTracked && outMap != nil {
+		if ec, ok := extractExitCode(outMap); ok {
+			rec.ExitCodeTracked = true
+			if ec != 0 {
+				t.nonZeroExitCount++
+				t.unresolvedNonZeroExitCount++
+			} else if t.unresolvedNonZeroExitCount > 0 {
+				// Subsequent command exited cleanly -> clear unresolved flag while preserving historical total.
+				t.unresolvedNonZeroExitCount = 0
+			}
 		}
 	}
 
@@ -178,93 +206,127 @@ func (t *ActiveSwarmTracker) evaluateCompletedLocked(rec *mergedToolCall) SwarmP
 
 	switch toolName {
 	case "swarm":
-		action := strings.ToLower(getMapString(inMap, "action"))
-		switch action {
-		case "add":
-			names := extractSwarmWorkerNames(inMap)
-			brief := getMapString(inMap, "brief")
-			for _, w := range names {
-				t.activeWorkers[w] = true
-				t.usedSwarm = true
-				proj.Members = append(proj.Members, map[string]any{
-					"memberName":  w,
-					"state":       string(protocol.BoardMemberWorking),
-					"currentStep": "assigned",
-				})
-				if brief != "" {
-					proj.Messages = append(proj.Messages, map[string]any{
-						"authorName":    "coordinator",
-						"targetMention": "@" + w,
-						"body":          brief,
-						"externalKey":   fmt.Sprintf("acp:%s:%s:%s", t.attemptID, rec.ToolCallID, w),
+		if !rec.WorkerTracked && inMap != nil {
+			action := strings.ToLower(getMapString(inMap, "action"))
+			switch action {
+			case "add":
+				names := extractSwarmWorkerNames(inMap)
+				if len(names) > 0 {
+					rec.WorkerTracked = true
+					rec.WorkerName = names[0]
+					brief := getMapString(inMap, "brief")
+					for _, w := range names {
+						t.activeWorkers[w] = true
+						t.usedSwarm = true
+						proj.Members = append(proj.Members, map[string]any{
+							"memberName":  w,
+							"state":       string(protocol.BoardMemberWorking),
+							"currentStep": "assigned",
+						})
+						if brief != "" {
+							proj.Messages = append(proj.Messages, map[string]any{
+								"authorName":    "coordinator",
+								"targetMention": "@" + w,
+								"body":          brief,
+								"externalKey":   fmt.Sprintf("acp:%s:%s:%s", t.attemptID, rec.ToolCallID, w),
+							})
+						}
+					}
+				}
+			case "kill":
+				name := getMapString(inMap, "name")
+				if name != "" {
+					rec.WorkerTracked = true
+					rec.WorkerName = name
+					delete(t.activeWorkers, name)
+					proj.Members = append(proj.Members, map[string]any{
+						"memberName":  name,
+						"state":       string(protocol.BoardMemberKilled),
+						"currentStep": "killed",
 					})
 				}
-			}
-		case "kill":
-			name := getMapString(inMap, "name")
-			if name != "" {
-				delete(t.activeWorkers, name)
-				proj.Members = append(proj.Members, map[string]any{
-					"memberName":  name,
-					"state":       string(protocol.BoardMemberKilled),
-					"currentStep": "killed",
-				})
 			}
 		}
 
 	case "post_message", "board_post":
-		body := getMapString(inMap, "body")
-		if body == "" {
-			body = getMapString(inMap, "message")
-		}
-		if body == "" {
-			body = getMapString(inMap, "content")
-		}
-		if body != "" {
-			author := getMapString(inMap, "author")
-			if author == "" {
-				author = getMapString(inMap, "authorName")
+		if !rec.BoardMsgEmitted && inMap != nil {
+			body := getMapString(inMap, "body")
+			if body == "" {
+				body = getMapString(inMap, "message")
 			}
-			if author == "" {
-				author = "coordinator"
+			if body == "" {
+				body = getMapString(inMap, "content")
 			}
-			mention := getMapString(inMap, "mention")
-			if mention == "" {
-				mention = getMapString(inMap, "targetMention")
+			if body != "" {
+				rec.BoardMsgEmitted = true
+				author := getMapString(inMap, "author")
+				if author == "" {
+					author = getMapString(inMap, "authorName")
+				}
+				if author == "" {
+					author = "coordinator"
+				}
+				rec.WorkerName = author
+				mention := getMapString(inMap, "mention")
+				if mention == "" {
+					mention = getMapString(inMap, "targetMention")
+				}
+				proj.Messages = append(proj.Messages, map[string]any{
+					"authorName":    author,
+					"targetMention": mention,
+					"body":          body,
+					"externalKey":   fmt.Sprintf("acp:%s:%s", t.attemptID, rec.ToolCallID),
+				})
 			}
-			proj.Messages = append(proj.Messages, map[string]any{
-				"authorName":    author,
-				"targetMention": mention,
-				"body":          body,
-				"externalKey":   fmt.Sprintf("acp:%s:%s", t.attemptID, rec.ToolCallID),
-			})
 		}
 
 	case "read_board":
-		member := getMapString(inMap, "member")
-		if member == "" {
-			member = getMapString(inMap, "memberName")
-		}
-		if member == "" {
-			member = "coordinator"
-		}
-		var latestSeq int64
-		if outMap != nil {
-			if v, ok := outMap["latestSeq"].(float64); ok {
-				latestSeq = int64(v)
-			} else if v, ok := outMap["lastSeq"].(float64); ok {
-				latestSeq = int64(v)
+		if !rec.ReadBoardTracked && (inMap != nil || outMap != nil) {
+			member := getMapString(inMap, "member")
+			if member == "" {
+				member = getMapString(inMap, "memberName")
+			}
+			if member == "" {
+				member = "coordinator"
+			}
+			var latestSeq int64
+			hasSeq := false
+			if outMap != nil {
+				if v, ok := outMap["latestSeq"].(float64); ok {
+					latestSeq = int64(v)
+					hasSeq = true
+				} else if v, ok := outMap["lastSeq"].(float64); ok {
+					latestSeq = int64(v)
+					hasSeq = true
+				}
+			}
+			if hasSeq || inMap != nil {
+				rec.ReadBoardTracked = hasSeq
+				rec.WorkerName = member
+				proj.Members = append(proj.Members, map[string]any{
+					"memberName":      member,
+					"state":           string(protocol.BoardMemberWorking),
+					"lastConsumedSeq": latestSeq,
+					"currentStep":     "read_board",
+				})
 			}
 		}
-		proj.Members = append(proj.Members, map[string]any{
-			"memberName":      member,
-			"state":           string(protocol.BoardMemberWorking),
-			"lastConsumedSeq": latestSeq,
-			"currentStep":     "read_board",
-		})
 	}
 
 	return proj
+}
+
+func extractExitCode(outMap map[string]any) (int, bool) {
+	if outMap == nil {
+		return 0, false
+	}
+	if ec, ok := outMap["exit_code"].(float64); ok {
+		return int(ec), true
+	}
+	if ec, ok := outMap["exitCode"].(float64); ok {
+		return int(ec), true
+	}
+	return 0, false
 }
 
 func normalizeToolName(name, title string) string {

@@ -75,12 +75,19 @@ WORK_REPO="$TMP_ROOT/work-repo"
 SOCK_PATH="$TMP_ROOT/runner.sock"
 mkdir -p "$CFG_DIR" "$DATA_DIR" "$WORK_REPO"
 
+read -r RUNNER_TOKEN RUNNER_TOKEN_HASH < <(python3 -c '
+import hashlib, secrets
+tok = "smoke-runner-" + secrets.token_hex(16)
+print(tok, "sha256:" + hashlib.sha256(tok.encode()).hexdigest())
+')
+
 cat > "$CFG_DIR/machines.yaml" <<YAML
 schemaVersion: 1
 machines:
   hub-node:
     displayName: "hub-node"
     transport: local_ws
+    tokenHash: "$RUNNER_TOKEN_HASH"
     tailscaleHost: "orbit.example.ts.net"
     capabilities: [primary-dev]
     adapters:
@@ -154,11 +161,38 @@ done
 curl -sf "${HUB_URL}/api/health" >/dev/null
 echo "[OK] orbit-hub healthy at ${HUB_URL}"
 
+# 2b. Verify Runner channel security (B5), adapter guard (B18), and WS ticket (S6)
+NO_TOK_STATUS="$(curl -s -o /dev/null -w '%{http_code}' "${HUB_URL}/ws/runner")"
+if [ "$NO_TOK_STATUS" != "401" ]; then
+  echo "FAIL: expected 401 for unauthenticated /ws/runner, got ${NO_TOK_STATUS}" >&2
+  exit 1
+fi
+ORIGIN_STATUS="$(curl -s -o /dev/null -w '%{http_code}' \
+  -H "Authorization: Bearer ${RUNNER_TOKEN}" \
+  -H "Origin: http://evil.example" \
+  "${HUB_URL}/ws/runner")"
+if [ "$ORIGIN_STATUS" != "403" ]; then
+  echo "FAIL: expected 403 for /ws/runner with browser Origin header, got ${ORIGIN_STATUS}" >&2
+  exit 1
+fi
+CLAUDE_STATUS="$(curl -s -o /dev/null -w '%{http_code}' -X POST "${HUB_URL}/api/projects/demo-app/tasks" \
+  -H "Content-Type: application/json" \
+  -H "X-Orbit-Request: 1" \
+  -d '{"title":"unsupported","goal":"noop","adapter":"claude"}')"
+if [ "$CLAUDE_STATUS" != "501" ]; then
+  echo "FAIL: expected 501 for unimplemented adapter=claude, got ${CLAUDE_STATUS}" >&2
+  exit 1
+fi
+WS_TICKET="$(curl -sf -X POST "${HUB_URL}/api/ws-ticket" -H "X-Orbit-Request: 1")"
+python3 -c 'import json, sys; d = json.loads(sys.argv[1]); assert d.get("ticket") and d.get("expiresAt", 0) > 0, d' "$WS_TICKET"
+echo "[OK] security & API guards verified (/ws/runner 401/403, adapter=claude 501, /api/ws-ticket)"
+
 # 3. Launch temporary orbit-runner with real agy acp
 "$RUNNER_BIN" \
   --machine-id hub-node \
   --hub-ws "$HUB_WS" \
   --hub-http "$HUB_URL" \
+  --token "$RUNNER_TOKEN" \
   --config-dir "$CFG_DIR" \
   --data-dir "$DATA_DIR" \
   --sock "$SOCK_PATH" \

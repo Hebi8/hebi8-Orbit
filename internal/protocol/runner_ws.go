@@ -1,10 +1,12 @@
 package protocol
 
-// LiveAttemptInfo reports an in-memory running attempt during runner.hello reconciliation.
+// LiveAttemptInfo reports an in-memory running attempt (or locally finalized attempt with unacked outbox)
+// during runner.hello reconciliation.
 type LiveAttemptInfo struct {
-	AttemptID  string       `json:"attemptId"`
-	LeaseToken string       `json:"leaseToken"`
-	State      AttemptState `json:"state"`
+	AttemptID    string       `json:"attemptId"`
+	LeaseToken   string       `json:"leaseToken"`
+	State        AttemptState `json:"state"`
+	PendingFinal bool         `json:"pendingFinal,omitempty"`
 }
 
 // HandledApprovalDecision reports an approval already applied locally to ACP
@@ -12,6 +14,7 @@ type LiveAttemptInfo struct {
 type HandledApprovalDecision struct {
 	ApprovalID string        `json:"approvalId"`
 	DecisionID string        `json:"decisionId"`
+	AttemptID  string        `json:"attemptId,omitempty"`
 	Outcome    ApprovalState `json:"outcome"`
 }
 
@@ -22,13 +25,14 @@ type RunnerHelloFrame struct {
 	MachineID                string                    `json:"machineId"`
 	RunnerInstanceID         string                    `json:"runnerInstanceId"`
 	RunnerVersion            string                    `json:"runnerVersion"`
+	Adapters                 []Adapter                 `json:"adapters,omitempty"`
 	LiveAttempts             []LiveAttemptInfo         `json:"liveAttempts"`
 	LivePendingApprovalIDs   []string                  `json:"livePendingApprovalIds"`
 	HandledApprovalDecisions []HandledApprovalDecision `json:"handledApprovalDecisions"`
 	Resources                map[string]ResourceState  `json:"resources"`
 }
 
-// ApprovalDecisionPayload carries a human approval decision to a live runner handle.
+// ApprovalDecisionPayload carries a human approval decision (or expiration unblock) to a live runner handle.
 type ApprovalDecisionPayload struct {
 	ApprovalID    string            `json:"approvalId"`
 	DecisionID    string            `json:"decisionId"`
@@ -36,6 +40,7 @@ type ApprovalDecisionPayload struct {
 	PayloadSHA256 string            `json:"payloadSha256"`
 	OptionID      string            `json:"optionId"`
 	DecidedBy     ApprovalDecidedBy `json:"decidedBy"`
+	Expired       bool              `json:"expired,omitempty"`
 }
 
 // HubWelcomeReconcile carries continuous outbox watermarks, stale attempt aborts,
@@ -78,6 +83,7 @@ type AttemptDispatchFrame struct {
 	WorktreeRoot       string              `json:"worktreeRoot,omitempty"`
 	WorktreePath       string              `json:"worktreePath,omitempty"`
 	MirrorBarePath     string              `json:"mirrorBarePath,omitempty"`
+	RepoIdentity       string              `json:"repoIdentity,omitempty"`
 	BaseSHA            string              `json:"baseSha,omitempty"`
 	DefaultBranch      string              `json:"defaultBranch,omitempty"`
 	DesiredConfig      map[string]string   `json:"desiredConfig,omitempty"`
@@ -95,7 +101,7 @@ type AttemptCancelFrame struct {
 	LeaseToken string              `json:"leaseToken"`
 }
 
-// ApprovalDecisionFrame pushes a human decision for a pending ACP permission request.
+// ApprovalDecisionFrame pushes a human decision (or expiration unblock) for a pending ACP permission request.
 type ApprovalDecisionFrame struct {
 	Type          RunnerWSMessageType `json:"type"`
 	ApprovalID    string              `json:"approvalId"`
@@ -104,6 +110,19 @@ type ApprovalDecisionFrame struct {
 	PayloadSHA256 string              `json:"payloadSha256"`
 	OptionID      string              `json:"optionId"`
 	DecidedBy     ApprovalDecidedBy   `json:"decidedBy"`
+	Expired       bool                `json:"expired,omitempty"`
+}
+
+// BoardMessageDispatchFrame delivers a web @worker board message to an active native Swarm coordinator.
+type BoardMessageDispatchFrame struct {
+	Type          RunnerWSMessageType `json:"type"`
+	TaskID        string              `json:"taskId"`
+	AttemptID     string              `json:"attemptId"`
+	MessageID     string              `json:"messageId"`
+	Seq           int64               `json:"seq"`
+	AuthorName    string              `json:"authorName"`
+	TargetMention string              `json:"targetMention,omitempty"`
+	Body          string              `json:"body"`
 }
 
 // SessionCloseFrame instructs a Runner to close an idle ACP worker session cleanly.
@@ -124,6 +143,7 @@ type RunnerHeartbeatFrame struct {
 	Type                   RunnerWSMessageType      `json:"type"`
 	MachineID              string                   `json:"machineId"`
 	RunnerInstanceID       string                   `json:"runnerInstanceId"`
+	Adapters               []Adapter                `json:"adapters,omitempty"`
 	LiveAttemptLeaseTokens []LiveAttemptLease       `json:"liveAttemptLeaseTokens"`
 	Resources              map[string]ResourceState `json:"resources"`
 	WorkerRssMb            int                      `json:"workerRssMb"`

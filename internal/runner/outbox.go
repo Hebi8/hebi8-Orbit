@@ -9,10 +9,12 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "github.com/ncruces/go-sqlite3/driver"
 
+	"github.com/Hebi8/hebi8-Orbit/internal/gitops"
 	"github.com/Hebi8/hebi8-Orbit/internal/protocol"
 )
 
@@ -21,6 +23,7 @@ import (
 type PendingDelivery struct {
 	DeliveryID     string
 	AttemptID      string
+	LeaseToken     string
 	TaskID         string
 	ProjectID      string
 	RepoRoot       string
@@ -29,6 +32,7 @@ type PendingDelivery struct {
 	HeadSHA        string
 	Summary        string
 	Manifest       protocol.DeliveryManifest
+	StagedBlobs    []gitops.PackagedBlob
 	IsFinal        bool
 	Pushed         bool
 	Emitted        bool
@@ -106,6 +110,7 @@ CREATE INDEX IF NOT EXISTS idx_handled_approvals_time ON handled_approvals(creat
 CREATE TABLE IF NOT EXISTS pending_deliveries (
   delivery_id      TEXT PRIMARY KEY,
   attempt_id       TEXT NOT NULL,
+  lease_token      TEXT NOT NULL DEFAULT '',
   task_id          TEXT NOT NULL,
   project_id       TEXT NOT NULL,
   repo_root        TEXT NOT NULL,
@@ -114,6 +119,7 @@ CREATE TABLE IF NOT EXISTS pending_deliveries (
   head_sha         TEXT NOT NULL,
   summary          TEXT NOT NULL,
   manifest_json    TEXT NOT NULL,
+  blobs_json       TEXT NOT NULL DEFAULT '[]',
   is_final         INTEGER NOT NULL DEFAULT 0,
   pushed           INTEGER NOT NULL DEFAULT 0,
   emitted          INTEGER NOT NULL DEFAULT 0,
@@ -123,6 +129,16 @@ CREATE TABLE IF NOT EXISTS pending_deliveries (
 	if _, err := db.ExecContext(ctx, ddl); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("apply outbox ddl: %w", err)
+	}
+	// Additive upgrade for existing runner-outbox sqlite files
+	for _, alter := range []string{
+		`ALTER TABLE pending_deliveries ADD COLUMN lease_token TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE pending_deliveries ADD COLUMN blobs_json TEXT NOT NULL DEFAULT '[]'`,
+	} {
+		if _, err := db.ExecContext(ctx, alter); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+			_ = db.Close()
+			return nil, fmt.Errorf("migrate outbox: %w", err)
+		}
 	}
 	return &LocalOutbox{db: db}, nil
 }
@@ -304,13 +320,43 @@ func (o *LocalOutbox) RecordHandledApproval(ctx context.Context, decisionID, app
 	return err
 }
 
-// LookupHandledApproval checks if decisionID has already been applied locally.
+// HasCursor reports whether attemptID has ever written to this Runner's local outbox (B10).
+func (o *LocalOutbox) HasCursor(ctx context.Context, attemptID string) (bool, error) {
+	var exists string
+	err := o.db.QueryRowContext(ctx, `SELECT attempt_id FROM attempt_cursors WHERE attempt_id = ?`, attemptID).Scan(&exists)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+// HasUnackedItems reports whether attemptID still has any unacknowledged outbox rows (B3, S1).
+func (o *LocalOutbox) HasUnackedItems(ctx context.Context, attemptID string) (bool, error) {
+	var cnt int
+	err := o.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM outbox_items i
+		JOIN attempt_cursors c ON c.attempt_id = i.attempt_id
+		WHERE i.attempt_id = ? AND i.outbox_seq > c.acked_seq
+	`, attemptID).Scan(&cnt)
+	return cnt > 0, err
+}
+
+// HasUnemittedDeliveriesForAttempt reports whether attemptID still has pending deliveries waiting to emit.
+func (o *LocalOutbox) HasUnemittedDeliveriesForAttempt(ctx context.Context, attemptID string) (bool, error) {
+	var cnt int
+	err := o.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM pending_deliveries WHERE attempt_id = ? AND emitted = 0
+	`, attemptID).Scan(&cnt)
+	return cnt > 0, err
+}
+
+// LookupHandledApproval checks if decisionID has already been applied locally (B8 includes AttemptID).
 func (o *LocalOutbox) LookupHandledApproval(ctx context.Context, decisionID string) (protocol.HandledApprovalDecision, bool, error) {
 	var hd protocol.HandledApprovalDecision
 	var outcome string
 	err := o.db.QueryRowContext(ctx, `
-		SELECT approval_id, decision_id, outcome FROM handled_approvals WHERE decision_id = ?
-	`, decisionID).Scan(&hd.ApprovalID, &hd.DecisionID, &outcome)
+		SELECT approval_id, attempt_id, decision_id, outcome FROM handled_approvals WHERE decision_id = ?
+	`, decisionID).Scan(&hd.ApprovalID, &hd.AttemptID, &hd.DecisionID, &outcome)
 	if errors.Is(err, sql.ErrNoRows) {
 		return hd, false, nil
 	}
@@ -321,13 +367,13 @@ func (o *LocalOutbox) LookupHandledApproval(ctx context.Context, decisionID stri
 	return hd, true, nil
 }
 
-// ListRecentHandledApprovals returns recent locally handled decisions for runner.hello.
+// ListRecentHandledApprovals returns recent locally handled decisions for runner.hello (B8 includes AttemptID).
 func (o *LocalOutbox) ListRecentHandledApprovals(ctx context.Context, limit int) ([]protocol.HandledApprovalDecision, error) {
 	if limit <= 0 {
 		limit = 50
 	}
 	rows, err := o.db.QueryContext(ctx, `
-		SELECT approval_id, decision_id, outcome
+		SELECT approval_id, attempt_id, decision_id, outcome
 		FROM handled_approvals
 		ORDER BY created_at DESC
 		LIMIT ?
@@ -340,7 +386,7 @@ func (o *LocalOutbox) ListRecentHandledApprovals(ctx context.Context, limit int)
 	for rows.Next() {
 		var hd protocol.HandledApprovalDecision
 		var outcome string
-		if err := rows.Scan(&hd.ApprovalID, &hd.DecisionID, &outcome); err != nil {
+		if err := rows.Scan(&hd.ApprovalID, &hd.AttemptID, &hd.DecisionID, &outcome); err != nil {
 			return nil, err
 		}
 		hd.Outcome = protocol.ApprovalState(outcome)
@@ -349,11 +395,18 @@ func (o *LocalOutbox) ListRecentHandledApprovals(ctx context.Context, limit int)
 	return out, rows.Err()
 }
 
-// SavePendingDelivery persists immutable delivery metadata prior to git push.
+// SavePendingDelivery persists immutable delivery metadata prior to git push / blob upload.
 func (o *LocalOutbox) SavePendingDelivery(ctx context.Context, d PendingDelivery) error {
 	manifestBytes, err := json.Marshal(d.Manifest)
 	if err != nil {
 		return err
+	}
+	blobsBytes, err := json.Marshal(d.StagedBlobs)
+	if err != nil {
+		return err
+	}
+	if d.StagedBlobs == nil {
+		blobsBytes = []byte("[]")
 	}
 	if d.CreatedAt == 0 {
 		d.CreatedAt = time.Now().UnixMilli()
@@ -364,11 +417,51 @@ func (o *LocalOutbox) SavePendingDelivery(ctx context.Context, d PendingDelivery
 	}
 	_, err = o.db.ExecContext(ctx, `
 		INSERT OR IGNORE INTO pending_deliveries (
-			delivery_id, attempt_id, task_id, project_id, repo_root, mirror_bare_path,
-			review_base_sha, head_sha, summary, manifest_json, is_final, pushed, emitted, created_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?)
-	`, d.DeliveryID, d.AttemptID, d.TaskID, d.ProjectID, d.RepoRoot, d.MirrorBarePath,
-		d.ReviewBaseSHA, d.HeadSHA, d.Summary, string(manifestBytes), isFinal, d.CreatedAt)
+			delivery_id, attempt_id, lease_token, task_id, project_id, repo_root, mirror_bare_path,
+			review_base_sha, head_sha, summary, manifest_json, blobs_json, is_final, pushed, emitted, created_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?)
+	`, d.DeliveryID, d.AttemptID, d.LeaseToken, d.TaskID, d.ProjectID, d.RepoRoot, d.MirrorBarePath,
+		d.ReviewBaseSHA, d.HeadSHA, d.Summary, string(manifestBytes), string(blobsBytes), isFinal, d.CreatedAt)
+	return err
+}
+
+// GetPendingDelivery fetches one locally persisted pending delivery by deliveryID (B13).
+func (o *LocalOutbox) GetPendingDelivery(ctx context.Context, deliveryID string) (PendingDelivery, bool, error) {
+	var d PendingDelivery
+	var mJSON, bJSON string
+	var isFinal, pushed, emitted int
+	err := o.db.QueryRowContext(ctx, `
+		SELECT delivery_id, attempt_id, lease_token, task_id, project_id, repo_root, mirror_bare_path,
+		       review_base_sha, head_sha, summary, manifest_json, blobs_json, is_final, pushed, emitted, created_at
+		FROM pending_deliveries
+		WHERE delivery_id = ?
+	`, deliveryID).Scan(
+		&d.DeliveryID, &d.AttemptID, &d.LeaseToken, &d.TaskID, &d.ProjectID, &d.RepoRoot, &d.MirrorBarePath,
+		&d.ReviewBaseSHA, &d.HeadSHA, &d.Summary, &mJSON, &bJSON, &isFinal, &pushed, &emitted, &d.CreatedAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return d, false, nil
+	}
+	if err != nil {
+		return d, false, err
+	}
+	d.IsFinal = isFinal != 0
+	d.Pushed = pushed != 0
+	d.Emitted = emitted != 0
+	_ = json.Unmarshal([]byte(mJSON), &d.Manifest)
+	if bJSON != "" {
+		_ = json.Unmarshal([]byte(bJSON), &d.StagedBlobs)
+	}
+	return d, true, nil
+}
+
+// UpdatePendingDeliveryFinal upgrades an unemitted delivery's is_final flag when retried with --final.
+func (o *LocalOutbox) UpdatePendingDeliveryFinal(ctx context.Context, deliveryID string, isFinal bool) error {
+	v := 0
+	if isFinal {
+		v = 1
+	}
+	_, err := o.db.ExecContext(ctx, `UPDATE pending_deliveries SET is_final = MAX(is_final, ?) WHERE delivery_id = ?`, v, deliveryID)
 	return err
 }
 
@@ -382,11 +475,101 @@ func (o *LocalOutbox) MarkDeliveryEmitted(ctx context.Context, deliveryID string
 	return err
 }
 
+// EmitPendingDeliveryAtomically writes delivery_published + optional terminal state frame + emitted=1
+// inside ONE local SQLite transaction so crashes can never leave emitted=0 or split final state (B13).
+func (o *LocalOutbox) EmitPendingDeliveryAtomically(
+	ctx context.Context,
+	deliveryID, attemptID, leaseToken, dlvEventID string,
+	dlvPayload map[string]any,
+	emitFinal bool,
+	finalEventID string,
+	finalPayload map[string]any,
+) (bool, error) {
+	now := time.Now().UnixMilli()
+	dlvBytes, err := json.Marshal(dlvPayload)
+	if err != nil {
+		return false, err
+	}
+	var finalBytes []byte
+	if emitFinal {
+		finalBytes, err = json.Marshal(finalPayload)
+		if err != nil {
+			return false, err
+		}
+	}
+
+	tx, err := o.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+
+	var alreadyEmitted int
+	if err := tx.QueryRowContext(ctx, `SELECT emitted FROM pending_deliveries WHERE delivery_id = ?`, deliveryID).Scan(&alreadyEmitted); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	if alreadyEmitted != 0 {
+		return false, nil
+	}
+
+	var nextSeq int64
+	addCount := int64(1)
+	if emitFinal {
+		addCount = 2
+	}
+	err = tx.QueryRowContext(ctx, `SELECT next_seq FROM attempt_cursors WHERE attempt_id = ?`, attemptID).Scan(&nextSeq)
+	if errors.Is(err, sql.ErrNoRows) {
+		nextSeq = 1
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO attempt_cursors (attempt_id, lease_token, next_seq, acked_seq, updated_at)
+			VALUES (?, ?, ?, 0, ?)
+		`, attemptID, leaseToken, 1+addCount, now); err != nil {
+			return false, err
+		}
+	} else if err != nil {
+		return false, err
+	} else {
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE attempt_cursors SET next_seq = ?, lease_token = ?, updated_at = ? WHERE attempt_id = ?
+		`, nextSeq+addCount, leaseToken, now, attemptID); err != nil {
+			return false, err
+		}
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO outbox_items (attempt_id, outbox_seq, event_id, frame_type, payload_json, ts, lease_token)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, attemptID, nextSeq, dlvEventID, string(protocol.OutboxFrameDeliveryPublished), string(dlvBytes), now, leaseToken); err != nil {
+		return false, fmt.Errorf("insert atomic delivery_published: %w", err)
+	}
+
+	if emitFinal {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO outbox_items (attempt_id, outbox_seq, event_id, frame_type, payload_json, ts, lease_token)
+			VALUES (?, ?, ?, ?, ?, ?, ?)
+		`, attemptID, nextSeq+1, finalEventID, string(protocol.OutboxFrameState), string(finalBytes), now, leaseToken); err != nil {
+			return false, fmt.Errorf("insert atomic final state: %w", err)
+		}
+	}
+
+	if _, err := tx.ExecContext(ctx, `UPDATE pending_deliveries SET pushed = 1, emitted = 1 WHERE delivery_id = ?`, deliveryID); err != nil {
+		return false, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // ListUnemittedDeliveries returns pending deliveries that haven't finished push + outbox emission yet.
 func (o *LocalOutbox) ListUnemittedDeliveries(ctx context.Context) ([]PendingDelivery, error) {
 	rows, err := o.db.QueryContext(ctx, `
-		SELECT delivery_id, attempt_id, task_id, project_id, repo_root, mirror_bare_path,
-		       review_base_sha, head_sha, summary, manifest_json, is_final, pushed, emitted, created_at
+		SELECT delivery_id, attempt_id, lease_token, task_id, project_id, repo_root, mirror_bare_path,
+		       review_base_sha, head_sha, summary, manifest_json, blobs_json, is_final, pushed, emitted, created_at
 		FROM pending_deliveries
 		WHERE emitted = 0
 		ORDER BY created_at ASC
@@ -398,11 +581,11 @@ func (o *LocalOutbox) ListUnemittedDeliveries(ctx context.Context) ([]PendingDel
 	var out []PendingDelivery
 	for rows.Next() {
 		var d PendingDelivery
-		var mJSON string
+		var mJSON, bJSON string
 		var isFinal, pushed, emitted int
 		if err := rows.Scan(
-			&d.DeliveryID, &d.AttemptID, &d.TaskID, &d.ProjectID, &d.RepoRoot, &d.MirrorBarePath,
-			&d.ReviewBaseSHA, &d.HeadSHA, &d.Summary, &mJSON, &isFinal, &pushed, &emitted, &d.CreatedAt,
+			&d.DeliveryID, &d.AttemptID, &d.LeaseToken, &d.TaskID, &d.ProjectID, &d.RepoRoot, &d.MirrorBarePath,
+			&d.ReviewBaseSHA, &d.HeadSHA, &d.Summary, &mJSON, &bJSON, &isFinal, &pushed, &emitted, &d.CreatedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -410,6 +593,9 @@ func (o *LocalOutbox) ListUnemittedDeliveries(ctx context.Context) ([]PendingDel
 		d.Pushed = pushed != 0
 		d.Emitted = emitted != 0
 		_ = json.Unmarshal([]byte(mJSON), &d.Manifest)
+		if bJSON != "" {
+			_ = json.Unmarshal([]byte(bJSON), &d.StagedBlobs)
+		}
 		out = append(out, d)
 	}
 	return out, rows.Err()

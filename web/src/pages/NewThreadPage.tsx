@@ -41,6 +41,14 @@ export function NewThreadPage({ boot, mode, projectId }: { boot: BootstrapRespon
   }, [projectId]);
 
   const project = projects.find((p) => p.projectId === pid);
+  const availableAdapters = useMemo(() => {
+    const set = new Set<string>();
+    for (const mach of boot.machines) {
+      for (const adp of mach.adapters ?? []) set.add(adp);
+    }
+    if (set.size === 0) set.add('agy');
+    return set;
+  }, [boot.machines]);
   useEffect(() => {
     setCapability('');
     setAdapter('');
@@ -154,12 +162,15 @@ export function NewThreadPage({ boot, mode, projectId }: { boot: BootstrapRespon
               {m !== 'pa' && (
                 <>
                   <select className="field" value={adapter} onChange={(e) => setAdapter(e.target.value)} aria-label="Agent">
-                    <option value="">{m === 'project' && project ? `默认 · ${project.defaultAdapter}` : '默认 Agent'}</option>
-                    {SessionAdapterValues.map((a) => (
-                      <option key={a} value={a}>
-                        {a}
-                      </option>
-                    ))}
+                    <option value="">{m === 'project' && project ? `默认 · ${project.defaultAdapter}` : '默认 · agy'}</option>
+                    {SessionAdapterValues.map((a) => {
+                      const supported = availableAdapters.has(a);
+                      return (
+                        <option key={a} value={a} disabled={!supported}>
+                          {supported ? a : `${a} (Phase 3 未接入)`}
+                        </option>
+                      );
+                    })}
                   </select>
                   <input className="field" value={model} onChange={(e) => setModel(e.target.value)} placeholder="模型（默认）" aria-label="模型" />
                 </>

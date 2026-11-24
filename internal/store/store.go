@@ -22,6 +22,7 @@ var (
 	ErrConflict             = errors.New("conflict")
 	ErrOwnershipMismatch    = errors.New("ownership mismatch")
 	ErrBlobMismatch         = errors.New("blob missing or size mismatch")
+	ErrDeliveryVerifyFailed = errors.New("delivery verification failed")
 	ErrForbidden            = errors.New("forbidden")
 	ErrVerificationRequired = errors.New("verification required")
 	ErrInvalidInput         = errors.New("invalid input")
@@ -195,6 +196,54 @@ func applySchema(ctx context.Context, db *sql.DB) error {
 		}
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO schema_migrations (version, applied_at) VALUES (2, ?)
+		`, now); err != nil {
+			return err
+		}
+	}
+
+	// Smooth versioned migration v3 (Phase 1 round-1 hardening): safe on fresh, v1, and v2 DBs.
+	var hasV3 int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version = 3`).Scan(&hasV3); err != nil {
+		return err
+	}
+	if hasV3 == 0 {
+		if _, err := tx.ExecContext(ctx, BuildMigrationV3DDL()); err != nil {
+			return fmt.Errorf("apply v3 ddl: %w", err)
+		}
+		if err := ensureColumnTx(ctx, tx, "approvals", "delivery_attempted", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+			return err
+		}
+		if err := ensureColumnTx(ctx, tx, "attempts", "cancel_requested", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+			return err
+		}
+		if err := ensureColumnTx(ctx, tx, "attempts", "cancel_reason_kind", "TEXT"); err != nil {
+			return err
+		}
+		if err := ensureColumnTx(ctx, tx, "attempts", "steer_input_id", "TEXT"); err != nil {
+			return err
+		}
+		if err := ensureColumnTx(ctx, tx, "attempts", "desired_config_json", "TEXT"); err != nil {
+			return err
+		}
+		if err := ensureColumnTx(ctx, tx, "attempts", "required_resources_json", "TEXT"); err != nil {
+			return err
+		}
+		if err := ensureColumnTx(ctx, tx, "attempts", "anchor_json", "TEXT"); err != nil {
+			return err
+		}
+		if err := ensureColumnTx(ctx, tx, "machines", "adapters_json", "TEXT NOT NULL DEFAULT '[]'"); err != nil {
+			return err
+		}
+		// S8: Backfill empty body on legacy Phase 0 task_pending_inputs from payload_json.prompt
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE task_pending_inputs
+			SET body = COALESCE(NULLIF(json_extract(payload_json, '$.prompt'), ''), '')
+			WHERE body = '' AND json_valid(payload_json)
+		`); err != nil {
+			return fmt.Errorf("backfill legacy pending input body: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO schema_migrations (version, applied_at) VALUES (3, ?)
 		`, now); err != nil {
 			return err
 		}

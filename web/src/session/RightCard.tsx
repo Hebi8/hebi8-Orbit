@@ -47,8 +47,15 @@ export function RightCard({
   const taskId = tl.task.taskId;
 
   const codeDeliveries = tl.deliveries.filter((d) => CODE_KINDS.has(d.kind) && d.manifest.filesChanged > 0);
-  const latestCode = codeDeliveries[codeDeliveries.length - 1];
-  const artDelivery = [...tl.deliveries].reverse().find((d) => (d.ryugiBindings?.length ?? 0) > 0);
+  const formalCodeDeliveries = codeDeliveries.filter((d) => !d.lateArrival);
+  const latestCode =
+    formalCodeDeliveries.find((d) => d.deliveryId === tl.task.latestDeliveryId) ??
+    formalCodeDeliveries[formalCodeDeliveries.length - 1] ??
+    codeDeliveries[codeDeliveries.length - 1];
+  const formalDeliveries = tl.deliveries.filter((d) => !d.lateArrival);
+  const artDelivery =
+    [...formalDeliveries].reverse().find((d) => (d.ryugiBindings?.length ?? 0) > 0) ??
+    [...tl.deliveries].reverse().find((d) => (d.ryugiBindings?.length ?? 0) > 0);
   const members = board?.members ?? tl.boardMembers;
   const showWorkers = members.length > 0 || tl.task.workerCount > 0;
 

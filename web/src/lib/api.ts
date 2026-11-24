@@ -36,6 +36,7 @@ import type {
   TaskSource,
   TaskSummary,
   TaskTimelineResponse,
+  WSTicketResponse,
   WorkerStreamResponse,
 } from '../generated/protocol';
 
@@ -116,6 +117,10 @@ async function apiFetch<T>(path: string, options: FetchOptions = {}): Promise<T>
 const enc = encodeURIComponent;
 
 export const api = {
+  createWSTicket(): Promise<WSTicketResponse> {
+    return apiFetch<WSTicketResponse>('/api/ws-ticket', { method: 'POST', json: {} });
+  },
+
   bootstrap(): Promise<BootstrapResponse> {
     return apiFetch<BootstrapResponse>('/api/bootstrap');
   },
@@ -201,8 +206,12 @@ export const api = {
     });
   },
 
-  getBoard(taskId: string): Promise<TaskBoardResponse> {
-    return apiFetch<TaskBoardResponse>(`/api/tasks/${enc(taskId)}/board`);
+  getBoard(taskId: string, opts?: { beforeSeq?: number; limit?: number }): Promise<TaskBoardResponse> {
+    const params = new URLSearchParams();
+    if (opts?.beforeSeq && opts.beforeSeq > 0) params.set('beforeSeq', String(opts.beforeSeq));
+    if (opts?.limit && opts.limit > 0) params.set('limit', String(opts.limit));
+    const q = params.toString();
+    return apiFetch<TaskBoardResponse>(`/api/tasks/${enc(taskId)}/board${q ? `?${q}` : ''}`);
   },
 
   postBoardMessage(taskId: string, req: PostBoardMessageRequest): Promise<BoardMessage> {

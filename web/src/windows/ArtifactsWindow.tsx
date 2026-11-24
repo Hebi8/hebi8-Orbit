@@ -1,7 +1,7 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { ArrowUpRight, RefreshCw } from 'lucide-react';
-import type { RyugiSyncResponse } from '../generated/protocol';
+import type { AnnotationView, RyugiSyncResponse } from '../generated/protocol';
 import { ArtIcon } from '../components/Icons';
 import { useDelivery, useTimeline } from '../hooks/queries';
 import { api, errMsg } from '../lib/api';
@@ -15,12 +15,15 @@ function openExternal(url: string) {
 
 function ArtifactsInner({ w }: { w: WinState }) {
   const qc = useQueryClient();
+  const deselectedArr = useWorkbenchStore((s) => s.deselectedAnnotations[w.taskId]);
+  const toggleAnnSelected = useWorkbenchStore((s) => s.toggleAnnotationSelected);
+  const clearDeselected = useWorkbenchStore((s) => s.clearDeselectedAnnotations);
+  const deselected = useMemo(() => new Set(deselectedArr ?? []), [deselectedArr]);
   const [deliveryId, setDeliveryId] = useState(w.deliveryId);
-  const [deselected, setDeselected] = useState<Set<string>>(new Set());
   const [lastSync, setLastSync] = useState<RyugiSyncResponse | null>(null);
+  const [verifiedSite, setVerifiedSite] = useState(false);
   useEffect(() => setDeliveryId(w.deliveryId), [w.deliveryId]);
   useEffect(() => {
-    setDeselected(new Set());
     setLastSync(null);
   }, [deliveryId]);
 
@@ -31,10 +34,31 @@ function ArtifactsInner({ w }: { w: WinState }) {
   const bindings = detail?.ryugiBindings ?? [];
   const notes = (detail?.annotations ?? []).filter((a) => a.source === 'ryugi');
   const openNotes = notes.filter((a) => a.status === 'open');
-  const selectedIds = openNotes.filter((a) => !deselected.has(a.annotationId)).map((a) => a.annotationId);
+  const localSelectedIds = openNotes.filter((a) => !deselected.has(a.annotationId)).map((a) => a.annotationId);
+  const lastAtt = tl.data?.attempts?.[tl.data.attempts.length - 1];
+  const needsVerifyAttemptId = !tl.data?.task.activeAttemptId && lastAtt?.state === 'needs_verification' ? lastAtt.attemptId : undefined;
+  useEffect(() => setVerifiedSite(false), [needsVerifyAttemptId]);
+
+  const { selDiffIds, selRyugiIds, combinedSelectedIds, allOpenDiffCount, allOpenRyugiCount } = useMemo(() => {
+    const byId = new Map<string, AnnotationView>();
+    for (const a of tl.data?.annotations ?? []) byId.set(a.annotationId, a);
+    for (const a of detail?.annotations ?? []) byId.set(a.annotationId, a);
+    const allOpen = [...byId.values()].filter((a) => a.status === 'open');
+    const openDiff = allOpen.filter((a) => a.source !== 'ryugi');
+    const openRyugi = allOpen.filter((a) => a.source === 'ryugi');
+    const diffIds = openDiff.filter((a) => !deselected.has(a.annotationId)).map((a) => a.annotationId);
+    const ryugiIds = openRyugi.filter((a) => !deselected.has(a.annotationId)).map((a) => a.annotationId);
+    return {
+      selDiffIds: diffIds,
+      selRyugiIds: ryugiIds,
+      combinedSelectedIds: [...diffIds, ...ryugiIds],
+      allOpenDiffCount: openDiff.length,
+      allOpenRyugiCount: openRyugi.length,
+    };
+  }, [tl.data?.annotations, detail?.annotations, deselected]);
 
   const refresh = () => {
-    void qc.invalidateQueries({ queryKey: ['delivery', deliveryId] });
+    void qc.invalidateQueries({ queryKey: ['delivery'] });
     void qc.invalidateQueries({ queryKey: ['task-timeline', w.taskId] });
   };
 
@@ -54,9 +78,17 @@ function ArtifactsInner({ w }: { w: WinState }) {
     onError: (e) => toast(errMsg(e), 'err'),
   });
   const dispatch = useMutation({
-    mutationFn: (ids: string[]) => api.dispatchAnnotations(w.taskId, { annotationIds: ids, mode: 'queue' }),
+    mutationFn: (ids: string[]) =>
+      api.dispatchAnnotations(w.taskId, {
+        annotationIds: ids,
+        mode: 'queue',
+        verifiedSite: needsVerifyAttemptId ? verifiedSite : undefined,
+        verifiedAttemptId: needsVerifyAttemptId,
+      }),
     onSuccess: (res) => {
-      toast(res.pendingInput ? `已打包 ${res.queuedCount} 条画布批注 → 待消费队列` : `已打包 ${res.queuedCount} 条画布批注 → 直接开始新一轮`);
+      toast(res.pendingInput ? `已打包 ${res.queuedCount} 条批注 → 待消费队列` : `已打包 ${res.queuedCount} 条批注 → 直接开始新一轮`);
+      clearDeselected(w.taskId);
+      setVerifiedSite(false);
       refresh();
       void qc.invalidateQueries({ queryKey: ['bootstrap'] });
     },
@@ -84,14 +116,39 @@ function ArtifactsInner({ w }: { w: WinState }) {
           <span className="l">
             {lastSync
               ? `上次同步：${lastSync.bindingsSynced} 画布 · +${lastSync.newAnnotations} 批注${lastSync.errors?.length ? ` · ${lastSync.errors.length} 个错误` : ''}`
-              : '批注会作为一条待消费消息挂到会话末尾'}
+              : allOpenDiffCount + allOpenRyugiCount > 0
+                ? `任务已选 ${combinedSelectedIds.length} 条未决批注（Ryugi ${selRyugiIds.length}/${allOpenRyugiCount}${allOpenDiffCount > 0 ? ` · Diff ${selDiffIds.length}/${allOpenDiffCount}` : ''}）`
+                : '批注可与 Code Review 行评合并，作为一条待消费消息挂到会话末尾'}
           </span>
           <span className="r">
+            {needsVerifyAttemptId && (
+              <label style={{ display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 12, color: 'var(--warn)', marginRight: 4, cursor: 'pointer' }}>
+                <input type="checkbox" checked={verifiedSite} onChange={(e) => setVerifiedSite(e.target.checked)} />
+                <span>已核对现场</span>
+              </label>
+            )}
             <button type="button" className="btn" disabled={sync.isPending || !d} onClick={() => sync.mutate()}>
               <RefreshCw size={12} strokeWidth={1.6} className={sync.isPending ? 'spinning' : ''} /> 立即同步批注
             </button>
-            <button type="button" className="btn pri" disabled={selectedIds.length === 0 || dispatch.isPending} onClick={() => dispatch.mutate(selectedIds)}>
-              打包 {selectedIds.length} 条画布批注 → 送入待消费队列
+            {selDiffIds.length > 0 && localSelectedIds.length > 0 && (
+              <button
+                type="button"
+                className="btn ghost"
+                disabled={dispatch.isPending || (!!needsVerifyAttemptId && !verifiedSite)}
+                onClick={() => dispatch.mutate(localSelectedIds)}
+              >
+                仅发本窗 ({localSelectedIds.length})
+              </button>
+            )}
+            <button
+              type="button"
+              className="btn pri"
+              disabled={combinedSelectedIds.length === 0 || dispatch.isPending || (!!needsVerifyAttemptId && !verifiedSite)}
+              onClick={() => dispatch.mutate(combinedSelectedIds)}
+            >
+              {selDiffIds.length > 0 && selRyugiIds.length > 0
+                ? `合并打包 ${combinedSelectedIds.length} 条（Diff ${selDiffIds.length} + Ryugi ${selRyugiIds.length}）→ 入队`
+                : `打包 ${combinedSelectedIds.length} 条批注 → 送入待消费队列`}
             </button>
           </span>
         </>
@@ -102,6 +159,7 @@ function ArtifactsInner({ w }: { w: WinState }) {
           {versions.map((v, i) => (
             <button type="button" key={v.deliveryId} className={v.deliveryId === deliveryId ? 'on' : ''} onClick={() => setDeliveryId(v.deliveryId)}>
               v{i + 1} <span className="mono faint">{shortSha(v.headSha)}</span>
+              {v.lateArrival && <span className="faint"> (迟到档案)</span>}
             </button>
           ))}
         </div>
@@ -159,14 +217,7 @@ function ArtifactsInner({ w }: { w: WinState }) {
                     type="checkbox"
                     disabled={!open}
                     checked={open && !deselected.has(a.annotationId)}
-                    onChange={(e) =>
-                      setDeselected((s) => {
-                        const n = new Set(s);
-                        if (e.target.checked) n.delete(a.annotationId);
-                        else n.add(a.annotationId);
-                        return n;
-                      })
-                    }
+                    onChange={(e) => toggleAnnSelected(w.taskId, a.annotationId, e.target.checked)}
                   />
                   <span style={{ minWidth: 0 }}>
                     {loc && <span className="loc">{loc}</span>}

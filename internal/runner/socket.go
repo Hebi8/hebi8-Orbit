@@ -18,6 +18,8 @@ import (
 type LocalDeliverRequest struct {
 	AttemptID   string                   `json:"attemptId,omitempty"`
 	TaskID      string                   `json:"taskId,omitempty"`
+	DeliveryID  string                   `json:"deliveryId,omitempty"`
+	Resume      bool                     `json:"resume,omitempty"`
 	CWD         string                   `json:"cwd,omitempty"`
 	Summary     string                   `json:"summary"`
 	Final       bool                     `json:"final"`

@@ -37,7 +37,7 @@ function BindMenu({ boot, taskId }: { boot: BootstrapResponse; taskId: string })
   });
   return (
     <div className="relpos" style={{ flex: 'none' }}>
-      <button type="button" className="branch" style={{ cursor: 'pointer' }} onClick={() => setOpen(!open)}>
+      <button type="button" className="bind-btn" style={{ cursor: 'pointer' }} onClick={() => setOpen(!open)}>
         <Link2 size={12} strokeWidth={1.6} /> 绑定到项目… <ChevronDown size={11} strokeWidth={1.6} />
       </button>
       {open && (
@@ -145,8 +145,13 @@ export function SessionPage({ boot, taskId, worker }: { boot: BootstrapResponse;
   }
 
   const codeDeliveries = tl.deliveries.filter((d) => CODE_KINDS.has(d.kind));
-  const latestCode = codeDeliveries[codeDeliveries.length - 1];
+  const formalCodeDeliveries = codeDeliveries.filter((d) => !d.lateArrival);
+  const latestCode =
+    formalCodeDeliveries.find((d) => d.deliveryId === task.latestDeliveryId) ??
+    formalCodeDeliveries[formalCodeDeliveries.length - 1] ??
+    codeDeliveries[codeDeliveries.length - 1];
   const lastAttempt = tl.attempts[tl.attempts.length - 1];
+  const needsVerifyAttemptId = !task.activeAttemptId && lastAttempt?.state === 'needs_verification' ? lastAttempt.attemptId : undefined;
   const branchText = latestCode
     ? `${basename(latestCode.manifest.worktreePath) || 'worktree'} · ${shortSha(latestCode.headSha)}`
     : lastAttempt?.worktreePath
@@ -308,7 +313,14 @@ export function SessionPage({ boot, taskId, worker }: { boot: BootstrapResponse;
               </>
             )}
           </div>
-          <Composer task={task} worker={worker} members={members} editing={editing} onEditDone={() => setEditing(null)} />
+          <Composer
+            task={task}
+            worker={worker}
+            members={members}
+            editing={editing}
+            needsVerifyAttemptId={needsVerifyAttemptId}
+            onEditDone={() => setEditing(null)}
+          />
         </div>
         {(dockMode || mobileDock) && (
           <div

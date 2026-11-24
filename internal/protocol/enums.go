@@ -77,6 +77,16 @@ var AllSessionAdapters = []SessionAdapter{
 
 func (v SessionAdapter) IsValid() bool { return slices.Contains(AllSessionAdapters, v) }
 
+// Phase1ImplementedSessionAdapters lists session adapters actually implemented in Phase 1.
+var Phase1ImplementedSessionAdapters = []Adapter{
+	AdapterAgy,
+}
+
+// IsSessionAdapterImplemented reports whether a session adapter has a real runtime driver in Phase 1.
+func IsSessionAdapterImplemented(a Adapter) bool {
+	return slices.Contains(Phase1ImplementedSessionAdapters, a)
+}
+
 // TaskState represents the lifecycle state of a logical task.
 type TaskState string
 
@@ -579,6 +589,7 @@ const (
 	EventTaskProjectBound        EventKind = "task.project_bound"
 	EventTaskSourceAdded         EventKind = "task.source_added"
 	EventTaskSourceRemoved       EventKind = "task.source_removed"
+	EventMachineStateChanged     EventKind = "machine.state_changed"
 )
 
 var AllEventKinds = []EventKind{
@@ -617,6 +628,7 @@ var AllEventKinds = []EventKind{
 	EventTaskProjectBound,
 	EventTaskSourceAdded,
 	EventTaskSourceRemoved,
+	EventMachineStateChanged,
 }
 
 // IDEScheme defines supported URI schemes for one-click IDE jump.
@@ -675,6 +687,7 @@ const (
 	RunnerMsgHeartbeat       RunnerWSMessageType = "runner.heartbeat"
 	RunnerMsgOutboxBatch     RunnerWSMessageType = "attempt.outbox_batch"
 	RunnerMsgOutboxAck       RunnerWSMessageType = "hub.outbox_ack"
+	RunnerMsgBoardMessage    RunnerWSMessageType = "board.message"
 )
 
 var AllRunnerWSMessageTypes = []RunnerWSMessageType{
@@ -687,6 +700,7 @@ var AllRunnerWSMessageTypes = []RunnerWSMessageType{
 	RunnerMsgHeartbeat,
 	RunnerMsgOutboxBatch,
 	RunnerMsgOutboxAck,
+	RunnerMsgBoardMessage,
 }
 
 func (v RunnerWSMessageType) IsValid() bool { return slices.Contains(AllRunnerWSMessageTypes, v) }
@@ -702,6 +716,7 @@ const (
 	OutboxFrameDeliveryPublished OutboxFrameType = "delivery_published"
 	OutboxFrameBoardMessage      OutboxFrameType = "board_message"
 	OutboxFrameBoardMember       OutboxFrameType = "board_member"
+	OutboxFrameBoardAck          OutboxFrameType = "board_message_ack"
 )
 
 var AllOutboxFrameTypes = []OutboxFrameType{
@@ -712,6 +727,7 @@ var AllOutboxFrameTypes = []OutboxFrameType{
 	OutboxFrameDeliveryPublished,
 	OutboxFrameBoardMessage,
 	OutboxFrameBoardMember,
+	OutboxFrameBoardAck,
 }
 
 func (v OutboxFrameType) IsValid() bool { return slices.Contains(AllOutboxFrameTypes, v) }

@@ -41,6 +41,7 @@ type MachineView struct {
 	SSHAlias      string                   `json:"sshAlias,omitempty"`
 	Status        MachineStatus            `json:"status"`
 	Capabilities  []string                 `json:"capabilities"`
+	Adapters      []Adapter                `json:"adapters,omitempty"`
 	Resources     map[string]ResourceState `json:"resources"`
 	RunnerVersion string                   `json:"runnerVersion,omitempty"`
 	LastSeenAt    *int64                   `json:"lastSeenAt,omitempty"`
@@ -180,6 +181,7 @@ type AttemptView struct {
 	MachineID        string            `json:"machineId"`
 	Adapter          Adapter           `json:"adapter"`
 	TriggerKind      TriggerKind       `json:"triggerKind"`
+	PromptText       string            `json:"promptText,omitempty"`
 	WorktreePath     string            `json:"worktreePath,omitempty"`
 	BaseSHA          string            `json:"baseSha,omitempty"`
 	OutputDeliveryID string            `json:"outputDeliveryId,omitempty"`
@@ -414,16 +416,19 @@ type BoardMemberCursor struct {
 type TaskBoardResponse struct {
 	TaskID    string              `json:"taskId"`
 	LatestSeq int64               `json:"latestSeq"`
+	HasMore   bool                `json:"hasMore,omitempty"`
 	Members   []BoardMemberCursor `json:"members"`
 	Messages  []BoardMessage      `json:"messages"`
 }
 
 // WorkerStreamResponse is returned by GET /api/tasks/:taskId/workers/:workerName/stream.
 type WorkerStreamResponse struct {
-	TaskID     string             `json:"taskId"`
-	WorkerName string             `json:"workerName"`
-	Member     *BoardMemberCursor `json:"member,omitempty"`
-	Events     []EventRecord      `json:"events"`
+	TaskID                 string             `json:"taskId"`
+	WorkerName             string             `json:"workerName"`
+	Member                 *BoardMemberCursor `json:"member,omitempty"`
+	PrivateStreamAvailable bool               `json:"privateStreamAvailable"`
+	StreamNotice           string             `json:"streamNotice,omitempty"`
+	Events                 []EventRecord      `json:"events"`
 }
 
 // TaskSource is a file, link, or nmem reference attached to a session's Sources card.
@@ -460,8 +465,9 @@ type ApprovalView struct {
 	RunnerInstanceID string              `json:"runnerInstanceId,omitempty"`
 	Options          []ApprovalOption    `json:"options"`
 	RequestedBy      ApprovalRequestedBy `json:"requestedBy"`
-	State            ApprovalState       `json:"state"`
-	DecisionID       string              `json:"decisionId,omitempty"`
+	State             ApprovalState       `json:"state"`
+	DeliveryAttempted bool                `json:"deliveryAttempted,omitempty"`
+	DecisionID        string              `json:"decisionId,omitempty"`
 	SelectedOptionID string              `json:"selectedOptionId,omitempty"`
 	DecidedBy        *ApprovalDecidedBy  `json:"decidedBy,omitempty"`
 	DecisionNote     string              `json:"decisionNote,omitempty"`
@@ -527,18 +533,26 @@ type PABriefRequest struct {
 
 // PABriefResponse is returned by POST /api/pa/brief (<1s stateless event/inbox/task aggregation).
 type PABriefResponse struct {
-	GeneratedAt      int64           `json:"generatedAt"`
-	SnapshotSeq      int64           `json:"snapshotSeq"`
-	SinceHours       int             `json:"sinceHours"`
-	ProjectID        string          `json:"projectId,omitempty"`
-	Summary          string          `json:"summary"`
-	OpenInboxCount   int             `json:"openInboxCount"`
-	OpenInboxItems   []InboxItemView `json:"openInboxItems"`
-	ActiveTasks      []TaskSummary   `json:"activeTasks"`
-	BlockedTasks     []TaskSummary   `json:"blockedTasks"`
-	RecentDeliveries []DeliveryView  `json:"recentDeliveries"`
-	Machines         []MachineView   `json:"machines"`
-	RecentEvents     []EventRecord   `json:"recentEvents"`
+	GeneratedAt           int64           `json:"generatedAt"`
+	SnapshotSeq           int64           `json:"snapshotSeq"`
+	SinceHours            int             `json:"sinceHours"`
+	ProjectID             string          `json:"projectId,omitempty"`
+	Summary               string          `json:"summary"`
+	OpenInboxCount        int             `json:"openInboxCount"`
+	TotalActiveTaskCount  int             `json:"totalActiveTaskCount,omitempty"`
+	TotalBlockedTaskCount int             `json:"totalBlockedTaskCount,omitempty"`
+	OpenInboxItems        []InboxItemView `json:"openInboxItems"`
+	ActiveTasks           []TaskSummary   `json:"activeTasks"`
+	BlockedTasks          []TaskSummary   `json:"blockedTasks"`
+	RecentDeliveries      []DeliveryView  `json:"recentDeliveries"`
+	Machines              []MachineView   `json:"machines"`
+	RecentEvents          []EventRecord   `json:"recentEvents"`
+}
+
+// WSTicketResponse returns a short-lived single-use ticket for browser /ws/client handshakes.
+type WSTicketResponse struct {
+	Ticket    string `json:"ticket"`
+	ExpiresAt int64  `json:"expiresAt"`
 }
 
 // CreateTaskSourceInput specifies a source to attach during task creation or POST /sources.
@@ -592,6 +606,8 @@ type FollowupTaskRequest struct {
 	RequiredResources  []string          `json:"requiredResources,omitempty"`
 	Adapter            Adapter           `json:"adapter,omitempty"`
 	Config             map[string]string `json:"config,omitempty"`
+	VerifiedSite       bool              `json:"verifiedSite,omitempty"`
+	VerifiedAttemptID  string            `json:"verifiedAttemptId,omitempty"`
 }
 
 // FollowupTaskResponse reports whether the follow-up was queued, steered, dispatched, or forked.
@@ -606,8 +622,9 @@ type FollowupTaskResponse struct {
 
 // RetryTaskRequest retries a failed/expired/waiting_resource/needs_verification task.
 type RetryTaskRequest struct {
-	VerifiedSite bool   `json:"verifiedSite,omitempty"`
-	Note         string `json:"note,omitempty"`
+	VerifiedSite      bool   `json:"verifiedSite,omitempty"`
+	VerifiedAttemptID string `json:"verifiedAttemptId,omitempty"`
+	Note              string `json:"note,omitempty"`
 }
 
 // RetryTaskResponse returns the newly created retry attempt.
@@ -657,9 +674,11 @@ type ReorderPendingInputsRequest struct {
 
 // DispatchAnnotationsRequest atomically moves open annotations to queued and runs or queues them.
 type DispatchAnnotationsRequest struct {
-	AnnotationIDs []string     `json:"annotationIds"`
-	Mode          FollowupMode `json:"mode,omitempty"`
-	Message       string       `json:"message,omitempty"`
+	AnnotationIDs     []string     `json:"annotationIds"`
+	Mode              FollowupMode `json:"mode,omitempty"`
+	Message           string       `json:"message,omitempty"`
+	VerifiedSite      bool         `json:"verifiedSite,omitempty"`
+	VerifiedAttemptID string       `json:"verifiedAttemptId,omitempty"`
 }
 
 // DispatchAnnotationsResponse reports the resulting attempt or queued pending input.

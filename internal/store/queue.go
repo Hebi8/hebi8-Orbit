@@ -33,7 +33,45 @@ func scanPendingInput(scanner interface{ Scan(...any) error }) (protocol.Pending
 	if payloadJSON != "" {
 		_ = json.Unmarshal([]byte(payloadJSON), &pi.Payload)
 	}
+	// S8: Backfill empty legacy body from payload.prompt if present.
+	if strings.TrimSpace(pi.Body) == "" {
+		if prompt, ok := pi.Payload["prompt"].(string); ok && strings.TrimSpace(prompt) != "" {
+			pi.Body = strings.TrimSpace(prompt)
+		}
+	}
 	return pi, nil
+}
+
+func lookupAnnotationDeliveryIDsTx(ctx context.Context, tx *sql.Tx, taskID string, annotationIDs []string) ([]string, error) {
+	if len(annotationIDs) == 0 {
+		return nil, nil
+	}
+	placeholders := make([]string, len(annotationIDs))
+	args := make([]any, 0, len(annotationIDs)+1)
+	args = append(args, taskID)
+	for i, id := range annotationIDs {
+		placeholders[i] = "?"
+		args = append(args, id)
+	}
+	rows, err := tx.QueryContext(ctx, fmt.Sprintf(`
+		SELECT DISTINCT delivery_id FROM annotations
+		WHERE task_id = ? AND annotation_id IN (%s)
+	`, strings.Join(placeholders, ",")), args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []string{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		if id != "" {
+			out = append(out, id)
+		}
+	}
+	return out, rows.Err()
 }
 
 // ListPendingInputs returns all queued pending inputs for taskID in consumption order.
@@ -281,8 +319,10 @@ func (s *Store) DeletePendingInput(ctx context.Context, taskID, inputID, actorID
 		}
 
 		// If this queued item held open->queued annotations, release them back to open
+		var affectedDeliveryIDs []string
 		if cur.Kind == protocol.PendingInputAnnotationBatch {
 			if annIDs := extractStringSlice(cur.Payload, "annotationIds"); len(annIDs) > 0 {
+				affectedDeliveryIDs, _ = lookupAnnotationDeliveryIDsTx(ctx, tx, taskID, annIDs)
 				placeholders := make([]string, len(annIDs))
 				args := make([]any, 0, len(annIDs)+1)
 				args = append(args, taskID)
@@ -301,6 +341,13 @@ func (s *Store) DeletePendingInput(ctx context.Context, taskID, inputID, actorID
 			}
 		}
 
+		evPayload := map[string]any{
+			"action":  "cancelled",
+			"inputId": inputID,
+		}
+		if len(affectedDeliveryIDs) > 0 {
+			evPayload["deliveryIds"] = affectedDeliveryIDs
+		}
 		ev, err := insertEventTx(ctx, tx, eventInsert{
 			StreamID:   "task:" + taskID,
 			ProjectID:  cur.ProjectID,
@@ -309,11 +356,8 @@ func (s *Store) DeletePendingInput(ctx context.Context, taskID, inputID, actorID
 			ActorID:    actorID,
 			Kind:       protocol.EventQueueUpdated,
 			Visibility: protocol.VisibilityTimeline,
-			Payload: map[string]any{
-				"action":  "cancelled",
-				"inputId": inputID,
-			},
-			CreatedAt: now,
+			Payload:    evPayload,
+			CreatedAt:  now,
 		})
 		if err != nil {
 			return err
@@ -431,12 +475,346 @@ func (s *Store) ReorderPendingInputs(ctx context.Context, taskID string, ordered
 	return out, emitted, err
 }
 
-// SteerPendingInput promotes inputID to the head of the task's queue (position 1, shifting others down)
-// and reports the task's current active_attempt_id so Hub can steer or dispatch immediately.
-func (s *Store) SteerPendingInput(ctx context.Context, taskID, inputID, actorID string) (protocol.PendingInput, string, *protocol.EventRecord, error) {
+// SubmitFollowupParams defines inputs for atomic busy-vs-idle follow-up handling (B9, B11, S2).
+type SubmitFollowupParams struct {
+	TaskID            string
+	Body              string
+	Mode              protocol.FollowupMode
+	Source            protocol.PendingInputSource
+	MachineID         string
+	Adapter           protocol.Adapter
+	WorktreePath      string
+	BaseSHA           string
+	InputDeliveryID   string
+	DesiredConfig     map[string]string
+	RequiredResources []string
+	Anchor            *protocol.ProjectAnchorConfig
+	AnchorCapability  string
+	VerifiedSite      bool
+	VerifiedAttemptID string
+	LeaseTTLMs        int64
+	ActorKind         protocol.ActorKind
+	ActorID           string
+	PayloadExtra      map[string]any
+}
+
+// SubmitFollowupResult reports whether the follow-up started an Attempt directly, queued while busy,
+// or persisted a steer cancellation against an active attempt.
+type SubmitFollowupResult struct {
+	Task           protocol.TaskSummary
+	Attempt        *AttemptRecord
+	PendingInput   *protocol.PendingInput
+	ActiveToCancel *AttemptRecord
+	Events         []protocol.EventRecord
+}
+
+// SubmitFollowupAtomic eliminates the check-vs-enqueue race (B9) by checking active_attempt_id,
+// enforcing needs_verification (B11), freezing effective route/config/resources/anchor (S2),
+// and either creating a new Attempt, enqueuing, or persisting steer cancellation in ONE BEGIN IMMEDIATE tx.
+func (s *Store) SubmitFollowupAtomic(ctx context.Context, p SubmitFollowupParams) (SubmitFollowupResult, error) {
+	var res SubmitFollowupResult
+	now := time.Now().UnixMilli()
+	if p.Mode == "" {
+		p.Mode = protocol.FollowupModeQueue
+	}
+	if !p.Mode.IsValid() {
+		return res, fmt.Errorf("%w: invalid followup mode %q", ErrInvalidInput, p.Mode)
+	}
+	if p.Source == "" {
+		p.Source = protocol.PendingSourceHuman
+	}
+	if p.ActorKind == "" {
+		p.ActorKind = protocol.ActorHuman
+	}
+	if p.ActorID == "" {
+		p.ActorID = string(p.ActorKind)
+	}
+	if p.LeaseTTLMs <= 0 {
+		p.LeaseTTLMs = 45000
+	}
+
+	err := s.WithWriteTx(ctx, func(tx *sql.Tx) error {
+		var projectID, prefAdapter, desiredCfgJSON, reqResJSON string
+		var activeAtt, latestDlv sql.NullString
+		err := tx.QueryRowContext(ctx, `
+			SELECT project_id, active_attempt_id, latest_delivery_id, preferred_adapter, desired_config_json, required_resources
+			FROM tasks WHERE task_id = ?
+		`, p.TaskID).Scan(&projectID, &activeAtt, &latestDlv, &prefAdapter, &desiredCfgJSON, &reqResJSON)
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("%w: task %s", ErrNotFound, p.TaskID)
+		}
+		if err != nil {
+			return err
+		}
+
+		adapter := p.Adapter
+		if adapter == "" {
+			adapter = protocol.Adapter(prefAdapter)
+		}
+		mergedCfg := map[string]string{}
+		if desiredCfgJSON != "" {
+			_ = json.Unmarshal([]byte(desiredCfgJSON), &mergedCfg)
+		}
+		for k, v := range p.DesiredConfig {
+			mergedCfg[k] = v
+		}
+		reqResources := p.RequiredResources
+		if reqResources == nil {
+			reqResources = []string{}
+			if reqResJSON != "" {
+				_ = json.Unmarshal([]byte(reqResJSON), &reqResources)
+			}
+		}
+		inputDlv := p.InputDeliveryID
+		if inputDlv == "" && latestDlv.Valid {
+			inputDlv = latestDlv.String
+		}
+
+		frozenPayload := cloneMap(p.PayloadExtra)
+		frozenPayload["prompt"] = p.Body
+		frozenPayload["mode"] = p.Mode
+		if p.MachineID != "" {
+			frozenPayload["machineId"] = p.MachineID
+		}
+		if adapter != "" {
+			frozenPayload["adapter"] = string(adapter)
+		}
+		if len(mergedCfg) > 0 {
+			frozenPayload["desiredConfig"] = mergedCfg
+		}
+		frozenPayload["requiredResources"] = reqResources
+		if p.WorktreePath != "" {
+			frozenPayload["worktreePath"] = p.WorktreePath
+		}
+		if p.BaseSHA != "" {
+			frozenPayload["baseSha"] = p.BaseSHA
+		}
+		if inputDlv != "" {
+			frozenPayload["inputDeliveryId"] = inputDlv
+		}
+		if p.AnchorCapability != "" {
+			frozenPayload["anchorCapability"] = p.AnchorCapability
+		}
+		if p.Anchor != nil {
+			frozenPayload["anchor"] = p.Anchor
+		}
+		if p.Mode == protocol.FollowupModeForkNewSession {
+			frozenPayload["forceNewSession"] = true
+		}
+
+		if activeAtt.Valid && activeAtt.String != "" {
+			actRec, err := loadAttemptRecordTx(ctx, tx, activeAtt.String)
+			if err != nil {
+				return err
+			}
+
+			if p.Mode == protocol.FollowupModeSteer {
+				// If the active attempt was never dispatched to any runner instance yet, cancel it immediately
+				// and fall through to create the new attempt directly!
+				if actRec.State == protocol.AttemptLeased && actRec.RunnerInstanceID == "" {
+					if err := cancelAttemptTx(ctx, tx, actRec, p.ActorID, "steered by user before dispatch", now, &res.Events); err != nil {
+						return err
+					}
+					activeAtt.Valid = false
+					activeAtt.String = ""
+				} else {
+					// Shift all existing queued inputs down by +1 and insert steered input at position 1.
+					if _, err := tx.ExecContext(ctx, `
+						UPDATE task_pending_inputs SET position = position + 1, updated_at = ?
+						WHERE task_id = ? AND state = 'queued'
+					`, now, p.TaskID); err != nil {
+						return err
+					}
+					payloadBytes, err := json.Marshal(frozenPayload)
+					if err != nil {
+						return err
+					}
+					inputID := newID("inp")
+					if _, err := tx.ExecContext(ctx, `
+						INSERT INTO task_pending_inputs (
+							input_id, task_id, project_id, kind, source, body, payload_json, position, state, created_at, updated_at
+						) VALUES (?, ?, ?, 'followup', ?, ?, ?, 1, 'queued', ?, ?)
+					`, inputID, p.TaskID, projectID, string(p.Source), p.Body, string(payloadBytes), now, now); err != nil {
+						return err
+					}
+					// B9: Persist explicit steer cancellation intent on the active attempt.
+					if _, err := tx.ExecContext(ctx, `
+						UPDATE attempts
+						SET cancel_requested = 1, cancel_reason_kind = 'steer', steer_input_id = ?
+						WHERE attempt_id = ?
+					`, inputID, actRec.AttemptID); err != nil {
+						return err
+					}
+					actRec.CancelRequested = true
+					actRec.CancelReasonKind = "steer"
+					actRec.SteerInputID = inputID
+
+					ev, err := insertEventTx(ctx, tx, eventInsert{
+						StreamID:   "task:" + p.TaskID,
+						ProjectID:  projectID,
+						TaskID:     p.TaskID,
+						ActorKind:  p.ActorKind,
+						ActorID:    p.ActorID,
+						Kind:       protocol.EventQueueUpdated,
+						Visibility: protocol.VisibilityTimeline,
+						Payload: map[string]any{
+							"action":  "steered",
+							"inputId": inputID,
+							"kind":    protocol.PendingInputFollowup,
+							"source":  p.Source,
+						},
+						CreatedAt: now,
+					})
+					if err != nil {
+						return err
+					}
+					res.Events = append(res.Events, ev)
+					res.PendingInput = &protocol.PendingInput{
+						InputID:   inputID,
+						TaskID:    p.TaskID,
+						ProjectID: projectID,
+						Kind:      protocol.PendingInputFollowup,
+						Source:    p.Source,
+						Body:      p.Body,
+						Payload:   frozenPayload,
+						Position:  1,
+						State:     protocol.PendingInputQueued,
+						CreatedAt: now,
+						UpdatedAt: now,
+					}
+					res.ActiveToCancel = &actRec
+					res.Task, err = loadTaskSummaryTx(ctx, tx, p.TaskID)
+					return err
+				}
+			} else {
+				// Queue or fork_new_session while busy -> enqueue into task_pending_inputs
+				var nextPos int
+				if err := tx.QueryRowContext(ctx, `
+					SELECT COALESCE(MAX(position), 0) + 1 FROM task_pending_inputs WHERE task_id = ? AND state = 'queued'
+				`, p.TaskID).Scan(&nextPos); err != nil {
+					return err
+				}
+				payloadBytes, err := json.Marshal(frozenPayload)
+				if err != nil {
+					return err
+				}
+				inputID := newID("inp")
+				if _, err := tx.ExecContext(ctx, `
+					INSERT INTO task_pending_inputs (
+						input_id, task_id, project_id, kind, source, body, payload_json, position, state, created_at, updated_at
+					) VALUES (?, ?, ?, 'followup', ?, ?, ?, ?, 'queued', ?, ?)
+				`, inputID, p.TaskID, projectID, string(p.Source), p.Body, string(payloadBytes), nextPos, now, now); err != nil {
+					return err
+				}
+				ev, err := insertEventTx(ctx, tx, eventInsert{
+					StreamID:   "task:" + p.TaskID,
+					ProjectID:  projectID,
+					TaskID:     p.TaskID,
+					ActorKind:  p.ActorKind,
+					ActorID:    p.ActorID,
+					Kind:       protocol.EventQueueUpdated,
+					Visibility: protocol.VisibilityTimeline,
+					Payload: map[string]any{
+						"action":  "enqueued",
+						"inputId": inputID,
+						"kind":    protocol.PendingInputFollowup,
+						"source":  p.Source,
+					},
+					CreatedAt: now,
+				})
+				if err != nil {
+					return err
+				}
+				res.Events = append(res.Events, ev)
+				res.PendingInput = &protocol.PendingInput{
+					InputID:   inputID,
+					TaskID:    p.TaskID,
+					ProjectID: projectID,
+					Kind:      protocol.PendingInputFollowup,
+					Source:    p.Source,
+					Body:      p.Body,
+					Payload:   frozenPayload,
+					Position:  nextPos,
+					State:     protocol.PendingInputQueued,
+					CreatedAt: now,
+					UpdatedAt: now,
+				}
+				res.Task, err = loadTaskSummaryTx(ctx, tx, p.TaskID)
+				return err
+			}
+		}
+
+		// Task is idle -> enforce B11 needs_verification gate before creating a new Attempt
+		lastAtt, err := checkNeedsVerificationTx(ctx, tx, p.TaskID, p.VerifiedSite, p.VerifiedAttemptID)
+		if err != nil {
+			return err
+		}
+		if lastAtt != nil {
+			_, _ = tx.ExecContext(ctx, `
+				UPDATE inbox_items SET state = 'resolved', resolved_at = ?, updated_at = ?
+				WHERE inbox_id = ? AND state = 'open'
+			`, now, now, "inb:blk:"+lastAtt.AttemptID)
+			if lastAtt.State == protocol.AttemptNeedsVerification {
+				if err := releaseQueuedAnnotationsTx(ctx, tx, lastAtt.AttemptID); err != nil {
+					return err
+				}
+				frozenPayload["verifiedAttemptId"] = lastAtt.AttemptID
+			}
+		}
+
+		att, evAtt, err := createAttemptInTx(ctx, tx, createAttemptTxParams{
+			TaskID:            p.TaskID,
+			ProjectID:         projectID,
+			MachineID:         p.MachineID,
+			Adapter:           adapter,
+			TriggerKind:       protocol.TriggerFollowup,
+			TriggerPayload:    frozenPayload,
+			Prompt:            p.Body,
+			WorktreePath:      p.WorktreePath,
+			BaseSHA:           p.BaseSHA,
+			InputDeliveryID:   inputDlv,
+			DesiredConfig:     mergedCfg,
+			RequiredResources: reqResources,
+			Anchor:            p.Anchor,
+			AnchorCapability:  p.AnchorCapability,
+			ForceNewSession:   p.Mode == protocol.FollowupModeForkNewSession,
+			LeaseTTLMs:        p.LeaseTTLMs,
+			ActorKind:         p.ActorKind,
+			ActorID:           p.ActorID,
+			Now:               now,
+		})
+		if err != nil {
+			return err
+		}
+		res.Attempt = &att
+		res.Events = append(res.Events, evAtt)
+
+		// B16: If this followup came from a board @mention, mark that board message consumed now.
+		if bmID := stringField(p.PayloadExtra, "boardMessageId"); bmID != "" {
+			bmTaskID := stringField(p.PayloadExtra, "boardTaskId")
+			if bmTaskID == "" {
+				bmTaskID = p.TaskID
+			}
+			bmMember := stringField(p.PayloadExtra, "boardMemberName")
+			bmSeq := int64Field(p.PayloadExtra, "boardSeq")
+			if evBM, err := markBoardMessageConsumedTx(ctx, tx, bmTaskID, bmID, bmSeq, bmMember, now); err == nil && evBM != nil {
+				res.Events = append(res.Events, *evBM)
+			}
+		}
+
+		res.Task, err = loadTaskSummaryTx(ctx, tx, p.TaskID)
+		return err
+	})
+	return res, err
+}
+
+// SteerPendingInput promotes inputID to the head of the task's queue (position 1, shifting others down),
+// and if an active attempt exists, atomically persists steer cancellation intent (or cancels immediately
+// if never dispatched) so Hub cancels the active attempt and auto-consumes inputID upon cancellation (B9).
+func (s *Store) SteerPendingInput(ctx context.Context, taskID, inputID, actorID string) (protocol.PendingInput, *AttemptRecord, []protocol.EventRecord, error) {
 	var promoted protocol.PendingInput
-	var activeAttemptID string
-	var emitted *protocol.EventRecord
+	var activeToCancel *AttemptRecord
+	var events []protocol.EventRecord
 	now := time.Now().UnixMilli()
 	if actorID == "" {
 		actorID = "human"
@@ -450,9 +828,6 @@ func (s *Store) SteerPendingInput(ctx context.Context, taskID, inputID, actorID 
 				return fmt.Errorf("%w: task %s", ErrNotFound, taskID)
 			}
 			return err
-		}
-		if activeAtt.Valid {
-			activeAttemptID = activeAtt.String
 		}
 
 		rows, err := tx.QueryContext(ctx, `
@@ -501,6 +876,30 @@ func (s *Store) SteerPendingInput(ctx context.Context, taskID, inputID, actorID 
 			return err
 		}
 
+		if activeAtt.Valid && activeAtt.String != "" {
+			actRec, err := loadAttemptRecordTx(ctx, tx, activeAtt.String)
+			if err != nil {
+				return err
+			}
+			if actRec.State == protocol.AttemptLeased && actRec.RunnerInstanceID == "" {
+				if err := cancelAttemptTx(ctx, tx, actRec, actorID, "steered before dispatch", now, &events); err != nil {
+					return err
+				}
+			} else {
+				if _, err := tx.ExecContext(ctx, `
+					UPDATE attempts
+					SET cancel_requested = 1, cancel_reason_kind = 'steer', steer_input_id = ?
+					WHERE attempt_id = ?
+				`, inputID, actRec.AttemptID); err != nil {
+					return err
+				}
+				actRec.CancelRequested = true
+				actRec.CancelReasonKind = "steer"
+				actRec.SteerInputID = inputID
+				activeToCancel = &actRec
+			}
+		}
+
 		ev, err := insertEventTx(ctx, tx, eventInsert{
 			StreamID:   "task:" + taskID,
 			ProjectID:  projectID,
@@ -518,26 +917,31 @@ func (s *Store) SteerPendingInput(ctx context.Context, taskID, inputID, actorID 
 		if err != nil {
 			return err
 		}
-		emitted = &ev
+		events = append(events, ev)
 		return nil
 	})
-	return promoted, activeAttemptID, emitted, err
+	return promoted, activeToCancel, events, err
 }
 
 // DispatchAnnotationsParams configures atomic open -> queued annotation dispatch.
 type DispatchAnnotationsParams struct {
-	TaskID          string
-	AnnotationIDs   []string
-	Message         string
-	MachineID       string
-	Adapter         protocol.Adapter
-	WorktreePath    string
-	BaseSHA         string
-	InputDeliveryID string
-	DesiredConfig   map[string]string
-	ForceNewSession bool
-	LeaseTTLMs      int64
-	ActorID         string
+	TaskID            string
+	AnnotationIDs     []string
+	Message           string
+	MachineID         string
+	Adapter           protocol.Adapter
+	WorktreePath      string
+	BaseSHA           string
+	InputDeliveryID   string
+	DesiredConfig     map[string]string
+	RequiredResources []string
+	Anchor            *protocol.ProjectAnchorConfig
+	AnchorCapability  string
+	ForceNewSession   bool
+	VerifiedSite      bool
+	VerifiedAttemptID string
+	LeaseTTLMs        int64
+	ActorID           string
 }
 
 // DispatchAnnotationsResult captures whether annotations launched a new Attempt or entered task_pending_inputs.
@@ -550,7 +954,8 @@ type DispatchAnnotationsResult struct {
 
 // DispatchAnnotations atomically transitions all specified open annotations to 'queued'
 // (verifying RowsAffected == len(uniqueIDs) to block duplicate clicks), then either enqueues
-// an annotation_batch into task_pending_inputs (if an active attempt exists) or starts a new Attempt.
+// an annotation_batch into task_pending_inputs (if an active attempt exists) or starts a new Attempt
+// (enforcing B11 needs_verification gate and freezing effective route/config per S2).
 func (s *Store) DispatchAnnotations(ctx context.Context, p DispatchAnnotationsParams) (DispatchAnnotationsResult, error) {
 	var res DispatchAnnotationsResult
 	now := time.Now().UnixMilli()
@@ -566,16 +971,30 @@ func (s *Store) DispatchAnnotations(ctx context.Context, p DispatchAnnotationsPa
 	err := s.WithWriteTx(ctx, func(tx *sql.Tx) error {
 		var projectID string
 		var activeAtt, latestDlv sql.NullString
-		var prefAdapter, desiredCfgJSON string
+		var prefAdapter, desiredCfgJSON, reqResJSON string
 		err := tx.QueryRowContext(ctx, `
-			SELECT project_id, active_attempt_id, latest_delivery_id, preferred_adapter, desired_config_json
+			SELECT project_id, active_attempt_id, latest_delivery_id, preferred_adapter, desired_config_json, required_resources
 			FROM tasks WHERE task_id = ?
-		`, p.TaskID).Scan(&projectID, &activeAtt, &latestDlv, &prefAdapter, &desiredCfgJSON)
+		`, p.TaskID).Scan(&projectID, &activeAtt, &latestDlv, &prefAdapter, &desiredCfgJSON, &reqResJSON)
 		if errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("%w: task %s", ErrNotFound, p.TaskID)
 		}
 		if err != nil {
 			return err
+		}
+
+		// B11: If task is idle, enforce needs_verification gate BEFORE transitioning annotations!
+		var lastAtt *AttemptRecord
+		if !activeAtt.Valid || activeAtt.String == "" {
+			lastAtt, err = checkNeedsVerificationTx(ctx, tx, p.TaskID, p.VerifiedSite, p.VerifiedAttemptID)
+			if err != nil {
+				return err
+			}
+			if lastAtt != nil && lastAtt.State == protocol.AttemptNeedsVerification {
+				if err := releaseQueuedAnnotationsTx(ctx, tx, lastAtt.AttemptID); err != nil {
+					return err
+				}
+			}
 		}
 
 		placeholders := make([]string, len(uniqueIDs))
@@ -616,6 +1035,8 @@ func (s *Store) DispatchAnnotations(ctx context.Context, p DispatchAnnotationsPa
 		}
 		var anns []protocol.AnnotationView
 		hasRyugi, hasDiff := false, false
+		deliveryIDSet := map[string]bool{}
+		deliveryIDs := []string{}
 		for anRows.Next() {
 			an, err := scanAnnotationView(anRows)
 			if err != nil {
@@ -626,6 +1047,10 @@ func (s *Store) DispatchAnnotations(ctx context.Context, p DispatchAnnotationsPa
 				hasRyugi = true
 			} else if an.Source == protocol.AnnotationSourceDiffDrawer {
 				hasDiff = true
+			}
+			if an.DeliveryID != "" && !deliveryIDSet[an.DeliveryID] {
+				deliveryIDSet[an.DeliveryID] = true
+				deliveryIDs = append(deliveryIDs, an.DeliveryID)
 			}
 			anns = append(anns, an)
 		}
@@ -639,10 +1064,62 @@ func (s *Store) DispatchAnnotations(ctx context.Context, p DispatchAnnotationsPa
 			source = protocol.PendingSourceDiffDrawer
 		}
 
+		adapter := p.Adapter
+		if adapter == "" {
+			adapter = protocol.Adapter(prefAdapter)
+		}
+		desiredCfg := map[string]string{}
+		if desiredCfgJSON != "" {
+			_ = json.Unmarshal([]byte(desiredCfgJSON), &desiredCfg)
+		}
+		for k, v := range p.DesiredConfig {
+			desiredCfg[k] = v
+		}
+		reqResources := p.RequiredResources
+		if reqResources == nil {
+			reqResources = []string{}
+			if reqResJSON != "" {
+				_ = json.Unmarshal([]byte(reqResJSON), &reqResources)
+			}
+		}
+		inputDlv := p.InputDeliveryID
+		if inputDlv == "" && latestDlv.Valid {
+			inputDlv = latestDlv.String
+		}
+
 		payload := map[string]any{
-			"annotationIds": uniqueIDs,
-			"prompt":        prompt,
-			"message":       p.Message,
+			"annotationIds":     uniqueIDs,
+			"deliveryIds":       deliveryIDs,
+			"prompt":            prompt,
+			"message":           p.Message,
+			"requiredResources": reqResources,
+		}
+		if p.MachineID != "" {
+			payload["machineId"] = p.MachineID
+		}
+		if adapter != "" {
+			payload["adapter"] = string(adapter)
+		}
+		if len(desiredCfg) > 0 {
+			payload["desiredConfig"] = desiredCfg
+		}
+		if p.WorktreePath != "" {
+			payload["worktreePath"] = p.WorktreePath
+		}
+		if p.BaseSHA != "" {
+			payload["baseSha"] = p.BaseSHA
+		}
+		if inputDlv != "" {
+			payload["inputDeliveryId"] = inputDlv
+		}
+		if p.AnchorCapability != "" {
+			payload["anchorCapability"] = p.AnchorCapability
+		}
+		if p.Anchor != nil {
+			payload["anchor"] = p.Anchor
+		}
+		if p.ForceNewSession {
+			payload["forceNewSession"] = true
 		}
 
 		if activeAtt.Valid && activeAtt.String != "" {
@@ -682,6 +1159,7 @@ func (s *Store) DispatchAnnotations(ctx context.Context, p DispatchAnnotationsPa
 					"action":        "annotation_batch_queued",
 					"inputId":       inputID,
 					"annotationIds": uniqueIDs,
+					"deliveryIds":   deliveryIDs,
 				},
 				CreatedAt: now,
 			})
@@ -705,38 +1183,37 @@ func (s *Store) DispatchAnnotations(ctx context.Context, p DispatchAnnotationsPa
 			return nil
 		}
 
-		// Task is idle -> start new Attempt immediately and bind triggered_attempt_id
-		adapter := p.Adapter
-		if adapter == "" {
-			adapter = protocol.Adapter(prefAdapter)
-		}
-		desiredCfg := p.DesiredConfig
-		if len(desiredCfg) == 0 && desiredCfgJSON != "" {
-			desiredCfg = map[string]string{}
-			_ = json.Unmarshal([]byte(desiredCfgJSON), &desiredCfg)
-		}
-		inputDlv := p.InputDeliveryID
-		if inputDlv == "" && latestDlv.Valid {
-			inputDlv = latestDlv.String
+		if lastAtt != nil {
+			_, _ = tx.ExecContext(ctx, `
+				UPDATE inbox_items SET state = 'resolved', resolved_at = ?, updated_at = ?
+				WHERE inbox_id = ? AND state = 'open'
+			`, now, now, "inb:blk:"+lastAtt.AttemptID)
+			if lastAtt.State == protocol.AttemptNeedsVerification {
+				payload["verifiedAttemptId"] = lastAtt.AttemptID
+			}
 		}
 
+		// Task is idle -> start new Attempt immediately and bind triggered_attempt_id
 		att, evAtt, err := createAttemptInTx(ctx, tx, createAttemptTxParams{
-			TaskID:          p.TaskID,
-			ProjectID:       projectID,
-			MachineID:       p.MachineID,
-			Adapter:         adapter,
-			TriggerKind:     protocol.TriggerAnnotationBatch,
-			TriggerPayload:  payload,
-			Prompt:          prompt,
-			WorktreePath:    p.WorktreePath,
-			BaseSHA:         p.BaseSHA,
-			InputDeliveryID: inputDlv,
-			DesiredConfig:   desiredCfg,
-			ForceNewSession: p.ForceNewSession,
-			LeaseTTLMs:      p.LeaseTTLMs,
-			ActorKind:       protocol.ActorHuman,
-			ActorID:         p.ActorID,
-			Now:             now,
+			TaskID:            p.TaskID,
+			ProjectID:         projectID,
+			MachineID:         p.MachineID,
+			Adapter:           adapter,
+			TriggerKind:       protocol.TriggerAnnotationBatch,
+			TriggerPayload:    payload,
+			Prompt:            prompt,
+			WorktreePath:      p.WorktreePath,
+			BaseSHA:           p.BaseSHA,
+			InputDeliveryID:   inputDlv,
+			DesiredConfig:     desiredCfg,
+			RequiredResources: reqResources,
+			Anchor:            p.Anchor,
+			AnchorCapability:  p.AnchorCapability,
+			ForceNewSession:   p.ForceNewSession,
+			LeaseTTLMs:        p.LeaseTTLMs,
+			ActorKind:         protocol.ActorHuman,
+			ActorID:           p.ActorID,
+			Now:               now,
 		})
 		if err != nil {
 			return err
@@ -754,8 +1231,30 @@ func (s *Store) DispatchAnnotations(ctx context.Context, p DispatchAnnotationsPa
 			return err
 		}
 
+		// S6: Emit queue.updated with deliveryIds so open delivery drawers refresh queued annotation state immediately.
+		evQ, err := insertEventTx(ctx, tx, eventInsert{
+			StreamID:   "task:" + p.TaskID,
+			ProjectID:  projectID,
+			TaskID:     p.TaskID,
+			AttemptID:  att.AttemptID,
+			ActorKind:  protocol.ActorHuman,
+			ActorID:    p.ActorID,
+			Kind:       protocol.EventQueueUpdated,
+			Visibility: protocol.VisibilityTimeline,
+			Payload: map[string]any{
+				"action":              "annotation_batch_dispatched",
+				"dispatchedAttemptId": att.AttemptID,
+				"annotationIds":       uniqueIDs,
+				"deliveryIds":         deliveryIDs,
+			},
+			CreatedAt: now,
+		})
+		if err != nil {
+			return err
+		}
+
 		res.Attempt = &att
-		res.Events = append(res.Events, evAtt)
+		res.Events = append(res.Events, evQ, evAtt)
 		return nil
 	})
 	return res, err
@@ -763,19 +1262,24 @@ func (s *Store) DispatchAnnotations(ctx context.Context, p DispatchAnnotationsPa
 
 // ConsumeNextPendingInputParams configures automatic queue pop after an Attempt completes.
 type ConsumeNextPendingInputParams struct {
-	TaskID          string
-	MachineID       string
-	Adapter         protocol.Adapter
-	WorktreePath    string
-	BaseSHA         string
-	InputDeliveryID string
-	DesiredConfig   map[string]string
-	LeaseTTLMs      int64
+	TaskID            string
+	PreferredInputID  string
+	MachineID         string
+	Adapter           protocol.Adapter
+	WorktreePath      string
+	BaseSHA           string
+	InputDeliveryID   string
+	DesiredConfig     map[string]string
+	RequiredResources []string
+	Anchor            *protocol.ProjectAnchorConfig
+	AnchorCapability  string
+	LeaseTTLMs        int64
 }
 
-// ConsumeNextPendingInput atomically pops the head queued item from task_pending_inputs,
+// ConsumeNextPendingInput atomically pops the head (or preferred steered) queued item from task_pending_inputs,
 // creates a new leased Attempt, marks the input 'dispatched', and binds any queued annotations.
-// Returns (nil, nil, nil, nil) if no queued input exists or task already has an active attempt.
+// Returns (nil, nil, nil, nil) if no queued input exists, task already has an active attempt,
+// or the latest attempt is in needs_verification (B11).
 func (s *Store) ConsumeNextPendingInput(ctx context.Context, p ConsumeNextPendingInputParams) (*protocol.PendingInput, *AttemptRecord, []protocol.EventRecord, error) {
 	var consumed *protocol.PendingInput
 	var createdAtt *AttemptRecord
@@ -783,12 +1287,12 @@ func (s *Store) ConsumeNextPendingInput(ctx context.Context, p ConsumeNextPendin
 	now := time.Now().UnixMilli()
 
 	err := s.WithWriteTx(ctx, func(tx *sql.Tx) error {
-		var projectID, prefAdapter, desiredCfgJSON string
+		var projectID, prefAdapter, desiredCfgJSON, reqResJSON string
 		var activeAtt, latestDlv sql.NullString
 		err := tx.QueryRowContext(ctx, `
-			SELECT project_id, active_attempt_id, latest_delivery_id, preferred_adapter, desired_config_json
+			SELECT project_id, active_attempt_id, latest_delivery_id, preferred_adapter, desired_config_json, required_resources
 			FROM tasks WHERE task_id = ?
-		`, p.TaskID).Scan(&projectID, &activeAtt, &latestDlv, &prefAdapter, &desiredCfgJSON)
+		`, p.TaskID).Scan(&projectID, &activeAtt, &latestDlv, &prefAdapter, &desiredCfgJSON, &reqResJSON)
 		if errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("%w: task %s", ErrNotFound, p.TaskID)
 		}
@@ -799,19 +1303,46 @@ func (s *Store) ConsumeNextPendingInput(ctx context.Context, p ConsumeNextPendin
 			return nil
 		}
 
-		row := tx.QueryRowContext(ctx, `
-			SELECT input_id, task_id, project_id, kind, source, body, payload_json, position, state, created_at, updated_at, dispatched_attempt_id
-			FROM task_pending_inputs
-			WHERE task_id = ? AND state = 'queued'
-			ORDER BY position ASC, created_at ASC
-			LIMIT 1
-		`, p.TaskID)
-		pi, err := scanPendingInput(row)
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil
-		}
-		if err != nil {
+		// B11: NEVER auto-consume pending queue when previous attempt requires human site verification!
+		if _, err := checkNeedsVerificationTx(ctx, tx, p.TaskID, false, ""); err != nil {
+			if errors.Is(err, ErrVerificationRequired) {
+				return nil
+			}
 			return err
+		}
+
+		var pi protocol.PendingInput
+		found := false
+		if strings.TrimSpace(p.PreferredInputID) != "" {
+			row := tx.QueryRowContext(ctx, `
+				SELECT input_id, task_id, project_id, kind, source, body, payload_json, position, state, created_at, updated_at, dispatched_attempt_id
+				FROM task_pending_inputs
+				WHERE task_id = ? AND input_id = ? AND state = 'queued'
+			`, p.TaskID, p.PreferredInputID)
+			cand, err := scanPendingInput(row)
+			if err == nil {
+				pi = cand
+				found = true
+			} else if !errors.Is(err, sql.ErrNoRows) {
+				return err
+			}
+		}
+		if !found {
+			row := tx.QueryRowContext(ctx, `
+				SELECT input_id, task_id, project_id, kind, source, body, payload_json, position, state, created_at, updated_at, dispatched_attempt_id
+				FROM task_pending_inputs
+				WHERE task_id = ? AND state = 'queued'
+				ORDER BY position ASC, created_at ASC
+				LIMIT 1
+			`, p.TaskID)
+			cand, err := scanPendingInput(row)
+			if errors.Is(err, sql.ErrNoRows) {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			pi = cand
 		}
 
 		triggerKind := protocol.TriggerFollowup
@@ -823,37 +1354,92 @@ func (s *Store) ConsumeNextPendingInput(ctx context.Context, p ConsumeNextPendin
 			prompt = rawPrompt
 		}
 
-		adapter := p.Adapter
+		// S2: Honor frozen creation-time overrides stored inside pi.Payload.
+		machineID := stringField(pi.Payload, "machineId")
+		if machineID == "" {
+			machineID = p.MachineID
+		}
+		adapter := protocol.Adapter(stringField(pi.Payload, "adapter"))
+		if adapter == "" {
+			adapter = p.Adapter
+		}
 		if adapter == "" {
 			adapter = protocol.Adapter(prefAdapter)
 		}
-		desiredCfg := p.DesiredConfig
-		if len(desiredCfg) == 0 && desiredCfgJSON != "" {
-			desiredCfg = map[string]string{}
+		desiredCfg := map[string]string{}
+		if desiredCfgJSON != "" {
 			_ = json.Unmarshal([]byte(desiredCfgJSON), &desiredCfg)
 		}
-		inputDlv := p.InputDeliveryID
+		for k, v := range p.DesiredConfig {
+			desiredCfg[k] = v
+		}
+		if rawCfg, ok := pi.Payload["desiredConfig"].(map[string]any); ok {
+			for k, v := range rawCfg {
+				if sv, ok := v.(string); ok {
+					desiredCfg[k] = sv
+				}
+			}
+		}
+		reqResources := extractStringSlice(pi.Payload, "requiredResources")
+		if reqResources == nil {
+			reqResources = p.RequiredResources
+		}
+		if reqResources == nil {
+			reqResources = []string{}
+			if reqResJSON != "" {
+				_ = json.Unmarshal([]byte(reqResJSON), &reqResources)
+			}
+		}
+		worktreePath := stringField(pi.Payload, "worktreePath")
+		if worktreePath == "" {
+			worktreePath = p.WorktreePath
+		}
+		baseSHA := stringField(pi.Payload, "baseSha")
+		if baseSHA == "" {
+			baseSHA = p.BaseSHA
+		}
+		inputDlv := stringField(pi.Payload, "inputDeliveryId")
+		if inputDlv == "" {
+			inputDlv = p.InputDeliveryID
+		}
 		if inputDlv == "" && latestDlv.Valid {
 			inputDlv = latestDlv.String
 		}
+		anchorCap := stringField(pi.Payload, "anchorCapability")
+		if anchorCap == "" {
+			anchorCap = p.AnchorCapability
+		}
+		anchor := p.Anchor
+		if rawAnchor, ok := pi.Payload["anchor"]; ok && rawAnchor != nil {
+			if b, err := json.Marshal(rawAnchor); err == nil {
+				var parsed protocol.ProjectAnchorConfig
+				if err := json.Unmarshal(b, &parsed); err == nil && parsed.Machine != "" {
+					anchor = &parsed
+				}
+			}
+		}
+		forceNewSession := boolField(pi.Payload, "forceNewSession")
 
 		att, evAtt, err := createAttemptInTx(ctx, tx, createAttemptTxParams{
-			TaskID:          p.TaskID,
-			ProjectID:       projectID,
-			MachineID:       p.MachineID,
-			Adapter:         adapter,
-			TriggerKind:     triggerKind,
-			TriggerPayload:  pi.Payload,
-			Prompt:          prompt,
-			WorktreePath:    p.WorktreePath,
-			BaseSHA:         p.BaseSHA,
-			InputDeliveryID: inputDlv,
-			DesiredConfig:   desiredCfg,
-			ForceNewSession: false,
-			LeaseTTLMs:      p.LeaseTTLMs,
-			ActorKind:       protocol.ActorSystem,
-			ActorID:         "queue-dispatcher",
-			Now:             now,
+			TaskID:            p.TaskID,
+			ProjectID:         projectID,
+			MachineID:         machineID,
+			Adapter:           adapter,
+			TriggerKind:       triggerKind,
+			TriggerPayload:    pi.Payload,
+			Prompt:            prompt,
+			WorktreePath:      worktreePath,
+			BaseSHA:           baseSHA,
+			InputDeliveryID:   inputDlv,
+			DesiredConfig:     desiredCfg,
+			RequiredResources: reqResources,
+			Anchor:            anchor,
+			AnchorCapability:  anchorCap,
+			ForceNewSession:   forceNewSession,
+			LeaseTTLMs:        p.LeaseTTLMs,
+			ActorKind:         protocol.ActorSystem,
+			ActorID:           "queue-dispatcher",
+			Now:               now,
 		})
 		if err != nil {
 			return err
@@ -868,8 +1454,10 @@ func (s *Store) ConsumeNextPendingInput(ctx context.Context, p ConsumeNextPendin
 		}
 
 		// If annotation_batch, bind triggered_attempt_id on the queued annotations
+		var affectedDeliveryIDs []string
 		if pi.Kind == protocol.PendingInputAnnotationBatch {
 			if annIDs := extractStringSlice(pi.Payload, "annotationIds"); len(annIDs) > 0 {
+				affectedDeliveryIDs, _ = lookupAnnotationDeliveryIDsTx(ctx, tx, p.TaskID, annIDs)
 				placeholders := make([]string, len(annIDs))
 				args := make([]any, 0, len(annIDs)+2)
 				args = append(args, att.AttemptID, p.TaskID)
@@ -887,6 +1475,14 @@ func (s *Store) ConsumeNextPendingInput(ctx context.Context, p ConsumeNextPendin
 			}
 		}
 
+		evQPayload := map[string]any{
+			"action":              "dispatched",
+			"inputId":             pi.InputID,
+			"dispatchedAttemptId": att.AttemptID,
+		}
+		if len(affectedDeliveryIDs) > 0 {
+			evQPayload["deliveryIds"] = affectedDeliveryIDs
+		}
 		evQ, err := insertEventTx(ctx, tx, eventInsert{
 			StreamID:   "task:" + p.TaskID,
 			ProjectID:  projectID,
@@ -896,15 +1492,24 @@ func (s *Store) ConsumeNextPendingInput(ctx context.Context, p ConsumeNextPendin
 			ActorID:    "queue-dispatcher",
 			Kind:       protocol.EventQueueUpdated,
 			Visibility: protocol.VisibilityTimeline,
-			Payload: map[string]any{
-				"action":              "dispatched",
-				"inputId":             pi.InputID,
-				"dispatchedAttemptId": att.AttemptID,
-			},
-			CreatedAt: now,
+			Payload:    evQPayload,
+			CreatedAt:  now,
 		})
 		if err != nil {
 			return err
+		}
+
+		// B16: If this queued input originated from a board @mention, mark that board message consumed now.
+		if bmID := stringField(pi.Payload, "boardMessageId"); bmID != "" {
+			bmTaskID := stringField(pi.Payload, "boardTaskId")
+			if bmTaskID == "" {
+				bmTaskID = p.TaskID
+			}
+			bmMember := stringField(pi.Payload, "boardMemberName")
+			bmSeq := int64Field(pi.Payload, "boardSeq")
+			if evBM, err := markBoardMessageConsumedTx(ctx, tx, bmTaskID, bmID, bmSeq, bmMember, now); err == nil && evBM != nil {
+				events = append(events, *evBM)
+			}
 		}
 
 		pi.State = protocol.PendingInputDispatched

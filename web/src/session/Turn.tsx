@@ -22,10 +22,11 @@ function usePromptFor(attempt: AttemptView, tl: TaskTimelineResponse): { text: s
   const cache = useWorkbenchStore((s) => s.promptCache);
   return useMemo(() => {
     const task = tl.task;
+    const serverPrompt = attempt.promptText?.trim() ?? '';
     switch (attempt.triggerKind) {
       case 'initial':
       case 'workspace_import':
-        return { text: task.goal, placeholder: false, detail: [] };
+        return { text: serverPrompt || task.goal, placeholder: false, detail: [] };
       case 'annotation_batch': {
         const anns = tl.annotations.filter((a) => a.triggeredAttemptId === attempt.attemptId);
         return {
@@ -38,6 +39,7 @@ function usePromptFor(attempt: AttemptView, tl: TaskTimelineResponse): { text: s
         };
       }
       case 'followup': {
+        if (serverPrompt) return { text: serverPrompt, placeholder: false, detail: [] };
         const direct = cache[`att:${attempt.attemptId}`];
         if (direct) return { text: direct, placeholder: false, detail: [] };
         const ev = tl.events.find(
@@ -49,7 +51,7 @@ function usePromptFor(attempt: AttemptView, tl: TaskTimelineResponse): { text: s
         return { text: '追问（原文未随时间线下发，可在 Agent 原生会话中查看）', placeholder: true, detail: [] };
       }
       case 'retry':
-        return { text: `重试 · ${task.goal.split('\n')[0]}`, placeholder: true, detail: [] };
+        return { text: serverPrompt || `重试 · ${task.goal.split('\n')[0]}`, placeholder: !serverPrompt, detail: [] };
       case 'manual_import': {
         const d = tl.deliveries.find((x) => x.deliveryId === attempt.outputDeliveryId);
         return { text: `导入交付${d?.summary ? ` · ${d.summary}` : ''}`, placeholder: true, detail: [] };
@@ -64,7 +66,11 @@ function RetryNotice({ attempt, taskId, needsVerify }: { attempt: AttemptView; t
   const qc = useQueryClient();
   const [verified, setVerified] = useState(false);
   const retry = useMutation({
-    mutationFn: () => api.retryTask(taskId, { verifiedSite: needsVerify ? verified : undefined }),
+    mutationFn: () =>
+      api.retryTask(taskId, {
+        verifiedSite: needsVerify ? verified : undefined,
+        verifiedAttemptId: needsVerify ? attempt.attemptId : undefined,
+      }),
     onSuccess: () => {
       toast('已发起重试');
       void qc.invalidateQueries({ queryKey: ['task-timeline', taskId] });

@@ -353,9 +353,107 @@ func upsertBoardMemberTx(ctx context.Context, tx *sql.Tx, bm protocol.BoardMembe
 	return &ev, nil
 }
 
-// GetTaskBoard returns the unified #seq message board and member cursors for a task,
-// merging both native swarm members and cross-machine child tasks (parent_task_id).
+func listTaskBoardMembersTx(ctx context.Context, tx *sql.Tx, taskID string) ([]protocol.BoardMemberCursor, error) {
+	members := []protocol.BoardMemberCursor{}
+	seenMembers := map[string]bool{}
+	seenWorkerTaskIDs := map[string]bool{}
+
+	mRows, err := tx.QueryContext(ctx, `
+		SELECT task_id, project_id, member_name, machine_id, adapter, state, last_consumed_seq, current_step, worker_task_id, updated_at
+		FROM board_members
+		WHERE task_id = ?
+		ORDER BY member_name ASC
+	`, taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer mRows.Close()
+	for mRows.Next() {
+		bm, err := scanBoardMember(mRows)
+		if err != nil {
+			return nil, err
+		}
+		seenMembers[bm.MemberName] = true
+		if bm.WorkerTaskID != "" {
+			seenWorkerTaskIDs[bm.WorkerTaskID] = true
+		}
+		members = append(members, bm)
+	}
+	if err := mRows.Err(); err != nil {
+		return nil, err
+	}
+
+	// Surface cross-machine child tasks (parent_task_id = taskID) as board members
+	cRows, err := tx.QueryContext(ctx, `
+		SELECT t.task_id, t.project_id, t.title, t.preferred_adapter, t.state, t.updated_at, a.machine_id
+		FROM tasks t
+		LEFT JOIN attempts a ON a.attempt_id = t.active_attempt_id
+		WHERE t.parent_task_id = ? AND t.archived_at IS NULL
+		ORDER BY t.created_at ASC
+	`, taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer cRows.Close()
+	for cRows.Next() {
+		var childID, childProj, title, adapter, tstate string
+		var updatedAt int64
+		var mach sql.NullString
+		if err := cRows.Scan(&childID, &childProj, &title, &adapter, &tstate, &updatedAt, &mach); err != nil {
+			return nil, err
+		}
+		if seenWorkerTaskIDs[childID] || seenMembers[childID] {
+			continue
+		}
+		mState := childTaskStateToMemberState(protocol.TaskState(tstate))
+		mid := ""
+		if mach.Valid {
+			mid = mach.String
+		}
+		members = append(members, protocol.BoardMemberCursor{
+			TaskID:       taskID,
+			ProjectID:    childProj,
+			MemberName:   title,
+			MachineID:    mid,
+			Adapter:      protocol.Adapter(adapter),
+			State:        mState,
+			WorkerTaskID: childID,
+			UpdatedAt:    updatedAt,
+		})
+	}
+	if err := cRows.Err(); err != nil {
+		return nil, err
+	}
+	return members, nil
+}
+
+func childTaskStateToMemberState(st protocol.TaskState) protocol.BoardMemberState {
+	switch st {
+	case protocol.TaskStateRunning, protocol.TaskStateQueued, protocol.TaskStateWaitingApproval, protocol.TaskStateWaitingResource:
+		return protocol.BoardMemberWorking
+	case protocol.TaskStateCancelled:
+		return protocol.BoardMemberKilled
+	case protocol.TaskStateDone, protocol.TaskStateFailed:
+		return protocol.BoardMemberStopped
+	default:
+		return protocol.BoardMemberWaiting
+	}
+}
+
+// GetTaskBoard returns the latest page of the unified #seq message board and member cursors.
 func (s *Store) GetTaskBoard(ctx context.Context, taskID string) (protocol.TaskBoardResponse, error) {
+	return s.GetTaskBoardPage(ctx, taskID, 0, 200)
+}
+
+// GetTaskBoardPage returns the unified #seq message board with true MAX(seq) latestSeq
+// and cursor pagination via beforeSeq (returning the newest `limit` messages in ascending seq order).
+func (s *Store) GetTaskBoardPage(ctx context.Context, taskID string, beforeSeq int64, limit int) (protocol.TaskBoardResponse, error) {
+	if limit <= 0 {
+		limit = 200
+	}
+	if limit > 500 {
+		limit = 500
+	}
 	resp := protocol.TaskBoardResponse{
 		TaskID:   taskID,
 		Members:  []protocol.BoardMemberCursor{},
@@ -371,86 +469,39 @@ func (s *Store) GetTaskBoard(ctx context.Context, taskID string) (protocol.TaskB
 			return err
 		}
 
-		seenMembers := map[string]bool{}
-		mRows, err := tx.QueryContext(ctx, `
-			SELECT task_id, project_id, member_name, machine_id, adapter, state, last_consumed_seq, current_step, worker_task_id, updated_at
-			FROM board_members
-			WHERE task_id = ?
-			ORDER BY member_name ASC
-		`, taskID)
+		members, err := listTaskBoardMembersTx(ctx, tx, taskID)
 		if err != nil {
 			return err
 		}
-		defer mRows.Close()
-		for mRows.Next() {
-			bm, err := scanBoardMember(mRows)
-			if err != nil {
-				return err
-			}
-			seenMembers[bm.MemberName] = true
-			resp.Members = append(resp.Members, bm)
-		}
-		if err := mRows.Err(); err != nil {
+		resp.Members = members
+
+		// S7: Always compute true latestSeq via MAX(seq) regardless of pagination window
+		if err := tx.QueryRowContext(ctx, `
+			SELECT COALESCE(MAX(seq), 0) FROM board_messages WHERE task_id = ?
+		`, taskID).Scan(&resp.LatestSeq); err != nil {
 			return err
 		}
 
-		// Also surface cross-machine child tasks (parent_task_id = taskID) as board members
-		cRows, err := tx.QueryContext(ctx, `
-			SELECT t.task_id, t.project_id, t.title, t.preferred_adapter, t.state, t.updated_at, a.machine_id
-			FROM tasks t
-			LEFT JOIN attempts a ON a.attempt_id = t.active_attempt_id
-			WHERE t.parent_task_id = ? AND t.archived_at IS NULL
-			ORDER BY t.created_at ASC
-		`, taskID)
-		if err != nil {
-			return err
+		var (
+			msgRows *sql.Rows
+		)
+		if beforeSeq > 0 {
+			msgRows, err = tx.QueryContext(ctx, `
+				SELECT seq, message_id, task_id, project_id, author_name, target_mention, body, status, external_key, created_at
+				FROM board_messages
+				WHERE task_id = ? AND seq < ?
+				ORDER BY seq DESC
+				LIMIT ?
+			`, taskID, beforeSeq, limit+1)
+		} else {
+			msgRows, err = tx.QueryContext(ctx, `
+				SELECT seq, message_id, task_id, project_id, author_name, target_mention, body, status, external_key, created_at
+				FROM board_messages
+				WHERE task_id = ?
+				ORDER BY seq DESC
+				LIMIT ?
+			`, taskID, limit+1)
 		}
-		defer cRows.Close()
-		for cRows.Next() {
-			var childID, childProj, title, adapter, tstate string
-			var updatedAt int64
-			var mach sql.NullString
-			if err := cRows.Scan(&childID, &childProj, &title, &adapter, &tstate, &updatedAt, &mach); err != nil {
-				return err
-			}
-			if seenMembers[childID] {
-				continue
-			}
-			mState := protocol.BoardMemberWaiting
-			switch protocol.TaskState(tstate) {
-			case protocol.TaskStateRunning, protocol.TaskStateQueued:
-				mState = protocol.BoardMemberWorking
-			case protocol.TaskStateCancelled:
-				mState = protocol.BoardMemberKilled
-			case protocol.TaskStateDone, protocol.TaskStateFailed:
-				mState = protocol.BoardMemberStopped
-			}
-			mid := ""
-			if mach.Valid {
-				mid = mach.String
-			}
-			resp.Members = append(resp.Members, protocol.BoardMemberCursor{
-				TaskID:       taskID,
-				ProjectID:    childProj,
-				MemberName:   title,
-				MachineID:    mid,
-				Adapter:      protocol.Adapter(adapter),
-				State:        mState,
-				WorkerTaskID: childID,
-				UpdatedAt:    updatedAt,
-			})
-		}
-		if err := cRows.Err(); err != nil {
-			return err
-		}
-
-		msgRows, err := tx.QueryContext(ctx, `
-			SELECT seq, message_id, task_id, project_id, author_name, target_mention, body, status, external_key, created_at
-			FROM board_messages
-			WHERE task_id = ?
-			ORDER BY seq ASC
-			LIMIT 500
-		`, taskID)
 		if err != nil {
 			return err
 		}
@@ -460,14 +511,110 @@ func (s *Store) GetTaskBoard(ctx context.Context, taskID string) (protocol.TaskB
 			if err != nil {
 				return err
 			}
-			if msg.Seq > resp.LatestSeq {
-				resp.LatestSeq = msg.Seq
-			}
 			resp.Messages = append(resp.Messages, msg)
 		}
-		return msgRows.Err()
+		if err := msgRows.Err(); err != nil {
+			return err
+		}
+		if len(resp.Messages) > limit {
+			resp.HasMore = true
+			resp.Messages = resp.Messages[:limit]
+		}
+		// Reverse descending page back into ascending chronological seq order
+		for i, j := 0, len(resp.Messages)-1; i < j; i, j = i+1, j-1 {
+			resp.Messages[i], resp.Messages[j] = resp.Messages[j], resp.Messages[i]
+		}
+		return nil
 	})
 	return resp, err
+}
+
+// ResolveBoardTarget looks up a @mention target on taskID across both persisted board_members
+// and virtual parent_task_id child tasks.
+func (s *Store) ResolveBoardTarget(ctx context.Context, taskID, targetMention string) (*protocol.BoardMemberCursor, error) {
+	target := strings.TrimPrefix(strings.TrimSpace(targetMention), "@")
+	if target == "" {
+		return nil, nil
+	}
+	var matched *protocol.BoardMemberCursor
+	err := s.WithReadTx(ctx, func(tx *sql.Tx) error {
+		members, err := listTaskBoardMembersTx(ctx, tx, taskID)
+		if err != nil {
+			return err
+		}
+		for i := range members {
+			m := members[i]
+			if strings.EqualFold(m.MemberName, target) || (m.WorkerTaskID != "" && m.WorkerTaskID == target) {
+				cp := m
+				matched = &cp
+				return nil
+			}
+		}
+		return nil
+	})
+	return matched, err
+}
+
+// MarkBoardMessageConsumed marks a board message as consumed and advances the target member's cursor.
+func (s *Store) MarkBoardMessageConsumed(ctx context.Context, taskID, messageID string, seq int64, memberName string) (*protocol.EventRecord, error) {
+	var emitted *protocol.EventRecord
+	now := time.Now().UnixMilli()
+	err := s.WithWriteTx(ctx, func(tx *sql.Tx) error {
+		var err error
+		emitted, err = markBoardMessageConsumedTx(ctx, tx, taskID, messageID, seq, memberName, now)
+		return err
+	})
+	return emitted, err
+}
+
+func markBoardMessageConsumedTx(ctx context.Context, tx *sql.Tx, taskID, messageID string, seq int64, memberName string, now int64) (*protocol.EventRecord, error) {
+	if now == 0 {
+		now = time.Now().UnixMilli()
+	}
+	var projectID string
+	if messageID != "" {
+		var msgSeq int64
+		if err := tx.QueryRowContext(ctx, `SELECT project_id, seq FROM board_messages WHERE message_id = ? AND task_id = ?`, messageID, taskID).Scan(&projectID, &msgSeq); err == nil {
+			if seq == 0 {
+				seq = msgSeq
+			}
+			_, _ = tx.ExecContext(ctx, `UPDATE board_messages SET status = 'consumed' WHERE message_id = ? AND task_id = ?`, messageID, taskID)
+		}
+	} else if seq > 0 {
+		if err := tx.QueryRowContext(ctx, `SELECT project_id FROM board_messages WHERE seq = ? AND task_id = ?`, seq, taskID).Scan(&projectID); err == nil {
+			_, _ = tx.ExecContext(ctx, `UPDATE board_messages SET status = 'consumed' WHERE seq = ? AND task_id = ?`, seq, taskID)
+		}
+	}
+	if projectID == "" {
+		if err := tx.QueryRowContext(ctx, `SELECT project_id FROM tasks WHERE task_id = ?`, taskID).Scan(&projectID); err != nil {
+			return nil, nil
+		}
+	}
+	member := strings.TrimPrefix(strings.TrimSpace(memberName), "@")
+	if member != "" && seq > 0 {
+		// Preserve existing worker_task_id/state if member already exists
+		var existingState, existingWorker, existingMachine, existingAdapter sql.NullString
+		_ = tx.QueryRowContext(ctx, `
+			SELECT state, worker_task_id, machine_id, adapter FROM board_members WHERE task_id = ? AND member_name = ?
+		`, taskID, member).Scan(&existingState, &existingWorker, &existingMachine, &existingAdapter)
+		st := protocol.BoardMemberWorking
+		if existingState.Valid && protocol.BoardMemberState(existingState.String).IsValid() {
+			st = protocol.BoardMemberState(existingState.String)
+		}
+		return upsertBoardMemberTx(ctx, tx, protocol.BoardMemberCursor{
+			TaskID:          taskID,
+			ProjectID:       projectID,
+			MemberName:      member,
+			MachineID:       existingMachine.String,
+			Adapter:         protocol.Adapter(existingAdapter.String),
+			State:           st,
+			LastConsumedSeq: seq,
+			CurrentStep:     fmt.Sprintf("consumed #%d", seq),
+			WorkerTaskID:    existingWorker.String,
+			UpdatedAt:       now,
+		})
+	}
+	return nil, nil
 }
 
 // PostBoardMessage inserts a human or agent message into a task's shared queue message board.
@@ -515,16 +662,49 @@ func (s *Store) GetWorkerStream(ctx context.Context, taskID, workerName string) 
 			return err
 		}
 
+		// 1. Check persisted board_members (matching member_name or worker_task_id)
 		row := tx.QueryRowContext(ctx, `
 			SELECT task_id, project_id, member_name, machine_id, adapter, state, last_consumed_seq, current_step, worker_task_id, updated_at
-			FROM board_members WHERE task_id = ? AND member_name = ?
-		`, taskID, workerName)
+			FROM board_members
+			WHERE task_id = ? AND (member_name = ? OR worker_task_id = ?)
+			LIMIT 1
+		`, taskID, workerName, workerName)
 		if bm, err := scanBoardMember(row); err == nil {
 			resp.Member = &bm
 		}
 
-		// If backed by a linked child task, return that child task's events; otherwise filter parent task events for workerName
+		// 2. Also support virtual cross-machine child tasks (parent_task_id = taskID) matched by stable workerTaskId or title
+		if resp.Member == nil {
+			var childID, childProj, title, adapter, tstate string
+			var updatedAt int64
+			var mach sql.NullString
+			err := tx.QueryRowContext(ctx, `
+				SELECT t.task_id, t.project_id, t.title, t.preferred_adapter, t.state, t.updated_at, a.machine_id
+				FROM tasks t
+				LEFT JOIN attempts a ON a.attempt_id = t.active_attempt_id
+				WHERE t.parent_task_id = ? AND t.archived_at IS NULL
+				  AND (t.task_id = ? OR t.title = ?)
+				ORDER BY CASE WHEN t.task_id = ? THEN 0 ELSE 1 END, t.created_at ASC
+				LIMIT 1
+			`, taskID, workerName, workerName, workerName).Scan(&childID, &childProj, &title, &adapter, &tstate, &updatedAt, &mach)
+			if err == nil {
+				bm := protocol.BoardMemberCursor{
+					TaskID:       taskID,
+					ProjectID:    childProj,
+					MemberName:   title,
+					MachineID:    mach.String,
+					Adapter:      protocol.Adapter(adapter),
+					State:        childTaskStateToMemberState(protocol.TaskState(tstate)),
+					WorkerTaskID: childID,
+					UpdatedAt:    updatedAt,
+				}
+				resp.Member = &bm
+			}
+		}
+
+		// If backed by a linked child task, return that child task's real event stream (full thought/tool stream available!)
 		if resp.Member != nil && resp.Member.WorkerTaskID != "" {
+			resp.PrivateStreamAvailable = true
 			eRows, err := tx.QueryContext(ctx, `
 				SELECT seq, event_id, stream_id, project_id, task_id, attempt_id,
 				       actor_kind, actor_id, kind, visibility, payload_json, created_at
@@ -544,6 +724,10 @@ func (s *Store) GetWorkerStream(ctx context.Context, taskID, workerName string) 
 			}
 			return eRows.Err()
 		}
+
+		// Native Swarm member: provider does not expose private worker internal reasoning streams
+		resp.PrivateStreamAvailable = false
+		resp.StreamNotice = "原生 Swarm 成员私有内部推理流未由 provider 透出，以下展示共享消息板往来与可观测事件。"
 
 		eRows, err := tx.QueryContext(ctx, `
 			SELECT seq, event_id, stream_id, project_id, task_id, attempt_id,
@@ -571,11 +755,15 @@ func (s *Store) GetWorkerStream(ctx context.Context, taskID, workerName string) 
 }
 
 func eventMatchesWorker(ev protocol.EventRecord, workerName string) bool {
-	if ev.ActorID == workerName {
+	want := strings.TrimPrefix(strings.TrimSpace(workerName), "@")
+	if want == "" {
+		return false
+	}
+	if strings.EqualFold(strings.TrimPrefix(ev.ActorID, "@"), want) {
 		return true
 	}
-	for _, k := range []string{"workerName", "memberName", "authorName", "targetMention", "name"} {
-		if v, ok := ev.Payload[k].(string); ok && strings.EqualFold(strings.TrimPrefix(v, "@"), strings.TrimPrefix(workerName, "@")) {
+	for _, k := range []string{"workerName", "memberName", "authorName", "targetMention", "name", "recipient"} {
+		if v, ok := ev.Payload[k].(string); ok && strings.EqualFold(strings.TrimPrefix(strings.TrimSpace(v), "@"), want) {
 			return true
 		}
 	}

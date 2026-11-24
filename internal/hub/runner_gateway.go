@@ -15,21 +15,30 @@ import (
 	"github.com/Hebi8/hebi8-Orbit/internal/protocol"
 )
 
+type outboundFrame struct {
+	data    []byte
+	onStart func() error
+	onFail  func(writeErr error)
+	errCh   chan error
+}
+
 type runnerConn struct {
 	machineID        string
 	runnerInstanceID string
+	adapters         []protocol.Adapter
 	conn             *websocket.Conn
-	sendCh           chan []byte
+	sendCh           chan outboundFrame
 	done             chan struct{}
 	closeOnce        sync.Once
 }
 
-func newRunnerConn(machineID, runnerInstanceID string, conn *websocket.Conn) *runnerConn {
+func newRunnerConn(machineID, runnerInstanceID string, adapters []protocol.Adapter, conn *websocket.Conn) *runnerConn {
 	return &runnerConn{
 		machineID:        machineID,
 		runnerInstanceID: runnerInstanceID,
+		adapters:         append([]protocol.Adapter(nil), adapters...),
 		conn:             conn,
-		sendCh:           make(chan []byte, 256),
+		sendCh:           make(chan outboundFrame, 256),
 		done:             make(chan struct{}),
 	}
 }
@@ -42,10 +51,39 @@ func (rc *runnerConn) sendJSON(v any) error {
 	select {
 	case <-rc.done:
 		return errors.New("runner connection closed")
-	case rc.sendCh <- data:
+	case rc.sendCh <- outboundFrame{data: data}:
 		return nil
 	case <-time.After(5 * time.Second):
 		return errors.New("runner send queue full")
+	}
+}
+
+func (rc *runnerConn) sendJSONSync(v any, onStart func() error, onFail func(error)) error {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	errCh := make(chan error, 1)
+	frame := outboundFrame{
+		data:    data,
+		onStart: onStart,
+		onFail:  onFail,
+		errCh:   errCh,
+	}
+	select {
+	case <-rc.done:
+		return errors.New("runner connection closed")
+	case rc.sendCh <- frame:
+	case <-time.After(5 * time.Second):
+		return errors.New("runner send queue full")
+	}
+	select {
+	case err := <-errCh:
+		return err
+	case <-rc.done:
+		return errors.New("runner connection closed before frame write")
+	case <-time.After(12 * time.Second):
+		return errors.New("runner frame write timed out")
 	}
 }
 
@@ -106,6 +144,15 @@ func (g *RunnerGateway) ActiveRunnerInstanceID(machineID string) string {
 	return rc.runnerInstanceID
 }
 
+// ReportedAdapters returns the live adapters reported by the connected runner for machineID.
+func (g *RunnerGateway) ReportedAdapters(machineID string) []protocol.Adapter {
+	rc := g.get(machineID)
+	if rc == nil || len(rc.adapters) == 0 {
+		return nil
+	}
+	return append([]protocol.Adapter(nil), rc.adapters...)
+}
+
 // DispatchAttempt sends an attempt.dispatch frame to machineID if connected.
 func (g *RunnerGateway) DispatchAttempt(machineID string, frame protocol.AttemptDispatchFrame) (string, error) {
 	rc := g.get(machineID)
@@ -129,14 +176,36 @@ func (g *RunnerGateway) CancelAttempt(machineID string, frame protocol.AttemptCa
 	return rc.sendJSON(frame)
 }
 
-// SendApprovalDecision pushes an approval.decision frame to machineID if connected.
+// SendApprovalDecision pushes an approval.decision frame synchronously to machineID if connected.
+// Optional onStart/onFail callbacks align delivery_attempted accounting with the real WS write boundary (B6).
 func (g *RunnerGateway) SendApprovalDecision(machineID string, frame protocol.ApprovalDecisionFrame) error {
+	return g.SendApprovalDecisionWithHooks(machineID, frame, nil, nil)
+}
+
+// SendApprovalDecisionWithHooks pushes an approval.decision frame and invokes onStart right before
+// writing to the live WS socket and onFail if the write directly errors.
+func (g *RunnerGateway) SendApprovalDecisionWithHooks(
+	machineID string,
+	frame protocol.ApprovalDecisionFrame,
+	onStart func() error,
+	onFail func(error),
+) error {
 	rc := g.get(machineID)
 	if rc == nil {
 		return fmt.Errorf("runner %s not connected", machineID)
 	}
 	frame.Type = protocol.RunnerMsgApprovalDecide
-	return rc.sendJSON(frame)
+	return rc.sendJSONSync(frame, onStart, onFail)
+}
+
+// SendBoardMessage pushes a board.message frame to machineID for an active swarm_monitoring attempt (B16).
+func (g *RunnerGateway) SendBoardMessage(machineID string, frame protocol.BoardMessageDispatchFrame) error {
+	rc := g.get(machineID)
+	if rc == nil {
+		return fmt.Errorf("runner %s not connected", machineID)
+	}
+	frame.Type = protocol.RunnerMsgBoardMessage
+	return rc.sendJSONSync(frame, nil, nil)
 }
 
 // CloseSession sends a session.close frame to machineID if connected.
@@ -164,6 +233,18 @@ func (g *RunnerGateway) CloseAll() {
 }
 
 func (s *Server) handleRunnerWS(w http.ResponseWriter, r *http.Request) {
+	// B5: Unconditionally reject browser handshakes carrying an Origin header on /ws/runner.
+	if strings.TrimSpace(r.Header.Get("Origin")) != "" {
+		writeAPIError(w, http.StatusForbidden, "ERR_ORIGIN_FORBIDDEN", "browser Origin header is forbidden on /ws/runner")
+		return
+	}
+
+	// B5: Require Bearer token on ALL runner connections (both local_ws and remote_ws) before upgrade.
+	if extractBearerToken(r.Header.Get("Authorization")) == "" {
+		writeAPIError(w, http.StatusUnauthorized, "ERR_UNAUTHORIZED", "runner bearer token required")
+		return
+	}
+
 	// Pre-upgrade auth check when machineId is declared in header or query param
 	claimedMachine := strings.TrimSpace(r.Header.Get("X-Orbit-Machine-Id"))
 	if claimedMachine == "" {
@@ -178,9 +259,6 @@ func (s *Server) handleRunnerWS(w http.ResponseWriter, r *http.Request) {
 			writeAPIError(w, statusCode, code, errMsg)
 			return
 		}
-	} else if !isLoopbackAddr(r.RemoteAddr) && extractBearerToken(r.Header.Get("Authorization")) == "" {
-		writeAPIError(w, http.StatusUnauthorized, "ERR_UNAUTHORIZED", "runner bearer token required")
-		return
 	}
 
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
@@ -231,7 +309,7 @@ func (s *Server) handleRunnerWS(w http.ResponseWriter, r *http.Request) {
 		s.broker.Broadcast(recRes.Events...)
 	}
 
-	rc := newRunnerConn(hello.MachineID, hello.RunnerInstanceID, conn)
+	rc := newRunnerConn(hello.MachineID, hello.RunnerInstanceID, hello.Adapters, conn)
 	if prev := s.runners.register(rc); prev != nil && prev != rc {
 		prev.close(websocket.StatusGoingAway, "replaced by newer runner connection")
 	}
@@ -240,12 +318,24 @@ func (s *Server) handleRunnerWS(w http.ResponseWriter, r *http.Request) {
 		rc.close(websocket.StatusNormalClosure, "closing")
 		if s.runners.unregister(rc) {
 			offCtx, cancelOff := context.WithTimeout(context.Background(), 2*time.Second)
-			_ = s.store.SetMachineStatus(offCtx, hello.MachineID, protocol.MachineOffline)
+			if ev, err := s.store.SetMachineStatus(offCtx, hello.MachineID, protocol.MachineOffline); err == nil && ev != nil {
+				s.broker.Broadcast(*ev)
+			}
 			cancelOff()
 		}
 	}()
 
-	// 3. Send hub.welcome as the very first frame BEFORE starting dispatch of pending leased attempts
+	// 3. Send hub.welcome as the very first frame BEFORE starting dispatch of pending leased attempts.
+	// B6: Mark redelivered approvals as delivery_attempted right before writing hub.welcome.
+	var redeliverIDs []string
+	for _, ap := range recRes.Reconcile.RedeliverApprovals {
+		if ap.ApprovalID != "" {
+			redeliverIDs = append(redeliverIDs, ap.ApprovalID)
+		}
+	}
+	if len(redeliverIDs) > 0 {
+		_ = s.store.MarkApprovalsDeliveryAttempted(r.Context(), redeliverIDs)
+	}
 	welcome := protocol.HubWelcomeFrame{
 		Type:                protocol.RunnerMsgHubWelcome,
 		ServerTime:          time.Now().UnixMilli(),
@@ -273,9 +363,23 @@ func (s *Server) handleRunnerWS(w http.ResponseWriter, r *http.Request) {
 			case <-rc.done:
 				return
 			case msg := <-rc.sendCh:
+				if msg.onStart != nil {
+					if err := msg.onStart(); err != nil {
+						if msg.errCh != nil {
+							msg.errCh <- err
+						}
+						continue
+					}
+				}
 				wctx, wcancel := context.WithTimeout(ctx, 10*time.Second)
-				err := conn.Write(wctx, websocket.MessageText, msg)
+				err := conn.Write(wctx, websocket.MessageText, msg.data)
 				wcancel()
+				if err != nil && msg.onFail != nil {
+					msg.onFail(err)
+				}
+				if msg.errCh != nil {
+					msg.errCh <- err
+				}
 				if err != nil {
 					return
 				}
@@ -283,7 +387,11 @@ func (s *Server) handleRunnerWS(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	// 5. Dispatch any queued/leased attempts waiting for this machine
+	// 5. Auto-consume any steered tasks whose cancelled attempts settled during reconcile (B9),
+	//    and dispatch any queued/leased attempts waiting for this machine.
+	for _, notice := range recRes.SteerTasksToConsume {
+		s.consumeAndDispatchNextPendingInput(ctx, notice.TaskID, notice.SteerInputID)
+	}
 	s.dispatchPendingLeasedForMachine(ctx, hello.MachineID)
 
 	// 6. Read loop for runner.heartbeat and attempt.outbox_batch
@@ -303,15 +411,28 @@ func (s *Server) handleRunnerWS(w http.ResponseWriter, r *http.Request) {
 			if err := json.Unmarshal(data, &hb); err != nil {
 				continue
 			}
-			_ = s.store.RenewMachineLeases(
+			cancelIDs, err := s.store.RenewMachineLeases(
 				ctx,
 				hello.MachineID,
 				hello.RunnerInstanceID,
 				hb.LiveAttemptLeaseTokens,
 				hb.Resources,
+				hb.Adapters,
 				time.Now().UnixMilli(),
 				s.leaseTTL.Milliseconds(),
 			)
+			if err == nil {
+				// B10: Re-deliver attempt.cancel for any live attempt with cancel_requested=1
+				for _, cid := range cancelIDs {
+					if attRec, err := s.store.GetAttemptRecord(ctx, cid); err == nil {
+						_ = rc.sendJSON(protocol.AttemptCancelFrame{
+							Type:       protocol.RunnerMsgAttemptCancel,
+							AttemptID:  attRec.AttemptID,
+							LeaseToken: attRec.LeaseToken,
+						})
+					}
+				}
+			}
 
 		case protocol.RunnerMsgOutboxBatch:
 			var batch protocol.AttemptOutboxBatchFrame
@@ -332,6 +453,15 @@ func (s *Server) handleRunnerWS(w http.ResponseWriter, r *http.Request) {
 				AcceptedMode:   ingestRes.AcceptedMode,
 			})
 
+			// B10: If an active attempt sending outbox frames has persisted cancel_requested=1, re-send cancel.
+			if ingestRes.CancelRequested {
+				_ = rc.sendJSON(protocol.AttemptCancelFrame{
+					Type:       protocol.RunnerMsgAttemptCancel,
+					AttemptID:  batch.AttemptID,
+					LeaseToken: batch.LeaseToken,
+				})
+			}
+
 			// Decoupled Ryugi registration for any delivery carrying .ryugi/artifacts/
 			for _, dlvNotice := range ingestRes.PublishedDeliveries {
 				if len(dlvNotice.RyugiArtifacts) > 0 {
@@ -346,9 +476,9 @@ func (s *Server) handleRunnerWS(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 
-			// When an attempt succeeds, automatically pop & dispatch the next queued task_pending_input
-			if ingestRes.AttemptSucceeded && ingestRes.TaskID != "" {
-				s.consumeAndDispatchNextPendingInput(ctx, ingestRes.TaskID)
+			// B9: Auto-pop next queued input on succeeded OR on steer-triggered cancellation (never human Stop).
+			if ingestRes.AutoConsumeQueue && ingestRes.TaskID != "" {
+				s.consumeAndDispatchNextPendingInput(ctx, ingestRes.TaskID, ingestRes.SteerInputID)
 			}
 		}
 	}

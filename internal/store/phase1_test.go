@@ -4,7 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -13,6 +16,72 @@ import (
 	"github.com/Hebi8/hebi8-Orbit/internal/protocol"
 	"github.com/Hebi8/hebi8-Orbit/internal/store"
 )
+
+func setupRealMirror(t *testing.T, s *store.Store, projectID string) (mirrorPath, workRepo, baseSHA string) {
+	t.Helper()
+	tmp := t.TempDir()
+	mirrorPath = filepath.Join(tmp, projectID+".git")
+	workRepo = filepath.Join(tmp, "work")
+	if err := os.MkdirAll(workRepo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gitEnv := append(os.Environ(),
+		"GIT_AUTHOR_NAME=Tester", "GIT_AUTHOR_EMAIL=tester@example.com",
+		"GIT_COMMITTER_NAME=Tester", "GIT_COMMITTER_EMAIL=tester@example.com",
+	)
+	runG := func(dir string, args ...string) string {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		cmd.Env = gitEnv
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, string(out))
+		}
+		return strings.TrimSpace(string(out))
+	}
+	runG(tmp, "init", "--bare", mirrorPath)
+	runG(workRepo, "init", "-b", "main")
+	if err := os.WriteFile(filepath.Join(workRepo, "main.go"), []byte("package main\n\nfunc main() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runG(workRepo, "add", ".")
+	runG(workRepo, "commit", "-m", "base")
+	baseSHA = runG(workRepo, "rev-parse", "HEAD")
+	runG(workRepo, "push", mirrorPath, "HEAD:refs/heads/main")
+	if err := s.WithWriteTx(context.Background(), func(tx *sql.Tx) error {
+		_, err := tx.Exec(`UPDATE projects SET mirror_bare_path = ? WHERE project_id = ?`, mirrorPath, projectID)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return mirrorPath, workRepo, baseSHA
+}
+
+func pushMirrorCommit(t *testing.T, mirrorPath, workRepo, deliveryID, fileContent string) string {
+	t.Helper()
+	gitEnv := append(os.Environ(),
+		"GIT_AUTHOR_NAME=Tester", "GIT_AUTHOR_EMAIL=tester@example.com",
+		"GIT_COMMITTER_NAME=Tester", "GIT_COMMITTER_EMAIL=tester@example.com",
+	)
+	runG := func(args ...string) string {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = workRepo
+		cmd.Env = gitEnv
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, string(out))
+		}
+		return strings.TrimSpace(string(out))
+	}
+	if err := os.WriteFile(filepath.Join(workRepo, "main.go"), []byte(fileContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runG("add", ".")
+	runG("commit", "-m", "delivery "+deliveryID)
+	headSHA := runG("rev-parse", "HEAD")
+	runG("push", mirrorPath, "HEAD:refs/orbit/deliveries/"+deliveryID)
+	return headSHA
+}
 
 func TestPhase0ToPhase1SmoothMigration(t *testing.T) {
 	ctx := context.Background()
@@ -57,8 +126,8 @@ func TestPhase0ToPhase1SmoothMigration(t *testing.T) {
 	if err := s.ReadDB().QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&maxVer); err != nil {
 		t.Fatal(err)
 	}
-	if maxVer != 2 {
-		t.Fatalf("expected schema version 2, got %d", maxVer)
+	if maxVer != 3 {
+		t.Fatalf("expected schema version 3, got %d", maxVer)
 	}
 
 	// Verify _scratch exists
@@ -70,10 +139,10 @@ func TestPhase0ToPhase1SmoothMigration(t *testing.T) {
 		t.Fatalf("unexpected _scratch metadata: %+v", scratch)
 	}
 
-	// Verify existing Phase 0 pending input survived with backfilled columns
+	// Verify existing Phase 0 pending input survived with backfilled columns AND backfilled body (S8)
 	items, err := s.ListPendingInputs(ctx, "tsk_legacy")
-	if err != nil || len(items) != 1 || items[0].InputID != "inp_legacy" {
-		t.Fatalf("legacy pending input did not survive migration: items=%+v err=%v", items, err)
+	if err != nil || len(items) != 1 || items[0].InputID != "inp_legacy" || items[0].Body != "hello" {
+		t.Fatalf("legacy pending input did not survive migration / backfill body: items=%+v err=%v", items, err)
 	}
 
 	// Verify PA state preserved last_read_event_seq=7 and added active_pa_thread_id
@@ -217,6 +286,9 @@ func TestPendingQueueOrderSteerDeleteAndAutoConsume(t *testing.T) {
 func TestStore_R4a_OutboxGapAndLateHistoryIsolation(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()
+	mirrorPath, workRepo, baseSHA := setupRealMirror(t, s, "proj-a")
+	headBase := pushMirrorCommit(t, mirrorPath, workRepo, "dlv_base", "package main\n// base delivery\nfunc main() {}\n")
+	headLate := pushMirrorCommit(t, mirrorPath, workRepo, "dlv_late_att1", "package main\n// late delivery\nfunc main() {}\n")
 
 	// Seed task with att_1
 	created, err := s.CreateTask(ctx, store.CreateTaskParams{
@@ -238,7 +310,7 @@ func TestStore_R4a_OutboxGapAndLateHistoryIsolation(t *testing.T) {
 		AttemptID:  att1.AttemptID,
 		LeaseToken: att1.LeaseToken,
 		Items: []protocol.OutboxItem{
-			{OutboxSeq: 1, EventID: "ev_1", FrameType: protocol.OutboxFrameState, Payload: map[string]any{"state": "running", "baseSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},
+			{OutboxSeq: 1, EventID: "ev_1", FrameType: protocol.OutboxFrameState, Payload: map[string]any{"state": "running", "baseSha": baseSHA}},
 		},
 	})
 	if err != nil || r1.AckedOutboxSeq != 1 || r1.AcceptedMode != protocol.OutboxModeActive {
@@ -265,8 +337,8 @@ func TestStore_R4a_OutboxGapAndLateHistoryIsolation(t *testing.T) {
 			{OutboxSeq: 1, EventID: "ev_1", FrameType: protocol.OutboxFrameState, Payload: map[string]any{"state": "running"}},
 			{OutboxSeq: 2, EventID: "ev_2", FrameType: protocol.OutboxFrameDeliveryPublished, Payload: map[string]any{
 				"deliveryId": "dlv_base",
-				"baseSha":    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-				"headSha":    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+				"baseSha":    baseSHA,
+				"headSha":    headBase,
 				"summary":    "initial delivery",
 			}},
 			{OutboxSeq: 3, EventID: "ev_3", FrameType: protocol.OutboxFrameEvents, Payload: map[string]any{"kind": "acp.message_batch", "visibility": "raw_acp", "payload": map[string]any{"text": "filled"}}},
@@ -315,8 +387,8 @@ func TestStore_R4a_OutboxGapAndLateHistoryIsolation(t *testing.T) {
 		Items: []protocol.OutboxItem{
 			{OutboxSeq: 4, EventID: "ev_late_dlv", FrameType: protocol.OutboxFrameDeliveryPublished, Payload: map[string]any{
 				"deliveryId": "dlv_late_att1",
-				"baseSha":    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-				"headSha":    "cccccccccccccccccccccccccccccccccccccccc",
+				"baseSha":    baseSHA,
+				"headSha":    headLate,
 				"summary":    "late delivery from att1",
 			}},
 			{OutboxSeq: 5, EventID: "ev_late_done", FrameType: protocol.OutboxFrameState, Payload: map[string]any{

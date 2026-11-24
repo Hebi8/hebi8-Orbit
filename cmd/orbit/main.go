@@ -280,9 +280,16 @@ func runDeliver(ctx context.Context, args []string, stdout, stderr io.Writer) er
 		return err
 	}
 
-	// Phase 1 Runner fast-path: if ORBIT_RUNNER_SOCK is set and not explicitly running Phase 0 --resume/--project manual import
-	if sock := strings.TrimSpace(os.Getenv("ORBIT_RUNNER_SOCK")); sock != "" && strings.TrimSpace(*resumeID) == "" && strings.TrimSpace(*projectID) == "" {
-		return runDeliverViaRunnerSocket(ctx, sock, *attemptID, *taskID, *repoDir, *summary, *finalFlag, attaches, *jsonOut, stdout)
+	// Phase 1 Runner fast-path: if ORBIT_RUNNER_SOCK is set and --project is not explicitly specified,
+	// route normal deliver AND --resume / --delivery-id retries through the local runner socket (B13).
+	if sock := strings.TrimSpace(os.Getenv("ORBIT_RUNNER_SOCK")); sock != "" && strings.TrimSpace(*projectID) == "" {
+		dlvOverride := strings.TrimSpace(*deliveryID)
+		resumeFlag := false
+		if strings.TrimSpace(*resumeID) != "" {
+			dlvOverride = strings.TrimSpace(*resumeID)
+			resumeFlag = true
+		}
+		return runDeliverViaRunnerSocket(ctx, sock, *attemptID, *taskID, dlvOverride, resumeFlag, *repoDir, *summary, *finalFlag, attaches, *jsonOut, stdout)
 	}
 
 	hubURL, dataDir, devToken := resolveHubDefaults(*configDir, *dataDirFlg, *hubURLFlag, *tokenFlag)
@@ -336,22 +343,10 @@ func runDeliver(ctx context.Context, args []string, stdout, stderr io.Writer) er
 			return fmt.Errorf("pending delivery %s already exists at %s; use `orbit deliver --resume %s` instead of re-packaging", dlvID, pendingPath, dlvID)
 		}
 
-		var attachInputs []gitops.AttachmentInput
-		for _, raw := range attaches {
-			localPath := raw
-			targetPath := ""
-			if idx := strings.Index(raw, ":"); idx > 0 {
-				candidateLocal := raw[:idx]
-				candidateTarget := raw[idx+1:]
-				if _, err := os.Stat(candidateLocal); err == nil {
-					localPath = candidateLocal
-					targetPath = candidateTarget
-				}
-			}
-			attachInputs = append(attachInputs, gitops.AttachmentInput{
-				LocalPath:  localPath,
-				TargetPath: targetPath,
-			})
+		cliCWD, _ := os.Getwd()
+		attachInputs, err := parseAttachFlags(attaches, cliCWD)
+		if err != nil {
+			return err
 		}
 
 		// 1. Zero-pollution checkpoint packaging (resolves git toplevel automatically)
@@ -627,9 +622,62 @@ func shortSHA(sha string) string {
 	return sha
 }
 
+func parseAttachFlags(attaches stringListFlag, cliCWD string) ([]gitops.AttachmentInput, error) {
+	if len(attaches) == 0 {
+		return nil, nil
+	}
+	if cliCWD == "" {
+		if wd, err := os.Getwd(); err == nil {
+			cliCWD = wd
+		}
+	}
+	resolveLocal := func(p string) string {
+		p = protocol.ExpandPath(strings.TrimSpace(p))
+		if p != "" && !filepath.IsAbs(p) && cliCWD != "" {
+			p = filepath.Join(cliCWD, p)
+		}
+		if abs, err := filepath.Abs(p); err == nil {
+			return abs
+		}
+		return p
+	}
+
+	out := make([]gitops.AttachmentInput, 0, len(attaches))
+	for _, raw := range attaches {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		localPath := resolveLocal(raw)
+		targetPath := ""
+		if idx := strings.Index(raw, ":"); idx > 0 {
+			candidateLocal := resolveLocal(raw[:idx])
+			candidateTarget := strings.TrimSpace(raw[idx+1:])
+			if fi, err := os.Stat(candidateLocal); err == nil && !fi.IsDir() {
+				localPath = candidateLocal
+				targetPath = filepath.ToSlash(filepath.Clean(candidateTarget))
+			}
+		}
+		fi, err := os.Stat(localPath)
+		if err != nil {
+			return nil, fmt.Errorf("attachment %q not found at %s: %w", raw, localPath, err)
+		}
+		if fi.IsDir() {
+			return nil, fmt.Errorf("attachment %q (%s) must be a regular file, not a directory", raw, localPath)
+		}
+		out = append(out, gitops.AttachmentInput{
+			LocalPath:  localPath,
+			TargetPath: targetPath,
+		})
+	}
+	return out, nil
+}
+
 func runDeliverViaRunnerSocket(
 	ctx context.Context,
-	sockPath, attemptFlag, taskFlag, repoFlag, summary string,
+	sockPath, attemptFlag, taskFlag, deliveryIDFlag string,
+	resume bool,
+	repoFlag, summary string,
 	final bool,
 	attaches stringListFlag,
 	jsonOut bool,
@@ -643,34 +691,27 @@ func runDeliverViaRunnerSocket(
 	if tid == "" {
 		tid = strings.TrimSpace(os.Getenv("ORBIT_TASK_ID"))
 	}
+	cliCWD, _ := os.Getwd()
 	cwd := strings.TrimSpace(repoFlag)
 	if cwd == "" {
-		if wd, err := os.Getwd(); err == nil {
-			cwd = wd
-		}
+		cwd = cliCWD
+	} else if !filepath.IsAbs(cwd) && cliCWD != "" {
+		cwd = filepath.Join(cliCWD, cwd)
+	}
+	if absCWD, err := filepath.Abs(cwd); err == nil {
+		cwd = absCWD
 	}
 
-	var attachInputs []gitops.AttachmentInput
-	for _, raw := range attaches {
-		localPath := raw
-		targetPath := ""
-		if idx := strings.Index(raw, ":"); idx > 0 {
-			candidateLocal := raw[:idx]
-			candidateTarget := raw[idx+1:]
-			if _, err := os.Stat(candidateLocal); err == nil {
-				localPath = candidateLocal
-				targetPath = candidateTarget
-			}
-		}
-		attachInputs = append(attachInputs, gitops.AttachmentInput{
-			LocalPath:  localPath,
-			TargetPath: targetPath,
-		})
+	attachInputs, err := parseAttachFlags(attaches, cliCWD)
+	if err != nil {
+		return err
 	}
 
 	reqBody := runner.LocalDeliverRequest{
 		AttemptID:   aid,
 		TaskID:      tid,
+		DeliveryID:  strings.TrimSpace(deliveryIDFlag),
+		Resume:      resume,
 		CWD:         cwd,
 		Summary:     strings.TrimSpace(summary),
 		Final:       final,

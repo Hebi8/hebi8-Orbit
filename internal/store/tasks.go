@@ -23,6 +23,8 @@ type AttemptRecord struct {
 	TriggerPayloadJSON string
 	DesiredConfig      map[string]string
 	RequiredResources  []string
+	Anchor             *protocol.ProjectAnchorConfig
+	AnchorCapability   string
 	LeaseToken         string
 	LeaseExpiresAt     int64
 	LastAckedOutbox    int64
@@ -30,6 +32,14 @@ type AttemptRecord struct {
 	ResumeState        string
 	TargetEnv          string
 	DeployPhase        string
+	CancelRequested    bool
+	CancelReasonKind   string
+	SteerInputID       string
+}
+
+type storedAttemptAnchor struct {
+	Capability string                        `json:"capability,omitempty"`
+	Anchor     *protocol.ProjectAnchorConfig `json:"anchor,omitempty"`
 }
 
 // AgentSessionRecord stores an underlying ACP session row.
@@ -62,6 +72,8 @@ type CreateTaskParams struct {
 	IdempotencyKey     string
 	Sources            []protocol.CreateTaskSourceInput
 	MachineID          string
+	Anchor             *protocol.ProjectAnchorConfig
+	AnchorCapability   string
 	WorktreePath       string
 	BaseSHA            string
 	InputDeliveryID    string
@@ -259,22 +271,25 @@ func (s *Store) CreateTask(ctx context.Context, p CreateTaskParams) (CreateTaskR
 
 		if p.CreateAttempt {
 			att, evAtt, err := createAttemptInTx(ctx, tx, createAttemptTxParams{
-				TaskID:          taskID,
-				ProjectID:       p.ProjectID,
-				MachineID:       p.MachineID,
-				Adapter:         p.Adapter,
-				TriggerKind:     p.TriggerKind,
-				TriggerPayload:  p.TriggerPayload,
-				Prompt:          p.Prompt,
-				WorktreePath:    p.WorktreePath,
-				BaseSHA:         p.BaseSHA,
-				InputDeliveryID: p.InputDeliveryID,
-				DesiredConfig:   p.DesiredConfig,
-				ForceNewSession: true,
-				LeaseTTLMs:      p.LeaseTTLMs,
-				ActorKind:       p.ActorKind,
-				ActorID:         p.ActorID,
-				Now:             now,
+				TaskID:            taskID,
+				ProjectID:         p.ProjectID,
+				MachineID:         p.MachineID,
+				Adapter:           p.Adapter,
+				TriggerKind:       p.TriggerKind,
+				TriggerPayload:    p.TriggerPayload,
+				Prompt:            p.Prompt,
+				WorktreePath:      p.WorktreePath,
+				BaseSHA:           p.BaseSHA,
+				InputDeliveryID:   p.InputDeliveryID,
+				DesiredConfig:     p.DesiredConfig,
+				RequiredResources: p.RequiredResources,
+				Anchor:            p.Anchor,
+				AnchorCapability:  p.AnchorCapability,
+				ForceNewSession:   true,
+				LeaseTTLMs:        p.LeaseTTLMs,
+				ActorKind:         p.ActorKind,
+				ActorID:           p.ActorID,
+				Now:               now,
 			})
 			if err != nil {
 				return err
@@ -309,9 +324,9 @@ func (s *Store) BindScratchTaskToProject(ctx context.Context, taskID, targetProj
 	}
 
 	err := s.WithWriteTx(ctx, func(tx *sql.Tx) error {
-		var curProject string
+		var curProject, curCapability string
 		var activeAtt sql.NullString
-		err := tx.QueryRowContext(ctx, `SELECT project_id, active_attempt_id FROM tasks WHERE task_id = ?`, taskID).Scan(&curProject, &activeAtt)
+		err := tx.QueryRowContext(ctx, `SELECT project_id, required_capability, active_attempt_id FROM tasks WHERE task_id = ?`, taskID).Scan(&curProject, &curCapability, &activeAtt)
 		if errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("%w: task %s", ErrNotFound, taskID)
 		}
@@ -325,12 +340,22 @@ func (s *Store) BindScratchTaskToProject(ctx context.Context, taskID, targetProj
 			return fmt.Errorf("%w: cannot rebind task %s while attempt %s is active", ErrConflict, taskID, activeAtt.String)
 		}
 
-		var exists string
-		if err := tx.QueryRowContext(ctx, `SELECT project_id FROM projects WHERE project_id = ? AND archived = 0`, targetProjectID).Scan(&exists); err != nil {
+		var exists, targetCfgJSON string
+		if err := tx.QueryRowContext(ctx, `SELECT project_id, config_json FROM projects WHERE project_id = ? AND archived = 0`, targetProjectID).Scan(&exists, &targetCfgJSON); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return fmt.Errorf("%w: project %s", ErrNotFound, targetProjectID)
 			}
 			return err
+		}
+
+		nextCapability := curCapability
+		var targetCfg protocol.ProjectConfig
+		if err := json.Unmarshal([]byte(targetCfgJSON), &targetCfg); err == nil {
+			if targetCfg.DefaultCapability != "" {
+				if nextCapability == "" || (len(targetCfg.Anchors) > 0 && targetCfg.Anchors[nextCapability].Machine == "") {
+					nextCapability = targetCfg.DefaultCapability
+				}
+			}
 		}
 
 		// Defer composite FK verification to COMMIT so parent + all child tables update atomically.
@@ -358,7 +383,18 @@ func (s *Store) BindScratchTaskToProject(ctx context.Context, taskID, targetProj
 				return fmt.Errorf("rebind %s: %w", tbl, err)
 			}
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE tasks SET version = version + 1, updated_at = ? WHERE task_id = ?`, now, taskID); err != nil {
+		// B14: Lock & terminate all prior _scratch ACP sessions so the next project turn MUST open a fresh session in the project's worktree.
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE agent_sessions
+			SET locked = 1, runtime_state = 'dead', provider_session_id = NULL,
+			    closed_at = COALESCE(closed_at, ?), last_activity_at = ?
+			WHERE task_id = ?
+		`, now, now, taskID); err != nil {
+			return fmt.Errorf("lock prior scratch sessions: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE tasks SET required_capability = ?, version = version + 1, updated_at = ? WHERE task_id = ?
+		`, nextCapability, now, taskID); err != nil {
 			return err
 		}
 
@@ -393,26 +429,60 @@ func (s *Store) BindScratchTaskToProject(ctx context.Context, taskID, targetProj
 
 // CreateNextAttemptParams configures creating a subsequent Attempt for an existing Task.
 type CreateNextAttemptParams struct {
-	TaskID          string
-	MachineID       string
-	Adapter         protocol.Adapter
-	TriggerKind     protocol.TriggerKind
-	TriggerPayload  map[string]any
-	Prompt          string
-	WorktreePath    string
-	BaseSHA         string
-	InputDeliveryID string
-	DesiredConfig   map[string]string
-	ForceNewSession bool
-	VerifiedSite    bool
-	LeaseTTLMs      int64
-	ActorKind       protocol.ActorKind
-	ActorID         string
+	TaskID            string
+	MachineID         string
+	Adapter           protocol.Adapter
+	TriggerKind       protocol.TriggerKind
+	TriggerPayload    map[string]any
+	Prompt            string
+	WorktreePath      string
+	BaseSHA           string
+	InputDeliveryID   string
+	DesiredConfig     map[string]string
+	RequiredResources []string
+	Anchor            *protocol.ProjectAnchorConfig
+	AnchorCapability  string
+	ForceNewSession   bool
+	VerifiedSite      bool
+	VerifiedAttemptID string
+	LeaseTTLMs        int64
+	ActorKind         protocol.ActorKind
+	ActorID           string
+}
+
+// checkNeedsVerificationTx enforces B11 across ALL continuation entry points.
+// If the task's most recent attempt ended in needs_verification, callers MUST provide
+// verifiedSite=true (and, if verifiedAttemptID is non-empty, it must match that attempt).
+func checkNeedsVerificationTx(ctx context.Context, tx *sql.Tx, taskID string, verifiedSite bool, verifiedAttemptID string) (*AttemptRecord, error) {
+	var lastAttemptID string
+	err := tx.QueryRowContext(ctx, `
+		SELECT attempt_id FROM attempts WHERE task_id = ?
+		ORDER BY attempt_no DESC LIMIT 1
+	`, taskID).Scan(&lastAttemptID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	lastAtt, err := loadAttemptRecordTx(ctx, tx, lastAttemptID)
+	if err != nil {
+		return nil, err
+	}
+	if lastAtt.State == protocol.AttemptNeedsVerification {
+		if !verifiedSite {
+			return &lastAtt, fmt.Errorf("%w: previous attempt %s is in needs_verification; pass verifiedSite=true after inspecting state", ErrVerificationRequired, lastAtt.AttemptID)
+		}
+		if strings.TrimSpace(verifiedAttemptID) != "" && strings.TrimSpace(verifiedAttemptID) != lastAtt.AttemptID {
+			return &lastAtt, fmt.Errorf("%w: verifiedAttemptId %q does not match needs_verification attempt %q", ErrVerificationRequired, verifiedAttemptID, lastAtt.AttemptID)
+		}
+	}
+	return &lastAtt, nil
 }
 
 // CreateNextAttempt atomically starts a new Attempt for an idle Task.
 // Rejects with ErrConflict if an active attempt already exists, or ErrVerificationRequired
-// when retrying a needs_verification attempt without verifiedSite=true.
+// when continuing after a needs_verification attempt without verifiedSite=true.
 func (s *Store) CreateNextAttempt(ctx context.Context, p CreateNextAttemptParams) (protocol.TaskSummary, AttemptRecord, []protocol.EventRecord, error) {
 	var task protocol.TaskSummary
 	var att AttemptRecord
@@ -429,13 +499,13 @@ func (s *Store) CreateNextAttempt(ctx context.Context, p CreateNextAttemptParams
 	}
 
 	err := s.WithWriteTx(ctx, func(tx *sql.Tx) error {
-		var projectID string
-		var activeAttID, latestDlvID, desiredCfgJSON sql.NullString
+		var projectID, taskGoal string
+		var activeAttID, latestDlvID, desiredCfgJSON, reqResJSON sql.NullString
 		var prefAdapter string
 		err := tx.QueryRowContext(ctx, `
-			SELECT project_id, active_attempt_id, latest_delivery_id, preferred_adapter, desired_config_json
+			SELECT project_id, goal, active_attempt_id, latest_delivery_id, preferred_adapter, desired_config_json, required_resources
 			FROM tasks WHERE task_id = ?
-		`, p.TaskID).Scan(&projectID, &activeAttID, &latestDlvID, &prefAdapter, &desiredCfgJSON)
+		`, p.TaskID).Scan(&projectID, &taskGoal, &activeAttID, &latestDlvID, &prefAdapter, &desiredCfgJSON, &reqResJSON)
 		if errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("%w: task %s", ErrNotFound, p.TaskID)
 		}
@@ -446,20 +516,10 @@ func (s *Store) CreateNextAttempt(ctx context.Context, p CreateNextAttemptParams
 			return fmt.Errorf("%w: task %s already has active attempt %s", ErrConflict, p.TaskID, activeAttID.String)
 		}
 
-		// Inspect latest attempt for retry verification guard and base delivery continuity
-		var lastAttemptID, lastAttemptState string
-		var lastWorktree, lastBaseSHA sql.NullString
-		err = tx.QueryRowContext(ctx, `
-			SELECT attempt_id, state, worktree_path, base_sha
-			FROM attempts WHERE task_id = ?
-			ORDER BY attempt_no DESC LIMIT 1
-		`, p.TaskID).Scan(&lastAttemptID, &lastAttemptState, &lastWorktree, &lastBaseSHA)
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		// B11: Unified needs_verification gate across ALL continuation entry points
+		lastAtt, err := checkNeedsVerificationTx(ctx, tx, p.TaskID, p.VerifiedSite, p.VerifiedAttemptID)
+		if err != nil {
 			return err
-		}
-
-		if p.TriggerKind == protocol.TriggerRetry && lastAttemptState == string(protocol.AttemptNeedsVerification) && !p.VerifiedSite {
-			return fmt.Errorf("%w: previous attempt %s is in needs_verification; pass verifiedSite=true after inspecting state", ErrVerificationRequired, lastAttemptID)
 		}
 
 		adapter := p.Adapter
@@ -471,40 +531,98 @@ func (s *Store) CreateNextAttempt(ctx context.Context, p CreateNextAttemptParams
 			desiredCfg = map[string]string{}
 			_ = json.Unmarshal([]byte(desiredCfgJSON.String), &desiredCfg)
 		}
+		reqResources := p.RequiredResources
+		if reqResources == nil {
+			reqResources = []string{}
+			if reqResJSON.Valid && reqResJSON.String != "" {
+				_ = json.Unmarshal([]byte(reqResJSON.String), &reqResources)
+			}
+		}
 		inputDeliveryID := p.InputDeliveryID
 		if inputDeliveryID == "" && latestDlvID.Valid {
 			inputDeliveryID = latestDlvID.String
 		}
 
+		prompt := p.Prompt
+		triggerPayload := cloneMap(p.TriggerPayload)
+		if lastAtt != nil && p.TriggerKind == protocol.TriggerRetry && lastAtt.TriggerPayloadJSON != "" {
+			var prevPayload map[string]any
+			if err := json.Unmarshal([]byte(lastAtt.TriggerPayloadJSON), &prevPayload); err == nil {
+				if strings.TrimSpace(prompt) == "" {
+					if prevPrompt, ok := prevPayload["prompt"].(string); ok && strings.TrimSpace(prevPrompt) != "" {
+						prompt = prevPrompt
+					}
+				}
+				if _, ok := triggerPayload["annotationIds"]; !ok {
+					if prevAnns, ok := prevPayload["annotationIds"]; ok {
+						triggerPayload["annotationIds"] = prevAnns
+					}
+				}
+			}
+		}
+		if p.TriggerKind == protocol.TriggerRetry {
+			if strings.TrimSpace(prompt) == "" {
+				prompt = taskGoal
+			}
+			if note := stringField(triggerPayload, "note"); note != "" && !strings.Contains(prompt, note) {
+				prompt = prompt + "\n\n重试补充说明: " + note
+			}
+			triggerPayload["prompt"] = prompt
+		}
+		if lastAtt != nil && lastAtt.State == protocol.AttemptNeedsVerification {
+			triggerPayload["verifiedAttemptId"] = lastAtt.AttemptID
+		}
+
 		// Resolve any previous blocked inbox card for the last attempt when retrying/continuing
-		if lastAttemptID != "" {
+		if lastAtt != nil {
 			_, _ = tx.ExecContext(ctx, `
 				UPDATE inbox_items SET state = 'resolved', resolved_at = ?, updated_at = ?
 				WHERE inbox_id = ? AND state = 'open'
-			`, now, now, "inb:blk:"+lastAttemptID)
+			`, now, now, "inb:blk:"+lastAtt.AttemptID)
 		}
 
 		createdAtt, evAtt, err := createAttemptInTx(ctx, tx, createAttemptTxParams{
-			TaskID:          p.TaskID,
-			ProjectID:       projectID,
-			MachineID:       p.MachineID,
-			Adapter:         adapter,
-			TriggerKind:     p.TriggerKind,
-			TriggerPayload:  p.TriggerPayload,
-			Prompt:          p.Prompt,
-			WorktreePath:    p.WorktreePath,
-			BaseSHA:         p.BaseSHA,
-			InputDeliveryID: inputDeliveryID,
-			DesiredConfig:   desiredCfg,
-			ForceNewSession: p.ForceNewSession,
-			LeaseTTLMs:      p.LeaseTTLMs,
-			ActorKind:       p.ActorKind,
-			ActorID:         p.ActorID,
-			Now:             now,
+			TaskID:            p.TaskID,
+			ProjectID:         projectID,
+			MachineID:         p.MachineID,
+			Adapter:           adapter,
+			TriggerKind:       p.TriggerKind,
+			TriggerPayload:    triggerPayload,
+			Prompt:            prompt,
+			WorktreePath:      p.WorktreePath,
+			BaseSHA:           p.BaseSHA,
+			InputDeliveryID:   inputDeliveryID,
+			DesiredConfig:     desiredCfg,
+			RequiredResources: reqResources,
+			Anchor:            p.Anchor,
+			AnchorCapability:  p.AnchorCapability,
+			ForceNewSession:   p.ForceNewSession,
+			LeaseTTLMs:        p.LeaseTTLMs,
+			ActorKind:         p.ActorKind,
+			ActorID:           p.ActorID,
+			Now:               now,
 		})
 		if err != nil {
 			return err
 		}
+
+		// B11: Never leave queued annotations stranded on a terminal needs_verification attempt.
+		// On retry, carry them forward onto the new attempt; on other continuations, release them back to open.
+		if lastAtt != nil && lastAtt.State == protocol.AttemptNeedsVerification {
+			if p.TriggerKind == protocol.TriggerRetry {
+				if _, err := tx.ExecContext(ctx, `
+					UPDATE annotations SET triggered_attempt_id = ?
+					WHERE triggered_attempt_id = ? AND status = 'queued'
+				`, createdAtt.AttemptID, lastAtt.AttemptID); err != nil {
+					return err
+				}
+			} else {
+				if err := releaseQueuedAnnotationsTx(ctx, tx, lastAtt.AttemptID); err != nil {
+					return err
+				}
+			}
+		}
+
 		att = createdAtt
 		events = append(events, evAtt)
 
@@ -515,22 +633,25 @@ func (s *Store) CreateNextAttempt(ctx context.Context, p CreateNextAttemptParams
 }
 
 type createAttemptTxParams struct {
-	TaskID          string
-	ProjectID       string
-	MachineID       string
-	Adapter         protocol.Adapter
-	TriggerKind     protocol.TriggerKind
-	TriggerPayload  map[string]any
-	Prompt          string
-	WorktreePath    string
-	BaseSHA         string
-	InputDeliveryID string
-	DesiredConfig   map[string]string
-	ForceNewSession bool
-	LeaseTTLMs      int64
-	ActorKind       protocol.ActorKind
-	ActorID         string
-	Now             int64
+	TaskID            string
+	ProjectID         string
+	MachineID         string
+	Adapter           protocol.Adapter
+	TriggerKind       protocol.TriggerKind
+	TriggerPayload    map[string]any
+	Prompt            string
+	WorktreePath      string
+	BaseSHA           string
+	InputDeliveryID   string
+	DesiredConfig     map[string]string
+	RequiredResources []string
+	Anchor            *protocol.ProjectAnchorConfig
+	AnchorCapability  string
+	ForceNewSession   bool
+	LeaseTTLMs        int64
+	ActorKind         protocol.ActorKind
+	ActorID           string
+	Now               int64
 }
 
 func createAttemptInTx(ctx context.Context, tx *sql.Tx, p createAttemptTxParams) (AttemptRecord, protocol.EventRecord, error) {
@@ -581,6 +702,30 @@ func createAttemptInTx(ctx context.Context, tx *sql.Tx, p createAttemptTxParams)
 	cfgBytes, err := json.Marshal(p.DesiredConfig)
 	if err != nil {
 		return AttemptRecord{}, protocol.EventRecord{}, err
+	}
+	reqResources := p.RequiredResources
+	if reqResources == nil {
+		var taskReqJSON sql.NullString
+		_ = tx.QueryRowContext(ctx, `SELECT required_resources FROM tasks WHERE task_id = ?`, p.TaskID).Scan(&taskReqJSON)
+		reqResources = []string{}
+		if taskReqJSON.Valid && taskReqJSON.String != "" {
+			_ = json.Unmarshal([]byte(taskReqJSON.String), &reqResources)
+		}
+	}
+	reqResBytes, err := json.Marshal(reqResources)
+	if err != nil {
+		return AttemptRecord{}, protocol.EventRecord{}, err
+	}
+	var anchorVal any
+	if p.Anchor != nil || p.AnchorCapability != "" {
+		ab, err := json.Marshal(storedAttemptAnchor{
+			Capability: p.AnchorCapability,
+			Anchor:     p.Anchor,
+		})
+		if err != nil {
+			return AttemptRecord{}, protocol.EventRecord{}, err
+		}
+		anchorVal = string(ab)
 	}
 	payloadBytes, err := json.Marshal(p.TriggerPayload)
 	if err != nil {
@@ -654,11 +799,13 @@ func createAttemptInTx(ctx context.Context, tx *sql.Tx, p createAttemptTxParams)
 			attempt_id, task_id, project_id, attempt_no, machine_id, adapter,
 			wb_session_id, trigger_kind, trigger_payload_json, worktree_path,
 			input_delivery_id, base_sha, state, lease_token, lease_expires_at,
-			last_acked_outbox, started_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'leased', ?, ?, 0, ?)
+			last_acked_outbox, started_at,
+			desired_config_json, required_resources_json, anchor_json
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'leased', ?, ?, 0, ?, ?, ?, ?)
 	`, attemptID, p.TaskID, p.ProjectID, nextAttemptNo, machineID, string(p.Adapter),
 		wbSessionVal, string(p.TriggerKind), string(payloadBytes), worktreeVal,
-		inputDlvVal, baseSHAVal, leaseToken, leaseExpiresAt, p.Now)
+		inputDlvVal, baseSHAVal, leaseToken, leaseExpiresAt, p.Now,
+		string(cfgBytes), string(reqResBytes), anchorVal)
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "unique") {
 			return AttemptRecord{}, protocol.EventRecord{}, fmt.Errorf("%w: %v", ErrConflict, err)
@@ -743,8 +890,11 @@ func loadAttemptRecordTx(ctx context.Context, tx *sql.Tx, attemptID string) (Att
 	var adapter, trigger, state string
 	var wbSessID, worktree, inputDlv, baseSHA, outDlv, compSrc, errCode, errDetail sql.NullString
 	var runnerInst, resumeState, targetEnv, deployPhase sql.NullString
+	var cancelReasonKind, steerInputID sql.NullString
+	var attCfgJSON, attReqResJSON, attAnchorJSON sql.NullString
 	var provSID, sessCWD, taskCfgJSON, taskReqResJSON sql.NullString
 	var sessLocked sql.NullInt64
+	var cancelRequested int
 	var finishedAt sql.NullInt64
 
 	err := tx.QueryRowContext(ctx, `
@@ -754,6 +904,8 @@ func loadAttemptRecordTx(ctx context.Context, tx *sql.Tx, attemptID string) (Att
 		       a.state, a.resume_state, a.completion_source, a.lease_token, a.lease_expires_at,
 		       a.last_acked_outbox, a.runner_instance_id, a.error_code, a.error_detail,
 		       a.started_at, a.finished_at,
+		       a.cancel_requested, a.cancel_reason_kind, a.steer_input_id,
+		       a.desired_config_json, a.required_resources_json, a.anchor_json,
 		       s.provider_session_id, s.cwd, s.locked,
 		       t.desired_config_json, t.required_resources
 		FROM attempts a
@@ -767,6 +919,8 @@ func loadAttemptRecordTx(ctx context.Context, tx *sql.Tx, attemptID string) (Att
 		&state, &resumeState, &compSrc, &a.LeaseToken, &a.LeaseExpiresAt,
 		&a.LastAckedOutbox, &runnerInst, &errCode, &errDetail,
 		&a.StartedAt, &finishedAt,
+		&cancelRequested, &cancelReasonKind, &steerInputID,
+		&attCfgJSON, &attReqResJSON, &attAnchorJSON,
 		&provSID, &sessCWD, &sessLocked,
 		&taskCfgJSON, &taskReqResJSON,
 	)
@@ -779,6 +933,14 @@ func loadAttemptRecordTx(ctx context.Context, tx *sql.Tx, attemptID string) (Att
 	a.Adapter = protocol.Adapter(adapter)
 	a.TriggerKind = protocol.TriggerKind(trigger)
 	a.State = protocol.AttemptState(state)
+	a.PromptText = extractBoundedPromptText(a.TriggerPayloadJSON)
+	a.CancelRequested = cancelRequested != 0
+	if cancelReasonKind.Valid {
+		a.CancelReasonKind = cancelReasonKind.String
+	}
+	if steerInputID.Valid {
+		a.SteerInputID = steerInputID.String
+	}
 	if wbSessID.Valid {
 		a.WBSessionID = wbSessID.String
 	}
@@ -830,23 +992,35 @@ func loadAttemptRecordTx(ctx context.Context, tx *sql.Tx, attemptID string) (Att
 		a.SessionLocked = sessLocked.Int64 != 0
 	}
 	a.DesiredConfig = map[string]string{}
-	if taskCfgJSON.Valid && taskCfgJSON.String != "" {
+	if attCfgJSON.Valid && attCfgJSON.String != "" {
+		_ = json.Unmarshal([]byte(attCfgJSON.String), &a.DesiredConfig)
+	} else if taskCfgJSON.Valid && taskCfgJSON.String != "" {
 		_ = json.Unmarshal([]byte(taskCfgJSON.String), &a.DesiredConfig)
 	}
 	a.RequiredResources = []string{}
-	if taskReqResJSON.Valid && taskReqResJSON.String != "" {
+	if attReqResJSON.Valid && attReqResJSON.String != "" {
+		_ = json.Unmarshal([]byte(attReqResJSON.String), &a.RequiredResources)
+	} else if taskReqResJSON.Valid && taskReqResJSON.String != "" {
 		_ = json.Unmarshal([]byte(taskReqResJSON.String), &a.RequiredResources)
+	}
+	if attAnchorJSON.Valid && attAnchorJSON.String != "" {
+		var sa storedAttemptAnchor
+		if err := json.Unmarshal([]byte(attAnchorJSON.String), &sa); err == nil {
+			a.AnchorCapability = sa.Capability
+			a.Anchor = sa.Anchor
+		}
 	}
 	return a, nil
 }
 
-// ListLeasedAttemptsForMachine lists attempts currently in 'leased' state for machineID.
+// ListLeasedAttemptsForMachine lists undispatched attempts currently in 'leased' state for machineID.
 func (s *Store) ListLeasedAttemptsForMachine(ctx context.Context, machineID string) ([]AttemptRecord, error) {
 	var out []AttemptRecord
 	err := s.WithReadTx(ctx, func(tx *sql.Tx) error {
 		rows, err := tx.QueryContext(ctx, `
 			SELECT attempt_id FROM attempts
-			WHERE machine_id = ? AND state = 'leased'
+			WHERE machine_id = ? AND state = 'leased' AND cancel_requested = 0
+			  AND (runner_instance_id IS NULL OR runner_instance_id = '')
 			ORDER BY started_at ASC
 		`, machineID)
 		if err != nil {
@@ -925,8 +1099,8 @@ type CancelTaskResult struct {
 	Events          []protocol.EventRecord
 }
 
-// CancelTaskActiveAttempt either immediately cancels an unstarted/disconnected attempt
-// or returns the active attempt so Hub can send attempt.cancel to the connected Runner.
+// CancelTaskActiveAttempt either immediately cancels a never-dispatched leased attempt
+// or persists cancel_requested=1 so Hub sends attempt.cancel and retries across reconnects/frames.
 func (s *Store) CancelTaskActiveAttempt(ctx context.Context, taskID, actorID, reason string, forceImmediate bool) (CancelTaskResult, error) {
 	var res CancelTaskResult
 	now := time.Now().UnixMilli()
@@ -954,7 +1128,22 @@ func (s *Store) CancelTaskActiveAttempt(ctx context.Context, taskID, actorID, re
 		}
 		res.Attempt = att
 
-		if !forceImmediate && att.State != protocol.AttemptLeased && att.State != protocol.AttemptWaitingResource {
+		// B10: Only cancel immediately without runner confirmation when explicitly forced
+		// OR when the leased attempt has NEVER been dispatched to any runner_instance_id.
+		neverDispatched := att.State == protocol.AttemptLeased && att.RunnerInstanceID == ""
+		if !forceImmediate && !neverDispatched {
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE attempts
+				SET cancel_requested = 1,
+				    cancel_reason_kind = 'human',
+				    steer_input_id = NULL
+				WHERE attempt_id = ?
+			`, att.AttemptID); err != nil {
+				return err
+			}
+			res.Attempt.CancelRequested = true
+			res.Attempt.CancelReasonKind = "human"
+			res.Attempt.SteerInputID = ""
 			res.NeedsRunnerSend = true
 			return nil
 		}
@@ -963,7 +1152,7 @@ func (s *Store) CancelTaskActiveAttempt(ctx context.Context, taskID, actorID, re
 			return err
 		}
 		res.CancelledNow = true
-		res.NeedsRunnerSend = att.State != protocol.AttemptLeased
+		res.NeedsRunnerSend = !neverDispatched
 		return nil
 	})
 	return res, err
@@ -1036,6 +1225,89 @@ func cancelAttemptTx(ctx context.Context, tx *sql.Tx, att AttemptRecord, actorID
 	return nil
 }
 
+// expireAttemptInTx transitions an active attempt whose lease has expired inside an existing write tx.
+// Used by ScanExpiredAttempts, IngestOutboxBatch (B4), and ReconcileRunnerHello (B4).
+func expireAttemptInTx(ctx context.Context, tx *sql.Tx, att *AttemptRecord, nowMs int64, actorID string, events *[]protocol.EventRecord) error {
+	if actorID == "" {
+		actorID = "lease-scanner"
+	}
+	hasUncertain, err := expireOrMarkUncertainApprovalsTx(ctx, tx, att.AttemptID, nowMs, events)
+	if err != nil {
+		return err
+	}
+
+	if att.CancelRequested && !hasUncertain {
+		if err := cancelAttemptTx(ctx, tx, *att, actorID, "已请求取消且租约超时，归档为已取消", nowMs, events); err != nil {
+			return err
+		}
+		att.State = protocol.AttemptCancelled
+		return nil
+	}
+
+	newAttState := protocol.AttemptExpired
+	newTaskState := protocol.TaskStateFailed
+	errCode := "LEASE_EXPIRED"
+	reason := "Runner 租约超时失联，可安全重跑"
+	if hasUncertain {
+		newAttState = protocol.AttemptNeedsVerification
+		newTaskState = protocol.TaskStateInReview
+		errCode = "APPROVAL_CRASH_WINDOW"
+		reason = "批准发出后租约过期，工具可能已执行，请核对现场后再决定是否重跑"
+		if att.WBSessionID != "" {
+			_, _ = tx.ExecContext(ctx, `UPDATE agent_sessions SET locked = 1, runtime_state = 'dead' WHERE wb_session_id = ?`, att.WBSessionID)
+		}
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE attempts
+		SET state = ?, error_code = ?, error_detail = ?, finished_at = ?
+		WHERE attempt_id = ?
+	`, string(newAttState), errCode, reason, nowMs, att.AttemptID); err != nil {
+		return err
+	}
+	att.State = newAttState
+
+	if !hasUncertain {
+		if err := releaseQueuedAnnotationsTx(ctx, tx, att.AttemptID); err != nil {
+			return err
+		}
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE tasks
+		SET state = ?, active_attempt_id = NULL, waiting_reason = ?, version = version + 1, updated_at = ?
+		WHERE task_id = ? AND active_attempt_id = ?
+	`, string(newTaskState), reason, nowMs, att.TaskID, att.AttemptID); err != nil {
+		return err
+	}
+
+	if err := upsertBlockedInboxTx(ctx, tx, att.ProjectID, att.TaskID, att.AttemptID, "任务租约超时", reason, 2, nowMs); err != nil {
+		return err
+	}
+
+	ev, err := insertEventTx(ctx, tx, eventInsert{
+		StreamID:   "task:" + att.TaskID,
+		ProjectID:  att.ProjectID,
+		TaskID:     att.TaskID,
+		AttemptID:  att.AttemptID,
+		ActorKind:  protocol.ActorSystem,
+		ActorID:    actorID,
+		Kind:       protocol.EventAttemptFinished,
+		Visibility: protocol.VisibilityInbox,
+		Payload: map[string]any{
+			"state":     newAttState,
+			"errorCode": errCode,
+			"reason":    reason,
+		},
+		CreatedAt: nowMs,
+	})
+	if err != nil {
+		return err
+	}
+	*events = append(*events, ev)
+	return nil
+}
+
 // ScanExpiredAttempts marks all active attempts whose lease_expires_at < nowMs as expired,
 // releases queued annotations back to open, clears active_attempt_id, and records task_blocked inbox cards.
 func (s *Store) ScanExpiredAttempts(ctx context.Context, nowMs int64) ([]string, []protocol.EventRecord, error) {
@@ -1073,71 +1345,9 @@ func (s *Store) ScanExpiredAttempts(ctx context.Context, nowMs int64) ([]string,
 			if err != nil {
 				return err
 			}
-			hasUncertain, err := expireOrMarkUncertainApprovalsTx(ctx, tx, att.AttemptID, nowMs, &events)
-			if err != nil {
+			if err := expireAttemptInTx(ctx, tx, &att, nowMs, "lease-scanner", &events); err != nil {
 				return err
 			}
-
-			newAttState := protocol.AttemptExpired
-			newTaskState := protocol.TaskStateFailed
-			errCode := "LEASE_EXPIRED"
-			reason := "Runner 租约超时失联，可安全重跑"
-			if hasUncertain {
-				newAttState = protocol.AttemptNeedsVerification
-				newTaskState = protocol.TaskStateInReview
-				errCode = "APPROVAL_CRASH_WINDOW"
-				reason = "批准发出后租约过期，工具可能已执行，请核对现场后再决定是否重跑"
-				if att.WBSessionID != "" {
-					_, _ = tx.ExecContext(ctx, `UPDATE agent_sessions SET locked = 1, runtime_state = 'dead' WHERE wb_session_id = ?`, att.WBSessionID)
-				}
-			}
-
-			if _, err := tx.ExecContext(ctx, `
-				UPDATE attempts
-				SET state = ?, error_code = ?, error_detail = ?, finished_at = ?
-				WHERE attempt_id = ?
-			`, string(newAttState), errCode, reason, nowMs, att.AttemptID); err != nil {
-				return err
-			}
-
-			if !hasUncertain {
-				if err := releaseQueuedAnnotationsTx(ctx, tx, att.AttemptID); err != nil {
-					return err
-				}
-			}
-
-			if _, err := tx.ExecContext(ctx, `
-				UPDATE tasks
-				SET state = ?, active_attempt_id = NULL, waiting_reason = ?, version = version + 1, updated_at = ?
-				WHERE task_id = ? AND active_attempt_id = ?
-			`, string(newTaskState), reason, nowMs, att.TaskID, att.AttemptID); err != nil {
-				return err
-			}
-
-			if err := upsertBlockedInboxTx(ctx, tx, att.ProjectID, att.TaskID, att.AttemptID, "任务租约超时", reason, 2, nowMs); err != nil {
-				return err
-			}
-
-			ev, err := insertEventTx(ctx, tx, eventInsert{
-				StreamID:   "task:" + att.TaskID,
-				ProjectID:  att.ProjectID,
-				TaskID:     att.TaskID,
-				AttemptID:  att.AttemptID,
-				ActorKind:  protocol.ActorSystem,
-				ActorID:    "lease-scanner",
-				Kind:       protocol.EventAttemptFinished,
-				Visibility: protocol.VisibilityInbox,
-				Payload: map[string]any{
-					"state":     newAttState,
-					"errorCode": errCode,
-					"reason":    reason,
-				},
-				CreatedAt: nowMs,
-			})
-			if err != nil {
-				return err
-			}
-			events = append(events, ev)
 			expiredIDs = append(expiredIDs, att.AttemptID)
 		}
 		return nil
@@ -1145,15 +1355,17 @@ func (s *Store) ScanExpiredAttempts(ctx context.Context, nowMs int64) ([]string,
 	return expiredIDs, events, err
 }
 
-// RenewMachineLeases updates machine liveness/resources and renews lease_expires_at ONLY for
-// active, non-expired attempts matching (attemptId, leaseToken, machineId).
+// RenewMachineLeases updates machine liveness/resources/adapters, renews lease_expires_at ONLY for
+// active, non-expired attempts matching (attemptId, leaseToken, machineId), and returns any
+// reported attempt IDs that have cancel_requested = 1 so Hub re-sends attempt.cancel.
 func (s *Store) RenewMachineLeases(
 	ctx context.Context,
 	machineID, runnerInstanceID string,
 	leases []protocol.LiveAttemptLease,
 	resources map[string]protocol.ResourceState,
+	adapters []protocol.Adapter,
 	nowMs, leaseTTLMs int64,
-) error {
+) ([]string, error) {
 	if nowMs == 0 {
 		nowMs = time.Now().UnixMilli()
 	}
@@ -1165,14 +1377,25 @@ func (s *Store) RenewMachineLeases(
 	}
 	resJSON, err := json.Marshal(resources)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return s.WithWriteTx(ctx, func(tx *sql.Tx) error {
+	var adaptersVal any
+	if len(adapters) > 0 {
+		if b, err := json.Marshal(adapters); err == nil {
+			adaptersVal = string(b)
+		}
+	}
+	var cancelIDs []string
+	err = s.WithWriteTx(ctx, func(tx *sql.Tx) error {
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE machines
-			SET status = 'online', resources_json = ?, last_seen_at = ?, updated_at = ?
+			SET status = 'online',
+			    resources_json = ?,
+			    adapters_json = COALESCE(?, adapters_json),
+			    last_seen_at = ?,
+			    updated_at = ?
 			WHERE machine_id = ?
-		`, string(resJSON), nowMs, nowMs, machineID); err != nil {
+		`, string(resJSON), adaptersVal, nowMs, nowMs, machineID); err != nil {
 			return err
 		}
 		newExp := nowMs + leaseTTLMs
@@ -1190,20 +1413,81 @@ func (s *Store) RenewMachineLeases(
 			if err != nil {
 				return err
 			}
+			var cancelReq int
+			if err := tx.QueryRowContext(ctx, `
+				SELECT cancel_requested FROM attempts
+				WHERE attempt_id = ? AND machine_id = ? AND lease_token = ?
+			`, l.AttemptID, machineID, l.LeaseToken).Scan(&cancelReq); err == nil && cancelReq != 0 {
+				cancelIDs = append(cancelIDs, l.AttemptID)
+			}
 		}
 		return nil
 	})
+	return cancelIDs, err
 }
 
-// SetMachineStatus updates a machine's connectivity status in SQLite.
-func (s *Store) SetMachineStatus(ctx context.Context, machineID string, status protocol.MachineStatus) error {
+// SetMachineStatus updates a machine's connectivity status in SQLite and emits
+// machine.state_changed when the status actually transitions.
+func (s *Store) SetMachineStatus(ctx context.Context, machineID string, status protocol.MachineStatus) (*protocol.EventRecord, error) {
 	now := time.Now().UnixMilli()
-	return s.WithWriteTx(ctx, func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx, `
+	var emitted *protocol.EventRecord
+	err := s.WithWriteTx(ctx, func(tx *sql.Tx) error {
+		var prevStatus string
+		err := tx.QueryRowContext(ctx, `SELECT status FROM machines WHERE machine_id = ?`, machineID).Scan(&prevStatus)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `
 			UPDATE machines SET status = ?, updated_at = ? WHERE machine_id = ?
-		`, string(status), now, machineID)
-		return err
+		`, string(status), now, machineID); err != nil {
+			return err
+		}
+		if prevStatus != string(status) {
+			ev, err := insertEventTx(ctx, tx, eventInsert{
+				StreamID:   "global",
+				ActorKind:  protocol.ActorSystem,
+				ActorID:    "runner-gateway",
+				Kind:       protocol.EventMachineStateChanged,
+				Visibility: protocol.VisibilityTimeline,
+				Payload: map[string]any{
+					"machineId":  machineID,
+					"prevStatus": prevStatus,
+					"status":     status,
+				},
+				CreatedAt: now,
+			})
+			if err != nil {
+				return err
+			}
+			emitted = &ev
+		}
+		return nil
 	})
+	return emitted, err
+}
+
+// TryBindAttemptDispatched atomically binds a leased, non-cancel-requested attempt to
+// runnerInstanceID right before sending attempt.dispatch. Returns true only if bound.
+func (s *Store) TryBindAttemptDispatched(ctx context.Context, attemptID, runnerInstanceID string) (bool, error) {
+	var bound bool
+	err := s.WithWriteTx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `
+			UPDATE attempts
+			SET runner_instance_id = ?
+			WHERE attempt_id = ? AND state = 'leased' AND cancel_requested = 0
+			  AND (runner_instance_id IS NULL OR runner_instance_id = '')
+		`, runnerInstanceID, attemptID)
+		if err != nil {
+			return err
+		}
+		n, _ := res.RowsAffected()
+		bound = n > 0
+		return nil
+	})
+	return bound, err
 }
 
 // BindAttemptRunnerInstance records which runnerInstanceId accepted an attempt dispatch.

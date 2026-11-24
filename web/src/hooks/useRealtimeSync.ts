@@ -1,11 +1,18 @@
 import { useEffect, useRef } from 'react';
 import { useQueryClient, type QueryClient } from '@tanstack/react-query';
 import type { EventRecord, WSServerMessage } from '../generated/protocol';
+import { api, getStoredDevToken } from '../lib/api';
 import { useWorkbenchStore } from '../store/useWorkbenchStore';
 
 const strField = (payload: Record<string, unknown> | undefined, key: string): string => {
   const v = payload?.[key];
   return typeof v === 'string' ? v : '';
+};
+
+const strListField = (payload: Record<string, unknown> | undefined, key: string): string[] => {
+  const v = payload?.[key];
+  if (!Array.isArray(v)) return [];
+  return v.filter((item): item is string => typeof item === 'string' && item.length > 0);
 };
 
 /**
@@ -61,10 +68,17 @@ export function collectInvalidations(events: EventRecord[]): unknown[][] {
       add('bootstrap');
       continue;
     }
+    if (kind === 'machine.state_changed') {
+      add('bootstrap');
+      continue;
+    }
     if (kind.startsWith('annotation.')) {
       add('delivery', deliveryId);
+      add('delivery', strField(p, 'resolutionDeliveryId'));
+      for (const did of strListField(p, 'deliveryIds')) add('delivery', did);
       add('task-timeline', tid);
       add('project-tasks', pid);
+      add('bootstrap');
       continue;
     }
     if (kind.startsWith('approval.')) {
@@ -88,6 +102,7 @@ export function collectInvalidations(events: EventRecord[]): unknown[][] {
       add('task-timeline', tid);
       add('project-tasks', pid);
       add('bootstrap');
+      for (const did of strListField(p, 'deliveryIds')) add('delivery', did);
       const dispatchedAttempt = strField(p, 'dispatchedAttemptId');
       if (dispatchedAttempt) add('attempt-raw', dispatchedAttempt);
       continue;
@@ -172,12 +187,35 @@ export function useRealtimeSync(snapshotSeq: number | undefined) {
       applyInvalidations(queryClient, collectInvalidations(fresh));
     };
 
-    const connect = () => {
+    const scheduleReconnect = () => {
+      if (cancelled) return;
+      setWSStatus('reconnecting');
+      const delay = backoffMs;
+      backoffMs = Math.min(10000, backoffMs * 2);
+      retryTimer = window.setTimeout(() => void connect(), delay);
+    };
+
+    const connect = async () => {
       if (cancelled) return;
       setWSStatus(backoffMs === 1000 ? 'connecting' : 'reconnecting');
 
       const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const url = `${proto}//${window.location.host}/ws/client?sinceSeq=${lastAppliedSeqRef.current}`;
+      let qs = `sinceSeq=${lastAppliedSeqRef.current}`;
+      // S6: In devToken mode, browsers cannot attach X-Orbit-Dev-Token to WS handshakes;
+      // obtain a short-lived single-use ticket via POST /api/ws-ticket first.
+      if (getStoredDevToken()) {
+        try {
+          const { ticket } = await api.createWSTicket();
+          if (cancelled) return;
+          if (ticket) qs += `&ticket=${encodeURIComponent(ticket)}`;
+        } catch {
+          scheduleReconnect();
+          return;
+        }
+      }
+      if (cancelled) return;
+
+      const url = `${proto}//${window.location.host}/ws/client?${qs}`;
 
       let replaying = true;
       const replayBatch: EventRecord[] = [];
@@ -218,11 +256,7 @@ export function useRealtimeSync(snapshotSeq: number | undefined) {
       };
 
       ws.onclose = () => {
-        if (cancelled) return;
-        setWSStatus('reconnecting');
-        const delay = backoffMs;
-        backoffMs = Math.min(10000, backoffMs * 2);
-        retryTimer = window.setTimeout(connect, delay);
+        scheduleReconnect();
       };
 
       ws.onerror = () => {
@@ -230,7 +264,7 @@ export function useRealtimeSync(snapshotSeq: number | undefined) {
       };
     };
 
-    connect();
+    void connect();
 
     return () => {
       cancelled = true;

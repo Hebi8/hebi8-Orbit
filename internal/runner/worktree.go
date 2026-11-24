@@ -50,6 +50,17 @@ func PrepareWorktree(ctx context.Context, dispatch protocol.AttemptDispatchFrame
 		gitSource = mirrorPath
 	}
 
+	// If gitSource defines an origin remote and dispatch declares RepoIdentity, verify they match.
+	if wantID := strings.TrimSpace(dispatch.RepoIdentity); wantID != "" {
+		if srcOrigin, err := runGitCmdTrim(ctx, gitSource, "remote", "get-url", "origin"); err == nil && srcOrigin != "" {
+			normSrc := normalizeRepoIdentity(srcOrigin)
+			normWant := normalizeRepoIdentity(wantID)
+			if normSrc != normWant && !strings.HasSuffix(normSrc, "/"+normWant) && !strings.HasSuffix(normWant, "/"+normSrc) {
+				return "", "", fmt.Errorf("ERR_REPO_IDENTITY_MISMATCH: source repo origin %q != project repoIdentity %q", srcOrigin, wantID)
+			}
+		}
+	}
+
 	// Determine fixed review base SHA
 	var baseSHA string
 	switch {
@@ -94,11 +105,15 @@ func PrepareWorktree(ctx context.Context, dispatch protocol.AttemptDispatchFrame
 		baseSHA = sha
 	}
 
-	// If worktree already exists (e.g. same-worktree session reuse or attempt retry), verify & reuse
-	if _, err := os.Stat(filepath.Join(absWorktree, ".git")); err == nil {
-		if _, err := runGitCmdTrim(ctx, absWorktree, "rev-parse", "--verify", "HEAD^{commit}"); err == nil {
-			return absWorktree, baseSHA, nil
+	// B14: If absWorktree already exists, strictly verify repository identity, common git dir,
+	// HEAD SHA, and cleanliness BEFORE reusing. NEVER silently reuse a mismatched or foreign directory!
+	if _, err := os.Stat(absWorktree); err == nil {
+		if err := validateExistingWorktree(ctx, absWorktree, gitSource, baseSHA, dispatch); err != nil {
+			return "", "", err
 		}
+		return absWorktree, baseSHA, nil
+	} else if !os.IsNotExist(err) {
+		return "", "", fmt.Errorf("stat worktree %s: %w", absWorktree, err)
 	}
 
 	if err := os.MkdirAll(filepath.Dir(absWorktree), 0o755); err != nil {
@@ -109,6 +124,110 @@ func PrepareWorktree(ctx context.Context, dispatch protocol.AttemptDispatchFrame
 	}
 
 	return absWorktree, baseSHA, nil
+}
+
+func validateExistingWorktree(ctx context.Context, absWorktree, gitSource, baseSHA string, dispatch protocol.AttemptDispatchFrame) error {
+	top, err := runGitCmdTrim(ctx, absWorktree, "rev-parse", "--show-toplevel")
+	if err != nil {
+		return fmt.Errorf("ERR_WORKTREE_INVALID: existing path %s is not a valid git worktree: %w", absWorktree, err)
+	}
+	if canonicalPath(top) != canonicalPath(absWorktree) {
+		return fmt.Errorf("ERR_WORKTREE_TOPLEVEL_MISMATCH: path %s belongs to parent repo %s", absWorktree, top)
+	}
+
+	wtCommonRaw, err := runGitCmdTrim(ctx, absWorktree, "rev-parse", "--git-common-dir")
+	if err != nil {
+		return fmt.Errorf("ERR_WORKTREE_COMMON_DIR: %w", err)
+	}
+	srcCommonRaw, err := runGitCmdTrim(ctx, gitSource, "rev-parse", "--git-common-dir")
+	if err != nil {
+		return fmt.Errorf("ERR_SOURCE_COMMON_DIR: %w", err)
+	}
+	wtCommon := resolveGitPath(absWorktree, wtCommonRaw)
+	srcCommon := resolveGitPath(gitSource, srcCommonRaw)
+	if wtCommon != srcCommon {
+		return fmt.Errorf("ERR_WORKTREE_REPO_MISMATCH: worktree %s common dir %s != expected repo %s", absWorktree, wtCommon, srcCommon)
+	}
+
+	// If both worktree and dispatch carry an origin URL / repoIdentity, ensure no conflict.
+	if wtOrigin, err := runGitCmdTrim(ctx, absWorktree, "remote", "get-url", "origin"); err == nil && wtOrigin != "" {
+		if srcOrigin, err := runGitCmdTrim(ctx, gitSource, "remote", "get-url", "origin"); err == nil && srcOrigin != "" {
+			if normalizeRepoIdentity(wtOrigin) != normalizeRepoIdentity(srcOrigin) {
+				return fmt.Errorf("ERR_WORKTREE_IDENTITY_MISMATCH: origin %q != source %q", wtOrigin, srcOrigin)
+			}
+		}
+		if wantID := strings.TrimSpace(dispatch.RepoIdentity); wantID != "" {
+			normWT := normalizeRepoIdentity(wtOrigin)
+			normWant := normalizeRepoIdentity(wantID)
+			if normWT != normWant && !strings.HasSuffix(normWT, "/"+normWant) && !strings.HasSuffix(normWant, "/"+normWT) {
+				return fmt.Errorf("ERR_WORKTREE_IDENTITY_MISMATCH: worktree origin %q != project repoIdentity %q", wtOrigin, wantID)
+			}
+		}
+	}
+
+	wtHEAD, err := runGitCmdTrim(ctx, absWorktree, "rev-parse", "--verify", "HEAD^{commit}")
+	if err != nil {
+		return fmt.Errorf("ERR_WORKTREE_HEAD_INVALID: %w", err)
+	}
+
+	sameSessionReuse := strings.TrimSpace(dispatch.ProviderSessionID) != "" &&
+		strings.TrimSpace(dispatch.ExpectedSessionCWD) != "" &&
+		canonicalPath(dispatch.ExpectedSessionCWD) == canonicalPath(absWorktree)
+
+	headMatches := wtHEAD == baseSHA
+	if !headMatches && sameSessionReuse && dispatch.InputDelivery != nil && dispatch.InputDelivery.HeadSHA != "" {
+		// PackageCheckpoint commits onto a temporary index without moving worktree HEAD,
+		// so on same-session Turn 2..N the worktree HEAD remains an ancestor of InputDelivery.HeadSHA.
+		if _, err := runGitCmd(ctx, gitSource, "merge-base", "--is-ancestor", wtHEAD, dispatch.InputDelivery.HeadSHA); err == nil {
+			headMatches = true
+		}
+	}
+	if !headMatches {
+		return fmt.Errorf("ERR_WORKTREE_SHA_MISMATCH: existing worktree %s HEAD=%s does not match expected base=%s", absWorktree, wtHEAD, baseSHA)
+	}
+
+	if !sameSessionReuse {
+		statusOut, err := runGitCmdTrim(ctx, absWorktree, "status", "--porcelain")
+		if err != nil {
+			return fmt.Errorf("ERR_WORKTREE_STATUS: %w", err)
+		}
+		if statusOut != "" {
+			return fmt.Errorf("ERR_WORKTREE_DIRTY: existing worktree %s has uncommitted modifications for a fresh attempt", absWorktree)
+		}
+	}
+	return nil
+}
+
+func canonicalPath(p string) string {
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return filepath.Clean(p)
+	}
+	if real, err := filepath.EvalSymlinks(abs); err == nil {
+		return filepath.Clean(real)
+	}
+	return filepath.Clean(abs)
+}
+
+func resolveGitPath(baseDir, raw string) string {
+	if filepath.IsAbs(raw) {
+		return canonicalPath(raw)
+	}
+	return canonicalPath(filepath.Join(baseDir, raw))
+}
+
+func normalizeRepoIdentity(raw string) string {
+	s := strings.TrimSpace(raw)
+	s = strings.TrimSuffix(s, ".git")
+	s = strings.TrimSuffix(s, "/")
+	if strings.HasPrefix(s, "git@") {
+		s = strings.TrimPrefix(s, "git@")
+		s = strings.Replace(s, ":", "/", 1)
+	}
+	s = strings.TrimPrefix(s, "https://")
+	s = strings.TrimPrefix(s, "http://")
+	s = strings.TrimPrefix(s, "ssh://")
+	return strings.ToLower(s)
 }
 
 func runGitCmd(ctx context.Context, dir string, args ...string) (string, error) {

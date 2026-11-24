@@ -423,3 +423,15 @@ CREATE INDEX IF NOT EXISTS idx_board_members_task ON board_members(task_id, upda
 		protocol.SQLInClause(protocol.AllBoardMemberStates),
 	)
 }
+
+// BuildMigrationV3DDL constructs the Phase 1 review-hardening additive tables.
+func BuildMigrationV3DDL() string {
+	return `
+CREATE TABLE IF NOT EXISTS pa_action_receipts (
+  idempotency_key TEXT PRIMARY KEY,
+  action          TEXT NOT NULL,
+  result_json     TEXT NOT NULL,
+  created_at      INTEGER NOT NULL
+);
+`
+}

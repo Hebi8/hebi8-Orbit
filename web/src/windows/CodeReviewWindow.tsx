@@ -73,13 +73,17 @@ function CodeReviewInner({ w, boot }: { w: WinState; boot: BootstrapResponse }) 
   const theme = useWorkbenchStore((s) => s.theme);
   const localMachineId = useWorkbenchStore((s) => s.localMachineId);
   const close = useWorkbenchStore((s) => s.closeWindow);
+  const deselectedArr = useWorkbenchStore((s) => s.deselectedAnnotations[w.taskId]);
+  const toggleAnnSelected = useWorkbenchStore((s) => s.toggleAnnotationSelected);
+  const clearDeselected = useWorkbenchStore((s) => s.clearDeselectedAnnotations);
+  const deselected = useMemo(() => new Set(deselectedArr ?? []), [deselectedArr]);
   const [deliveryId, setDeliveryId] = useState(w.deliveryId);
   const [file, setFile] = useState('');
   const [viewType, setViewType] = useState<ViewType>('unified');
   const [draft, setDraft] = useState<LineDraft | null>(null);
   const [body, setBody] = useState('');
   const [tokens, setTokens] = useState<HunkTokens | null>(null);
-  const [deselected, setDeselected] = useState<Set<string>>(new Set());
+  const [verifiedSite, setVerifiedSite] = useState(false);
   const [lastLine, setLastLine] = useState<{ path: string; line?: number } | null>(null);
 
   useEffect(() => setDeliveryId(w.deliveryId), [w.deliveryId]);
@@ -87,7 +91,6 @@ function CodeReviewInner({ w, boot }: { w: WinState; boot: BootstrapResponse }) 
     setFile('');
     setDraft(null);
     setBody('');
-    setDeselected(new Set());
   }, [deliveryId]);
 
   const tl = useTimeline(w.taskId);
@@ -96,6 +99,9 @@ function CodeReviewInner({ w, boot }: { w: WinState; boot: BootstrapResponse }) 
   const detail = dq.data;
   const files = detail?.diffFiles ?? [];
   const activeFile = (file && files.some((f) => f.path === file) ? file : files[0]?.path) || '';
+  const lastAtt = tl.data?.attempts?.[tl.data.attempts.length - 1];
+  const needsVerifyAttemptId = !tl.data?.task.activeAttemptId && lastAtt?.state === 'needs_verification' ? lastAtt.attemptId : undefined;
+  useEffect(() => setVerifiedSite(false), [needsVerifyAttemptId]);
 
   const diffQ = useQuery({
     queryKey: ['delivery-diff', deliveryId, activeFile],
@@ -126,11 +132,28 @@ function CodeReviewInner({ w, boot }: { w: WinState; boot: BootstrapResponse }) 
 
   const annotations = (detail?.annotations ?? []).filter(isDiffAnnotation);
   const openAnns = annotations.filter((a) => a.status === 'open');
-  const selectedIds = openAnns.filter((a) => !deselected.has(a.annotationId)).map((a) => a.annotationId);
+  const localSelectedIds = openAnns.filter((a) => !deselected.has(a.annotationId)).map((a) => a.annotationId);
+  const { selDiffIds, selRyugiIds, combinedSelectedIds, allOpenDiffCount, allOpenRyugiCount } = useMemo(() => {
+    const byId = new Map<string, AnnotationView>();
+    for (const a of tl.data?.annotations ?? []) byId.set(a.annotationId, a);
+    for (const a of detail?.annotations ?? []) byId.set(a.annotationId, a);
+    const allOpen = [...byId.values()].filter((a) => a.status === 'open');
+    const openDiff = allOpen.filter(isDiffAnnotation);
+    const openRyugi = allOpen.filter((a) => a.source === 'ryugi');
+    const diffIds = openDiff.filter((a) => !deselected.has(a.annotationId)).map((a) => a.annotationId);
+    const ryugiIds = openRyugi.filter((a) => !deselected.has(a.annotationId)).map((a) => a.annotationId);
+    return {
+      selDiffIds: diffIds,
+      selRyugiIds: ryugiIds,
+      combinedSelectedIds: [...diffIds, ...ryugiIds],
+      allOpenDiffCount: openDiff.length,
+      allOpenRyugiCount: openRyugi.length,
+    };
+  }, [tl.data?.annotations, detail?.annotations, deselected]);
   const fileAnns = annotations.filter((a) => a.anchor.path === activeFile);
 
   const refresh = () => {
-    void qc.invalidateQueries({ queryKey: ['delivery', deliveryId] });
+    void qc.invalidateQueries({ queryKey: ['delivery'] });
     void qc.invalidateQueries({ queryKey: ['task-timeline', w.taskId] });
   };
 
@@ -163,15 +186,23 @@ function CodeReviewInner({ w, boot }: { w: WinState; boot: BootstrapResponse }) 
   });
 
   const dispatch = useMutation({
-    mutationFn: (ids: string[]) => api.dispatchAnnotations(w.taskId, { annotationIds: ids, mode: 'queue' }),
+    mutationFn: (ids: string[]) =>
+      api.dispatchAnnotations(w.taskId, {
+        annotationIds: ids,
+        mode: 'queue',
+        verifiedSite: needsVerifyAttemptId ? verifiedSite : undefined,
+        verifiedAttemptId: needsVerifyAttemptId,
+      }),
     onSuccess: (res) => {
       toast(
         res.pendingInput
-          ? `已打包 ${res.queuedCount} 条行评 → 待消费队列`
+          ? `已打包 ${res.queuedCount} 条批注 → 待消费队列`
           : res.attempt
-            ? `已打包 ${res.queuedCount} 条行评 → 会话空闲，直接开始新一轮`
-            : `已打包 ${res.queuedCount} 条行评`,
+            ? `已打包 ${res.queuedCount} 条批注 → 会话空闲，直接开始新一轮`
+            : `已打包 ${res.queuedCount} 条批注`,
       );
+      clearDeselected(w.taskId);
+      setVerifiedSite(false);
       refresh();
       void qc.invalidateQueries({ queryKey: ['bootstrap'] });
     },
@@ -354,19 +385,39 @@ function CodeReviewInner({ w, boot }: { w: WinState; boot: BootstrapResponse }) 
       footer={
         <>
           <span className="l">
-            {openAnns.length > 0 ? `已选 ${selectedIds.length}/${openAnns.length} 条未决行评（跨文件）` : '点代码行号留行评；攒好后一起送进会话'}
+            {allOpenDiffCount + allOpenRyugiCount > 0
+              ? `任务已选 ${combinedSelectedIds.length} 条未决批注（Diff ${selDiffIds.length}/${allOpenDiffCount}${allOpenRyugiCount > 0 ? ` · Ryugi ${selRyugiIds.length}/${allOpenRyugiCount}` : ''}）`
+              : '点代码行号留行评；攒好后可与 Ryugi 画布批注合并送进会话'}
           </span>
           <span className="r">
+            {needsVerifyAttemptId && (
+              <label style={{ display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 12, color: 'var(--warn)', marginRight: 4, cursor: 'pointer' }}>
+                <input type="checkbox" checked={verifiedSite} onChange={(e) => setVerifiedSite(e.target.checked)} />
+                <span>已核对现场</span>
+              </label>
+            )}
             <button type="button" className="btn" disabled={complete.isPending || !d} onClick={() => complete.mutate()}>
               标记审阅完成
             </button>
+            {selRyugiIds.length > 0 && localSelectedIds.length > 0 && (
+              <button
+                type="button"
+                className="btn ghost"
+                disabled={dispatch.isPending || (!!needsVerifyAttemptId && !verifiedSite)}
+                onClick={() => dispatch.mutate(localSelectedIds)}
+              >
+                仅发本窗 ({localSelectedIds.length})
+              </button>
+            )}
             <button
               type="button"
               className="btn pri"
-              disabled={selectedIds.length === 0 || dispatch.isPending}
-              onClick={() => dispatch.mutate(selectedIds)}
+              disabled={combinedSelectedIds.length === 0 || dispatch.isPending || (!!needsVerifyAttemptId && !verifiedSite)}
+              onClick={() => dispatch.mutate(combinedSelectedIds)}
             >
-              打包 {selectedIds.length} 条行评 → 送入待消费队列
+              {selDiffIds.length > 0 && selRyugiIds.length > 0
+                ? `合并打包 ${combinedSelectedIds.length} 条（Diff ${selDiffIds.length} + Ryugi ${selRyugiIds.length}）→ 入队`
+                : `打包 ${combinedSelectedIds.length} 条批注 → 送入待消费队列`}
             </button>
           </span>
         </>
@@ -377,6 +428,7 @@ function CodeReviewInner({ w, boot }: { w: WinState; boot: BootstrapResponse }) 
           <button type="button" key={v.deliveryId} className={v.deliveryId === deliveryId ? 'on' : ''} onClick={() => setDeliveryId(v.deliveryId)}>
             v{i + 1}
             <span className="mono faint">{shortSha(v.headSha)}</span>
+            {v.lateArrival && <span className="faint"> (迟到档案)</span>}
           </button>
         ))}
         {vIdx < 0 && d && (
@@ -434,14 +486,7 @@ function CodeReviewInner({ w, boot }: { w: WinState; boot: BootstrapResponse }) 
                   <input
                     type="checkbox"
                     checked={!deselected.has(a.annotationId)}
-                    onChange={(e) =>
-                      setDeselected((s) => {
-                        const n = new Set(s);
-                        if (e.target.checked) n.delete(a.annotationId);
-                        else n.add(a.annotationId);
-                        return n;
-                      })
-                    }
+                    onChange={(e) => toggleAnnSelected(w.taskId, a.annotationId, e.target.checked)}
                   />
                   <span style={{ minWidth: 0 }}>
                     <span className="loc mono">

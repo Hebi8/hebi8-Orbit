@@ -87,6 +87,9 @@ func (s *Server) handleGetPAThread(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handlePAResetSession(w http.ResponseWriter, r *http.Request) {
+	s.paMu.Lock()
+	defer s.paMu.Unlock()
+
 	thread, state, ev, err := s.store.CreatePAThread(r.Context(), "default", "")
 	if err != nil {
 		writeAPIError(w, http.StatusInternalServerError, "ERR_PA_RESET", err.Error())
@@ -101,12 +104,23 @@ func (s *Server) handlePAResetSession(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func isPAWriteAction(action string) bool {
+	switch action {
+	case "create_task", "send_task_followup", "cancel_task":
+		return true
+	default:
+		return false
+	}
+}
+
 // handlePAChat executes one serialized PA turn:
 // 1. Per-PA mutex lock prevents interleaved watermark races.
-// 2. Single read snapshot locks H = MAX(seq) and reads deterministic events in (lastSeq, H].
-// 3. Formats budgeted <network_delta> (preserving open inbox > blocked/failed > annotations/approvals > deliveries).
-// 4. Executes optional deterministic read/dispatch action (with post-route ssh_deploy 403 block!).
-// 5. Advances pa_state.last_read_event_seq strictly to H ONLY on success (H+1 events stay for next turn).
+// 2. Validates threadId existence BEFORE executing any side-effecting action (S5).
+// 3. Single read snapshot locks H = MAX(seq) and reads deterministic events in (lastSeq, H].
+// 4. Formats budgeted <network_delta> (preserving open inbox > blocked/failed > annotations/approvals > deliveries).
+// 5. Executes optional deterministic read/dispatch action (with post-route ssh_deploy 403 block and
+//    mandatory idempotency keys on all write actions per S5).
+// 6. Advances pa_state.last_read_event_seq strictly to H ONLY on success (H+1 events stay for next turn).
 func (s *Server) handlePAChat(w http.ResponseWriter, r *http.Request) {
 	var req protocol.PAChatRequest
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
@@ -123,6 +137,17 @@ func (s *Server) handlePAChat(w http.ResponseWriter, r *http.Request) {
 	defer s.paMu.Unlock()
 
 	ctx := r.Context()
+
+	// S5: Validate target PA thread exists BEFORE executing any action side effects.
+	if err := s.store.CheckPAThreadExists(ctx, req.ThreadID); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeAPIError(w, http.StatusNotFound, "ERR_PA_THREAD_NOT_FOUND", err.Error())
+			return
+		}
+		writeAPIError(w, http.StatusInternalServerError, "ERR_PA_THREAD_CHECK", err.Error())
+		return
+	}
+
 	// Step 1: Lock upper bound H = MAX(seq) and read (lastSeq, H]
 	snap, err := s.store.ReadPADeltaSnapshot(ctx, "default")
 	if err != nil {
@@ -145,125 +170,197 @@ func (s *Server) handlePAChat(w http.ResponseWriter, r *http.Request) {
 	// Step 3: Execute explicit PA control action (strictly scoped as ActorPA -> ssh_deploy returns 403!)
 	if req.Action != nil {
 		act := req.Action
-		switch strings.TrimSpace(act.Action) {
-		case "create_task":
+		actionName := strings.TrimSpace(act.Action)
+
+		// Pre-check deploy security guard on write actions targeting ssh_deploy so 403 takes precedence.
+		if actionName == "create_task" {
 			pid := strings.TrimSpace(act.ProjectID)
 			if pid == "" {
 				pid = protocol.ScratchProjectID
 			}
-			createResp, status, code, err := s.createTaskInternal(ctx, pid, protocol.CreateTaskRequest{
-				Goal:               act.Goal,
-				RequiredCapability: act.RequiredCapability,
-				Adapter:            act.Adapter,
-				Config:             act.Config,
-				IdempotencyKey:     act.IdempotencyKey,
-			}, protocol.ActorPA, "pa:default", act.IdempotencyKey)
+			if proj, err := s.store.GetProject(ctx, pid); err == nil {
+				if route, err := s.resolveExecutionRoute(proj, act.RequiredCapability, act.Adapter); err == nil {
+					if err := enforcePostRouteGuard(protocol.ActorPA, route); err != nil {
+						writeAPIError(w, http.StatusForbidden, "ERR_DEPLOY_FORBIDDEN", err.Error())
+						return
+					}
+				}
+			}
+		} else if actionName == "send_task_followup" && strings.TrimSpace(act.TaskID) != "" {
+			if task, err := s.store.GetTask(ctx, act.TaskID); err == nil {
+				if proj, err := s.store.GetProject(ctx, task.ProjectID); err == nil {
+					reqCap := strings.TrimSpace(act.RequiredCapability)
+					if reqCap == "" {
+						reqCap = task.RequiredCapability
+					}
+					reqAdp := act.Adapter
+					if reqAdp == "" {
+						reqAdp = task.PreferredAdapter
+					}
+					if route, err := s.resolveExecutionRoute(proj, reqCap, reqAdp); err == nil {
+						if err := enforcePostRouteGuard(protocol.ActorPA, route); err != nil {
+							writeAPIError(w, http.StatusForbidden, "ERR_DEPLOY_FORBIDDEN", err.Error())
+							return
+						}
+					}
+				}
+			}
+		}
+
+		// S5: Enforce idempotency key on all PA write actions and replay cached receipts cleanly.
+		idempKey := strings.TrimSpace(act.IdempotencyKey)
+		if idempKey == "" {
+			idempKey = strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+		}
+		replayed := false
+		if isPAWriteAction(actionName) {
+			if idempKey == "" {
+				writeAPIError(w, http.StatusBadRequest, "ERR_IDEMPOTENCY_KEY_REQUIRED", fmt.Sprintf("PA write action %q requires idempotencyKey or Idempotency-Key header", actionName))
+				return
+			}
+			prevAction, prevRes, found, err := s.store.GetPAActionReceipt(ctx, idempKey)
 			if err != nil {
-				writeAPIError(w, status, code, err.Error())
+				writeAPIError(w, http.StatusInternalServerError, "ERR_PA_IDEMPOTENCY", err.Error())
 				return
 			}
-			actions = append(actions, protocol.PAActionResult{
-				Action:  "create_task",
-				Status:  "ok",
-				Summary: fmt.Sprintf("已为 %s 创建任务 %s（dispatched=%v）", pid, createResp.Task.TaskID, createResp.Dispatched),
-				Data: map[string]any{
-					"taskId":     createResp.Task.TaskID,
-					"projectId":  createResp.Task.ProjectID,
-					"dispatched": createResp.Dispatched,
-				},
-			})
-			replyParts = append(replyParts, fmt.Sprintf("已派发任务 `%s` 到项目 `%s`（目标：%s）。", createResp.Task.TaskID, createResp.Task.ProjectID, createResp.Task.Goal))
+			if found {
+				if prevAction != actionName {
+					writeAPIError(w, http.StatusConflict, "ERR_IDEMPOTENCY_CONFLICT", fmt.Sprintf("idempotencyKey %q already bound to action %q", idempKey, prevAction))
+					return
+				}
+				actions = append(actions, prevRes)
+				replyParts = append(replyParts, prevRes.Summary+"（幂等回放）")
+				replayed = true
+			}
+		}
 
-		case "send_task_followup":
-			fResp, status, code, err := s.followupTaskInternal(ctx, act.TaskID, protocol.FollowupTaskRequest{
-				Message:            act.Message,
-				Mode:               act.Mode,
-				RequiredCapability: act.RequiredCapability,
-				Adapter:            act.Adapter,
-				Config:             act.Config,
-			}, protocol.ActorPA, "pa:default")
-			if err != nil {
-				writeAPIError(w, status, code, err.Error())
+		if !replayed {
+			switch actionName {
+			case "create_task":
+				pid := strings.TrimSpace(act.ProjectID)
+				if pid == "" {
+					pid = protocol.ScratchProjectID
+				}
+				createResp, status, code, err := s.createTaskInternal(ctx, pid, protocol.CreateTaskRequest{
+					Goal:               act.Goal,
+					RequiredCapability: act.RequiredCapability,
+					Adapter:            act.Adapter,
+					Config:             act.Config,
+					IdempotencyKey:     idempKey,
+				}, protocol.ActorPA, "pa:default", idempKey)
+				if err != nil {
+					writeAPIError(w, status, code, err.Error())
+					return
+				}
+				actRes := protocol.PAActionResult{
+					Action:  "create_task",
+					Status:  "ok",
+					Summary: fmt.Sprintf("已为 %s 创建任务 %s（dispatched=%v）", pid, createResp.Task.TaskID, createResp.Dispatched),
+					Data: map[string]any{
+						"taskId":     createResp.Task.TaskID,
+						"projectId":  createResp.Task.ProjectID,
+						"dispatched": createResp.Dispatched,
+					},
+				}
+				_ = s.store.SavePAActionReceipt(ctx, idempKey, actionName, actRes)
+				actions = append(actions, actRes)
+				replyParts = append(replyParts, fmt.Sprintf("已派发任务 `%s` 到项目 `%s`（目标：%s）。", createResp.Task.TaskID, createResp.Task.ProjectID, createResp.Task.Goal))
+
+			case "send_task_followup":
+				fResp, status, code, err := s.followupTaskInternal(ctx, act.TaskID, protocol.FollowupTaskRequest{
+					Message:            act.Message,
+					Mode:               act.Mode,
+					RequiredCapability: act.RequiredCapability,
+					Adapter:            act.Adapter,
+					Config:             act.Config,
+				}, protocol.ActorPA, "pa:default")
+				if err != nil {
+					writeAPIError(w, status, code, err.Error())
+					return
+				}
+				actRes := protocol.PAActionResult{
+					Action:  "send_task_followup",
+					Status:  "ok",
+					Summary: fmt.Sprintf("已向任务 %s 发送追问（mode=%s）", act.TaskID, fResp.Mode),
+					Data: map[string]any{
+						"taskId": act.TaskID,
+						"mode":   fResp.Mode,
+					},
+				}
+				_ = s.store.SavePAActionReceipt(ctx, idempKey, actionName, actRes)
+				actions = append(actions, actRes)
+				replyParts = append(replyParts, fmt.Sprintf("已向任务 `%s` 发送追问（模式：%s）。", act.TaskID, fResp.Mode))
+
+			case "cancel_task":
+				cResp, status, code, err := s.cancelTaskInternal(ctx, act.TaskID, "pa:default", act.Message)
+				if err != nil {
+					writeAPIError(w, status, code, err.Error())
+					return
+				}
+				actRes := protocol.PAActionResult{
+					Action:  "cancel_task",
+					Status:  "ok",
+					Summary: fmt.Sprintf("已请求取消任务 %s（attempt=%s）", cResp.TaskID, cResp.AttemptID),
+					Data: map[string]any{
+						"taskId":    cResp.TaskID,
+						"attemptId": cResp.AttemptID,
+					},
+				}
+				_ = s.store.SavePAActionReceipt(ctx, idempKey, actionName, actRes)
+				actions = append(actions, actRes)
+				replyParts = append(replyParts, fmt.Sprintf("已取消任务 `%s` 的活跃尝试 `%s`。", cResp.TaskID, cResp.AttemptID))
+
+			case "list_projects_and_machines":
+				s.mu.RLock()
+				mm := s.machines.Machines
+				s.mu.RUnlock()
+				boot, err := s.store.Bootstrap(ctx, mm)
+				if err != nil {
+					writeAPIError(w, http.StatusInternalServerError, "ERR_PA_LIST", err.Error())
+					return
+				}
+				actions = append(actions, protocol.PAActionResult{
+					Action:  "list_projects_and_machines",
+					Status:  "ok",
+					Summary: fmt.Sprintf("%d 个项目，%d 台机器", len(boot.Projects), len(boot.Machines)),
+					Data: map[string]any{
+						"projects": len(boot.Projects),
+						"machines": len(boot.Machines),
+					},
+				})
+				replyParts = append(replyParts, fmt.Sprintf("当前共有 %d 个项目、%d 台机器、%d 项待拍板。", len(boot.Projects), len(boot.Machines), len(boot.OpenInboxItems)))
+
+			case "read_task_timeline":
+				tl, err := s.store.GetTaskTimeline(ctx, act.TaskID, 0, false)
+				if errors.Is(err, store.ErrNotFound) {
+					writeAPIError(w, http.StatusNotFound, "ERR_TASK_NOT_FOUND", err.Error())
+					return
+				}
+				if err != nil {
+					writeAPIError(w, http.StatusInternalServerError, "ERR_PA_TIMELINE", err.Error())
+					return
+				}
+				actions = append(actions, protocol.PAActionResult{
+					Action:  "read_task_timeline",
+					Status:  "ok",
+					Summary: fmt.Sprintf("任务 %s 当前状态 %s，%d 次尝试，%d 个交付", tl.Task.TaskID, tl.Task.State, len(tl.Attempts), len(tl.Deliveries)),
+					Data: map[string]any{
+						"taskId":     tl.Task.TaskID,
+						"state":      tl.Task.State,
+						"attempts":   len(tl.Attempts),
+						"deliveries": len(tl.Deliveries),
+					},
+				})
+				replyParts = append(replyParts, fmt.Sprintf("任务 `%s`（%s）当前状态为 `%s`，共 %d 次尝试、%d 个交付、%d 条未决批注。",
+					tl.Task.TaskID, tl.Task.Title, tl.Task.State, len(tl.Attempts), len(tl.Deliveries), tl.Task.OpenAnnotationCount))
+
+			case "brief", "":
+				// Handled below via stateless brief aggregation
+
+			default:
+				writeAPIError(w, http.StatusBadRequest, "ERR_UNKNOWN_PA_ACTION", fmt.Sprintf("unsupported PA action %q", act.Action))
 				return
 			}
-			actions = append(actions, protocol.PAActionResult{
-				Action:  "send_task_followup",
-				Status:  "ok",
-				Summary: fmt.Sprintf("已向任务 %s 发送追问（mode=%s）", act.TaskID, fResp.Mode),
-				Data: map[string]any{
-					"taskId": act.TaskID,
-					"mode":   fResp.Mode,
-				},
-			})
-			replyParts = append(replyParts, fmt.Sprintf("已向任务 `%s` 发送追问（模式：%s）。", act.TaskID, fResp.Mode))
-
-		case "cancel_task":
-			cResp, status, code, err := s.cancelTaskInternal(ctx, act.TaskID, "pa:default", act.Message)
-			if err != nil {
-				writeAPIError(w, status, code, err.Error())
-				return
-			}
-			actions = append(actions, protocol.PAActionResult{
-				Action:  "cancel_task",
-				Status:  "ok",
-				Summary: fmt.Sprintf("已请求取消任务 %s（attempt=%s）", cResp.TaskID, cResp.AttemptID),
-				Data: map[string]any{
-					"taskId":    cResp.TaskID,
-					"attemptId": cResp.AttemptID,
-				},
-			})
-			replyParts = append(replyParts, fmt.Sprintf("已取消任务 `%s` 的活跃尝试 `%s`。", cResp.TaskID, cResp.AttemptID))
-
-		case "list_projects_and_machines":
-			s.mu.RLock()
-			mm := s.machines.Machines
-			s.mu.RUnlock()
-			boot, err := s.store.Bootstrap(ctx, mm)
-			if err != nil {
-				writeAPIError(w, http.StatusInternalServerError, "ERR_PA_LIST", err.Error())
-				return
-			}
-			actions = append(actions, protocol.PAActionResult{
-				Action:  "list_projects_and_machines",
-				Status:  "ok",
-				Summary: fmt.Sprintf("%d 个项目，%d 台机器", len(boot.Projects), len(boot.Machines)),
-				Data: map[string]any{
-					"projects": len(boot.Projects),
-					"machines": len(boot.Machines),
-				},
-			})
-			replyParts = append(replyParts, fmt.Sprintf("当前共有 %d 个项目、%d 台机器、%d 项待拍板。", len(boot.Projects), len(boot.Machines), len(boot.OpenInboxItems)))
-
-		case "read_task_timeline":
-			tl, err := s.store.GetTaskTimeline(ctx, act.TaskID, 0, false)
-			if errors.Is(err, store.ErrNotFound) {
-				writeAPIError(w, http.StatusNotFound, "ERR_TASK_NOT_FOUND", err.Error())
-				return
-			}
-			if err != nil {
-				writeAPIError(w, http.StatusInternalServerError, "ERR_PA_TIMELINE", err.Error())
-				return
-			}
-			actions = append(actions, protocol.PAActionResult{
-				Action:  "read_task_timeline",
-				Status:  "ok",
-				Summary: fmt.Sprintf("任务 %s 当前状态 %s，%d 次尝试，%d 个交付", tl.Task.TaskID, tl.Task.State, len(tl.Attempts), len(tl.Deliveries)),
-				Data: map[string]any{
-					"taskId":     tl.Task.TaskID,
-					"state":      tl.Task.State,
-					"attempts":   len(tl.Attempts),
-					"deliveries": len(tl.Deliveries),
-				},
-			})
-			replyParts = append(replyParts, fmt.Sprintf("任务 `%s`（%s）当前状态为 `%s`，共 %d 次尝试、%d 个交付、%d 条未决批注。",
-				tl.Task.TaskID, tl.Task.Title, tl.Task.State, len(tl.Attempts), len(tl.Deliveries), tl.Task.OpenAnnotationCount))
-
-		case "brief", "":
-			// Handled below via stateless brief aggregation
-
-		default:
-			writeAPIError(w, http.StatusBadRequest, "ERR_UNKNOWN_PA_ACTION", fmt.Sprintf("unsupported PA action %q", act.Action))
-			return
 		}
 	}
 

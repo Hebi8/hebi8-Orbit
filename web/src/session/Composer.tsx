@@ -22,24 +22,28 @@ export function Composer({
   worker,
   members,
   editing,
+  needsVerifyAttemptId,
   onEditDone,
 }: {
   task: TaskSummary;
   worker?: string;
   members: BoardMemberCursor[];
   editing: PendingInput | null;
+  needsVerifyAttemptId?: string;
   onEditDone: () => void;
 }) {
   const qc = useQueryClient();
   const remember = useWorkbenchStore((s) => s.rememberPrompt);
   const [text, setText] = useState(() => drafts.get(task.taskId) ?? '');
+  const [siteVerified, setSiteVerified] = useState(false);
   const stash = useRef<string | null>(null);
   const taRef = useRef<HTMLTextAreaElement | null>(null);
   const busy = isTaskBusy(task);
 
   useEffect(() => {
     setText(drafts.get(task.taskId) ?? '');
-  }, [task.taskId]);
+    setSiteVerified(false);
+  }, [task.taskId, needsVerifyAttemptId]);
 
   // Entering edit mode stashes the in-progress draft; leaving restores it verbatim.
   useEffect(() => {
@@ -90,13 +94,20 @@ export function Composer({
   });
 
   const followup = useMutation({
-    mutationFn: (v: { message: string; mode: FollowupMode }) => api.followup(task.taskId, { message: v.message, mode: v.mode }),
+    mutationFn: (v: { message: string; mode: FollowupMode; verifiedSite?: boolean; verifiedAttemptId?: string }) =>
+      api.followup(task.taskId, {
+        message: v.message,
+        mode: v.mode,
+        verifiedSite: v.verifiedSite,
+        verifiedAttemptId: v.verifiedAttemptId,
+      }),
     onSuccess: (res, v) => {
       if (res.attempt) remember(`att:${res.attempt.attemptId}`, v.message);
       if (res.pendingInput) remember(`inp:${res.pendingInput.inputId}`, v.message);
       if (res.pendingInput && v.mode === 'queue') toast('已加入待消费队列');
       if (v.mode === 'steer') toast('已 Steer：中断当前轮并优先执行');
       setDraft('');
+      setSiteVerified(false);
       refresh();
     },
     onError: (e) => toast(errMsg(e), 'err'),
@@ -124,6 +135,8 @@ export function Composer({
 
   const pending = followup.isPending || boardPost.isPending || saveEdit.isPending;
 
+  const needsVerifyGate = !editing && !worker && !busy && !!needsVerifyAttemptId;
+
   const submit = (steer: boolean) => {
     const msg = text.trim();
     if (!msg || pending) return;
@@ -140,7 +153,16 @@ export function Composer({
       boardPost.mutate(mention);
       return;
     }
-    followup.mutate({ message: msg, mode: steer && busy ? 'steer' : 'queue' });
+    if (needsVerifyGate && !siteVerified) {
+      toast('上一轮处于待核对状态，请先勾选「我已核对现场」再继续续跑', 'err');
+      return;
+    }
+    followup.mutate({
+      message: msg,
+      mode: steer && busy ? 'steer' : 'queue',
+      verifiedSite: needsVerifyGate ? true : undefined,
+      verifiedAttemptId: needsVerifyGate ? needsVerifyAttemptId : undefined,
+    });
   };
 
   let placeholder = '继续追问…';
@@ -161,6 +183,15 @@ export function Composer({
         {worker && !editing && (
           <div className="cbanner" style={{ color: 'var(--muted)' }}>
             <SwarmIcon size={12} /> 经共享消息板发给 <b style={{ color: 'var(--fg)' }}>@{worker}</b> · 不绕过队列私聊
+          </div>
+        )}
+        {needsVerifyGate && (
+          <div className="cbanner">
+            <span>上一轮待核对现场 · 续跑前请先确认 worktree 与外部副作用：</span>
+            <label className="chk" style={{ marginLeft: 'auto', cursor: 'pointer' }}>
+              <input type="checkbox" checked={siteVerified} onChange={(e) => setSiteVerified(e.target.checked)} />
+              我已核对现场
+            </label>
           </div>
         )}
         <textarea
@@ -220,7 +251,12 @@ export function Composer({
               </button>
             </>
           ) : (
-            <button type="button" className="cbtn pri" disabled={!text.trim() || pending} onClick={() => submit(false)}>
+            <button
+              type="button"
+              className="cbtn pri"
+              disabled={!text.trim() || pending || (needsVerifyGate && !siteVerified)}
+              onClick={() => submit(false)}
+            >
               发送 <span className="kb">↵</span>
             </button>
           )}

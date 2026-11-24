@@ -214,6 +214,7 @@ type testEnv struct {
 	srv       *hub.Server
 	ts        *httptest.Server
 	hubWSURL  string
+	hubTok    string
 	remoteTok string
 }
 
@@ -245,6 +246,10 @@ func newTestEnv(t *testing.T) *testEnv {
 	runG("add", ".")
 	runG("commit", "-m", "initial")
 
+	hubToken := "secret-hub-test-token-456"
+	hubSum := sha256.Sum256([]byte(hubToken))
+	hubTokenHash := "sha256:" + hex.EncodeToString(hubSum[:])
+
 	remoteToken := "secret-runner-test-token-123"
 	sum := sha256.Sum256([]byte(remoteToken))
 	tokenHash := "sha256:" + hex.EncodeToString(sum[:])
@@ -255,6 +260,7 @@ machines:
     displayName: "hub-node"
     transport: local_ws
     tailscaleHost: "orbit.example.ts.net"
+    tokenHash: %q
     capabilities: [primary-dev]
   mac-node:
     displayName: "mac-node"
@@ -262,7 +268,7 @@ machines:
     tailscaleHost: "mac-node.example.ts.net"
     tokenHash: %q
     capabilities: [macos-env, xcode]
-`, tokenHash)
+`, hubTokenHash, tokenHash)
 	projectsYAML := fmt.Sprintf(`schemaVersion: 1
 projects:
   demo-app:
@@ -328,12 +334,20 @@ projects:
 		srv:       srv,
 		ts:        ts,
 		hubWSURL:  wsURL,
+		hubTok:    hubToken,
 		remoteTok: remoteToken,
 	}
 }
 
 func (e *testEnv) startRunner(machineID, token, outboxPath string, drv *FakeAcpDriver, mutate func(*runner.Config)) *runner.Runner {
 	e.t.Helper()
+	if token == "" {
+		if machineID == "hub-node" {
+			token = e.hubTok
+		} else if machineID == "mac-node" {
+			token = e.remoteTok
+		}
+	}
 	if outboxPath == "" {
 		outboxPath = filepath.Join(e.dataDir, fmt.Sprintf("outbox-%s-%d.sqlite", machineID, time.Now().UnixNano()))
 	}
@@ -1087,13 +1101,16 @@ func TestRegression_R3_ApprovalDisconnectRedeliverAndCrashWindows(t *testing.T) 
 		}
 
 		// Same Runner reconnects automatically -> hub.welcome.reconcile.redeliverApprovals delivers BOTH decisions!
+		// Under B1, demo-app has no verified delivery and had a rejected tool, so attempt settles to failed (NO_VERIFIED_DELIVERY)
+		// while BOTH approvals settle cleanly to consumed_allowed and consumed_rejected!
 		eventually(t, 4*time.Second, func() bool {
 			a1, _ := env.st.GetApproval(context.Background(), apAllow.ApprovalID)
 			a2, _ := env.st.GetApproval(context.Background(), apReject.ApprovalID)
 			att, _ := env.st.GetAttemptRecord(context.Background(), attID)
 			return a1.State == protocol.ApprovalConsumedAllowed &&
 				a2.State == protocol.ApprovalConsumedRejected &&
-				att.State == protocol.AttemptSucceeded
+				att.State == protocol.AttemptFailed &&
+				att.ErrorCode == "NO_VERIFIED_DELIVERY"
 		}, "approvals did not redeliver and settle cleanly (allow=consumed_allowed, reject=consumed_rejected)")
 
 		if allowOutcome.Outcome.Selected == nil || allowOutcome.Outcome.Selected.OptionId != "allow_once" {
@@ -1329,13 +1346,44 @@ func TestRegression_R4a_WSAuthOutboxGapAndLateHistory(t *testing.T) {
 	att1ID := disp.AttemptID
 	tid := disp.TaskID
 
+	// Prepare real commits pushed to demo-app's bare mirror so B12 mirror verification passes!
+	projDemo, err := env.st.GetProject(ctx, "demo-app")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gitEnv := append(os.Environ(),
+		"GIT_AUTHOR_NAME=Tester", "GIT_AUTHOR_EMAIL=tester@example.com",
+		"GIT_COMMITTER_NAME=Tester", "GIT_COMMITTER_EMAIL=tester@example.com",
+	)
+	runRepoGit := func(args ...string) string {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = env.repoDir
+		cmd.Env = gitEnv
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, string(out))
+		}
+		return strings.TrimSpace(string(out))
+	}
+	baseSHA := runRepoGit("rev-parse", "HEAD")
+	_ = os.WriteFile(filepath.Join(env.repoDir, "app.go"), []byte("package main\n// dlv_r4_1\nfunc main() {}\n"), 0o644)
+	runRepoGit("add", ".")
+	runRepoGit("commit", "-m", "dlv_r4_1")
+	headR41 := runRepoGit("rev-parse", "HEAD")
+	runRepoGit("push", projDemo.MirrorBarePath, "HEAD:refs/orbit/deliveries/dlv_r4_1")
+	_ = os.WriteFile(filepath.Join(env.repoDir, "app.go"), []byte("package main\n// dlv_r4_late\nfunc main() {}\n"), 0o644)
+	runRepoGit("add", ".")
+	runRepoGit("commit", "-m", "dlv_r4_late")
+	headR4Late := runRepoGit("rev-parse", "HEAD")
+	runRepoGit("push", projDemo.MirrorBarePath, "HEAD:refs/orbit/deliveries/dlv_r4_late")
+
 	// 2. Send seq=1 -> ack=1; skip seq=2 and send seq=3 -> Hub MUST stay at ack=1!
 	writeFrame(protocol.AttemptOutboxBatchFrame{
 		Type:       protocol.RunnerMsgOutboxBatch,
 		AttemptID:  att1ID,
 		LeaseToken: disp.LeaseToken,
 		Items: []protocol.OutboxItem{
-			{OutboxSeq: 1, EventID: "r4_e1", FrameType: protocol.OutboxFrameState, Payload: map[string]any{"state": "running", "baseSha": "1111111111111111111111111111111111111111"}},
+			{OutboxSeq: 1, EventID: "r4_e1", FrameType: protocol.OutboxFrameState, Payload: map[string]any{"state": "running", "baseSha": baseSHA}},
 			{OutboxSeq: 3, EventID: "r4_e3", FrameType: protocol.OutboxFrameEvents, Payload: map[string]any{"kind": "acp.message_batch", "visibility": "raw_acp", "payload": map[string]any{"text": "skip"}}},
 		},
 	})
@@ -1353,8 +1401,8 @@ func TestRegression_R4a_WSAuthOutboxGapAndLateHistory(t *testing.T) {
 		Items: []protocol.OutboxItem{
 			{OutboxSeq: 2, EventID: "r4_e2", FrameType: protocol.OutboxFrameDeliveryPublished, Payload: map[string]any{
 				"deliveryId": "dlv_r4_1",
-				"baseSha":    "1111111111111111111111111111111111111111",
-				"headSha":    "2222222222222222222222222222222222222222",
+				"baseSha":    baseSHA,
+				"headSha":    headR41,
 				"summary":    "valid delivery 1",
 			}},
 			{OutboxSeq: 3, EventID: "r4_e3", FrameType: protocol.OutboxFrameEvents, Payload: map[string]any{"kind": "acp.message_batch", "visibility": "raw_acp", "payload": map[string]any{"text": "filled"}}},
@@ -1407,8 +1455,8 @@ func TestRegression_R4a_WSAuthOutboxGapAndLateHistory(t *testing.T) {
 		Items: []protocol.OutboxItem{
 			{OutboxSeq: 4, EventID: "r4_late_dlv", FrameType: protocol.OutboxFrameDeliveryPublished, Payload: map[string]any{
 				"deliveryId": "dlv_r4_late",
-				"baseSha":    "1111111111111111111111111111111111111111",
-				"headSha":    "3333333333333333333333333333333333333333",
+				"baseSha":    baseSHA,
+				"headSha":    headR4Late,
 				"summary":    "late att1 delivery",
 			}},
 			{OutboxSeq: 5, EventID: "r4_late_ok", FrameType: protocol.OutboxFrameState, Payload: map[string]any{

@@ -2,6 +2,7 @@ package hub
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
@@ -10,9 +11,16 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/Hebi8/hebi8-Orbit/internal/protocol"
 )
+
+type wsTicketEntry struct {
+	actor     string
+	kind      authKind
+	expiresAt time.Time
+}
 
 type actorContextKey struct{}
 type actorKindContextKey struct{}
@@ -161,8 +169,88 @@ func (s *Server) authenticate(r *http.Request) (string, authKind, bool) {
 	return "", authNone, false
 }
 
+// blobAuthMiddleware authenticates /api/blobs/{sha256} for either normal human/CLI API callers
+// OR authenticated Runners (X-Orbit-Machine-Id + Authorization: Bearer <token>, no browser Origin) per B12.
+func (s *Server) blobAuthMiddleware(next http.Handler) http.Handler {
+	standard := s.authMiddleware(next)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		machineID := strings.TrimSpace(r.Header.Get("X-Orbit-Machine-Id"))
+		if machineID != "" && extractBearerToken(r.Header.Get("Authorization")) != "" {
+			if _, statusCode, errMsg := s.verifyRunnerAuth(r, machineID); statusCode != http.StatusOK {
+				code := "ERR_UNAUTHORIZED"
+				if statusCode == http.StatusForbidden {
+					code = "ERR_FORBIDDEN"
+				}
+				writeAPIError(w, statusCode, code, errMsg)
+				return
+			}
+			next.ServeHTTP(w, r.WithContext(withActor(r.Context(), "runner:"+machineID, protocol.ActorRunner)))
+			return
+		}
+		standard.ServeHTTP(w, r)
+	})
+}
+
+func (s *Server) issueWSTicket(actor string, kind authKind) (string, int64) {
+	var raw [24]byte
+	_, _ = rand.Read(raw[:])
+	ticket := "wst_" + hex.EncodeToString(raw[:])
+	now := time.Now()
+	exp := now.Add(30 * time.Second)
+
+	s.wsTicketsMu.Lock()
+	if s.wsTickets == nil {
+		s.wsTickets = map[string]wsTicketEntry{}
+	}
+	for k, v := range s.wsTickets {
+		if now.After(v.expiresAt) {
+			delete(s.wsTickets, k)
+		}
+	}
+	s.wsTickets[ticket] = wsTicketEntry{actor: actor, kind: kind, expiresAt: exp}
+	s.wsTicketsMu.Unlock()
+	return ticket, exp.UnixMilli()
+}
+
+func (s *Server) consumeWSTicket(ticket string) (string, authKind, bool) {
+	ticket = strings.TrimSpace(ticket)
+	if ticket == "" {
+		return "", authNone, false
+	}
+	now := time.Now()
+	s.wsTicketsMu.Lock()
+	defer s.wsTicketsMu.Unlock()
+	entry, ok := s.wsTickets[ticket]
+	if !ok {
+		return "", authNone, false
+	}
+	delete(s.wsTickets, ticket)
+	if now.After(entry.expiresAt) {
+		return "", authNone, false
+	}
+	return entry.actor, entry.kind, true
+}
+
+func (s *Server) handleCreateWSTicket(w http.ResponseWriter, r *http.Request) {
+	actor, kind, ok := s.authenticate(r)
+	if !ok {
+		writeAPIError(w, http.StatusUnauthorized, "ERR_UNAUTHORIZED", "authentication required")
+		return
+	}
+	ticket, expiresAt := s.issueWSTicket(actor, kind)
+	writeJSON(w, http.StatusOK, protocol.WSTicketResponse{
+		Ticket:    ticket,
+		ExpiresAt: expiresAt,
+	})
+}
+
 func (s *Server) validateWSRequest(r *http.Request) (string, int, string) {
 	actor, kind, ok := s.authenticate(r)
+	if !ok {
+		if ticket := strings.TrimSpace(r.URL.Query().Get("ticket")); ticket != "" {
+			actor, kind, ok = s.consumeWSTicket(ticket)
+		}
+	}
 	if !ok {
 		return "", http.StatusUnauthorized, "authentication required"
 	}
@@ -191,7 +279,7 @@ func (s *Server) isAllowedOrigin(origin string, r *http.Request) bool {
 	if cfg.HubOrigin != "" && normOrigin == normalizeOrigin(cfg.HubOrigin) {
 		return true
 	}
-	if cfg.DevOpen && isLoopbackAddr(r.RemoteAddr) {
+	if (cfg.DevOpen || cfg.DevToken != "") && isLoopbackAddr(r.RemoteAddr) {
 		u, err := url.Parse(normOrigin)
 		if err == nil && (u.Scheme == "http" || u.Scheme == "https") {
 			host := u.Hostname()
@@ -240,10 +328,15 @@ func isLoopbackAddr(remoteAddr string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-// verifyRunnerAuth validates runner authentication for a machineId against machines.yaml:
-// - local_ws: requires loopback peer (and constant-time tokenHash match if tokenHash is configured).
-// - remote_ws: requires Authorization: Bearer <token> matching sha256(token) == tokenHash in constant time.
+// verifyRunnerAuth validates runner authentication for a machineId against machines.yaml (B5):
+// - Unconditionally rejects any browser Origin header (runners are never browser clients).
+// - BOTH local_ws (loopback-only) and remote_ws unconditionally require a configured tokenHash
+//   and a matching Authorization: Bearer <token> verified in constant time.
 func (s *Server) verifyRunnerAuth(r *http.Request, machineID string) (protocol.MachineConfig, int, string) {
+	if strings.TrimSpace(r.Header.Get("Origin")) != "" {
+		return protocol.MachineConfig{}, http.StatusForbidden, "browser Origin header is forbidden on runner endpoints"
+	}
+
 	s.mu.RLock()
 	mCfg, ok := s.machines.Machines[machineID]
 	s.mu.RUnlock()
@@ -257,10 +350,11 @@ func (s *Server) verifyRunnerAuth(r *http.Request, machineID string) (protocol.M
 		if !isLoopbackAddr(r.RemoteAddr) {
 			return protocol.MachineConfig{}, http.StatusForbidden, "local_ws runner must connect from loopback"
 		}
-		if strings.TrimSpace(mCfg.TokenHash) != "" {
-			if !matchTokenHash(bearer, mCfg.TokenHash) {
-				return protocol.MachineConfig{}, http.StatusUnauthorized, "invalid runner bearer token"
-			}
+		if strings.TrimSpace(mCfg.TokenHash) == "" {
+			return protocol.MachineConfig{}, http.StatusForbidden, "local_ws machine missing tokenHash in machines.yaml"
+		}
+		if !matchTokenHash(bearer, mCfg.TokenHash) {
+			return protocol.MachineConfig{}, http.StatusUnauthorized, "invalid runner bearer token"
 		}
 		return mCfg, http.StatusOK, ""
 

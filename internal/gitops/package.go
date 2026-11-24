@@ -177,9 +177,23 @@ func PackageCheckpoint(ctx context.Context, opts PackageOptions) (PackageResult,
 	var packagedBlobs []PackagedBlob
 	var manifestBlobs []protocol.BlobManifestItem
 	for _, att := range opts.Attachments {
-		localAbs, err := filepath.Abs(att.LocalPath)
+		rawLocal := strings.TrimSpace(att.LocalPath)
+		if rawLocal == "" {
+			return res, fmt.Errorf("%w: empty attachment path", ErrInvalidPath)
+		}
+		if !filepath.IsAbs(rawLocal) {
+			rawLocal = filepath.Join(repoRoot, rawLocal)
+		}
+		localAbs, err := filepath.Abs(rawLocal)
 		if err != nil {
 			return res, fmt.Errorf("resolve attachment %s: %w", att.LocalPath, err)
+		}
+		fi, err := os.Stat(localAbs)
+		if err != nil {
+			return res, fmt.Errorf("stat attachment %s: %w", localAbs, err)
+		}
+		if fi.IsDir() {
+			return res, fmt.Errorf("%w: attachment %s is a directory", ErrInvalidPath, localAbs)
 		}
 		target := att.TargetPath
 		if target == "" {

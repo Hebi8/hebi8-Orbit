@@ -438,6 +438,58 @@ func (s *Store) CommitPATurn(ctx context.Context, p CommitPATurnParams) (CommitP
 	return res, err
 }
 
+// CheckPAThreadExists verifies that a non-empty threadID exists in pa_threads BEFORE executing any PA write actions (S5).
+func (s *Store) CheckPAThreadExists(ctx context.Context, threadID string) error {
+	threadID = strings.TrimSpace(threadID)
+	if threadID == "" {
+		return nil
+	}
+	var exists string
+	err := s.ro.QueryRowContext(ctx, `SELECT pa_thread_id FROM pa_threads WHERE pa_thread_id = ?`, threadID).Scan(&exists)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("%w: pa thread %s", ErrNotFound, threadID)
+	}
+	return err
+}
+
+// GetPAActionReceipt looks up a persisted PA write action receipt by idempotencyKey (S5).
+func (s *Store) GetPAActionReceipt(ctx context.Context, idempotencyKey string) (string, protocol.PAActionResult, bool, error) {
+	var action, resultJSON string
+	var out protocol.PAActionResult
+	err := s.ro.QueryRowContext(ctx, `
+		SELECT action, result_json FROM pa_action_receipts WHERE idempotency_key = ?
+	`, idempotencyKey).Scan(&action, &resultJSON)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", out, false, nil
+	}
+	if err != nil {
+		return "", out, false, err
+	}
+	if err := json.Unmarshal([]byte(resultJSON), &out); err != nil {
+		return action, out, true, err
+	}
+	return action, out, true, nil
+}
+
+// SavePAActionReceipt records the outcome of an idempotent PA write action (S5).
+func (s *Store) SavePAActionReceipt(ctx context.Context, idempotencyKey, action string, result protocol.PAActionResult) error {
+	if strings.TrimSpace(idempotencyKey) == "" {
+		return nil
+	}
+	b, err := json.Marshal(result)
+	if err != nil {
+		return err
+	}
+	now := time.Now().UnixMilli()
+	return s.WithWriteTx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `
+			INSERT OR IGNORE INTO pa_action_receipts (idempotency_key, action, result_json, created_at)
+			VALUES (?, ?, ?, ?)
+		`, idempotencyKey, action, string(b), now)
+		return err
+	})
+}
+
 // BuildPABrief aggregates inbox_items, active/blocked tasks, recent deliveries, machines,
 // and recent non-raw events in a single read-only SQLite snapshot (<10ms, zero mutation).
 func (s *Store) BuildPABrief(
@@ -464,12 +516,60 @@ func (s *Store) BuildPABrief(
 		RecentEvents:     []protocol.EventRecord{},
 	}
 
+	const blockedConditionSQL = `(
+		t.state IN ('waiting_resource', 'waiting_approval', 'failed')
+		OR (
+			t.state = 'in_review'
+			AND EXISTS (
+				SELECT 1 FROM attempts a
+				WHERE a.task_id = t.task_id
+				  AND a.attempt_no = (SELECT MAX(a2.attempt_no) FROM attempts a2 WHERE a2.task_id = t.task_id)
+				  AND a.state = 'needs_verification'
+			)
+		)
+	)`
+
 	err := s.WithReadTx(ctx, func(tx *sql.Tx) error {
 		if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(seq), 0) FROM events`).Scan(&resp.SnapshotSeq); err != nil {
 			return err
 		}
 
-		// Open inbox items
+		// S4: Exact totals independent of display LIMIT
+		if projectID != "" {
+			if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM inbox_items WHERE state = 'open' AND project_id = ?`, projectID).Scan(&resp.OpenInboxCount); err != nil {
+				return err
+			}
+			if err := tx.QueryRowContext(ctx, `
+				SELECT COUNT(*) FROM tasks t
+				WHERE t.project_id = ? AND t.archived_at IS NULL
+				  AND t.state IN ('queued', 'running', 'waiting_resource', 'waiting_approval')
+			`, projectID).Scan(&resp.TotalActiveTaskCount); err != nil {
+				return err
+			}
+			if err := tx.QueryRowContext(ctx, `
+				SELECT COUNT(*) FROM tasks t
+				WHERE t.project_id = ? AND t.archived_at IS NULL AND `+blockedConditionSQL, projectID).Scan(&resp.TotalBlockedTaskCount); err != nil {
+				return err
+			}
+		} else {
+			if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM inbox_items WHERE state = 'open'`).Scan(&resp.OpenInboxCount); err != nil {
+				return err
+			}
+			if err := tx.QueryRowContext(ctx, `
+				SELECT COUNT(*) FROM tasks t
+				WHERE t.archived_at IS NULL
+				  AND t.state IN ('queued', 'running', 'waiting_resource', 'waiting_approval')
+			`).Scan(&resp.TotalActiveTaskCount); err != nil {
+				return err
+			}
+			if err := tx.QueryRowContext(ctx, `
+				SELECT COUNT(*) FROM tasks t
+				WHERE t.archived_at IS NULL AND `+blockedConditionSQL).Scan(&resp.TotalBlockedTaskCount); err != nil {
+				return err
+			}
+		}
+
+		// Open inbox items (top 50)
 		var iRows *sql.Rows
 		var err error
 		if projectID != "" {
@@ -501,36 +601,62 @@ func (s *Store) BuildPABrief(
 		if err := iRows.Err(); err != nil {
 			return err
 		}
-		resp.OpenInboxCount = len(resp.OpenInboxItems)
 
-		// Active & blocked tasks
-		var tRows *sql.Rows
+		// Active tasks: strictly queued / running / waiting_resource / waiting_approval
+		var aRows *sql.Rows
 		if projectID != "" {
-			tRows, err = tx.QueryContext(ctx, taskSummarySelectSQL+`
-				WHERE t.project_id = ? AND t.archived_at IS NULL AND t.state NOT IN ('done', 'cancelled')
+			aRows, err = tx.QueryContext(ctx, taskSummarySelectSQL+`
+				WHERE t.project_id = ? AND t.archived_at IS NULL
+				  AND t.state IN ('queued', 'running', 'waiting_resource', 'waiting_approval')
 				ORDER BY t.updated_at DESC LIMIT 50
 			`, projectID)
 		} else {
-			tRows, err = tx.QueryContext(ctx, taskSummarySelectSQL+`
-				WHERE t.archived_at IS NULL AND t.state NOT IN ('done', 'cancelled')
+			aRows, err = tx.QueryContext(ctx, taskSummarySelectSQL+`
+				WHERE t.archived_at IS NULL
+				  AND t.state IN ('queued', 'running', 'waiting_resource', 'waiting_approval')
 				ORDER BY t.updated_at DESC LIMIT 50
 			`)
 		}
 		if err != nil {
 			return err
 		}
-		defer tRows.Close()
-		for tRows.Next() {
-			ts, err := scanTaskSummary(tRows)
+		defer aRows.Close()
+		for aRows.Next() {
+			ts, err := scanTaskSummary(aRows)
 			if err != nil {
 				return err
 			}
-			if ts.State == protocol.TaskStateWaitingResource || ts.State == protocol.TaskStateFailed || ts.State == protocol.TaskStateWaitingApproval {
-				resp.BlockedTasks = append(resp.BlockedTasks, ts)
-			}
 			resp.ActiveTasks = append(resp.ActiveTasks, ts)
 		}
-		if err := tRows.Err(); err != nil {
+		if err := aRows.Err(); err != nil {
+			return err
+		}
+
+		// Blocked tasks: waiting_resource / waiting_approval / failed / in_review with latest attempt needs_verification
+		var bRows *sql.Rows
+		if projectID != "" {
+			bRows, err = tx.QueryContext(ctx, taskSummarySelectSQL+`
+				WHERE t.project_id = ? AND t.archived_at IS NULL AND `+blockedConditionSQL+`
+				ORDER BY t.updated_at DESC LIMIT 50
+			`, projectID)
+		} else {
+			bRows, err = tx.QueryContext(ctx, taskSummarySelectSQL+`
+				WHERE t.archived_at IS NULL AND `+blockedConditionSQL+`
+				ORDER BY t.updated_at DESC LIMIT 50
+			`)
+		}
+		if err != nil {
+			return err
+		}
+		defer bRows.Close()
+		for bRows.Next() {
+			ts, err := scanTaskSummary(bRows)
+			if err != nil {
+				return err
+			}
+			resp.BlockedTasks = append(resp.BlockedTasks, ts)
+		}
+		if err := bRows.Err(); err != nil {
 			return err
 		}
 
@@ -577,7 +703,7 @@ func (s *Store) BuildPABrief(
 		// Machines
 		mRows, err := tx.QueryContext(ctx, `
 			SELECT machine_id, transport_mode, status, capabilities_json, resources_json,
-			       runner_version, last_seen_at, updated_at
+			       adapters_json, runner_version, last_seen_at, updated_at
 			FROM machines ORDER BY machine_id ASC
 		`)
 		if err != nil {
@@ -587,11 +713,11 @@ func (s *Store) BuildPABrief(
 		for mRows.Next() {
 			var mv protocol.MachineView
 			var transport, status, capsJSON, resJSON string
-			var runnerVer sql.NullString
+			var adaptersJSON, runnerVer sql.NullString
 			var lastSeen sql.NullInt64
 			if err := mRows.Scan(
 				&mv.MachineID, &transport, &status, &capsJSON, &resJSON,
-				&runnerVer, &lastSeen, &mv.UpdatedAt,
+				&adaptersJSON, &runnerVer, &lastSeen, &mv.UpdatedAt,
 			); err != nil {
 				return err
 			}
@@ -615,6 +741,12 @@ func (s *Store) BuildPABrief(
 			_ = json.Unmarshal([]byte(resJSON), &mv.Resources)
 			if mv.Resources == nil {
 				mv.Resources = map[string]protocol.ResourceState{}
+			}
+			if adaptersJSON.Valid && adaptersJSON.String != "" {
+				_ = json.Unmarshal([]byte(adaptersJSON.String), &mv.Adapters)
+			}
+			if mv.Adapters == nil {
+				mv.Adapters = []protocol.Adapter{}
 			}
 			resp.Machines = append(resp.Machines, mv)
 		}
@@ -671,7 +803,7 @@ func formatBriefSummary(b protocol.PABriefResponse) string {
 		}
 	}
 	parts = append(parts, fmt.Sprintf("事件水位 #%d · 在线节点 %d/%d", b.SnapshotSeq, onlineCount, len(b.Machines)))
-	parts = append(parts, fmt.Sprintf("待拍板 %d 项 · 活跃线程 %d 个（其中阻塞/待批 %d）", b.OpenInboxCount, len(b.ActiveTasks), len(b.BlockedTasks)))
+	parts = append(parts, fmt.Sprintf("待拍板 %d 项 · 活跃线程 %d 个 · 阻塞/待核对 %d 个", b.OpenInboxCount, b.TotalActiveTaskCount, b.TotalBlockedTaskCount))
 	if len(b.RecentDeliveries) > 0 {
 		parts = append(parts, fmt.Sprintf("近 %dh 产出 %d 个新交付", b.SinceHours, len(b.RecentDeliveries)))
 	}

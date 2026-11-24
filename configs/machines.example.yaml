@@ -6,6 +6,7 @@ machines:
     displayName: "hub-node (Primary Hub & Dev)"
     transport: local_ws
     tailscaleHost: "orbit.example.ts.net"
+    tokenHash: "sha256:replace-with-sha256-of-runner-token"
     capabilities: [primary-dev, linux-x64, docker-local, ryugi-host, pa-host]
     adapters:
       agy:
@@ -13,14 +14,15 @@ machines:
         defaultArgs: ["acp", "--stdio", "--process-per-session"]
         maxLiveWorkers: 8
         idleCloseSeconds: 1200
-      claude:
-        bin: "claude-agent-acp"
-        maxLiveWorkers: 4
-        idleCloseSeconds: 900
-      codex:
-        bin: "codex-acp"
-        maxLiveWorkers: 4
-        idleCloseSeconds: 900
+      # Phase 3 adapters (not enabled in Phase 1):
+      # claude:
+      #   bin: "claude-agent-acp"
+      #   maxLiveWorkers: 4
+      #   idleCloseSeconds: 900
+      # codex:
+      #   bin: "codex-acp"
+      #   maxLiveWorkers: 4
+      #   idleCloseSeconds: 900
     exclusiveResources: {}
 
   mac-node:

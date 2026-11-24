@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -123,6 +125,34 @@ func enforcePostRouteGuard(actorKind protocol.ActorKind, route resolvedRoute) er
 	return nil
 }
 
+// validateAdapterSupport enforces B18: rejects unimplemented Phase 3 adapters (claude/codex) with 501
+// and checks machine/runner-advertised adapters so unimplemented adapters can never silently run agy.
+func (s *Server) validateAdapterSupport(route resolvedRoute) (int, string, error) {
+	if !protocol.SessionAdapter(route.Adapter).IsValid() {
+		return http.StatusOK, "", nil
+	}
+	if !protocol.IsSessionAdapterImplemented(route.Adapter) {
+		return http.StatusNotImplemented, "ERR_ADAPTER_NOT_IMPLEMENTED", fmt.Errorf(
+			"adapter %q is not implemented in Phase 1 (supported session adapters: agy)", route.Adapter,
+		)
+	}
+	if reported := s.runners.ReportedAdapters(route.MachineID); len(reported) > 0 {
+		if !slices.Contains(reported, route.Adapter) {
+			return http.StatusBadRequest, "ERR_ADAPTER_UNSUPPORTED", fmt.Errorf(
+				"connected runner on machine %s does not advertise adapter %q (advertised: %v)",
+				route.MachineID, route.Adapter, reported,
+			)
+		}
+	} else if len(route.MachineCfg.Adapters) > 0 {
+		if _, ok := route.MachineCfg.Adapters[string(route.Adapter)]; !ok {
+			return http.StatusBadRequest, "ERR_ADAPTER_UNSUPPORTED", fmt.Errorf(
+				"machine %s does not configure adapter %q", route.MachineID, route.Adapter,
+			)
+		}
+	}
+	return http.StatusOK, "", nil
+}
+
 func (s *Server) resolveWorktreeRoot(proj protocol.ProjectView, anchor protocol.ProjectAnchorConfig) string {
 	if strings.TrimSpace(anchor.WorktreeRoot) != "" {
 		return protocol.ExpandPath(anchor.WorktreeRoot)
@@ -193,7 +223,13 @@ func (s *Server) buildAttemptDispatchFrame(
 		expectedCWD = ""
 	}
 
-	worktreeRoot := s.resolveWorktreeRoot(proj, anchor)
+	// S2: Prefer the anchor frozen on the AttemptRecord at creation time when available.
+	effAnchor := anchor
+	if att.Anchor != nil {
+		effAnchor = *att.Anchor
+	}
+
+	worktreeRoot := s.resolveWorktreeRoot(proj, effAnchor)
 	worktreePath := att.WorktreePath
 	if worktreePath == "" {
 		if provSID != "" && expectedCWD != "" {
@@ -213,7 +249,8 @@ func (s *Server) buildAttemptDispatchFrame(
 		WBSessionID:        att.WBSessionID,
 		ProviderSessionID:  provSID,
 		ExpectedSessionCWD: expectedCWD,
-		RepoPath:           protocol.ExpandPath(anchor.RepoPath),
+		RepoPath:           protocol.ExpandPath(effAnchor.RepoPath),
+		RepoIdentity:       proj.RepoIdentity,
 		WorktreeRoot:       worktreeRoot,
 		WorktreePath:       worktreePath,
 		MirrorBarePath:     proj.MirrorBarePath,
@@ -229,7 +266,11 @@ func (s *Server) buildAttemptDispatchFrame(
 }
 
 func (s *Server) dispatchAttemptRecord(ctx context.Context, att store.AttemptRecord, promptOverride string, swarmIdleTimeoutMs int64) bool {
-	if !s.runners.IsConnected(att.MachineID) {
+	if att.CancelRequested {
+		return false
+	}
+	instID := s.runners.ActiveRunnerInstanceID(att.MachineID)
+	if instID == "" {
 		return false
 	}
 	proj, err := s.store.GetProject(ctx, att.ProjectID)
@@ -240,17 +281,29 @@ func (s *Server) dispatchAttemptRecord(ctx context.Context, att store.AttemptRec
 	if err != nil {
 		return false
 	}
-	route, err := s.resolveExecutionRoute(proj, task.RequiredCapability, att.Adapter)
-	if err != nil {
+	var anchor protocol.ProjectAnchorConfig
+	if att.Anchor != nil {
+		anchor = *att.Anchor
+	} else {
+		capName := att.AnchorCapability
+		if capName == "" {
+			capName = task.RequiredCapability
+		}
+		route, err := s.resolveExecutionRoute(proj, capName, att.Adapter)
+		if err != nil {
+			return false
+		}
+		anchor = route.Anchor
+	}
+	// B10: Atomically bind runner_instance_id BEFORE sending attempt.dispatch (only if still leased & !cancel_requested),
+	// so any concurrent cancel sees a dispatched attempt and persists cancel_requested=1.
+	bound, err := s.store.TryBindAttemptDispatched(ctx, att.AttemptID, instID)
+	if err != nil || !bound {
 		return false
 	}
-	frame := s.buildAttemptDispatchFrame(ctx, att, proj, route.Anchor, promptOverride, swarmIdleTimeoutMs)
-	instID, err := s.runners.DispatchAttempt(att.MachineID, frame)
-	if err != nil {
+	frame := s.buildAttemptDispatchFrame(ctx, att, proj, anchor, promptOverride, swarmIdleTimeoutMs)
+	if _, err := s.runners.DispatchAttempt(att.MachineID, frame); err != nil {
 		return false
-	}
-	if instID != "" {
-		_ = s.store.BindAttemptRunnerInstance(ctx, att.AttemptID, instID)
 	}
 	return true
 }
@@ -265,7 +318,7 @@ func (s *Server) dispatchPendingLeasedForMachine(ctx context.Context, machineID 
 	}
 }
 
-func (s *Server) consumeAndDispatchNextPendingInput(ctx context.Context, taskID string) {
+func (s *Server) consumeAndDispatchNextPendingInput(ctx context.Context, taskID, preferredInputID string) {
 	task, err := s.store.GetTask(ctx, taskID)
 	if err != nil {
 		return
@@ -281,11 +334,19 @@ func (s *Server) consumeAndDispatchNextPendingInput(ctx context.Context, taskID 
 	if route.Adapter == protocol.AdapterSSHDeploy {
 		return
 	}
+	var anchorPtr *protocol.ProjectAnchorConfig
+	if route.HasAnchor {
+		a := route.Anchor
+		anchorPtr = &a
+	}
 	_, att, events, err := s.store.ConsumeNextPendingInput(ctx, store.ConsumeNextPendingInputParams{
-		TaskID:     taskID,
-		MachineID:  route.MachineID,
-		Adapter:    route.Adapter,
-		LeaseTTLMs: s.leaseTTL.Milliseconds(),
+		TaskID:           taskID,
+		PreferredInputID: preferredInputID,
+		MachineID:        route.MachineID,
+		Adapter:          route.Adapter,
+		Anchor:           anchorPtr,
+		AnchorCapability: route.Capability,
+		LeaseTTLMs:       s.leaseTTL.Milliseconds(),
 	})
 	if err != nil || att == nil {
 		return

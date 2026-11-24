@@ -4,13 +4,19 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/Hebi8/hebi8-Orbit/internal/gitops"
 	"github.com/Hebi8/hebi8-Orbit/internal/protocol"
 )
+
+var blobSHA256Regex = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 // PublishedDeliveryNotice informs the Hub of a newly persisted delivery that may need Ryugi registration.
 type PublishedDeliveryNotice struct {
@@ -24,6 +30,9 @@ type IngestOutboxResult struct {
 	AcceptedMode        protocol.OutboxAcceptedMode
 	TaskID              string
 	AttemptSucceeded    bool
+	AutoConsumeQueue    bool
+	SteerInputID        string
+	CancelRequested     bool
 	PublishedDeliveries []PublishedDeliveryNotice
 	Events              []protocol.EventRecord
 }
@@ -31,7 +40,10 @@ type IngestOutboxResult struct {
 // IngestOutboxBatch processes an ordered attempt.outbox_batch inside a single BEGIN IMMEDIATE transaction.
 // Enforces:
 // 1. Strict contiguous outboxSeq == last_acked_outbox + 1 (stops immediately on any gap).
-// 2. Active vs late_history isolation: inactive/superseded attempts NEVER mutate tasks, inbox_items, or annotations.
+// 2. Same-transaction lease expiration check (never extends/projects an expired lease).
+// 3. Per-frame active vs late_history projection isolation: once a frame transitions an attempt to
+//    terminal (or its lease is already expired), all subsequent frames in the same batch go strictly
+//    to late_history and NEVER mutate tasks, inbox_items, or annotations.
 func (s *Store) IngestOutboxBatch(
 	ctx context.Context,
 	machineID, runnerInstanceID string,
@@ -55,21 +67,27 @@ func (s *Store) IngestOutboxBatch(
 		res.TaskID = att.TaskID
 
 		var activeAttemptID sql.NullString
-		var repoIdentity string
+		var repoIdentity, mirrorBarePath string
 		if err := tx.QueryRowContext(ctx, `
-			SELECT t.active_attempt_id, p.repo_identity
+			SELECT t.active_attempt_id, p.repo_identity, p.mirror_bare_path
 			FROM tasks t JOIN projects p ON p.project_id = t.project_id
 			WHERE t.task_id = ?
-		`, att.TaskID).Scan(&activeAttemptID, &repoIdentity); err != nil {
+		`, att.TaskID).Scan(&activeAttemptID, &repoIdentity, &mirrorBarePath); err != nil {
 			return err
 		}
 
-		isActive := protocol.IsActiveAttemptState(att.State) && activeAttemptID.Valid && activeAttemptID.String == att.AttemptID
-		mode := protocol.OutboxModeLateHistory
-		if isActive {
-			mode = protocol.OutboxModeActive
+		// B4: Enforce lease expiration inside the SAME BEGIN IMMEDIATE transaction even if scanner hasn't run yet.
+		if protocol.IsActiveAttemptState(att.State) && att.LeaseExpiresAt < now {
+			if err := expireAttemptInTx(ctx, tx, &att, now, "outbox-lease-check", &res.Events); err != nil {
+				return err
+			}
+			activeAttemptID.Valid = false
+			activeAttemptID.String = ""
 		}
-		res.AcceptedMode = mode
+
+		initiallyActive := protocol.IsActiveAttemptState(att.State) && activeAttemptID.Valid && activeAttemptID.String == att.AttemptID
+		sawLate := false
+		sawActive := false
 
 		acked := att.LastAckedOutbox
 
@@ -87,20 +105,36 @@ func (s *Store) IngestOutboxBatch(
 			if ts <= 0 {
 				ts = now
 			}
-			if mode == protocol.OutboxModeLateHistory {
-				if err := applyLateHistoryItemTx(ctx, tx, att, repoIdentity, item, ts, &res.Events); err != nil {
+
+			// B4: Check active projection authority PER FRAME.
+			frameActive := protocol.IsActiveAttemptState(att.State) && activeAttemptID.Valid && activeAttemptID.String == att.AttemptID
+			if !frameActive {
+				sawLate = true
+				if err := applyLateHistoryItemTx(ctx, tx, att, repoIdentity, mirrorBarePath, item, ts, &res.Events); err != nil {
 					return err
 				}
 			} else {
-				if err := applyActiveOutboxItemTx(ctx, tx, &att, repoIdentity, runnerInstanceID, item, ts, &res); err != nil {
+				sawActive = true
+				if err := applyActiveOutboxItemTx(ctx, tx, &att, repoIdentity, mirrorBarePath, runnerInstanceID, item, ts, &res); err != nil {
 					return err
+				}
+				if !protocol.IsActiveAttemptState(att.State) {
+					activeAttemptID.Valid = false
+					activeAttemptID.String = ""
 				}
 			}
 			acked = item.OutboxSeq
 		}
 
-		if acked != att.LastAckedOutbox || (runnerInstanceID != "" && att.RunnerInstanceID == "" && mode == protocol.OutboxModeActive) {
-			if mode == protocol.OutboxModeActive && runnerInstanceID != "" {
+		if sawLate || (!initiallyActive && !sawActive) {
+			res.AcceptedMode = protocol.OutboxModeLateHistory
+		} else {
+			res.AcceptedMode = protocol.OutboxModeActive
+		}
+		res.CancelRequested = att.CancelRequested && protocol.IsActiveAttemptState(att.State)
+
+		if acked != att.LastAckedOutbox || (runnerInstanceID != "" && att.RunnerInstanceID == "" && initiallyActive) {
+			if initiallyActive && runnerInstanceID != "" {
 				if _, err := tx.ExecContext(ctx, `
 					UPDATE attempts
 					SET last_acked_outbox = ?, runner_instance_id = COALESCE(NULLIF(runner_instance_id, ''), ?)
@@ -127,7 +161,7 @@ func applyLateHistoryItemTx(
 	ctx context.Context,
 	tx *sql.Tx,
 	att AttemptRecord,
-	repoIdentity string,
+	repoIdentity, mirrorBarePath string,
 	item protocol.OutboxItem,
 	ts int64,
 	events *[]protocol.EventRecord,
@@ -139,22 +173,62 @@ func applyLateHistoryItemTx(
 	switch item.FrameType {
 	case protocol.OutboxFrameDeliveryPublished:
 		deliveryID := stringField(item.Payload, "deliveryId")
-		if deliveryID == "" {
-			deliveryID = newID("dlv")
-		}
 		baseSHA := stringField(item.Payload, "baseSha")
 		if baseSHA == "" {
 			baseSHA = att.BaseSHA
 		}
 		headSHA := stringField(item.Payload, "headSha")
 		gitRef := stringField(item.Payload, "gitRef")
-		if gitRef == "" {
+		if gitRef == "" && deliveryID != "" {
 			gitRef = "refs/orbit/deliveries/" + deliveryID
 		}
 		summary := stringField(item.Payload, "summary")
 		manifest := extractDeliveryManifest(item.Payload)
-		kind := resolveDeliveryKind(protocol.DeliveryKind(stringField(item.Payload, "kind")), manifest)
-		manifestBytes, _ := json.Marshal(normalizeManifest(manifest))
+
+		// Idempotent check for duplicate (delivery_id, head_sha)
+		if deliveryID != "" {
+			var existingHead string
+			err := tx.QueryRowContext(ctx, `SELECT head_sha FROM deliveries WHERE delivery_id = ?`, deliveryID).Scan(&existingHead)
+			if err == nil {
+				return nil
+			} else if !errors.Is(err, sql.ErrNoRows) {
+				return err
+			}
+		}
+
+		// Verify ref/mirror/blobs before inserting into deliveries (reject corrupt late records into audit only)
+		verifiedManifest, verErr := verifyDeliveryPayloadTx(ctx, tx, att.ProjectID, mirrorBarePath, deliveryID, baseSHA, headSHA, gitRef, manifest, true)
+		if verErr != nil {
+			ev, inserted, err := insertEventIdempotentTx(ctx, tx, eventInsert{
+				EventID:    item.EventID,
+				StreamID:   "attempt:" + att.AttemptID,
+				ProjectID:  att.ProjectID,
+				TaskID:     att.TaskID,
+				AttemptID:  att.AttemptID,
+				ActorKind:  protocol.ActorSystem,
+				ActorID:    "outbox-verifier",
+				Kind:       protocol.EventAttemptStateChanged,
+				Visibility: protocol.VisibilityAudit,
+				Payload: map[string]any{
+					"late_arrival":  true,
+					"lateFrameType": string(item.FrameType),
+					"deliveryId":    deliveryID,
+					"rejected":      true,
+					"reason":        verErr.Error(),
+				},
+				CreatedAt: ts,
+			})
+			if err != nil {
+				return err
+			}
+			if inserted {
+				*events = append(*events, ev)
+			}
+			return nil
+		}
+
+		kind := resolveDeliveryKind(protocol.DeliveryKind(stringField(item.Payload, "kind")), verifiedManifest)
+		manifestBytes, _ := json.Marshal(normalizeManifest(verifiedManifest))
 
 		// Insert strictly as late_arrival = 1 read-only history; NEVER touch tasks, inbox_items, or annotations!
 		_, err := tx.ExecContext(ctx, `
@@ -260,7 +334,7 @@ func applyActiveOutboxItemTx(
 	ctx context.Context,
 	tx *sql.Tx,
 	att *AttemptRecord,
-	repoIdentity, runnerInstanceID string,
+	repoIdentity, mirrorBarePath, runnerInstanceID string,
 	item protocol.OutboxItem,
 	ts int64,
 	res *IngestOutboxResult,
@@ -313,10 +387,23 @@ func applyActiveOutboxItemTx(
 		approvalID := stringField(item.Payload, "approvalId")
 		decisionID := stringField(item.Payload, "decisionId")
 		outcome := protocol.ApprovalState(stringField(item.Payload, "outcome"))
-		return consumeApprovalAckByDecisionTx(ctx, tx, approvalID, decisionID, outcome, ts, &res.Events)
+		return consumeApprovalAckByDecisionTx(ctx, tx, att.MachineID, runnerInstanceID, att.AttemptID, approvalID, decisionID, outcome, ts, &res.Events)
 
 	case protocol.OutboxFrameDeliveryPublished:
-		return applyDeliveryPublishedFrameTx(ctx, tx, att, repoIdentity, item, ts, res)
+		return applyDeliveryPublishedFrameTx(ctx, tx, att, repoIdentity, mirrorBarePath, item, ts, res)
+
+	case protocol.OutboxFrameBoardAck:
+		msgID := stringField(item.Payload, "messageId")
+		memberName := stringField(item.Payload, "memberName")
+		seq := int64Field(item.Payload, "seq")
+		ev, err := markBoardMessageConsumedTx(ctx, tx, att.TaskID, msgID, seq, memberName, ts)
+		if err != nil {
+			return err
+		}
+		if ev != nil {
+			res.Events = append(res.Events, *ev)
+		}
+		return nil
 
 	case protocol.OutboxFrameBoardMessage:
 		author := stringField(item.Payload, "authorName")
@@ -400,11 +487,61 @@ func applyStateFrameTx(
 	worktree := stringField(item.Payload, "worktreePath")
 	baseSHA := stringField(item.Payload, "baseSha")
 	compSrc := stringField(item.Payload, "completionSource")
+	stopReason := stringField(item.Payload, "stopReason")
 	errCode := stringField(item.Payload, "errorCode")
 	errDetail := stringField(item.Payload, "errorDetail")
 	waitingReason := stringField(item.Payload, "waitingReason")
 	resumeState := stringField(item.Payload, "resumeState")
 	sessionLocked := boolField(item.Payload, "sessionLocked")
+	unresolvedRejected := int64Field(item.Payload, "unresolvedRejectedToolCount")
+	unresolvedNonZero := int64Field(item.Payload, "unresolvedNonZeroExitCount")
+	rejectedToolCount := int64Field(item.Payload, "rejectedToolCount")
+	nonZeroExitCount := int64Field(item.Payload, "nonZeroExitCount")
+
+	// B1: Hub-side authoritative adjudication of succeeded claims.
+	// - Abnormal ACP stop_reason (e.g. refusal / max_tokens / max_turn_requests) cannot succeed.
+	// - Non-_scratch project / annotation turns MUST have a verified output_delivery_id before succeeding
+	//   or marking queued annotations as addressed.
+	// - Unresolved tool rejections or non-zero exits require verification rather than clean success.
+	if newState == protocol.AttemptSucceeded {
+		if stopReason != "" && stopReason != "end_turn" {
+			newState = protocol.AttemptFailed
+			if errCode == "" {
+				errCode = "ABNORMAL_STOP_REASON"
+			}
+			if errDetail == "" {
+				errDetail = fmt.Sprintf("agent stopped with %s", stopReason)
+			}
+		} else {
+			var queuedAnnCount int
+			_ = tx.QueryRowContext(ctx, `
+				SELECT COUNT(*) FROM annotations
+				WHERE triggered_attempt_id = ? AND status = 'queued'
+			`, att.AttemptID).Scan(&queuedAnnCount)
+
+			requiresDelivery := att.ProjectID != protocol.ScratchProjectID ||
+				queuedAnnCount > 0 ||
+				att.TriggerKind == protocol.TriggerAnnotationBatch
+			if requiresDelivery && att.OutputDeliveryID == "" {
+				newState = protocol.AttemptFailed
+				if errCode == "" {
+					errCode = "NO_VERIFIED_DELIVERY"
+				}
+				if errDetail == "" {
+					errDetail = "项目交付/批注轮未产出已核验交付，已拒判成功并释放未处理批注"
+				}
+			} else if unresolvedRejected > 0 || unresolvedNonZero > 0 ||
+				(compSrc == string(protocol.CompletionPromptEndTurn) && (rejectedToolCount > 0 || nonZeroExitCount > 0)) {
+				newState = protocol.AttemptNeedsVerification
+				if errCode == "" {
+					errCode = "UNRESOLVED_TOOL_FAILURE"
+				}
+				if errDetail == "" {
+					errDetail = "本轮存在未解决的工具拒绝或非零失败，请人工核对后再决定是否续跑"
+				}
+			}
+		}
+	}
 
 	var tokenUsageVal any
 	if tu, ok := item.Payload["tokenUsage"]; ok && tu != nil {
@@ -518,6 +655,7 @@ func applyStateFrameTx(
 
 	case protocol.AttemptSucceeded:
 		res.AttemptSucceeded = true
+		res.AutoConsumeQueue = true
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE tasks SET state = 'in_review', active_attempt_id = NULL, waiting_reason = NULL, version = version + 1, updated_at = ?
 			WHERE task_id = ? AND active_attempt_id = ?
@@ -529,41 +667,44 @@ func applyStateFrameTx(
 			WHERE inbox_id = ? AND state = 'open'
 		`, ts, ts, "inb:blk:"+att.AttemptID)
 
-		// Mark queued annotations owned by THIS attempt as addressed
-		var resDlvVal any
+		// B1: ONLY mark queued annotations addressed when a verified output delivery exists.
 		if att.OutputDeliveryID != "" {
-			resDlvVal = att.OutputDeliveryID
-		}
-		updRes, err := tx.ExecContext(ctx, `
-			UPDATE annotations
-			SET status = 'addressed', resolution_delivery_id = ?, resolved_at = ?
-			WHERE triggered_attempt_id = ? AND status = 'queued'
-		`, resDlvVal, ts, att.AttemptID)
-		if err != nil {
-			return err
-		}
-		if n, _ := updRes.RowsAffected(); n > 0 {
-			evAnn, inserted, err := insertEventIdempotentTx(ctx, tx, eventInsert{
-				EventID:    item.EventID + ":ann",
-				StreamID:   "task:" + att.TaskID,
-				ProjectID:  att.ProjectID,
-				TaskID:     att.TaskID,
-				AttemptID:  att.AttemptID,
-				ActorKind:  protocol.ActorRunner,
-				ActorID:    att.MachineID,
-				Kind:       protocol.EventAnnotationAddressed,
-				Visibility: protocol.VisibilityTimeline,
-				Payload: map[string]any{
-					"count":                n,
-					"resolutionDeliveryId": att.OutputDeliveryID,
-				},
-				CreatedAt: ts,
-			})
+			affectedDeliveryIDs, err := lookupQueuedAnnotationDeliveryIDsTx(ctx, tx, att.AttemptID)
 			if err != nil {
 				return err
 			}
-			if inserted {
-				res.Events = append(res.Events, evAnn)
+			updRes, err := tx.ExecContext(ctx, `
+				UPDATE annotations
+				SET status = 'addressed', resolution_delivery_id = ?, resolved_at = ?
+				WHERE triggered_attempt_id = ? AND status = 'queued'
+			`, att.OutputDeliveryID, ts, att.AttemptID)
+			if err != nil {
+				return err
+			}
+			if n, _ := updRes.RowsAffected(); n > 0 {
+				evAnn, inserted, err := insertEventIdempotentTx(ctx, tx, eventInsert{
+					EventID:    item.EventID + ":ann",
+					StreamID:   "task:" + att.TaskID,
+					ProjectID:  att.ProjectID,
+					TaskID:     att.TaskID,
+					AttemptID:  att.AttemptID,
+					ActorKind:  protocol.ActorRunner,
+					ActorID:    att.MachineID,
+					Kind:       protocol.EventAnnotationAddressed,
+					Visibility: protocol.VisibilityTimeline,
+					Payload: map[string]any{
+						"count":                n,
+						"resolutionDeliveryId": att.OutputDeliveryID,
+						"deliveryIds":          affectedDeliveryIDs,
+					},
+					CreatedAt: ts,
+				})
+				if err != nil {
+					return err
+				}
+				if inserted {
+					res.Events = append(res.Events, evAnn)
+				}
 			}
 		}
 
@@ -607,6 +748,10 @@ func applyStateFrameTx(
 		}
 
 	case protocol.AttemptCancelled:
+		if att.CancelReasonKind == "steer" {
+			res.AutoConsumeQueue = true
+			res.SteerInputID = att.SteerInputID
+		}
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE tasks SET state = 'cancelled', active_attempt_id = NULL, waiting_reason = NULL, version = version + 1, updated_at = ?
 			WHERE task_id = ? AND active_attempt_id = ?
@@ -633,6 +778,14 @@ func applyStateFrameTx(
 			evVis = protocol.VisibilityInbox
 		}
 	}
+	evPayload := cloneMap(item.Payload)
+	evPayload["state"] = newState
+	if errCode != "" {
+		evPayload["errorCode"] = errCode
+	}
+	if errDetail != "" {
+		evPayload["errorDetail"] = errDetail
+	}
 	ev, inserted, err := insertEventIdempotentTx(ctx, tx, eventInsert{
 		EventID:    item.EventID,
 		StreamID:   "task:" + att.TaskID,
@@ -643,7 +796,7 @@ func applyStateFrameTx(
 		ActorID:    att.MachineID,
 		Kind:       evKind,
 		Visibility: evVis,
-		Payload:    cloneMap(item.Payload),
+		Payload:    evPayload,
 		CreatedAt:  ts,
 	})
 	if err != nil {
@@ -655,42 +808,190 @@ func applyStateFrameTx(
 	return nil
 }
 
+func lookupQueuedAnnotationDeliveryIDsTx(ctx context.Context, tx *sql.Tx, attemptID string) ([]string, error) {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT DISTINCT delivery_id FROM annotations
+		WHERE triggered_attempt_id = ? AND status = 'queued'
+	`, attemptID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []string{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		if id != "" {
+			out = append(out, id)
+		}
+	}
+	return out, rows.Err()
+}
+
+// verifyDeliveryPayloadTx enforces B12 strong delivery verification (gitRef, headSha, bare mirror ref/base/head,
+// authoritative diff stats & Ryugi artifacts, and blob existence/size/on-disk presence + ref_count increment).
+func verifyDeliveryPayloadTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	projectID, mirrorBarePath, deliveryID, baseSHA, headSHA, gitRef string,
+	manifest protocol.DeliveryManifest,
+	incrementBlobRefs bool,
+) (protocol.DeliveryManifest, error) {
+	if strings.TrimSpace(deliveryID) == "" {
+		return manifest, fmt.Errorf("%w: deliveryId is required", ErrDeliveryVerifyFailed)
+	}
+	if strings.TrimSpace(headSHA) == "" {
+		return manifest, fmt.Errorf("%w: headSha is required for delivery %s", ErrDeliveryVerifyFailed, deliveryID)
+	}
+	expectedRef := "refs/orbit/deliveries/" + deliveryID
+	if gitRef == "" {
+		gitRef = expectedRef
+	}
+	if gitRef != expectedRef {
+		return manifest, fmt.Errorf("%w: gitRef %q must equal %q", ErrDeliveryVerifyFailed, gitRef, expectedRef)
+	}
+
+	outManifest := manifest
+	if projectID != protocol.ScratchProjectID && strings.TrimSpace(mirrorBarePath) != "" {
+		if strings.TrimSpace(baseSHA) == "" {
+			return outManifest, fmt.Errorf("%w: baseSha is required for project delivery %s", ErrDeliveryVerifyFailed, deliveryID)
+		}
+		if err := gitops.VerifyMirrorDelivery(ctx, mirrorBarePath, deliveryID, baseSHA, headSHA); err != nil {
+			if errors.Is(err, gitops.ErrDeliveryRefConflict) {
+				return outManifest, fmt.Errorf("%w: %v", ErrConflict, err)
+			}
+			return outManifest, fmt.Errorf("%w: %v", ErrDeliveryVerifyFailed, err)
+		}
+		diffFiles, err := gitops.ComputeMirrorDiffStats(ctx, mirrorBarePath, baseSHA, headSHA)
+		if err != nil {
+			return outManifest, fmt.Errorf("%w: compute diff stats: %v", ErrDeliveryVerifyFailed, err)
+		}
+		ins, del := 0, 0
+		for _, f := range diffFiles {
+			ins += f.Insertions
+			del += f.Deletions
+		}
+		outManifest.FilesChanged = len(diffFiles)
+		outManifest.Insertions = ins
+		outManifest.Deletions = del
+
+		discovered, err := gitops.DiscoverRyugiArtifactsInMirror(ctx, mirrorBarePath, headSHA)
+		if err != nil {
+			return outManifest, fmt.Errorf("%w: discover ryugi artifacts: %v", ErrDeliveryVerifyFailed, err)
+		}
+		outManifest.RyugiArtifacts = discovered
+	}
+
+	// Verify all declared blobs exist in delivery_blobs, match size, exist on disk, and increment ref_count once per distinct sha256.
+	distinctBlobs := map[string]int64{}
+	for _, b := range outManifest.Blobs {
+		if !blobSHA256Regex.MatchString(b.SHA256) {
+			return outManifest, fmt.Errorf("%w: invalid blob sha256 %q", ErrBlobMismatch, b.SHA256)
+		}
+		if prev, dup := distinctBlobs[b.SHA256]; dup && prev != b.Size {
+			return outManifest, fmt.Errorf("%w: conflicting sizes for blob %s", ErrBlobMismatch, b.SHA256)
+		}
+		distinctBlobs[b.SHA256] = b.Size
+	}
+	for sha, expectedSize := range distinctBlobs {
+		var actualSize int64
+		var storagePath string
+		err := tx.QueryRowContext(ctx, `SELECT size_bytes, storage_path FROM delivery_blobs WHERE sha256 = ?`, sha).Scan(&actualSize, &storagePath)
+		if errors.Is(err, sql.ErrNoRows) {
+			return outManifest, fmt.Errorf("%w: blob %s not uploaded", ErrBlobMismatch, sha)
+		}
+		if err != nil {
+			return outManifest, err
+		}
+		if actualSize != expectedSize {
+			return outManifest, fmt.Errorf("%w: blob %s size mismatch (stored=%d manifest=%d)", ErrBlobMismatch, sha, actualSize, expectedSize)
+		}
+		if storagePath == "" {
+			return outManifest, fmt.Errorf("%w: blob %s has empty storage path", ErrBlobMismatch, sha)
+		}
+		fi, err := os.Stat(storagePath)
+		if err != nil {
+			return outManifest, fmt.Errorf("%w: blob %s file missing on disk: %v", ErrBlobMismatch, sha, err)
+		}
+		if fi.Size() != expectedSize {
+			return outManifest, fmt.Errorf("%w: blob %s file size mismatch on disk (%d != %d)", ErrBlobMismatch, sha, fi.Size(), expectedSize)
+		}
+		if incrementBlobRefs {
+			if _, err := tx.ExecContext(ctx, `UPDATE delivery_blobs SET ref_count = ref_count + 1 WHERE sha256 = ?`, sha); err != nil {
+				return outManifest, err
+			}
+		}
+	}
+
+	return outManifest, nil
+}
+
 func applyDeliveryPublishedFrameTx(
 	ctx context.Context,
 	tx *sql.Tx,
 	att *AttemptRecord,
-	repoIdentity string,
+	repoIdentity, mirrorBarePath string,
 	item protocol.OutboxItem,
 	ts int64,
 	res *IngestOutboxResult,
 ) error {
 	deliveryID := stringField(item.Payload, "deliveryId")
-	if deliveryID == "" {
-		deliveryID = newID("dlv")
-	}
 	baseSHA := stringField(item.Payload, "baseSha")
 	if baseSHA == "" {
 		baseSHA = att.BaseSHA
 	}
 	headSHA := stringField(item.Payload, "headSha")
 	gitRef := stringField(item.Payload, "gitRef")
-	if gitRef == "" {
+	if gitRef == "" && deliveryID != "" {
 		gitRef = "refs/orbit/deliveries/" + deliveryID
 	}
 	summary := stringField(item.Payload, "summary")
 	manifest := extractDeliveryManifest(item.Payload)
-	kind := resolveDeliveryKind(protocol.DeliveryKind(stringField(item.Payload, "kind")), manifest)
+
+	// B13: Strictly idempotent handling for duplicate (delivery_id, head_sha) publication.
+	if deliveryID != "" {
+		var exProjectID, exTaskID, exHeadSHA, exGitRef string
+		err := tx.QueryRowContext(ctx, `
+			SELECT project_id, task_id, head_sha, git_ref FROM deliveries WHERE delivery_id = ?
+		`, deliveryID).Scan(&exProjectID, &exTaskID, &exHeadSHA, &exGitRef)
+		if err == nil {
+			if exProjectID != att.ProjectID || exTaskID != att.TaskID || exHeadSHA != headSHA || (gitRef != "" && exGitRef != gitRef) {
+				return fmt.Errorf("%w: delivery %s already exists with conflicting metadata", ErrConflict, deliveryID)
+			}
+			att.OutputDeliveryID = deliveryID
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE attempts SET output_delivery_id = ?
+				WHERE attempt_id = ? AND (output_delivery_id IS NULL OR output_delivery_id = '')
+			`, deliveryID, att.AttemptID); err != nil {
+				return err
+			}
+			// Idempotent no-op: do NOT re-open resolved inbox card, do NOT emit duplicate delivery.published event.
+			return nil
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+	}
+
+	// B12: Verify mirror ref / headSha / baseSha / blobs before admitting delivery.
+	verifiedManifest, err := verifyDeliveryPayloadTx(ctx, tx, att.ProjectID, mirrorBarePath, deliveryID, baseSHA, headSHA, gitRef, manifest, true)
+	if err != nil {
+		return err
+	}
+
+	kind := resolveDeliveryKind(protocol.DeliveryKind(stringField(item.Payload, "kind")), verifiedManifest)
 	ryugiSyncState := protocol.RyugiSyncNone
-	if len(manifest.RyugiArtifacts) > 0 {
+	if len(verifiedManifest.RyugiArtifacts) > 0 {
 		ryugiSyncState = protocol.RyugiSyncPending
 	}
-	manifestBytes, err := json.Marshal(normalizeManifest(manifest))
+	manifestBytes, err := json.Marshal(normalizeManifest(verifiedManifest))
 	if err != nil {
 		return err
 	}
 
 	insRes, err := tx.ExecContext(ctx, `
-		INSERT OR IGNORE INTO deliveries (
+		INSERT INTO deliveries (
 			delivery_id, project_id, task_id, attempt_id, source_machine_id,
 			repo_identity, base_sha, head_sha, git_ref, kind, summary,
 			manifest_json, verified_machines_json, ryugi_sync_state, late_arrival, pinned, created_at
@@ -708,10 +1009,11 @@ func applyDeliveryPublishedFrameTx(
 	`, deliveryID, att.AttemptID); err != nil {
 		return err
 	}
+	// B4: Strictly guard latest_delivery_id mutation by active_attempt_id = att.AttemptID.
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE tasks SET latest_delivery_id = ?, version = version + 1, updated_at = ?
-		WHERE task_id = ?
-	`, deliveryID, ts, att.TaskID); err != nil {
+		WHERE task_id = ? AND active_attempt_id = ?
+	`, deliveryID, ts, att.TaskID, att.AttemptID); err != nil {
 		return err
 	}
 
@@ -723,19 +1025,14 @@ func applyDeliveryPublishedFrameTx(
 	inboxTitle := fmt.Sprintf("待审交付 · %s (%s)", att.ProjectID, shortHead)
 	inboxSummary := summary
 	if inboxSummary == "" {
-		inboxSummary = fmt.Sprintf("+%d -%d · %d files", manifest.Insertions, manifest.Deletions, manifest.FilesChanged)
+		inboxSummary = fmt.Sprintf("+%d -%d · %d files", verifiedManifest.Insertions, verifiedManifest.Deletions, verifiedManifest.FilesChanged)
 	}
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO inbox_items (
 			inbox_id, project_id, task_id, category, ref_id, title, summary,
 			priority, state, created_at, updated_at
 		) VALUES (?, ?, ?, 'delivery_review', ?, ?, ?, 2, 'open', ?, ?)
-		ON CONFLICT(inbox_id) DO UPDATE SET
-			title = excluded.title,
-			summary = excluded.summary,
-			state = 'open',
-			updated_at = excluded.updated_at,
-			resolved_at = NULL
+		ON CONFLICT(inbox_id) DO NOTHING
 	`, inboxID, att.ProjectID, att.TaskID, deliveryID, inboxTitle, inboxSummary, ts, ts); err != nil {
 		return err
 	}
@@ -743,7 +1040,7 @@ func applyDeliveryPublishedFrameTx(
 	if n, _ := insRes.RowsAffected(); n > 0 {
 		res.PublishedDeliveries = append(res.PublishedDeliveries, PublishedDeliveryNotice{
 			DeliveryID:     deliveryID,
-			RyugiArtifacts: manifest.RyugiArtifacts,
+			RyugiArtifacts: verifiedManifest.RyugiArtifacts,
 		})
 	}
 
@@ -761,10 +1058,10 @@ func applyDeliveryPublishedFrameTx(
 			"deliveryId":     deliveryID,
 			"baseSha":        baseSHA,
 			"headSha":        headSHA,
-			"filesChanged":   manifest.FilesChanged,
-			"insertions":     manifest.Insertions,
-			"deletions":      manifest.Deletions,
-			"ryugiArtifacts": manifest.RyugiArtifacts,
+			"filesChanged":   verifiedManifest.FilesChanged,
+			"insertions":     verifiedManifest.Insertions,
+			"deletions":      verifiedManifest.Deletions,
+			"ryugiArtifacts": verifiedManifest.RyugiArtifacts,
 			"summary":        summary,
 		},
 		CreatedAt: ts,
@@ -896,6 +1193,13 @@ func extractDeliveryManifest(payload map[string]any) protocol.DeliveryManifest {
 	if raw, ok := payload["manifest"]; ok && raw != nil {
 		if b, err := json.Marshal(raw); err == nil {
 			_ = json.Unmarshal(b, &m)
+		}
+	}
+	if len(m.Blobs) == 0 {
+		if rawBlobs, ok := payload["blobs"]; ok && rawBlobs != nil {
+			if b, err := json.Marshal(rawBlobs); err == nil {
+				_ = json.Unmarshal(b, &m.Blobs)
+			}
 		}
 	}
 	return m

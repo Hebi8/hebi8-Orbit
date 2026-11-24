@@ -3,6 +3,7 @@ package runner
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -16,6 +17,218 @@ import (
 
 	acp "github.com/coder/acp-go-sdk"
 )
+
+// PermissionWriteMeta carries the ACP JSON-RPC request ID and a channel signaled strictly AFTER
+// the JSON-RPC permission response bytes finish writing to the underlying ACP stdio Writer (B6).
+type PermissionWriteMeta struct {
+	RPCID       string
+	WriteDoneCh <-chan error
+}
+
+type permWriteMetaContextKey struct{}
+
+// WithPermissionWriteMeta attaches PermissionWriteMeta to a permission handler context.
+func WithPermissionWriteMeta(ctx context.Context, meta PermissionWriteMeta) context.Context {
+	return context.WithValue(ctx, permWriteMetaContextKey{}, meta)
+}
+
+// PermissionWriteMetaFromContext extracts PermissionWriteMeta if provided by the ACP driver.
+func PermissionWriteMetaFromContext(ctx context.Context) (PermissionWriteMeta, bool) {
+	if ctx == nil {
+		return PermissionWriteMeta{}, false
+	}
+	meta, ok := ctx.Value(permWriteMetaContextKey{}).(PermissionWriteMeta)
+	return meta, ok
+}
+
+type permRPCEntry struct {
+	rpcID       string
+	writeDoneCh chan error
+}
+
+type rpcPermTracker struct {
+	mu          sync.Mutex
+	pendingKeys map[string][]permRPCEntry
+	waitersByID map[string]chan error
+	closed      bool
+}
+
+func newRPCPermTracker() *rpcPermTracker {
+	return &rpcPermTracker{
+		pendingKeys: map[string][]permRPCEntry{},
+		waitersByID: map[string]chan error{},
+	}
+}
+
+func (t *rpcPermTracker) observeInboundLine(line []byte) {
+	line = bytes.TrimSpace(line)
+	if len(line) == 0 || line[0] != '{' {
+		return
+	}
+	var msg struct {
+		ID     json.RawMessage `json:"id"`
+		Method string          `json:"method"`
+		Params struct {
+			SessionID string `json:"sessionId"`
+			ToolCall  struct {
+				ToolCallID string `json:"toolCallId"`
+			} `json:"toolCall"`
+		} `json:"params"`
+	}
+	if err := json.Unmarshal(line, &msg); err != nil {
+		return
+	}
+	if msg.Method != "session/request_permission" {
+		return
+	}
+	rpcID := strings.TrimSpace(string(msg.ID))
+	if rpcID == "" || rpcID == "null" {
+		return
+	}
+	key := msg.Params.SessionID + "|" + msg.Params.ToolCall.ToolCallID
+	ch := make(chan error, 1)
+
+	t.mu.Lock()
+	if !t.closed {
+		t.pendingKeys[key] = append(t.pendingKeys[key], permRPCEntry{rpcID: rpcID, writeDoneCh: ch})
+		t.waitersByID[rpcID] = ch
+	} else {
+		ch <- io.ErrClosedPipe
+		close(ch)
+	}
+	t.mu.Unlock()
+}
+
+func (t *rpcPermTracker) claim(sessionID, toolCallID string) (PermissionWriteMeta, bool) {
+	key := sessionID + "|" + toolCallID
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	list := t.pendingKeys[key]
+	if len(list) == 0 {
+		return PermissionWriteMeta{}, false
+	}
+	entry := list[0]
+	if len(list) == 1 {
+		delete(t.pendingKeys, key)
+	} else {
+		t.pendingKeys[key] = list[1:]
+	}
+	return PermissionWriteMeta{RPCID: entry.rpcID, WriteDoneCh: entry.writeDoneCh}, true
+}
+
+func (t *rpcPermTracker) observeOutboundLine(line []byte, writeErr error) {
+	line = bytes.TrimSpace(line)
+	if len(line) == 0 || line[0] != '{' {
+		return
+	}
+	var msg struct {
+		ID     json.RawMessage `json:"id"`
+		Method string          `json:"method"`
+	}
+	if err := json.Unmarshal(line, &msg); err != nil {
+		return
+	}
+	if msg.Method != "" {
+		return
+	}
+	rpcID := strings.TrimSpace(string(msg.ID))
+	if rpcID == "" || rpcID == "null" {
+		return
+	}
+	t.mu.Lock()
+	ch, ok := t.waitersByID[rpcID]
+	if ok {
+		delete(t.waitersByID, rpcID)
+	}
+	t.mu.Unlock()
+	if ok {
+		ch <- writeErr
+		close(ch)
+	}
+}
+
+func (t *rpcPermTracker) closeAll(err error) {
+	if err == nil {
+		err = io.ErrClosedPipe
+	}
+	t.mu.Lock()
+	if t.closed {
+		t.mu.Unlock()
+		return
+	}
+	t.closed = true
+	waiters := t.waitersByID
+	t.waitersByID = map[string]chan error{}
+	t.pendingKeys = map[string][]permRPCEntry{}
+	t.mu.Unlock()
+	for _, ch := range waiters {
+		ch <- err
+		close(ch)
+	}
+}
+
+type observedReadCloser struct {
+	underlying io.ReadCloser
+	tracker    *rpcPermTracker
+	buf        []byte
+}
+
+func (r *observedReadCloser) Read(p []byte) (int, error) {
+	n, err := r.underlying.Read(p)
+	if n > 0 {
+		r.buf = append(r.buf, p[:n]...)
+		for {
+			idx := bytes.IndexByte(r.buf, '\n')
+			if idx < 0 {
+				break
+			}
+			line := r.buf[:idx]
+			r.tracker.observeInboundLine(line)
+			r.buf = r.buf[idx+1:]
+		}
+	}
+	return n, err
+}
+
+func (r *observedReadCloser) Close() error {
+	return r.underlying.Close()
+}
+
+type observedWriteCloser struct {
+	mu         sync.Mutex
+	underlying io.WriteCloser
+	tracker    *rpcPermTracker
+	buf        []byte
+}
+
+func (w *observedWriteCloser) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	// Execute the real underlying stdio Write FIRST so observers fire strictly AFTER bytes are written.
+	n, err := w.underlying.Write(p)
+	chunk := p[:n]
+	if err != nil {
+		chunk = p
+	}
+	if len(chunk) > 0 {
+		w.buf = append(w.buf, chunk...)
+		for {
+			idx := bytes.IndexByte(w.buf, '\n')
+			if idx < 0 {
+				break
+			}
+			line := w.buf[:idx]
+			w.tracker.observeOutboundLine(line, err)
+			w.buf = w.buf[idx+1:]
+		}
+	}
+	return n, err
+}
+
+func (w *observedWriteCloser) Close() error {
+	w.tracker.closeAll(io.ErrClosedPipe)
+	return w.underlying.Close()
+}
 
 // SessionUpdateHandler receives persistent session/update notifications across prompt turns & swarm wakes.
 type SessionUpdateHandler func(ctx context.Context, note acp.SessionNotification) error
@@ -59,6 +272,9 @@ type AgyAcpDriver struct {
 	conn           *acp.ClientSideConnection
 	stdin          io.WriteCloser
 	stdout         io.ReadCloser
+	customStdin    io.WriteCloser
+	customStdout   io.ReadCloser
+	permTracker    *rpcPermTracker
 	stderrBuf      bytes.Buffer
 	started        bool
 	supportsResume bool
@@ -89,6 +305,15 @@ func NewAgyAcpDriver(cfg AgyDriverConfig) *AgyAcpDriver {
 	}
 }
 
+// NewStreamAcpDriver constructs an AgyAcpDriver bound to pre-existing peerInput/peerOutput streams
+// (e.g. io.Pipe() to an in-process acp.NewAgentSideConnection for real wire-protocol tests).
+func NewStreamAcpDriver(cfg AgyDriverConfig, peerInput io.WriteCloser, peerOutput io.ReadCloser) *AgyAcpDriver {
+	d := NewAgyAcpDriver(cfg)
+	d.customStdin = peerInput
+	d.customStdout = peerOutput
+	return d
+}
+
 func (d *AgyAcpDriver) Start(ctx context.Context, onUpdate SessionUpdateHandler, onPerm PermissionHandler) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -98,26 +323,43 @@ func (d *AgyAcpDriver) Start(ctx context.Context, onUpdate SessionUpdateHandler,
 	d.onUpdate = onUpdate
 	d.onPerm = onPerm
 
-	cmd := exec.Command(d.cfg.Bin, d.cfg.Args...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Env = d.buildEnv()
-	cmd.Stderr = &d.stderrBuf
+	var (
+		cmd       *exec.Cmd
+		rawStdin  io.WriteCloser
+		rawStdout io.ReadCloser
+		err       error
+	)
 
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		return fmt.Errorf("agy stdin pipe: %w", err)
-	}
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		_ = stdin.Close()
-		return fmt.Errorf("agy stdout pipe: %w", err)
-	}
-	if err := cmd.Start(); err != nil {
-		_ = stdin.Close()
-		_ = stdout.Close()
-		return fmt.Errorf("start %s: %w", d.cfg.Bin, err)
+	if d.customStdin != nil && d.customStdout != nil {
+		rawStdin = d.customStdin
+		rawStdout = d.customStdout
+	} else {
+		cmd = exec.Command(d.cfg.Bin, d.cfg.Args...)
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		cmd.Env = d.buildEnv()
+		cmd.Stderr = &d.stderrBuf
+
+		rawStdin, err = cmd.StdinPipe()
+		if err != nil {
+			return fmt.Errorf("agy stdin pipe: %w", err)
+		}
+		rawStdout, err = cmd.StdoutPipe()
+		if err != nil {
+			_ = rawStdin.Close()
+			return fmt.Errorf("agy stdout pipe: %w", err)
+		}
+		if err := cmd.Start(); err != nil {
+			_ = rawStdin.Close()
+			_ = rawStdout.Close()
+			return fmt.Errorf("start %s: %w", d.cfg.Bin, err)
+		}
 	}
 
+	tracker := newRPCPermTracker()
+	stdin := &observedWriteCloser{underlying: rawStdin, tracker: tracker}
+	stdout := &observedReadCloser{underlying: rawStdout, tracker: tracker}
+
+	d.permTracker = tracker
 	bridge := &acpClientBridge{driver: d}
 	conn := acp.NewClientSideConnection(bridge, stdin, stdout)
 
@@ -139,7 +381,9 @@ func (d *AgyAcpDriver) Start(ctx context.Context, onUpdate SessionUpdateHandler,
 	})
 	if err != nil {
 		_ = stdin.Close()
-		killProcessGroup(cmd)
+		if cmd != nil {
+			killProcessGroup(cmd)
+		}
 		return fmt.Errorf("acp initialize: %w (stderr=%s)", err, strings.TrimSpace(d.stderrBuf.String()))
 	}
 
@@ -406,9 +650,15 @@ func (b *acpClientBridge) SessionUpdate(ctx context.Context, params acp.SessionN
 func (b *acpClientBridge) RequestPermission(ctx context.Context, params acp.RequestPermissionRequest) (acp.RequestPermissionResponse, error) {
 	b.driver.mu.Lock()
 	handler := b.driver.onPerm
+	tracker := b.driver.permTracker
 	b.driver.mu.Unlock()
 	if handler == nil {
 		return acp.RequestPermissionResponse{Outcome: acp.NewRequestPermissionOutcomeCancelled()}, nil
+	}
+	if tracker != nil {
+		if meta, ok := tracker.claim(string(params.SessionId), string(params.ToolCall.ToolCallId)); ok {
+			ctx = WithPermissionWriteMeta(ctx, meta)
+		}
 	}
 	return handler(ctx, params)
 }

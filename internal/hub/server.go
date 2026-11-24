@@ -57,6 +57,9 @@ type Server struct {
 	paMu               sync.Mutex
 	paBeforeCommitHook func(fromSeq, highSeq int64)
 
+	wsTicketsMu sync.Mutex
+	wsTickets   map[string]wsTicketEntry
+
 	store   *store.Store
 	broker  *EventBroker
 	runners *RunnerGateway
@@ -250,10 +253,19 @@ func (s *Server) buildRouter() http.Handler {
 	r.Get("/ws/client", s.handleClientWS)
 	r.Get("/ws/runner", s.handleRunnerWS)
 
+	// Content-addressed blob endpoints accept both standard API auth AND authenticated Runners (B12)
+	r.Route("/api/blobs", func(blobs chi.Router) {
+		blobs.Use(s.blobAuthMiddleware)
+		blobs.Put("/{sha256}", s.handlePutBlob)
+		blobs.Get("/{sha256}", s.handleGetBlob)
+		blobs.Head("/{sha256}", s.handleHeadBlob)
+	})
+
 	// Authenticated REST API
 	r.Route("/api", func(api chi.Router) {
 		api.Use(s.authMiddleware)
 
+		api.Post("/ws-ticket", s.handleCreateWSTicket)
 		api.Get("/bootstrap", s.handleBootstrap)
 		api.Get("/projects/{projectId}/tasks", s.handleListProjectTasks)
 		api.Post("/projects/{projectId}/tasks", s.handleCreateTask)
@@ -299,10 +311,6 @@ func (s *Server) buildRouter() http.Handler {
 		api.Post("/deliveries/{deliveryId}/annotations", s.handleCreateAnnotation)
 		api.Post("/deliveries/{deliveryId}/ryugi/sync", s.handleSyncDeliveryRyugi)
 		api.Post("/deliveries/{deliveryId}/complete-review", s.handleCompleteDeliveryReview)
-
-		api.Put("/blobs/{sha256}", s.handlePutBlob)
-		api.Get("/blobs/{sha256}", s.handleGetBlob)
-		api.Head("/blobs/{sha256}", s.handleHeadBlob)
 
 		api.Post("/admin/reload-config", s.handleReloadConfig)
 		api.Post("/admin/gc-pause", s.handleGCPause)

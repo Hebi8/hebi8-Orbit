@@ -50,6 +50,9 @@ func (s *Server) createTaskInternal(
 	if err := enforcePostRouteGuard(actorKind, route); err != nil {
 		return resp, http.StatusForbidden, "ERR_DEPLOY_FORBIDDEN", err
 	}
+	if st, code, err := s.validateAdapterSupport(route); err != nil {
+		return resp, st, code, err
+	}
 
 	// Merge default project model config with request overrides
 	desiredCfg := map[string]string{}
@@ -109,6 +112,12 @@ func (s *Server) createTaskInternal(
 
 	createAttempt := route.Adapter != protocol.AdapterSSHDeploy && route.Adapter != protocol.AdapterManual
 
+	var anchorPtr *protocol.ProjectAnchorConfig
+	if route.HasAnchor {
+		a := route.Anchor
+		anchorPtr = &a
+	}
+
 	res, err := s.store.CreateTask(ctx, store.CreateTaskParams{
 		ProjectID:          projectID,
 		ParentTaskID:       strings.TrimSpace(req.ParentTaskID),
@@ -122,6 +131,8 @@ func (s *Server) createTaskInternal(
 		IdempotencyKey:     idempKey,
 		Sources:            req.Sources,
 		MachineID:          route.MachineID,
+		Anchor:             anchorPtr,
+		AnchorCapability:   route.Capability,
 		BaseSHA:            baseSHA,
 		Prompt:             req.Goal,
 		TriggerKind:        triggerKind,
@@ -268,6 +279,17 @@ func (s *Server) followupTaskInternal(
 	actorKind protocol.ActorKind,
 	actorID string,
 ) (protocol.FollowupTaskResponse, int, string, error) {
+	return s.followupTaskWithExtra(ctx, taskID, req, actorKind, actorID, nil)
+}
+
+func (s *Server) followupTaskWithExtra(
+	ctx context.Context,
+	taskID string,
+	req protocol.FollowupTaskRequest,
+	actorKind protocol.ActorKind,
+	actorID string,
+	payloadExtra map[string]any,
+) (protocol.FollowupTaskResponse, int, string, error) {
 	var resp protocol.FollowupTaskResponse
 	req.Message = strings.TrimSpace(req.Message)
 	if req.Message == "" {
@@ -312,156 +334,147 @@ func (s *Server) followupTaskInternal(
 	if err := enforcePostRouteGuard(actorKind, route); err != nil {
 		return resp, http.StatusForbidden, "ERR_DEPLOY_FORBIDDEN", err
 	}
-
-	// If task currently has an active attempt (e.g. running / swarm_monitoring / waiting_approval):
-	// NEVER shove a prompt into the active provider session!
-	if task.ActiveAttemptID != "" {
-		switch mode {
-		case protocol.FollowupModeQueue:
-			src := protocol.PendingSourceHuman
-			if actorKind == protocol.ActorPA {
-				src = protocol.PendingSourcePA
-			}
-			pi, ev, err := s.store.EnqueuePendingInput(ctx, taskID, protocol.PendingInputFollowup, src, req.Message, map[string]any{
-				"prompt":             req.Message,
-				"requiredCapability": route.Capability,
-				"adapter":            route.Adapter,
-				"config":             req.Config,
-			}, actorID)
-			if err != nil {
-				return resp, http.StatusInternalServerError, "ERR_QUEUE_ENQUEUE", err
-			}
-			if ev != nil {
-				s.broker.Broadcast(*ev)
-			}
-			updatedTask, _ := s.store.GetTask(ctx, taskID)
-			resp = protocol.FollowupTaskResponse{
-				Mode:         mode,
-				Task:         updatedTask,
-				PendingInput: &pi,
-			}
-			return resp, http.StatusAccepted, "", nil
-
-		case protocol.FollowupModeSteer:
-			src := protocol.PendingSourceHuman
-			if actorKind == protocol.ActorPA {
-				src = protocol.PendingSourcePA
-			}
-			pi, ev1, err := s.store.EnqueuePendingInput(ctx, taskID, protocol.PendingInputFollowup, src, req.Message, map[string]any{
-				"prompt":             req.Message,
-				"requiredCapability": route.Capability,
-				"adapter":            route.Adapter,
-				"config":             req.Config,
-			}, actorID)
-			if err != nil {
-				return resp, http.StatusInternalServerError, "ERR_QUEUE_ENQUEUE", err
-			}
-			promoted, activeAttID, ev2, err := s.store.SteerPendingInput(ctx, taskID, pi.InputID, actorID)
-			if err != nil {
-				return resp, http.StatusInternalServerError, "ERR_QUEUE_STEER", err
-			}
-			if ev1 != nil {
-				s.broker.Broadcast(*ev1)
-			}
-			if ev2 != nil {
-				s.broker.Broadcast(*ev2)
-			}
-			if activeAttID != "" {
-				if attRec, err := s.store.GetAttemptRecord(ctx, activeAttID); err == nil {
-					_ = s.runners.CancelAttempt(attRec.MachineID, protocol.AttemptCancelFrame{
-						AttemptID:  attRec.AttemptID,
-						LeaseToken: attRec.LeaseToken,
-					})
-				}
-			}
-			updatedTask, _ := s.store.GetTask(ctx, taskID)
-			resp = protocol.FollowupTaskResponse{
-				Mode:         mode,
-				Task:         updatedTask,
-				PendingInput: &promoted,
-			}
-			return resp, http.StatusAccepted, "", nil
-
-		case protocol.FollowupModeForkNewSession:
-			// Branch immediately onto a linked child task with a fresh wb_session_id & isolated worktree
-			// seeded from task.LatestDeliveryID, leaving the active attempt's session completely untouched.
-			createdBy := protocol.TaskCreatedByHuman
-			if actorKind == protocol.ActorPA {
-				createdBy = protocol.TaskCreatedByPA
-			}
-			forkRes, err := s.store.CreateTask(ctx, store.CreateTaskParams{
-				ProjectID:          task.ProjectID,
-				ParentTaskID:       task.TaskID,
-				Title:              task.Title + " (分支)",
-				Goal:               req.Message,
-				RequiredCapability: route.Capability,
-				RequiredResources:  req.RequiredResources,
-				Adapter:            route.Adapter,
-				DesiredConfig:      req.Config,
-				CreatedBy:          createdBy,
-				MachineID:          route.MachineID,
-				InputDeliveryID:    task.LatestDeliveryID,
-				Prompt:             req.Message,
-				TriggerKind:        protocol.TriggerFollowup,
-				TriggerPayload:     map[string]any{"prompt": req.Message, "forkedFromTaskId": task.TaskID},
-				CreateAttempt:      true,
-				LeaseTTLMs:         s.leaseTTL.Milliseconds(),
-				ActorID:            actorID,
-				ActorKind:          actorKind,
-			})
-			if err != nil {
-				return resp, http.StatusInternalServerError, "ERR_FORK_TASK", err
-			}
-			if len(forkRes.Events) > 0 {
-				s.broker.Broadcast(forkRes.Events...)
-			}
-			dispatched := false
-			var attView *protocol.AttemptView
-			if forkRes.Attempt != nil {
-				dispatched = s.dispatchAttemptRecord(ctx, *forkRes.Attempt, req.Message, 0)
-				v := forkRes.Attempt.AttemptView
-				attView = &v
-			}
-			resp = protocol.FollowupTaskResponse{
-				Mode:         mode,
-				Task:         forkRes.Task,
-				Attempt:      attView,
-				ForkedTaskID: forkRes.Task.TaskID,
-				Dispatched:   dispatched,
-			}
-			return resp, http.StatusCreated, "", nil
-		}
+	if st, code, err := s.validateAdapterSupport(route); err != nil {
+		return resp, st, code, err
 	}
 
-	// Task is currently idle -> start next attempt directly (fork_new_session forces brand new wb_session_id)
-	updatedTask, att, events, err := s.store.CreateNextAttempt(ctx, store.CreateNextAttemptParams{
-		TaskID:          taskID,
-		MachineID:       route.MachineID,
-		Adapter:         route.Adapter,
-		TriggerKind:     protocol.TriggerFollowup,
-		TriggerPayload:  map[string]any{"prompt": req.Message},
-		Prompt:          req.Message,
-		DesiredConfig:   req.Config,
-		ForceNewSession: mode == protocol.FollowupModeForkNewSession,
-		LeaseTTLMs:      s.leaseTTL.Milliseconds(),
-		ActorKind:       actorKind,
-		ActorID:         actorID,
+	var anchorPtr *protocol.ProjectAnchorConfig
+	if route.HasAnchor {
+		a := route.Anchor
+		anchorPtr = &a
+	}
+
+	// fork_new_session while task has an active attempt creates a linked child task immediately
+	// seeded from task.LatestDeliveryID so the active session remains undisturbed.
+	if mode == protocol.FollowupModeForkNewSession && task.ActiveAttemptID != "" {
+		createdBy := protocol.TaskCreatedByHuman
+		if actorKind == protocol.ActorPA {
+			createdBy = protocol.TaskCreatedByPA
+		}
+		forkRes, err := s.store.CreateTask(ctx, store.CreateTaskParams{
+			ProjectID:          task.ProjectID,
+			ParentTaskID:       task.TaskID,
+			Title:              task.Title + " (分支)",
+			Goal:               req.Message,
+			RequiredCapability: route.Capability,
+			RequiredResources:  req.RequiredResources,
+			Adapter:            route.Adapter,
+			DesiredConfig:      req.Config,
+			CreatedBy:          createdBy,
+			MachineID:          route.MachineID,
+			Anchor:             anchorPtr,
+			AnchorCapability:   route.Capability,
+			InputDeliveryID:    task.LatestDeliveryID,
+			Prompt:             req.Message,
+			TriggerKind:        protocol.TriggerFollowup,
+			TriggerPayload:     map[string]any{"prompt": req.Message, "forkedFromTaskId": task.TaskID},
+			CreateAttempt:      true,
+			LeaseTTLMs:         s.leaseTTL.Milliseconds(),
+			ActorID:            actorID,
+			ActorKind:          actorKind,
+		})
+		if err != nil {
+			return resp, http.StatusInternalServerError, "ERR_FORK_TASK", err
+		}
+		if len(forkRes.Events) > 0 {
+			s.broker.Broadcast(forkRes.Events...)
+		}
+		dispatched := false
+		var attView *protocol.AttemptView
+		if forkRes.Attempt != nil {
+			dispatched = s.dispatchAttemptRecord(ctx, *forkRes.Attempt, req.Message, 0)
+			v := forkRes.Attempt.AttemptView
+			attView = &v
+		}
+		resp = protocol.FollowupTaskResponse{
+			Mode:         mode,
+			Task:         forkRes.Task,
+			Attempt:      attView,
+			ForkedTaskID: forkRes.Task.TaskID,
+			Dispatched:   dispatched,
+		}
+		return resp, http.StatusCreated, "", nil
+	}
+
+	// B9, B11, S2: Single BEGIN IMMEDIATE transaction decides busy vs idle, enforces needs_verification,
+	// persists steer cancellation intent, and freezes effective route/config/resources/anchor.
+	src := protocol.PendingSourceHuman
+	if actorKind == protocol.ActorPA {
+		src = protocol.PendingSourcePA
+	}
+	subRes, err := s.store.SubmitFollowupAtomic(ctx, store.SubmitFollowupParams{
+		TaskID:            taskID,
+		Body:              req.Message,
+		Mode:              mode,
+		Source:            src,
+		MachineID:         route.MachineID,
+		Adapter:           route.Adapter,
+		DesiredConfig:     req.Config,
+		RequiredResources: req.RequiredResources,
+		Anchor:            anchorPtr,
+		AnchorCapability:  route.Capability,
+		VerifiedSite:      req.VerifiedSite,
+		VerifiedAttemptID: strings.TrimSpace(req.VerifiedAttemptID),
+		LeaseTTLMs:        s.leaseTTL.Milliseconds(),
+		ActorKind:         actorKind,
+		ActorID:           actorID,
+		PayloadExtra:      payloadExtra,
 	})
+	if errors.Is(err, store.ErrNotFound) {
+		return resp, http.StatusNotFound, "ERR_TASK_NOT_FOUND", err
+	}
+	if errors.Is(err, store.ErrVerificationRequired) {
+		return resp, http.StatusConflict, "ERR_VERIFICATION_REQUIRED", err
+	}
 	if errors.Is(err, store.ErrConflict) {
 		return resp, http.StatusConflict, "ERR_TASK_BUSY", err
+	}
+	if errors.Is(err, store.ErrInvalidInput) {
+		return resp, http.StatusBadRequest, "ERR_INVALID_INPUT", err
 	}
 	if err != nil {
 		return resp, http.StatusInternalServerError, "ERR_FOLLOWUP", err
 	}
-	if len(events) > 0 {
-		s.broker.Broadcast(events...)
+
+	if len(subRes.Events) > 0 {
+		s.broker.Broadcast(subRes.Events...)
 	}
-	dispatched := s.dispatchAttemptRecord(ctx, att, req.Message, 0)
-	v := att.AttemptView
+
+	// If steer targeted a live dispatched attempt, send attempt.cancel immediately
+	// (persisted cancel_requested=1 + steer_input_id ensures retry & auto-consume on cancel even if send fails).
+	if subRes.ActiveToCancel != nil {
+		_ = s.runners.CancelAttempt(subRes.ActiveToCancel.MachineID, protocol.AttemptCancelFrame{
+			AttemptID:  subRes.ActiveToCancel.AttemptID,
+			LeaseToken: subRes.ActiveToCancel.LeaseToken,
+		})
+		resp = protocol.FollowupTaskResponse{
+			Mode:         mode,
+			Task:         subRes.Task,
+			PendingInput: subRes.PendingInput,
+		}
+		return resp, http.StatusAccepted, "", nil
+	}
+
+	if subRes.PendingInput != nil {
+		resp = protocol.FollowupTaskResponse{
+			Mode:         mode,
+			Task:         subRes.Task,
+			PendingInput: subRes.PendingInput,
+		}
+		return resp, http.StatusAccepted, "", nil
+	}
+
+	dispatched := false
+	var attView *protocol.AttemptView
+	if subRes.Attempt != nil {
+		dispatched = s.dispatchAttemptRecord(ctx, *subRes.Attempt, req.Message, 0)
+		v := subRes.Attempt.AttemptView
+		attView = &v
+	}
 	resp = protocol.FollowupTaskResponse{
 		Mode:       mode,
-		Task:       updatedTask,
-		Attempt:    &v,
+		Task:       subRes.Task,
+		Attempt:    attView,
 		Dispatched: dispatched,
 	}
 	return resp, http.StatusCreated, "", nil
@@ -499,7 +512,9 @@ func (s *Server) cancelTaskInternal(ctx context.Context, taskID, actorID, reason
 		return resp, http.StatusInternalServerError, "ERR_ATTEMPT_LOOKUP", err
 	}
 	runnerConnected := s.runners.IsConnected(attRec.MachineID)
-	res, err := s.store.CancelTaskActiveAttempt(ctx, taskID, actorID, reason, !runnerConnected)
+	// B10: Never force-immediate cancel a dispatched attempt just because WS send might fail or runner is
+	// transiently disconnected; persist cancel_requested=1 so hello/heartbeat/outbox keep enforcing abort.
+	res, err := s.store.CancelTaskActiveAttempt(ctx, taskID, actorID, reason, false)
 	if errors.Is(err, store.ErrNotFound) {
 		return resp, http.StatusNotFound, "ERR_TASK_NOT_FOUND", err
 	}
@@ -581,23 +596,32 @@ func (s *Server) handleRetryTask(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusForbidden, "ERR_DEPLOY_FORBIDDEN", err.Error())
 		return
 	}
-
-	prompt := task.Goal
-	if strings.TrimSpace(req.Note) != "" {
-		prompt = prompt + "\n\n重试补充说明: " + strings.TrimSpace(req.Note)
+	if st, code, err := s.validateAdapterSupport(route); err != nil {
+		writeAPIError(w, st, code, err.Error())
+		return
 	}
 
+	var anchorPtr *protocol.ProjectAnchorConfig
+	if route.HasAnchor {
+		a := route.Anchor
+		anchorPtr = &a
+	}
+
+	// B11: Pass empty Prompt so CreateNextAttempt preserves the original trigger prompt (e.g. annotation batch)
+	// from the failed / needs_verification attempt and appends any retry note, falling back to task.Goal if absent.
 	updatedTask, att, events, err := s.store.CreateNextAttempt(r.Context(), store.CreateNextAttemptParams{
-		TaskID:         taskID,
-		MachineID:      route.MachineID,
-		Adapter:        route.Adapter,
-		TriggerKind:    protocol.TriggerRetry,
-		TriggerPayload: map[string]any{"prompt": prompt, "note": req.Note, "verifiedSite": req.VerifiedSite},
-		Prompt:         prompt,
-		VerifiedSite:   req.VerifiedSite,
-		LeaseTTLMs:     s.leaseTTL.Milliseconds(),
-		ActorKind:      actorKindFromContext(r.Context()),
-		ActorID:        actorFromContext(r.Context()),
+		TaskID:            taskID,
+		MachineID:         route.MachineID,
+		Adapter:           route.Adapter,
+		TriggerKind:       protocol.TriggerRetry,
+		TriggerPayload:    map[string]any{"note": strings.TrimSpace(req.Note), "verifiedSite": req.VerifiedSite},
+		Anchor:            anchorPtr,
+		AnchorCapability:  route.Capability,
+		VerifiedSite:      req.VerifiedSite,
+		VerifiedAttemptID: strings.TrimSpace(req.VerifiedAttemptID),
+		LeaseTTLMs:        s.leaseTTL.Milliseconds(),
+		ActorKind:         actorKindFromContext(r.Context()),
+		ActorID:           actorFromContext(r.Context()),
 	})
 	if errors.Is(err, store.ErrVerificationRequired) {
 		writeAPIError(w, http.StatusConflict, "ERR_VERIFICATION_REQUIRED", err.Error())
@@ -614,7 +638,7 @@ func (s *Server) handleRetryTask(w http.ResponseWriter, r *http.Request) {
 	if len(events) > 0 {
 		s.broker.Broadcast(events...)
 	}
-	dispatched := s.dispatchAttemptRecord(r.Context(), att, prompt, 0)
+	dispatched := s.dispatchAttemptRecord(r.Context(), att, "", 0)
 	writeJSON(w, http.StatusCreated, protocol.RetryTaskResponse{
 		Task:       updatedTask,
 		Attempt:    att.AttemptView,
@@ -719,7 +743,7 @@ func (s *Server) handleDeleteQueueInput(w http.ResponseWriter, r *http.Request) 
 func (s *Server) handleSteerQueueInput(w http.ResponseWriter, r *http.Request) {
 	taskID := chi.URLParam(r, "taskId")
 	inputID := chi.URLParam(r, "inputId")
-	pi, activeAttID, ev, err := s.store.SteerPendingInput(r.Context(), taskID, inputID, actorFromContext(r.Context()))
+	pi, activeToCancel, events, err := s.store.SteerPendingInput(r.Context(), taskID, inputID, actorFromContext(r.Context()))
 	if errors.Is(err, store.ErrNotFound) {
 		writeAPIError(w, http.StatusNotFound, "ERR_NOT_FOUND", err.Error())
 		return
@@ -728,20 +752,18 @@ func (s *Server) handleSteerQueueInput(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusInternalServerError, "ERR_QUEUE_STEER", err.Error())
 		return
 	}
-	if ev != nil {
-		s.broker.Broadcast(*ev)
+	if len(events) > 0 {
+		s.broker.Broadcast(events...)
 	}
 
-	if activeAttID != "" {
-		if attRec, err := s.store.GetAttemptRecord(r.Context(), activeAttID); err == nil {
-			_ = s.runners.CancelAttempt(attRec.MachineID, protocol.AttemptCancelFrame{
-				AttemptID:  attRec.AttemptID,
-				LeaseToken: attRec.LeaseToken,
-			})
-		}
+	if activeToCancel != nil {
+		_ = s.runners.CancelAttempt(activeToCancel.MachineID, protocol.AttemptCancelFrame{
+			AttemptID:  activeToCancel.AttemptID,
+			LeaseToken: activeToCancel.LeaseToken,
+		})
 	} else {
-		// Idle task: immediately pop & dispatch the steered head input
-		s.consumeAndDispatchNextPendingInput(r.Context(), taskID)
+		// Idle task (or undispatched leased attempt cancelled immediately): pop & dispatch the steered input now.
+		s.consumeAndDispatchNextPendingInput(r.Context(), taskID, pi.InputID)
 	}
 	writeJSON(w, http.StatusOK, pi)
 }
@@ -803,16 +825,30 @@ func (s *Server) handleDispatchAnnotations(w http.ResponseWriter, r *http.Reques
 		writeAPIError(w, http.StatusForbidden, "ERR_DEPLOY_FORBIDDEN", err.Error())
 		return
 	}
+	if st, code, err := s.validateAdapterSupport(route); err != nil {
+		writeAPIError(w, st, code, err.Error())
+		return
+	}
+
+	var anchorPtr *protocol.ProjectAnchorConfig
+	if route.HasAnchor {
+		a := route.Anchor
+		anchorPtr = &a
+	}
 
 	res, err := s.store.DispatchAnnotations(r.Context(), store.DispatchAnnotationsParams{
-		TaskID:          taskID,
-		AnnotationIDs:   req.AnnotationIDs,
-		Message:         req.Message,
-		MachineID:       route.MachineID,
-		Adapter:         route.Adapter,
-		ForceNewSession: req.Mode == protocol.FollowupModeForkNewSession,
-		LeaseTTLMs:      s.leaseTTL.Milliseconds(),
-		ActorID:         actorFromContext(r.Context()),
+		TaskID:            taskID,
+		AnnotationIDs:     req.AnnotationIDs,
+		Message:           req.Message,
+		MachineID:         route.MachineID,
+		Adapter:           route.Adapter,
+		Anchor:            anchorPtr,
+		AnchorCapability:  route.Capability,
+		ForceNewSession:   req.Mode == protocol.FollowupModeForkNewSession,
+		VerifiedSite:      req.VerifiedSite,
+		VerifiedAttemptID: strings.TrimSpace(req.VerifiedAttemptID),
+		LeaseTTLMs:        s.leaseTTL.Milliseconds(),
+		ActorID:           actorFromContext(r.Context()),
 	})
 	if errors.Is(err, store.ErrNotFound) {
 		writeAPIError(w, http.StatusNotFound, "ERR_TASK_NOT_FOUND", err.Error())
@@ -820,6 +856,10 @@ func (s *Server) handleDispatchAnnotations(w http.ResponseWriter, r *http.Reques
 	}
 	if errors.Is(err, store.ErrInvalidInput) {
 		writeAPIError(w, http.StatusBadRequest, "ERR_INVALID_INPUT", err.Error())
+		return
+	}
+	if errors.Is(err, store.ErrVerificationRequired) {
+		writeAPIError(w, http.StatusConflict, "ERR_VERIFICATION_REQUIRED", err.Error())
 		return
 	}
 	if errors.Is(err, store.ErrConflict) {
@@ -854,7 +894,25 @@ func (s *Server) handleDispatchAnnotations(w http.ResponseWriter, r *http.Reques
 
 func (s *Server) handleGetTaskBoard(w http.ResponseWriter, r *http.Request) {
 	taskID := chi.URLParam(r, "taskId")
-	board, err := s.store.GetTaskBoard(r.Context(), taskID)
+	var beforeSeq int64
+	if raw := strings.TrimSpace(r.URL.Query().Get("beforeSeq")); raw != "" {
+		v, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || v < 0 {
+			writeAPIError(w, http.StatusBadRequest, "ERR_INVALID_BEFORE_SEQ", "beforeSeq must be a non-negative integer")
+			return
+		}
+		beforeSeq = v
+	}
+	limit := 200
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		v, err := strconv.Atoi(raw)
+		if err != nil || v <= 0 {
+			writeAPIError(w, http.StatusBadRequest, "ERR_INVALID_LIMIT", "limit must be a positive integer")
+			return
+		}
+		limit = v
+	}
+	board, err := s.store.GetTaskBoardPage(r.Context(), taskID, beforeSeq, limit)
 	if errors.Is(err, store.ErrNotFound) {
 		writeAPIError(w, http.StatusNotFound, "ERR_TASK_NOT_FOUND", err.Error())
 		return
@@ -897,6 +955,73 @@ func (s *Server) handlePostBoardMessage(w http.ResponseWriter, r *http.Request) 
 	if ev != nil {
 		s.broker.Broadcast(*ev)
 	}
+
+	// B16: Route @worker / @member board messages onto a real executable delivery path so
+	// status transitions posted -> consumed when dispatched/delivered.
+	if msg.TargetMention != "" && msg.Status == protocol.BoardMessagePosted {
+		target, _ := s.store.ResolveBoardTarget(r.Context(), taskID, msg.TargetMention)
+		actorKind := actorKindFromContext(r.Context())
+		actorID := actorFromContext(r.Context())
+		if target != nil && target.WorkerTaskID != "" {
+			// Child-task worker: deliver directly via its followup/queue path.
+			fResp, _, _, fErr := s.followupTaskWithExtra(r.Context(), target.WorkerTaskID, protocol.FollowupTaskRequest{
+				Message: fmt.Sprintf("[Board @%s] %s", target.MemberName, msg.Body),
+				Mode:    protocol.FollowupModeQueue,
+			}, actorKind, actorID, map[string]any{
+				"boardMessageId":  msg.MessageID,
+				"boardTaskId":     taskID,
+				"boardMemberName": target.MemberName,
+				"boardSeq":        msg.Seq,
+			})
+			if fErr == nil && fResp.Attempt != nil {
+				msg.Status = protocol.BoardMessageConsumed
+			}
+		} else {
+			// Native Swarm worker (or coordinator mention): forward live into active swarm_monitoring attempt,
+			// or fall back to parent task's followup/queue path.
+			forwardedLive := false
+			if parentTask, err := s.store.GetTask(r.Context(), taskID); err == nil && parentTask.ActiveAttemptID != "" {
+				if attRec, err := s.store.GetAttemptRecord(r.Context(), parentTask.ActiveAttemptID); err == nil &&
+					attRec.State == protocol.AttemptSwarmMonitoring && s.runners.IsConnected(attRec.MachineID) {
+					memberName := msg.TargetMention
+					if target != nil && target.MemberName != "" {
+						memberName = target.MemberName
+					}
+					if sendErr := s.runners.SendBoardMessage(attRec.MachineID, protocol.BoardMessageDispatchFrame{
+						Type:          protocol.RunnerMsgBoardMessage,
+						AttemptID:     attRec.AttemptID,
+						TaskID:        taskID,
+						MessageID:     msg.MessageID,
+						Seq:           msg.Seq,
+						AuthorName:    msg.AuthorName,
+						TargetMention: memberName,
+						Body:          msg.Body,
+					}); sendErr == nil {
+						forwardedLive = true
+					}
+				}
+			}
+			if !forwardedLive {
+				memberName := msg.TargetMention
+				if target != nil && target.MemberName != "" {
+					memberName = target.MemberName
+				}
+				fResp, _, _, fErr := s.followupTaskWithExtra(r.Context(), taskID, protocol.FollowupTaskRequest{
+					Message: fmt.Sprintf("[Board @%s] %s", memberName, msg.Body),
+					Mode:    protocol.FollowupModeQueue,
+				}, actorKind, actorID, map[string]any{
+					"boardMessageId":  msg.MessageID,
+					"boardTaskId":     taskID,
+					"boardMemberName": memberName,
+					"boardSeq":        msg.Seq,
+				})
+				if fErr == nil && fResp.Attempt != nil {
+					msg.Status = protocol.BoardMessageConsumed
+				}
+			}
+		}
+	}
+
 	writeJSON(w, http.StatusCreated, msg)
 }
 

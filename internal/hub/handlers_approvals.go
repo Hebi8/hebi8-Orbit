@@ -1,6 +1,7 @@
 package hub
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -50,6 +51,23 @@ func (s *Server) handleDecideApproval(w http.ResponseWriter, r *http.Request) {
 		ActorID:               actorFromContext(r.Context()),
 		Note:                  strings.TrimSpace(req.Note),
 	})
+	// B7: Even when DecideApproval returns ErrConflict due to expiry, its expired state transition,
+	// inbox resolution, and events were COMMITTED — broadcast events and unblock the Runner before 409.
+	if len(res.Events) > 0 {
+		s.broker.Broadcast(res.Events...)
+	}
+	if res.Expired && res.MachineID != "" {
+		_ = s.runners.SendApprovalDecision(res.MachineID, protocol.ApprovalDecisionFrame{
+			Type:          protocol.RunnerMsgApprovalDecide,
+			ApprovalID:    res.Decision.ApprovalID,
+			DecisionID:    res.Decision.DecisionID,
+			AttemptID:     res.Decision.AttemptID,
+			PayloadSHA256: res.Decision.PayloadSHA256,
+			DecidedBy:     res.Decision.DecidedBy,
+			Expired:       true,
+		})
+	}
+
 	if errors.Is(err, store.ErrNotFound) {
 		writeAPIError(w, http.StatusNotFound, "ERR_APPROVAL_NOT_FOUND", err.Error())
 		return
@@ -67,23 +85,33 @@ func (s *Server) handleDecideApproval(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if len(res.Events) > 0 {
-		s.broker.Broadcast(res.Events...)
-	}
-
 	sentToRunner := false
 	if res.Approval.Kind == protocol.ApprovalACPToolPermission && res.MachineID != "" {
-		err := s.runners.SendApprovalDecision(res.MachineID, protocol.ApprovalDecisionFrame{
-			Type:          protocol.RunnerMsgApprovalDecide,
-			ApprovalID:    res.Decision.ApprovalID,
-			DecisionID:    res.Decision.DecisionID,
-			AttemptID:     res.Decision.AttemptID,
-			PayloadSHA256: res.Decision.PayloadSHA256,
-			OptionID:      res.Decision.OptionID,
-			DecidedBy:     res.Decision.DecidedBy,
-		})
-		if err == nil {
+		// B6: Mark delivery_attempted=1 ONLY when Hub actually begins writing the decision frame
+		// over a live Runner WebSocket connection, and clear it if an immediate write error occurs.
+		sendErr := s.runners.SendApprovalDecisionWithHooks(
+			res.MachineID,
+			protocol.ApprovalDecisionFrame{
+				Type:          protocol.RunnerMsgApprovalDecide,
+				ApprovalID:    res.Decision.ApprovalID,
+				DecisionID:    res.Decision.DecisionID,
+				AttemptID:     res.Decision.AttemptID,
+				PayloadSHA256: res.Decision.PayloadSHA256,
+				OptionID:      res.Decision.OptionID,
+				DecidedBy:     res.Decision.DecidedBy,
+			},
+			func() error {
+				return s.store.MarkApprovalsDeliveryAttempted(r.Context(), []string{res.Approval.ApprovalID})
+			},
+			func(writeErr error) {
+				if !errors.Is(writeErr, context.DeadlineExceeded) {
+					_ = s.store.ClearApprovalsDeliveryAttempted(context.Background(), []string{res.Approval.ApprovalID})
+				}
+			},
+		)
+		if sendErr == nil {
 			sentToRunner = true
+			res.Approval.DeliveryAttempted = true
 		}
 	}
 

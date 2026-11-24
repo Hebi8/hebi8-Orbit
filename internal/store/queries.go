@@ -30,18 +30,32 @@ func (s *Store) SyncRegistry(ctx context.Context, dataDir string, projects proto
 			if err != nil {
 				return err
 			}
+			// Only advertise Phase 1 implemented session adapters statically until a Runner reports live adapters.
+			adapters := []protocol.Adapter{}
+			for name := range m.Adapters {
+				a := protocol.Adapter(name)
+				if protocol.IsSessionAdapterImplemented(a) {
+					adapters = append(adapters, a)
+				}
+			}
+			sort.Slice(adapters, func(i, j int) bool { return adapters[i] < adapters[j] })
+			adaptersJSON, err := json.Marshal(adapters)
+			if err != nil {
+				return err
+			}
 			initialStatus := protocol.MachineOffline
 			if m.Transport == protocol.TransportLocalWS || m.Transport == protocol.TransportSSHOutbound {
 				initialStatus = protocol.MachineOnline
 			}
 			_, err = tx.ExecContext(ctx, `
-				INSERT INTO machines (machine_id, transport_mode, status, capabilities_json, resources_json, last_seen_at, updated_at)
-				VALUES (?, ?, ?, ?, '{}', ?, ?)
+				INSERT INTO machines (machine_id, transport_mode, status, capabilities_json, adapters_json, resources_json, last_seen_at, updated_at)
+				VALUES (?, ?, ?, ?, ?, '{}', ?, ?)
 				ON CONFLICT(machine_id) DO UPDATE SET
 					transport_mode = excluded.transport_mode,
 					capabilities_json = excluded.capabilities_json,
+					adapters_json = CASE WHEN machines.runner_version IS NULL THEN excluded.adapters_json ELSE machines.adapters_json END,
 					updated_at = excluded.updated_at
-			`, machineID, string(m.Transport), string(initialStatus), string(capsJSON), now, now)
+			`, machineID, string(m.Transport), string(initialStatus), string(capsJSON), string(adaptersJSON), now, now)
 			if err != nil {
 				return fmt.Errorf("upsert machine %s: %w", machineID, err)
 			}
@@ -153,7 +167,7 @@ func (s *Store) Bootstrap(ctx context.Context, machineMeta map[string]protocol.M
 
 		// Machines
 		mRows, err := tx.QueryContext(ctx, `
-			SELECT machine_id, transport_mode, status, capabilities_json, resources_json,
+			SELECT machine_id, transport_mode, status, capabilities_json, adapters_json, resources_json,
 			       runner_version, last_seen_at, updated_at
 			FROM machines
 			ORDER BY machine_id ASC
@@ -165,11 +179,11 @@ func (s *Store) Bootstrap(ctx context.Context, machineMeta map[string]protocol.M
 
 		for mRows.Next() {
 			var mv protocol.MachineView
-			var transport, status, capsJSON, resJSON string
+			var transport, status, capsJSON, adaptersJSON, resJSON string
 			var runnerVer sql.NullString
 			var lastSeen sql.NullInt64
 			if err := mRows.Scan(
-				&mv.MachineID, &transport, &status, &capsJSON, &resJSON,
+				&mv.MachineID, &transport, &status, &capsJSON, &adaptersJSON, &resJSON,
 				&runnerVer, &lastSeen, &mv.UpdatedAt,
 			); err != nil {
 				return err
@@ -194,6 +208,10 @@ func (s *Store) Bootstrap(ctx context.Context, machineMeta map[string]protocol.M
 			_ = json.Unmarshal([]byte(capsJSON), &mv.Capabilities)
 			if mv.Capabilities == nil {
 				mv.Capabilities = []string{}
+			}
+			_ = json.Unmarshal([]byte(adaptersJSON), &mv.Adapters)
+			if mv.Adapters == nil {
+				mv.Adapters = []protocol.Adapter{}
 			}
 			_ = json.Unmarshal([]byte(resJSON), &mv.Resources)
 			if mv.Resources == nil {
@@ -352,7 +370,9 @@ const taskSummarySelectSQL = `
 		       (SELECT COUNT(*) FROM annotations an WHERE an.task_id = t.task_id AND an.status = 'open') AS open_ann,
 		       (SELECT COUNT(*) FROM deliveries dl WHERE dl.task_id = t.task_id) AS dlv_count,
 		       (SELECT COUNT(*) FROM task_pending_inputs pi WHERE pi.task_id = t.task_id AND pi.state = 'queued') AS queued_inputs,
-		       (SELECT COUNT(*) FROM board_members bm WHERE bm.task_id = t.task_id AND bm.state IN ('working', 'waiting')) AS worker_count,
+		       (SELECT COUNT(*) FROM board_members bm WHERE bm.task_id = t.task_id AND bm.state IN ('working', 'waiting'))
+		       + (SELECT COUNT(*) FROM tasks ct WHERE ct.parent_task_id = t.task_id AND ct.archived_at IS NULL AND ct.state NOT IN ('done', 'cancelled')
+		          AND NOT EXISTS (SELECT 1 FROM board_members bm2 WHERE bm2.task_id = t.task_id AND bm2.worker_task_id = ct.task_id)) AS worker_count,
 		       t.created_by, t.created_at, t.updated_at
 		FROM tasks t
 		LEFT JOIN attempts a ON a.attempt_id = t.active_attempt_id
@@ -454,7 +474,7 @@ func (s *Store) GetTaskTimeline(ctx context.Context, taskID string, beforeSeq in
 		// Attempts
 		aRows, err := tx.QueryContext(ctx, `
 			SELECT attempt_id, task_id, project_id, attempt_no, machine_id, adapter,
-			       trigger_kind, worktree_path, base_sha, output_delivery_id,
+			       trigger_kind, trigger_payload_json, worktree_path, base_sha, output_delivery_id,
 			       state, completion_source, error_code, error_detail, started_at, finished_at
 			FROM attempts
 			WHERE task_id = ?
@@ -468,6 +488,9 @@ func (s *Store) GetTaskTimeline(ctx context.Context, taskID string, beforeSeq in
 			att, err := scanAttemptView(aRows)
 			if err != nil {
 				return err
+			}
+			if att.PromptText == "" && att.TriggerKind == protocol.TriggerInitial {
+				att.PromptText = truncatePromptText(resp.Task.Goal)
 			}
 			resp.Attempts = append(resp.Attempts, att)
 		}
@@ -615,27 +638,12 @@ func (s *Store) GetTaskTimeline(ctx context.Context, taskID string, beforeSeq in
 			return err
 		}
 
-		// Board Members
-		bmRows, err := tx.QueryContext(ctx, `
-			SELECT task_id, project_id, member_name, machine_id, adapter, state, last_consumed_seq, current_step, worker_task_id, updated_at
-			FROM board_members
-			WHERE task_id = ?
-			ORDER BY member_name ASC
-		`, taskID)
+		// Board Members (persisted board_members + virtual parent_task_id child tasks)
+		boardMembers, err := listTaskBoardMembersTx(ctx, tx, taskID)
 		if err != nil {
 			return err
 		}
-		defer bmRows.Close()
-		for bmRows.Next() {
-			bm, err := scanBoardMember(bmRows)
-			if err != nil {
-				return err
-			}
-			resp.BoardMembers = append(resp.BoardMembers, bm)
-		}
-		if err := bmRows.Err(); err != nil {
-			return err
-		}
+		resp.BoardMembers = boardMembers
 
 		// Events: fetch newest page via ORDER BY seq DESC LIMIT 500, then reverse to ascending order
 		var evQuery string
@@ -679,20 +687,51 @@ func (s *Store) GetTaskTimeline(ctx context.Context, taskID string, beforeSeq in
 	return resp, err
 }
 
+func extractBoundedPromptText(triggerPayloadJSON string) string {
+	if strings.TrimSpace(triggerPayloadJSON) == "" {
+		return ""
+	}
+	var tp map[string]any
+	if err := json.Unmarshal([]byte(triggerPayloadJSON), &tp); err != nil {
+		return ""
+	}
+	prompt, _ := tp["prompt"].(string)
+	prompt = strings.TrimSpace(prompt)
+	if prompt == "" {
+		prompt, _ = tp["goal"].(string)
+		prompt = strings.TrimSpace(prompt)
+	}
+	return truncatePromptText(prompt)
+}
+
+func truncatePromptText(prompt string) string {
+	prompt = strings.TrimSpace(prompt)
+	if prompt == "" {
+		return ""
+	}
+	const maxRunes = 2000
+	runes := []rune(prompt)
+	if len(runes) > maxRunes {
+		return string(runes[:maxRunes]) + "…"
+	}
+	return prompt
+}
+
 func scanAttemptView(scanner interface{ Scan(...any) error }) (protocol.AttemptView, error) {
 	var a protocol.AttemptView
-	var adapter, trigger, state string
+	var adapter, trigger, triggerPayloadJSON, state string
 	var worktree, baseSHA, outDlv, compSrc, errCode, errDetail sql.NullString
 	var finishedAt sql.NullInt64
 	if err := scanner.Scan(
 		&a.AttemptID, &a.TaskID, &a.ProjectID, &a.AttemptNo, &a.MachineID, &adapter,
-		&trigger, &worktree, &baseSHA, &outDlv,
+		&trigger, &triggerPayloadJSON, &worktree, &baseSHA, &outDlv,
 		&state, &compSrc, &errCode, &errDetail, &a.StartedAt, &finishedAt,
 	); err != nil {
 		return a, err
 	}
 	a.Adapter = protocol.Adapter(adapter)
 	a.TriggerKind = protocol.TriggerKind(trigger)
+	a.PromptText = extractBoundedPromptText(triggerPayloadJSON)
 	a.State = protocol.AttemptState(state)
 	if worktree.Valid {
 		a.WorktreePath = worktree.String
@@ -1158,7 +1197,7 @@ func loadManualImportExisting(ctx context.Context, tx *sql.Tx, taskID, attemptID
 
 	aRow := tx.QueryRowContext(ctx, `
 		SELECT attempt_id, task_id, project_id, attempt_no, machine_id, adapter,
-		       trigger_kind, worktree_path, base_sha, output_delivery_id,
+		       trigger_kind, trigger_payload_json, worktree_path, base_sha, output_delivery_id,
 		       state, completion_source, error_code, error_detail, started_at, finished_at
 		FROM attempts WHERE attempt_id = ?
 	`, attemptID)
