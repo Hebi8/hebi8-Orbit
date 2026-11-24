@@ -2,10 +2,20 @@ import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { ArrowUpRight, FolderGit2, MessagesSquare } from 'lucide-react';
 import type { PAActionResult, PABriefResponse, PAChatResponse, ProjectView } from '../generated/protocol';
 import { api, errMsg } from '../lib/api';
-import { relTime, shortSha, taskDot, taskStateLabel, taskTitle } from '../lib/format';
+import {
+  displayMarkRank,
+  inboxItemsMark,
+  indexInboxByTask,
+  relTime,
+  sessionMark,
+  shortSha,
+  taskTitle,
+  type SessionMark,
+} from '../lib/format';
 import { navigate, paths } from '../lib/router';
 import { toast, useWorkbenchStore } from '../store/useWorkbenchStore';
 import { Md } from './Md';
+import { StatusMark } from './StatusMark';
 
 export function usePAChat(onDone?: (res: PAChatResponse) => void) {
   const qc = useQueryClient();
@@ -56,68 +66,73 @@ export function ActionCards({ actions }: { actions?: PAActionResult[] }) {
   );
 }
 
+interface BriefRow {
+  key: string;
+  taskId?: string;
+  title: string;
+  project: string;
+  mark: SessionMark;
+}
+
 export function BriefView({ brief, projects }: { brief: PABriefResponse; projects: ProjectView[] }) {
   const pname = (pid: string) => projects.find((p) => p.projectId === pid)?.displayName ?? pid;
   const openReview = useWorkbenchStore((s) => s.openReview);
-  const attentionItems = brief.openInboxItems.slice(0, 6);
-  const runningTasks = brief.activeTasks.slice(0, 6);
-  const blockedTasks = brief.blockedTasks.filter((t) => !attentionItems.some((it) => it.taskId === t.taskId)).slice(0, 6);
+
+  const inboxByTask = indexInboxByTask(brief.openInboxItems);
+  const seen = new Set<string>();
+  const rows: BriefRow[] = [];
+
+  for (const t of [...brief.blockedTasks, ...brief.activeTasks]) {
+    if (seen.has(t.taskId)) continue;
+    const mark = sessionMark(t, inboxByTask.get(t.taskId));
+    if (!mark) continue;
+    seen.add(t.taskId);
+    rows.push({ key: t.taskId, taskId: t.taskId, title: taskTitle(t), project: pname(t.projectId), mark });
+  }
+  for (const it of brief.openInboxItems) {
+    const key = it.taskId || it.inboxId;
+    if (seen.has(key)) continue;
+    const mark = inboxItemsMark([it]);
+    if (!mark) continue;
+    seen.add(key);
+    rows.push({ key, taskId: it.taskId, title: it.title, project: pname(it.projectId), mark });
+  }
+  rows.sort((a, b) => displayMarkRank(a.mark) - displayMarkRank(b.mark));
 
   return (
     <div className="brief">
       <Md text={brief.summary} />
-      {(attentionItems.length > 0 || blockedTasks.length > 0) && (
-        <>
-          <h5>需要注意</h5>
-          <ul>
-            {attentionItems.map((it) => (
-              <li key={it.inboxId}>
-                <span className="sd wait" />
-                <button type="button" className="lk" onClick={() => navigate(it.taskId ? paths.session(it.taskId) : paths.home())}>
-                  {it.title}
-                </button>
-                <span className="faint ell">{pname(it.projectId)}</span>
-              </li>
-            ))}
-            {blockedTasks.map((t) => (
-              <li key={t.taskId}>
-                <span className="sd wait" />
-                <button type="button" className="lk" onClick={() => navigate(paths.session(t.taskId))}>
-                  {taskTitle(t)}
-                </button>
-                <span className="faint ell">{pname(t.projectId)}</span>
-              </li>
-            ))}
-          </ul>
-        </>
-      )}
-      {runningTasks.length > 0 && (
-        <>
-          <h5>运行中</h5>
-          <ul>
-            {runningTasks.map((t) => (
-              <li key={t.taskId}>
-                <span className={`sd ${taskDot(t.state, t.activeAttemptState)}`} />
-                <button type="button" className="lk" onClick={() => navigate(paths.session(t.taskId))}>
-                  {taskTitle(t)}
-                </button>
-                <span className="faint ell">{taskStateLabel(t)}</span>
-              </li>
-            ))}
-          </ul>
-        </>
+      {rows.length > 0 && (
+        <ul>
+          {rows.slice(0, 10).map((r) => (
+            <li key={r.key}>
+              <button
+                type="button"
+                className="lk"
+                onClick={() => navigate(r.taskId ? paths.session(r.taskId) : paths.home())}
+              >
+                {r.title}
+              </button>
+              <span className="faint ell">{r.project}</span>
+              <span style={{ marginLeft: 'auto', flex: 'none' }}>
+                <StatusMark mark={r.mark} />
+              </span>
+            </li>
+          ))}
+        </ul>
       )}
       {brief.recentDeliveries.length > 0 && (
         <>
-          <h5>近期产出</h5>
+          <h5>新产出</h5>
           <ul>
             {brief.recentDeliveries.slice(0, 5).map((d) => (
               <li key={d.deliveryId}>
-                <span className="sd done" />
                 <button type="button" className="lk" onClick={() => openReview('code', d.taskId, d.deliveryId)}>
                   {d.summary || shortSha(d.headSha)}
                 </button>
-                <span className="faint">{relTime(d.createdAt)}</span>
+                <span className="faint" style={{ marginLeft: 'auto', flex: 'none' }}>
+                  {relTime(d.createdAt)}
+                </span>
               </li>
             ))}
           </ul>

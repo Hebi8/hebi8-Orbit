@@ -8,9 +8,9 @@ import type {
   TaskSourceKind,
   TaskTimelineResponse,
 } from '../generated/protocol';
-import { ArtIcon, BranchIcon, CursorIcon, SwarmIcon } from '../components/Icons';
+import { ArtIcon, CursorIcon, DiffIcon, SwarmIcon } from '../components/Icons';
 import { api, errMsg } from '../lib/api';
-import { basename, memberDot, memberStateLabel, shortSha } from '../lib/format';
+import { basename, memberDot, memberStateLabel } from '../lib/format';
 import { buildIDEJump, launchIDE } from '../lib/ide';
 import { navigate, paths } from '../lib/router';
 import { toast, useWorkbenchStore } from '../store/useWorkbenchStore';
@@ -23,7 +23,7 @@ function SourceIcon({ kind }: { kind: TaskSourceKind }) {
   return <FileText size={13} strokeWidth={1.6} className="faint" />;
 }
 
-/** Codex-Desktop-style compact floating card: every block appears only when it has real data. */
+/** Compact floating context card: blocks appear only when backed by real data. */
 export function RightCard({
   tl,
   project,
@@ -75,30 +75,27 @@ export function RightCard({
     latestCode && project
       ? buildIDEJump({ scheme: project.ideScheme, localMachineId, delivery: latestCode, project, machines })
       : null;
-  const branchLabel = latestCode ? basename(latestCode.manifest.worktreePath) || latestCode.gitRef.split('/').pop() || 'worktree' : '';
 
   return (
     <aside className="fcard" aria-label="会话上下文">
       {latestCode && (
         <div className="fsec">
-          <div className="fsec-h">
-            Changes
-            <span className="r mono">v{formalCodeDeliveries.length}</span>
-          </div>
+          <div className="fsec-h">改动</div>
           <div
             className="frow"
             role="button"
             tabIndex={0}
             onClick={() => openReview('code', taskId, latestCode.deliveryId)}
             onKeyDown={(e) => e.key === 'Enter' && openReview('code', taskId, latestCode.deliveryId)}
-            title="打开产出审阅"
+            title="打开代码审阅"
           >
-            <BranchIcon size={13} />
-            <span className="ell mono" style={{ flex: 1 }}>
-              {branchLabel} · {shortSha(latestCode.headSha)}
+            <DiffIcon size={13} />
+            <span className="ell" style={{ flex: 1 }}>
+              {latestCode.manifest.filesChanged} 个文件
             </span>
             <span className="fx mono hide-on-hover">
-              <span className="add">+{latestCode.manifest.insertions}</span> <span className="del">−{latestCode.manifest.deletions}</span>
+              <span className="add">+{latestCode.manifest.insertions}</span>{' '}
+              <span className="del">−{latestCode.manifest.deletions}</span>
             </span>
             {ide && (
               <button
@@ -114,13 +111,12 @@ export function RightCard({
               </button>
             )}
           </div>
-          <div className="fsub">{latestCode.manifest.filesChanged} 个文件</div>
         </div>
       )}
 
       {artDelivery && (
         <div className="fsec">
-          <div className="fsec-h">Artifacts</div>
+          <div className="fsec-h">设计稿</div>
           {(artDelivery.ryugiBindings ?? []).map((b) => (
             <button
               type="button"
@@ -140,7 +136,7 @@ export function RightCard({
 
       {showWorkers && (
         <div className="fsec">
-          <div className="fsec-h">Workers</div>
+          <div className="fsec-h">协作</div>
           {members.map((m) => (
             <button
               type="button"
@@ -157,70 +153,79 @@ export function RightCard({
           ))}
           {members.length === 0 && <div className="fsub">有协作子任务</div>}
           <button type="button" className="flink" onClick={onOpenBoard}>
-            <SwarmIcon size={12} /> 打开消息板 →
+            <SwarmIcon size={12} /> 消息板 →
           </button>
         </div>
       )}
 
-      <div className="fsec">
-        <div className="fsec-h">
-          Sources
-          <span className="r">
-            <button type="button" className="ib" title="添加 Source" onClick={() => setAdding(!adding)}>
-              <Plus size={12} strokeWidth={1.6} />
-            </button>
-          </span>
-        </div>
-        {tl.sources.length === 0 && !adding && <div className="fsub">挂载参考文件、链接或 nmem 记忆</div>}
-        {tl.sources.map((s) => (
-          <div className="frow" key={s.sourceId} title={s.uriOrRef}>
-            <SourceIcon kind={s.kind} />
-            {s.kind === 'link' && /^https?:\/\//.test(s.uriOrRef) ? (
-              <a className="ell" style={{ flex: 1 }} href={s.uriOrRef} target="_blank" rel="noopener noreferrer">
-                {s.label}
-              </a>
-            ) : (
-              <span className="ell" style={{ flex: 1 }}>
-                {s.label}
-              </span>
-            )}
-            <button type="button" className="ib hov" title="移除" disabled={delSrc.isPending} onClick={() => delSrc.mutate(s.sourceId)}>
-              <X size={12} strokeWidth={1.6} />
-            </button>
-          </div>
-        ))}
-        {adding && (
-          <form
-            className="srcform"
-            onSubmit={(e) => {
-              e.preventDefault();
-              if (uri.trim()) addSrc.mutate();
-            }}
-          >
-            <select className="field" value={kind} onChange={(e) => setKind(e.target.value as TaskSourceKind)}>
-              <option value="link">链接</option>
-              <option value="file">文件</option>
-              <option value="nmem">nmem 记忆</option>
-            </select>
-            <input className="field" placeholder="标题（可选）" value={label} onChange={(e) => setLabel(e.target.value)} />
-            <input
-              className="field"
-              placeholder={kind === 'link' ? 'https://…' : kind === 'file' ? '仓库内路径' : 'nmem 引用'}
-              value={uri}
-              onChange={(e) => setUri(e.target.value)}
-              autoFocus
-            />
-            <div className="row">
-              <button type="button" className="btn ghost" onClick={() => setAdding(false)}>
-                取消
+      {(tl.sources.length > 0 || adding) && (
+        <div className="fsec">
+          <div className="fsec-h">
+            参考
+            <span className="r">
+              <button type="button" className="ib" title="添加参考" onClick={() => setAdding(!adding)}>
+                <Plus size={12} strokeWidth={1.6} />
               </button>
-              <button type="submit" className="btn pri" disabled={!uri.trim() || addSrc.isPending}>
-                添加
+            </span>
+          </div>
+          {tl.sources.map((s) => (
+            <div className="frow" key={s.sourceId} title={s.uriOrRef}>
+              <SourceIcon kind={s.kind} />
+              {s.kind === 'link' && /^https?:\/\//.test(s.uriOrRef) ? (
+                <a className="ell" style={{ flex: 1 }} href={s.uriOrRef} target="_blank" rel="noopener noreferrer">
+                  {s.label}
+                </a>
+              ) : (
+                <span className="ell" style={{ flex: 1 }}>
+                  {s.label}
+                </span>
+              )}
+              <button type="button" className="ib hov" title="移除" disabled={delSrc.isPending} onClick={() => delSrc.mutate(s.sourceId)}>
+                <X size={12} strokeWidth={1.6} />
               </button>
             </div>
-          </form>
-        )}
-      </div>
+          ))}
+          {adding && (
+            <form
+              className="srcform"
+              onSubmit={(e) => {
+                e.preventDefault();
+                if (uri.trim()) addSrc.mutate();
+              }}
+            >
+              <select className="field" value={kind} onChange={(e) => setKind(e.target.value as TaskSourceKind)}>
+                <option value="link">链接</option>
+                <option value="file">文件</option>
+                <option value="nmem">nmem 记忆</option>
+              </select>
+              <input className="field" placeholder="标题（可选）" value={label} onChange={(e) => setLabel(e.target.value)} />
+              <input
+                className="field"
+                placeholder={kind === 'link' ? 'https://…' : kind === 'file' ? '仓库内路径' : 'nmem 引用'}
+                value={uri}
+                onChange={(e) => setUri(e.target.value)}
+                autoFocus
+              />
+              <div className="row">
+                <button type="button" className="btn ghost" onClick={() => setAdding(false)}>
+                  取消
+                </button>
+                <button type="submit" className="btn pri" disabled={!uri.trim() || addSrc.isPending}>
+                  添加
+                </button>
+              </div>
+            </form>
+          )}
+        </div>
+      )}
+
+      {tl.sources.length === 0 && !adding && (
+        <div className="fsec fsec-add">
+          <button type="button" className="flink faint" onClick={() => setAdding(true)}>
+            <Plus size={12} strokeWidth={1.6} /> 参考
+          </button>
+        </div>
+      )}
     </aside>
   );
 }

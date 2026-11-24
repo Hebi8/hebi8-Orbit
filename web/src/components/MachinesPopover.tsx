@@ -1,42 +1,39 @@
-import { X } from 'lucide-react';
+import { CircleAlert } from 'lucide-react';
 import type { MachineView } from '../generated/protocol';
 import { useHubLatency } from '../hooks/useHubLatency';
-import { relTime } from '../lib/format';
+import { humanResourceLabel, relTime } from '../lib/format';
 import { useWorkbenchStore } from '../store/useWorkbenchStore';
 
 const OK_RESOURCE_STATES = new Set(['free', 'available', 'ok', 'idle', 'ready', 'unlocked', 'online']);
 
-function MachineBlock({ m, latency }: { m: MachineView; latency?: number | null }) {
+function MachineBlock({ m, latency, isCurrent }: { m: MachineView; latency?: number | null; isCurrent?: boolean }) {
   const res = Object.entries(m.resources ?? {});
   const busyRes = res.filter(([, v]) => !OK_RESOURCE_STATES.has((v.state || '').toLowerCase()));
+  const unreachable = (isCurrent && latency === null) || m.status === 'offline';
+  const degraded = !unreachable && m.status === 'degraded';
+
+  const statusText = unreachable
+    ? `未连接${m.lastSeenAt ? ` · ${relTime(m.lastSeenAt)}见过` : ''}`
+    : degraded
+      ? `降级${m.lastSeenAt ? ` · ${relTime(m.lastSeenAt)}` : ''}`
+      : typeof latency === 'number'
+        ? `${latency} ms`
+        : '在线';
+
   return (
     <div className="mrow">
       <div className="h">
-        <span className={`sd ${m.status === 'online' ? 'on' : m.status === 'degraded' ? 'wait' : ''}`} />
-        <b className="ell">{m.displayName}</b>
-        <span className="r">
-          {m.status === 'online' ? '在线' : m.status === 'degraded' ? '降级' : '离线'}
-          {typeof latency === 'number' ? ` · ${latency} ms` : m.lastSeenAt ? ` · ${relTime(m.lastSeenAt)}` : ''}
-        </span>
+        <b className="ell" title={m.runnerVersion ? `Runner ${m.runnerVersion}` : undefined}>
+          {m.displayName}
+        </b>
+        <span className={`r ${unreachable ? 'bad-t' : degraded ? 'warn-t' : ''}`}>{statusText}</span>
       </div>
-      {(m.runnerVersion || busyRes.length > 0) && (
-        <div className="locks">
-          {m.runnerVersion && (
-            <>
-              <span className="k">Runner</span>
-              <span className="mono">{m.runnerVersion}</span>
-            </>
-          )}
+      {busyRes.length > 0 && (
+        <div className="mbusy">
           {busyRes.map(([k, v]) => (
-            <span key={k} style={{ display: 'contents' }}>
-              <span className="k mono" title={k}>
-                {k}
-              </span>
-              <span className="w">
-                {v.state}
-                {v.reason ? ` · ${v.reason}` : ''}
-              </span>
-            </span>
+            <div key={k} className="mbusy-i" title={`${k}: ${v.state}`}>
+              {humanResourceLabel(k, v.state, v.reason)}
+            </div>
           ))}
         </div>
       )}
@@ -55,45 +52,63 @@ export function MachinesPopover({ machines }: { machines: MachineView[] }) {
     machines.find((m) => m.machineId === localMachineId) ??
     machines[0];
   const others = currentHost ? machines.filter((m) => m.machineId !== currentHost.machineId) : [];
+  const otherIssue = others.some((m) => m.status !== 'online');
 
   return (
     <>
-      <div className="scrim" style={{ background: 'transparent', backdropFilter: 'none', zIndex: 54 }} onClick={() => setOpen(false)} />
-      <section className="pop mach" style={{ left: 10, bottom: 48, width: 310, maxHeight: 'calc(100vh - 80px)' }} role="dialog" aria-label="当前主机">
-        <div className="pop-h">
-          <span className="t">当前主机</span>
-          <button type="button" className="ib" title="关闭 (Esc)" onClick={() => setOpen(false)}>
-            <X size={14} strokeWidth={1.6} />
-          </button>
-        </div>
+      <div
+        className="scrim"
+        style={{ background: 'transparent', backdropFilter: 'none', zIndex: 54 }}
+        onClick={() => setOpen(false)}
+      />
+      <section
+        className="pop mach"
+        style={{ left: 10, bottom: 44, width: 292, maxHeight: 'calc(100vh - 80px)' }}
+        role="dialog"
+        aria-label="主机连接状态"
+      >
         <div className="pop-b">
           {currentHost ? (
-            <MachineBlock m={currentHost} latency={latency} />
+            <MachineBlock m={currentHost} latency={latency} isCurrent />
           ) : (
             <div className="mrow faint">未检测到主机</div>
           )}
-          {machines.length > 0 && (
-            <div className="mrow">
-              <div className="locks" style={{ marginTop: 0, alignItems: 'center' }}>
-                <span className="k">本机 IDE</span>
-                <select className="field" value={localMachineId} onChange={(e) => setLocal(e.target.value)} style={{ height: 26, padding: '0 22px 0 8px' }}>
-                  <option value="">自动（SSH Remote）</option>
-                  {machines.map((m) => (
-                    <option key={m.machineId} value={m.machineId}>
-                      {m.machineId}
-                    </option>
-                  ))}
-                </select>
-              </div>
-            </div>
-          )}
           {others.length > 0 && (
             <details className="m-others">
-              <summary>其他节点</summary>
+              <summary>
+                <span>其他节点</span>
+                {otherIssue && (
+                  <CircleAlert
+                    size={12}
+                    strokeWidth={2}
+                    className="warn-t"
+                    style={{ marginLeft: 6 }}
+                    aria-label="有节点异常"
+                  />
+                )}
+              </summary>
               {others.map((m) => (
                 <MachineBlock key={m.machineId} m={m} />
               ))}
             </details>
+          )}
+          {machines.length > 0 && (
+            <div className="mrow m-ide">
+              <span className="faint">Cursor 打开方式</span>
+              <select
+                className="field"
+                value={localMachineId}
+                onChange={(e) => setLocal(e.target.value)}
+                aria-label="Cursor 打开方式"
+              >
+                <option value="">自动（SSH Remote）</option>
+                {machines.map((m) => (
+                  <option key={m.machineId} value={m.machineId}>
+                    {m.displayName || m.machineId}
+                  </option>
+                ))}
+              </select>
+            </div>
           )}
         </div>
       </section>

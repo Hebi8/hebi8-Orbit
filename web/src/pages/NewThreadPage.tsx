@@ -22,7 +22,6 @@ export function NewThreadPage({ boot, mode, projectId }: { boot: BootstrapRespon
   const [m, setM] = useState<NewMode>(mode ?? (projects.length ? 'project' : 'chat'));
   const [pid, setPid] = useState<string>(projectId ?? projects[0]?.projectId ?? '');
   const [text, setText] = useState('');
-  const [paTarget, setPaTarget] = useState<'continue' | 'new'>('continue');
   const [adapter, setAdapter] = useState<string>('');
   const [model, setModel] = useState('');
   const [advOpen, setAdvOpen] = useState(false);
@@ -65,12 +64,8 @@ export function NewThreadPage({ boot, mode, projectId }: { boot: BootstrapRespon
     mutationFn: async () => {
       const goal = text.trim();
       if (m === 'pa') {
-        let threadId = boot.paState.activePaThreadId || undefined;
-        if (paTarget === 'new' || !threadId) {
-          const created = await api.createPAThread();
-          threadId = created.thread.paThreadId;
-        }
-        const res = await api.paChat({ threadId, message: goal });
+        const created = await api.createPAThread();
+        const res = await api.paChat({ threadId: created.thread.paThreadId, message: goal });
         return { kind: 'pa' as const, id: res.thread.paThreadId };
       }
       const req: CreateTaskRequest = { goal };
@@ -106,12 +101,7 @@ export function NewThreadPage({ boot, mode, projectId }: { boot: BootstrapRespon
 
   const canSend = !!text.trim() && !submit.isPending && (m !== 'project' || !!pid);
   const send = () => canSend && submit.mutate();
-  const placeholder =
-    m === 'pa'
-      ? '问 PA：今天的安排、项目进展，或让它帮你起草任务…'
-      : m === 'chat'
-        ? '随便聊聊或调研点什么…'
-        : '描述你的目标，或直接粘贴需求…';
+  const placeholder = m === 'pa' ? '问点什么…' : m === 'chat' ? '想聊什么…' : '要做什么…';
 
   return (
     <main className="main">
@@ -120,7 +110,6 @@ export function NewThreadPage({ boot, mode, projectId }: { boot: BootstrapRespon
       </PageHeader>
       <div className="page-scroll">
         <div className="nt-wrap">
-          <h2>新建线程</h2>
           {/* Fixed labels & geometry: switching tabs never shifts button positions. */}
           <div className="pills" role="tablist" aria-label="线程类型">
             <button type="button" role="tab" aria-selected={m === 'pa'} className={`pill ${m === 'pa' ? 'on' : ''}`} onClick={() => setM('pa')}>
@@ -155,16 +144,6 @@ export function NewThreadPage({ boot, mode, projectId }: { boot: BootstrapRespon
               aria-label="线程目标"
             />
             <div className="cv-foot">
-              {m === 'pa' && (
-                <div className="seg">
-                  <button type="button" className={paTarget === 'continue' ? 'on' : ''} onClick={() => setPaTarget('continue')}>
-                    续聊当前 PA
-                  </button>
-                  <button type="button" className={paTarget === 'new' ? 'on' : ''} onClick={() => setPaTarget('new')}>
-                    新开 PA 线
-                  </button>
-                </div>
-              )}
               {m === 'project' && (
                 <select className="field" value={pid} onChange={(e) => setPid(e.target.value)} aria-label="项目">
                   {projects.map((p) => (
@@ -175,19 +154,6 @@ export function NewThreadPage({ boot, mode, projectId }: { boot: BootstrapRespon
                 </select>
               )}
               {m !== 'pa' && (
-                <>
-                  <select className="field" value={adapter} onChange={(e) => setAdapter(e.target.value)} aria-label="Agent">
-                    <option value="">{m === 'project' && project ? `默认 · ${project.defaultAdapter}` : `默认 · ${availableAdapters[0]}`}</option>
-                    {availableAdapters.map((a) => (
-                      <option key={a} value={a}>
-                        {a}
-                      </option>
-                    ))}
-                  </select>
-                  <input className="field" value={model} onChange={(e) => setModel(e.target.value)} placeholder="模型（默认）" aria-label="模型" />
-                </>
-              )}
-              {m === 'project' && (
                 <button type="button" className={`btn ghost ${advOpen ? 'on' : ''}`} onClick={() => setAdvOpen(!advOpen)}>
                   <Settings2 size={13} strokeWidth={1.6} /> 高级
                 </button>
@@ -195,65 +161,80 @@ export function NewThreadPage({ boot, mode, projectId }: { boot: BootstrapRespon
               <span className="sp">
                 <button type="button" className="cbtn pri" disabled={!canSend} onClick={send}>
                   {submit.isPending ? <span className="spin" /> : null}
-                  {m === 'pa' ? '发送' : '开始'} <span className="kb">↵</span>
+                  开始 <span className="kb">↵</span>
                 </button>
               </span>
             </div>
-            {m === 'project' && advOpen && project && (
+            {m !== 'pa' && advOpen && (
               <div className="adv">
-                <span>运行环境</span>
-                <select className="field" value={capability} onChange={(e) => setCapability(e.target.value)}>
-                  <option value="">默认 · {project.defaultCapability}</option>
-                  {Object.entries(project.anchors).map(([cap, a]) => (
-                    <option key={cap} value={cap}>
-                      {cap} · {a.machine}
+                <span>Agent</span>
+                <select className="field" value={adapter} onChange={(e) => setAdapter(e.target.value)} aria-label="Agent">
+                  <option value="">{m === 'project' && project ? `默认 · ${project.defaultAdapter}` : `默认 · ${availableAdapters[0]}`}</option>
+                  {availableAdapters.map((a) => (
+                    <option key={a} value={a}>
+                      {a}
                     </option>
                   ))}
                 </select>
-                <span>工作区</span>
-                <label className="chk">
-                  <input type="checkbox" checked={importDirty} onChange={(e) => setImportDirty(e.target.checked)} />
-                  带入当前未提交改动
-                </label>
-                <span style={{ alignSelf: 'start', paddingTop: 6 }}>参考 Sources</span>
-                <div className="srcs">
-                  {sources.map((s) => (
-                    <div className="r" key={s.key}>
-                      <select
-                        className="field"
-                        value={s.kind}
-                        onChange={(e) => setSources((xs) => xs.map((x) => (x.key === s.key ? { ...x, kind: e.target.value as TaskSourceKind } : x)))}
+                <span>模型</span>
+                <input className="field" value={model} onChange={(e) => setModel(e.target.value)} placeholder="默认" aria-label="模型" />
+                {m === 'project' && project && (
+                  <>
+                    <span>运行环境</span>
+                    <select className="field" value={capability} onChange={(e) => setCapability(e.target.value)}>
+                      <option value="">默认 · {project.defaultCapability}</option>
+                      {Object.entries(project.anchors).map(([cap, a]) => (
+                        <option key={cap} value={cap}>
+                          {cap} · {a.machine}
+                        </option>
+                      ))}
+                    </select>
+                    <span>工作区</span>
+                    <label className="chk">
+                      <input type="checkbox" checked={importDirty} onChange={(e) => setImportDirty(e.target.checked)} />
+                      带入当前未提交改动
+                    </label>
+                    <span style={{ alignSelf: 'start', paddingTop: 6 }}>参考</span>
+                    <div className="srcs">
+                      {sources.map((s) => (
+                        <div className="r" key={s.key}>
+                          <select
+                            className="field"
+                            value={s.kind}
+                            onChange={(e) => setSources((xs) => xs.map((x) => (x.key === s.key ? { ...x, kind: e.target.value as TaskSourceKind } : x)))}
+                          >
+                            <option value="link">链接</option>
+                            <option value="file">文件</option>
+                            <option value="nmem">nmem</option>
+                          </select>
+                          <input
+                            className="field lbl-in"
+                            placeholder="标题"
+                            value={s.label}
+                            onChange={(e) => setSources((xs) => xs.map((x) => (x.key === s.key ? { ...x, label: e.target.value } : x)))}
+                          />
+                          <input
+                            className="field"
+                            placeholder={s.kind === 'link' ? 'https://…' : s.kind === 'file' ? '仓库内路径' : 'nmem 引用'}
+                            value={s.uriOrRef}
+                            onChange={(e) => setSources((xs) => xs.map((x) => (x.key === s.key ? { ...x, uriOrRef: e.target.value } : x)))}
+                          />
+                          <button type="button" className="ib" title="移除" onClick={() => setSources((xs) => xs.filter((x) => x.key !== s.key))}>
+                            <X size={13} strokeWidth={1.6} />
+                          </button>
+                        </div>
+                      ))}
+                      <button
+                        type="button"
+                        className="btn ghost"
+                        style={{ alignSelf: 'flex-start' }}
+                        onClick={() => setSources((xs) => [...xs, { key: ++srcKey, kind: 'link', label: '', uriOrRef: '' }])}
                       >
-                        <option value="link">链接</option>
-                        <option value="file">文件</option>
-                        <option value="nmem">nmem</option>
-                      </select>
-                      <input
-                        className="field lbl-in"
-                        placeholder="标题"
-                        value={s.label}
-                        onChange={(e) => setSources((xs) => xs.map((x) => (x.key === s.key ? { ...x, label: e.target.value } : x)))}
-                      />
-                      <input
-                        className="field"
-                        placeholder={s.kind === 'link' ? 'https://…' : s.kind === 'file' ? '仓库内路径' : 'nmem 引用'}
-                        value={s.uriOrRef}
-                        onChange={(e) => setSources((xs) => xs.map((x) => (x.key === s.key ? { ...x, uriOrRef: e.target.value } : x)))}
-                      />
-                      <button type="button" className="ib" title="移除" onClick={() => setSources((xs) => xs.filter((x) => x.key !== s.key))}>
-                        <X size={13} strokeWidth={1.6} />
+                        <Plus size={13} strokeWidth={1.6} /> 添加参考
                       </button>
                     </div>
-                  ))}
-                  <button
-                    type="button"
-                    className="btn ghost"
-                    style={{ alignSelf: 'flex-start' }}
-                    onClick={() => setSources((xs) => [...xs, { key: ++srcKey, kind: 'link', label: '', uriOrRef: '' }])}
-                  >
-                    <Plus size={13} strokeWidth={1.6} /> 添加 Source
-                  </button>
-                </div>
+                  </>
+                )}
               </div>
             )}
           </div>

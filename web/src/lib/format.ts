@@ -4,8 +4,6 @@ import type {
   BoardMemberState,
   InboxItemView,
   PendingInputSource,
-  ProjectView,
-  TaskState,
   TaskSummary,
   TriggerKind,
 } from '../generated/protocol';
@@ -38,74 +36,158 @@ export function relTime(ts?: number | null): string {
   return `${d.getMonth() + 1}-${String(d.getDate()).padStart(2, '0')}`;
 }
 
-export function todayLabel(): { greet: string; date: string } {
-  const d = new Date();
-  const h = d.getHours();
-  const greet = h < 5 ? '夜深了' : h < 11 ? '早上好' : h < 14 ? '中午好' : h < 18 ? '下午好' : '晚上好';
-  const date = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-  return { greet, date };
+/**
+ * Low-stimulus 5-state single-channel session mark:
+ *   failed > needs-you > running > ready > null (resting/quiet = blank).
+ * Never rendered as visible status prose; hint text is strictly for title / aria-label.
+ */
+export type SessionMark = 'failed' | 'needs-you' | 'running' | 'ready' | null;
+
+const ROLLUP_RANK: Record<Exclude<SessionMark, null>, number> = {
+  failed: 0,
+  'needs-you': 1,
+  running: 2,
+  ready: 3,
+};
+
+/** Display sort order on Home & Project lists: actionable marks above hairline, running below, resting last. */
+export function displayMarkRank(m: SessionMark): number {
+  switch (m) {
+    case 'failed':
+      return 0;
+    case 'needs-you':
+      return 1;
+    case 'ready':
+      return 2;
+    case 'running':
+      return 3;
+    default:
+      return 4;
+  }
 }
 
-export type SimpleSessionState = 'attention' | 'running' | 'finished';
-
-/**
- * Low-stimulus 3-state session rollup:
- *   attention (需要注意) > running (运行中) > finished (已结束).
- * Mirrors Lody LAN fork's low-stimulus model: one row, one mark, no count bombardment.
- */
-export function taskSimpleState(
-  t: Pick<TaskSummary, 'state' | 'activeAttemptState'>,
-  hasOpenInbox = false,
-): SimpleSessionState {
-  if (
-    hasOpenInbox ||
-    t.activeAttemptState === 'needs_verification' ||
-    t.state === 'waiting_approval' ||
-    t.state === 'waiting_resource' ||
-    t.state === 'in_review' ||
-    t.state === 'failed'
-  ) {
-    return 'attention';
+export function indexInboxByTask(items: readonly InboxItemView[]): Map<string, InboxItemView[]> {
+  const map = new Map<string, InboxItemView[]>();
+  for (const it of items) {
+    if (!it.taskId) continue;
+    const list = map.get(it.taskId);
+    if (list) list.push(it);
+    else map.set(it.taskId, [it]);
   }
-  if (t.state === 'running' || t.state === 'queued') {
+  return map;
+}
+
+export function inboxItemsMark(items?: readonly InboxItemView[]): SessionMark {
+  if (!items || items.length === 0) return null;
+  let best: SessionMark = null;
+  for (const it of items) {
+    let m: SessionMark = null;
+    if (it.category === 'approval_pending' || it.category === 'memory_conflict' || it.category === 'task_blocked') {
+      m = 'needs-you';
+    } else if (it.category === 'delivery_review') {
+      m = 'ready';
+    }
+    best = mergeSessionMarks(best, m);
+  }
+  return best;
+}
+
+export function sessionMark(
+  t: Pick<TaskSummary, 'state' | 'activeAttemptState'>,
+  inboxItems?: readonly InboxItemView[],
+): SessionMark {
+  if (
+    t.state === 'failed' ||
+    t.activeAttemptState === 'failed' ||
+    t.activeAttemptState === 'expired'
+  ) {
+    return 'failed';
+  }
+  const hasApprovalOrBlock = inboxItems?.some(
+    (it) => it.category === 'approval_pending' || it.category === 'task_blocked' || it.category === 'memory_conflict',
+  );
+  if (
+    hasApprovalOrBlock ||
+    t.state === 'waiting_approval' ||
+    t.activeAttemptState === 'waiting_approval' ||
+    t.activeAttemptState === 'needs_verification'
+  ) {
+    return 'needs-you';
+  }
+  if (
+    t.state === 'running' ||
+    t.state === 'queued' ||
+    t.state === 'waiting_resource' ||
+    t.activeAttemptState === 'leased' ||
+    t.activeAttemptState === 'preparing' ||
+    t.activeAttemptState === 'waiting_resource' ||
+    t.activeAttemptState === 'running' ||
+    t.activeAttemptState === 'swarm_monitoring'
+  ) {
     return 'running';
   }
-  return 'finished';
-}
-
-export function taskSimpleLabel(s: SimpleSessionState): string {
-  if (s === 'attention') return '需要注意';
-  if (s === 'running') return '运行中';
-  return '已结束';
-}
-
-export function taskSimpleDot(s: SimpleSessionState): string {
-  if (s === 'attention') return 'wait';
-  if (s === 'running') return 'run';
-  return 'done';
-}
-
-export function attentionTaskIds(items: InboxItemView[]): Set<string> {
-  const set = new Set<string>();
-  for (const it of items) {
-    if (it.taskId) set.add(it.taskId);
+  if (t.state === 'in_review' || inboxItems?.some((it) => it.category === 'delivery_review')) {
+    return 'ready';
   }
-  return set;
+  return null;
 }
 
-export function taskDot(state: TaskState, attemptState?: AttemptState | null, hasOpenInbox = false): string {
-  return taskSimpleDot(taskSimpleState({ state, activeAttemptState: attemptState }, hasOpenInbox));
+export function mergeSessionMarks(...marks: SessionMark[]): SessionMark {
+  let best: SessionMark = null;
+  for (const m of marks) {
+    if (!m) continue;
+    if (!best || ROLLUP_RANK[m] < ROLLUP_RANK[best]) best = m;
+  }
+  return best;
 }
 
-export function taskStateLabel(
-  t: Pick<TaskSummary, 'state' | 'activeAttemptState' | 'waitingReason'>,
-  hasOpenInbox = false,
-): string {
-  return taskSimpleLabel(taskSimpleState(t, hasOpenInbox));
+/** Rolls hidden child-task marks up onto their root thread so each root row draws at most one mark. */
+export function rootSessionMark(
+  root: TaskSummary,
+  allTasks: readonly TaskSummary[],
+  inboxByTask: ReadonlyMap<string, InboxItemView[]>,
+): SessionMark {
+  let best = sessionMark(root, inboxByTask.get(root.taskId));
+  for (const child of allTasks) {
+    if (child.parentTaskId === root.taskId) {
+      best = mergeSessionMarks(best, sessionMark(child, inboxByTask.get(child.taskId)));
+    }
+  }
+  return best;
 }
 
-export function isTaskActive(t: Pick<TaskSummary, 'state'>): boolean {
-  return t.state === 'queued' || t.state === 'running' || t.state === 'waiting_resource' || t.state === 'waiting_approval';
+/** Strictly for `title` / `aria-label` tooltips — never rendered inline in visible prose. */
+export function sessionMarkHint(m: SessionMark): string {
+  switch (m) {
+    case 'failed':
+      return '出错了';
+    case 'needs-you':
+      return '等你确认';
+    case 'running':
+      return '进行中';
+    case 'ready':
+      return '有新产出';
+    default:
+      return '';
+  }
+}
+
+/** Mobile tab dot lights up ONLY for urgent human intervention (`failed` or `needs-you`). */
+export function hasUrgentSession(
+  inboxItems: readonly InboxItemView[],
+  activeTasks: readonly TaskSummary[],
+): boolean {
+  const byTask = indexInboxByTask(inboxItems);
+  for (const t of activeTasks) {
+    const m = sessionMark(t, byTask.get(t.taskId));
+    if (m === 'failed' || m === 'needs-you') return true;
+  }
+  for (const it of inboxItems) {
+    if (it.category === 'approval_pending' || it.category === 'task_blocked' || it.category === 'memory_conflict') {
+      return true;
+    }
+  }
+  return false;
 }
 
 export function isTaskBusy(t: Pick<TaskSummary, 'activeAttemptId'>): boolean {
@@ -114,17 +196,17 @@ export function isTaskBusy(t: Pick<TaskSummary, 'activeAttemptId'>): boolean {
 
 export function attemptStateLabel(s: AttemptState): string {
   const m: Record<AttemptState, string> = {
-    leased: '已派发',
+    leased: '准备中',
     preparing: '准备工作区',
     waiting_resource: '等待资源',
-    running: '运行中',
-    swarm_monitoring: 'Swarm 监控中',
-    waiting_approval: '等待审批',
+    running: '进行中',
+    swarm_monitoring: '协作进行中',
+    waiting_approval: '等你确认',
     succeeded: '完成',
-    needs_verification: '中断 · 待核对',
-    failed: '失败',
+    needs_verification: '中途中断',
+    failed: '出错了',
     expired: '已过期',
-    cancelled: '已取消',
+    cancelled: '已停止',
   };
   return m[s] ?? s;
 }
@@ -156,8 +238,8 @@ export function triggerLabel(k: TriggerKind): string {
 export function sourceLabel(s: PendingInputSource): string {
   const m: Record<PendingInputSource, string> = {
     human: '你',
-    diff_drawer: 'Code Review',
-    ryugi: 'Ryugi',
+    diff_drawer: '批注',
+    ryugi: '批注',
     pa: 'PA',
     system: '系统',
   };
@@ -166,7 +248,7 @@ export function sourceLabel(s: PendingInputSource): string {
 
 export function approvalStateLabel(s: ApprovalState): string {
   const m: Record<ApprovalState, string> = {
-    pending: '待确认',
+    pending: '等你确认',
     approved_pending_delivery: '已批准 · 送达中',
     rejected_pending_delivery: '已拒绝 · 送达中',
     consumed_allowed: '已批准',
@@ -186,23 +268,28 @@ export function memberDot(s: BoardMemberState): string {
     case 'killed':
       return 'block';
     default:
-      return 'done';
+      return 'idle';
   }
 }
 
 export function memberStateLabel(s: BoardMemberState): string {
-  const m: Record<BoardMemberState, string> = { working: '工作中', waiting: '等待', stopped: '已停止', killed: '已终止' };
+  const m: Record<BoardMemberState, string> = { working: '进行中', waiting: '等待中', stopped: '已停止', killed: '已终止' };
   return m[s] ?? s;
-}
-
-export function projectInitial(p?: Pick<ProjectView, 'displayName' | 'projectId'> | null): string {
-  const n = (p?.displayName || p?.projectId || '?').replace(/^[^a-zA-Z0-9一-龥]+/, '');
-  return n.slice(0, 1) || '?';
 }
 
 export function taskTitle(t: Pick<TaskSummary, 'title' | 'goal' | 'taskId'>): string {
   const s = (t.title || '').trim() || (t.goal || '').trim().split('\n')[0] || t.taskId;
   return s.length > 80 ? `${s.slice(0, 80)}…` : s;
+}
+
+/** Human-readable copy for busy exclusive machine resources (no raw mono resource keys). */
+export function humanResourceLabel(key: string, state: string, reason?: string): string {
+  const k = key.toLowerCase();
+  if (k === 'macos_gui') return reason || 'macOS 锁屏中';
+  if (k === 'xcode_sim') return reason ? `iOS 模拟器占用 · ${reason}` : 'iOS 模拟器占用';
+  if (k === 'chrome_logged_in') return reason ? `浏览器占用 · ${reason}` : '登录态浏览器占用';
+  if (reason) return reason;
+  return `${key} (${state})`;
 }
 
 /** Extracts a human-readable command / target preview from an approval payload. */

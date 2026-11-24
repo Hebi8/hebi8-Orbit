@@ -1,7 +1,7 @@
 import { useState } from 'react';
+import { CaretIcon } from '../components/Icons';
 import { Md } from '../components/Md';
 import type { Segment, ToolStep } from '../lib/segments';
-import { CaretIcon } from '../components/Icons';
 
 function stepClass(s: ToolStep): string {
   if (s.status === 'completed') return 'ok';
@@ -10,39 +10,41 @@ function stepClass(s: ToolStep): string {
   return '';
 }
 
-function Thought({ text, defaultOpen }: { text: string; defaultOpen: boolean }) {
-  const [open, setOpen] = useState(defaultOpen);
-  const chars = text.length;
+function Thought({ text }: { text: string }) {
+  const [open, setOpen] = useState(false);
   return (
     <div className={`it ${open ? 'open' : ''}`}>
       <button type="button" className="think-h" onClick={() => setOpen(!open)}>
         <CaretIcon className="i caret" />
-        思考过程
-        <span className="faint" style={{ fontSize: 11 }}>
-          · {chars > 1000 ? `${(chars / 1000).toFixed(1)}k` : chars} 字
-        </span>
+        思考
       </button>
       {open && <div className="think-b">{text}</div>}
     </div>
   );
 }
 
-function ToolGroup({ steps, defaultOpen }: { steps: ToolStep[]; defaultOpen: boolean }) {
-  const [open, setOpen] = useState(defaultOpen);
-  const done = steps.filter((s) => s.status === 'completed').length;
-  const failed = steps.filter((s) => s.status === 'failed').length;
-  const live = steps.some((s) => s.status === 'in_progress' || s.status === 'pending');
+function ToolGroup({ steps }: { steps: ToolStep[] }) {
+  const [open, setOpen] = useState(false);
+  const activeStep = [...steps].reverse().find((s) => s.status === 'in_progress' || s.status === 'pending');
+  const hasFailed = steps.some((s) => s.status === 'failed');
+
   return (
     <div className={`it ${open ? 'open' : ''}`}>
       <button type="button" className="wg-h" onClick={() => setOpen(!open)}>
         <CaretIcon className="i caret" />
-        <span className="t">工作组</span>
-        <span className="faint">· {steps.length} 步</span>
-        {live && <span className="spin" />}
-        <span className="r">
-          {done > 0 && <span>{done} 完成</span>}
-          {failed > 0 && <span className="bad-t">{failed} 失败</span>}
-        </span>
+        {activeStep ? (
+          <>
+            <span className="spin" />
+            <span className="shim ell">
+              {activeStep.verb} {activeStep.title}
+            </span>
+          </>
+        ) : (
+          <>
+            <span className="t">过程</span>
+            {hasFailed && <span className="bad-t" style={{ fontSize: 11.5 }}>有步骤出错</span>}
+          </>
+        )}
       </button>
       {open && (
         <ul className="wg-steps">
@@ -52,7 +54,7 @@ function ToolGroup({ steps, defaultOpen }: { steps: ToolStep[]; defaultOpen: boo
                 <span className="k">{s.verb}</span>
                 <span className="tg">{s.title}</span>
                 <span className="m">
-                  {s.status === 'in_progress' ? <span className="spin" /> : s.status === 'failed' ? <span className="bad-t">失败</span> : null}
+                  {s.status === 'in_progress' ? <span className="spin" /> : s.status === 'failed' ? <span className="bad-t">出错</span> : null}
                 </span>
               </div>
             </li>
@@ -63,18 +65,16 @@ function ToolGroup({ steps, defaultOpen }: { steps: ToolStep[]; defaultOpen: boo
   );
 }
 
-/** Renders folded raw ACP segments in Opus' thin-timeline vocabulary. */
-export function Segments({ segs, live }: { segs: Segment[]; live: boolean }) {
-  const lastThought = segs.map((s) => s.kind).lastIndexOf('thought');
-  const lastTools = segs.map((s) => s.kind).lastIndexOf('tools');
+/** Renders folded raw ACP segments cleanly; thoughts are hidden in compact split-review panes. */
+export function Segments({ segs, compact = false }: { segs: Segment[]; live?: boolean; compact?: boolean }) {
   return (
     <>
-      {segs.map((s, i) => {
+      {segs.map((s) => {
         switch (s.kind) {
           case 'thought':
-            return <Thought key={s.key} text={s.text} defaultOpen={live && i === lastThought && i === segs.length - 1} />;
+            return compact ? null : <Thought key={s.key} text={s.text} />;
           case 'tools':
-            return <ToolGroup key={s.key} steps={s.steps} defaultOpen={live && i === lastTools} />;
+            return <ToolGroup key={s.key} steps={s.steps} />;
           case 'msg':
             return (
               <div className="it" key={s.key}>
@@ -95,7 +95,7 @@ export function Segments({ segs, live }: { segs: Segment[]; live: boolean }) {
           case 'note':
             return (
               <div className="it dline faint" key={s.key}>
-                <span className="sd" /> {s.text}
+                {s.text}
               </div>
             );
           default:

@@ -1,9 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
 import { ArrowUpRight, PanelRightClose, PanelRightOpen, X } from 'lucide-react';
 import type { BootstrapResponse } from '../generated/protocol';
-import { ArtIcon, DiffIcon } from '../components/Icons';
 import { useTimeline } from '../hooks/queries';
-import { attentionTaskIds, taskDot, taskStateLabel, taskTitle } from '../lib/format';
+import { taskTitle } from '../lib/format';
 import { navigate, paths, useRoute } from '../lib/router';
 import { SessionConversation } from '../session/SessionConversation';
 import { useWorkbenchStore } from '../store/useWorkbenchStore';
@@ -14,13 +13,12 @@ const CODE_KINDS = new Set(['code_diff', 'mixed', 'workspace_snapshot']);
 
 /**
  * Fixed centered split overlay mirroring Lody LAN fork's `BoardArticleDialog` + `WorktreeReviewDialog`:
- *   - Left pane: deliverable review (Code Diff / Artifacts)
- *   - Right pane: the task's live Session conversation (collapsible, resizable divider)
- *   - Fixed position (never draggable); backdrop click or Esc closes.
+ *   - Left pane: single merged 40px bar + Code Diff or Artifacts workspace
+ *   - Right pane: compact live Session conversation (collapsible, per-tab resizable divider)
  */
 export function ReviewOverlay({ boot }: { boot: BootstrapResponse }) {
   const review = useWorkbenchStore((s) => s.review);
-  const ratio = useWorkbenchStore((s) => s.reviewRatio);
+  const reviewRatios = useWorkbenchStore((s) => s.reviewRatios);
   const setRatio = useWorkbenchStore((s) => s.setReviewRatio);
   const sessionHidden = useWorkbenchStore((s) => s.reviewSessionHidden);
   const setSessionHidden = useWorkbenchStore((s) => s.setReviewSessionHidden);
@@ -44,13 +42,68 @@ export function ReviewOverlay({ boot }: { boot: BootstrapResponse }) {
   const deliveries = tl?.deliveries ?? [];
   const hasCode = review.tab === 'code' || deliveries.some((d) => CODE_KINDS.has(d.kind));
   const hasArt = review.tab === 'art' || deliveries.some((d) => (d.ryugiBindings?.length ?? 0) > 0);
+  const showTabs = hasCode && hasArt;
   const alreadyOnSession = route.name === 'session' && route.taskId === review.taskId && !route.worker;
-  const attentionSet = attentionTaskIds(boot.openInboxItems);
+  const ratio = reviewRatios[review.tab];
 
   const fromPointer = (clientX: number) => {
     const rect = bodyRef.current?.getBoundingClientRect();
-    if (rect && rect.width > 0) setRatio(((clientX - rect.left) / rect.width) * 100);
+    if (rect && rect.width > 0) setRatio(review.tab, ((clientX - rect.left) / rect.width) * 100);
   };
+
+  const tabSwitch = showTabs ? (
+    <div className="seg" role="tablist" aria-label="产物类型">
+      <button
+        type="button"
+        role="tab"
+        aria-selected={review.tab === 'code'}
+        className={review.tab === 'code' ? 'on' : ''}
+        onClick={() => setTab('code')}
+      >
+        代码
+      </button>
+      <button
+        type="button"
+        role="tab"
+        aria-selected={review.tab === 'art'}
+        className={review.tab === 'art' ? 'on' : ''}
+        onClick={() => setTab('art')}
+      >
+        设计稿
+      </button>
+    </div>
+  ) : null;
+
+  const leftHeaderEnd = (
+    <>
+      <div className="seg only-mobile">
+        <button type="button" className={mobilePane === 'artifact' ? 'on' : ''} onClick={() => setMobilePane('artifact')}>
+          产物
+        </button>
+        <button type="button" className={mobilePane === 'session' ? 'on' : ''} onClick={() => setMobilePane('session')}>
+          会话
+        </button>
+      </div>
+      {sessionHidden && (
+        <>
+          <button
+            type="button"
+            className="ib no-mobile"
+            title="显示右侧会话"
+            onClick={() => setSessionHidden(false)}
+          >
+            <PanelRightOpen size={14} strokeWidth={1.6} />
+          </button>
+          <button type="button" className="ib no-mobile" title="关闭 (Esc)" onClick={close}>
+            <X size={14} strokeWidth={1.6} />
+          </button>
+        </>
+      )}
+      <button type="button" className="ib only-mobile" title="关闭" onClick={close}>
+        <X size={14} strokeWidth={1.6} />
+      </button>
+    </>
+  );
 
   return (
     <div className="rev-layer" role="presentation">
@@ -65,65 +118,8 @@ export function ReviewOverlay({ boot }: { boot: BootstrapResponse }) {
               : { gridTemplateColumns: `minmax(0, ${ratio}fr) 1px minmax(0, ${100 - ratio}fr)` }
           }
         >
-          {/* Left: Artifact / Code Review */}
+          {/* Left: Deliverable Review */}
           <div className="rev-pane rev-left">
-            <div className="rev-h">
-              <div className="rev-tabs" role="tablist">
-                {hasCode && (
-                  <button
-                    type="button"
-                    role="tab"
-                    aria-selected={review.tab === 'code'}
-                    className={`rev-tab ${review.tab === 'code' ? 'on' : ''}`}
-                    onClick={() => setTab('code')}
-                  >
-                    <DiffIcon size={13} /> Code
-                  </button>
-                )}
-                {hasArt && (
-                  <button
-                    type="button"
-                    role="tab"
-                    aria-selected={review.tab === 'art'}
-                    className={`rev-tab ${review.tab === 'art' ? 'on' : ''}`}
-                    onClick={() => setTab('art')}
-                  >
-                    <ArtIcon size={13} /> Artifacts
-                  </button>
-                )}
-              </div>
-
-              <div className="seg only-mobile" style={{ marginLeft: 'auto' }}>
-                <button type="button" className={mobilePane === 'artifact' ? 'on' : ''} onClick={() => setMobilePane('artifact')}>
-                  产物
-                </button>
-                <button type="button" className={mobilePane === 'session' ? 'on' : ''} onClick={() => setMobilePane('session')}>
-                  会话
-                </button>
-              </div>
-
-              <div className="rev-h-acts">
-                {sessionHidden && (
-                  <>
-                    <button
-                      type="button"
-                      className="hb no-mobile"
-                      title="显示右侧会话"
-                      onClick={() => setSessionHidden(false)}
-                    >
-                      <PanelRightOpen size={14} strokeWidth={1.6} /> 会话
-                    </button>
-                    <button type="button" className="ib no-mobile" title="关闭 (Esc)" onClick={close}>
-                      <X size={14} strokeWidth={1.6} />
-                    </button>
-                  </>
-                )}
-                <button type="button" className="ib only-mobile" title="关闭" onClick={close}>
-                  <X size={14} strokeWidth={1.6} />
-                </button>
-              </div>
-            </div>
-
             {review.tab === 'code' ? (
               <CodeReviewPane
                 taskId={review.taskId}
@@ -132,6 +128,8 @@ export function ReviewOverlay({ boot }: { boot: BootstrapResponse }) {
                 tl={tl}
                 boot={boot}
                 onClose={close}
+                tabSwitch={tabSwitch}
+                headerEnd={leftHeaderEnd}
               />
             ) : (
               <ArtifactsPane
@@ -139,6 +137,8 @@ export function ReviewOverlay({ boot }: { boot: BootstrapResponse }) {
                 deliveryId={review.deliveryId}
                 onSelectDelivery={setDelivery}
                 tl={tl}
+                tabSwitch={tabSwitch}
+                headerEnd={leftHeaderEnd}
               />
             )}
           </div>
@@ -170,7 +170,7 @@ export function ReviewOverlay({ boot }: { boot: BootstrapResponse }) {
                   const step = e.key === 'ArrowLeft' ? -4 : e.key === 'ArrowRight' ? 4 : 0;
                   if (step === 0) return;
                   e.preventDefault();
-                  setRatio(ratio + step);
+                  setRatio(review.tab, ratio + step);
                 }}
               />
             </div>
@@ -180,19 +180,9 @@ export function ReviewOverlay({ boot }: { boot: BootstrapResponse }) {
           {!sessionHidden && (
             <div className="rev-pane rev-right">
               <div className="rev-h">
-                {task ? (
-                  <>
-                    <span className={`sd ${taskDot(task.state, task.activeAttemptState, attentionSet.has(task.taskId))}`} />
-                    <span className="rev-sttl ell" title={task.goal}>
-                      {taskTitle(task)}
-                    </span>
-                    <span className="faint no-mobile" style={{ fontSize: 11.5, whiteSpace: 'nowrap', flex: 'none' }}>
-                      {taskStateLabel(task, attentionSet.has(task.taskId))}
-                    </span>
-                  </>
-                ) : (
-                  <span className="faint">会话</span>
-                )}
+                <span className="rev-sttl ell" title={task?.goal}>
+                  {task ? taskTitle(task) : '会话'}
+                </span>
 
                 <div className="seg only-mobile" style={{ marginLeft: 'auto' }}>
                   <button type="button" className={mobilePane === 'artifact' ? 'on' : ''} onClick={() => setMobilePane('artifact')}>

@@ -2,13 +2,15 @@ import { useMemo, useState } from 'react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import type { AttemptView, TaskTimelineResponse } from '../generated/protocol';
 import { ApprovalNotice } from '../components/ApprovalNotice';
-import { ArtIcon, CaretIcon, DiffIcon, SwarmIcon } from '../components/Icons';
+import { CaretIcon } from '../components/Icons';
 import { useAttemptRaw } from '../hooks/queries';
 import { api, errMsg } from '../lib/api';
 import { attemptStateLabel, hhmm, isAttemptLive, shortSha, triggerLabel } from '../lib/format';
 import { buildSegments, lastLiveStep } from '../lib/segments';
 import { toast, useWorkbenchStore } from '../store/useWorkbenchStore';
 import { Segments } from './Segments';
+
+const CODE_KINDS = new Set(['code_diff', 'mixed', 'workspace_snapshot']);
 
 function usePromptFor(attempt: AttemptView, tl: TaskTimelineResponse): { text: string; placeholder: boolean; detail: string[] } {
   const cache = useWorkbenchStore((s) => s.promptCache);
@@ -22,7 +24,7 @@ function usePromptFor(attempt: AttemptView, tl: TaskTimelineResponse): { text: s
       case 'annotation_batch': {
         const anns = tl.annotations.filter((a) => a.triggeredAttemptId === attempt.attemptId);
         return {
-          text: `批注包 · ${anns.length || '若干'} 条`,
+          text: `批注 · ${anns.length || '若干'} 条`,
           placeholder: false,
           detail: anns.map((a) => {
             const loc = a.anchor.path ? `${a.anchor.path}${a.anchor.startLine ? `:${a.anchor.startLine}` : ''}` : a.anchor.artifact || a.source;
@@ -73,20 +75,20 @@ function RetryNotice({ attempt, taskId, needsVerify }: { attempt: AttemptView; t
   return (
     <div className={`it nt ${needsVerify ? '' : 'bad'}`}>
       <div className="nt-h">
-        <span className="lbl">{needsVerify ? '中断 · 需核对现场' : attemptStateLabel(attempt.state)}</span>
-        {attempt.errorCode && <span className="where mono">{attempt.errorCode}</span>}
+        <span className="lbl" title={attempt.errorCode || undefined}>
+          {needsVerify ? '上一轮中途断了' : attemptStateLabel(attempt.state)}
+        </span>
       </div>
       <div className="nt-b">
         {needsVerify
-          ? 'Runner 中途失联，工作区可能残留未提交改动，核对现场后再重试。'
-          : attempt.errorDetail || '本轮未能完成。'}
-        {needsVerify && attempt.errorDetail ? ` · ${attempt.errorDetail}` : ''}
+          ? '工作区可能有没提交的改动，看一眼再继续。'
+          : attempt.errorDetail || '这一轮没能完成。'}
       </div>
       <div className="nt-a">
         {needsVerify && (
           <label className="chk">
             <input type="checkbox" checked={verified} onChange={(e) => setVerified(e.target.checked)} />
-            我已核对现场
+            看过了
           </label>
         )}
         <button type="button" className="btn pri" disabled={retry.isPending || (needsVerify && !verified)} onClick={() => retry.mutate()}>
@@ -102,13 +104,13 @@ export function Turn({
   index,
   isLast,
   tl,
-  onOpenBoard,
+  compact = false,
 }: {
   attempt: AttemptView;
   index: number;
   isLast: boolean;
   tl: TaskTimelineResponse;
-  onOpenBoard?: () => void;
+  compact?: boolean;
 }) {
   const live = isAttemptLive(attempt.state);
   const [expanded, setExpanded] = useState(false);
@@ -123,7 +125,13 @@ export function Turn({
   const delivery = deliveryIdx >= 0 ? tl.deliveries[deliveryIdx] : undefined;
   const taskIdle = !tl.task.activeAttemptId;
   const step = live ? lastLiveStep(segs) : null;
-  const showSwarm = !!onOpenBoard && (attempt.state === 'swarm_monitoring' || (isLast && tl.boardMembers.length > 0));
+  const hasActiveToolStep = !!step && (step.status === 'in_progress' || step.status === 'pending');
+
+  const deliveryTab = delivery
+    ? CODE_KINDS.has(delivery.kind)
+      ? ('code' as const)
+      : ('art' as const)
+    : ('code' as const);
 
   return (
     <div className="turn" id={`turn-${attempt.attemptId}`} data-turn={index}>
@@ -139,7 +147,7 @@ export function Turn({
             {prompt.detail.length > 8 && <div className="faint">… 另 {prompt.detail.length - 8} 条</div>}
           </div>
         )}
-        <div className="umeta">{hhmm(attempt.startedAt)}</div>
+        <div className="umeta hover-meta">{hhmm(attempt.startedAt)}</div>
       </div>
 
       {attempt.state === 'waiting_resource' && (
@@ -157,16 +165,13 @@ export function Turn({
             <span className="spin" /> 载入过程…
           </div>
         ) : (
-          <Segments segs={segs} live={live} />
+          <Segments segs={segs} live={live} compact={compact} />
         )
       ) : (
         <div className="it">
           <button type="button" className="lazy-turn" onClick={() => setExpanded(true)}>
             <CaretIcon className="i" />
             展开历史过程
-            <span className="faint" style={{ marginLeft: 'auto' }}>
-              {attempt.state === 'succeeded' ? '已结束' : attemptStateLabel(attempt.state)}
-            </span>
           </button>
         </div>
       )}
@@ -177,50 +182,24 @@ export function Turn({
         </div>
       ))}
 
-      {showSwarm && (
-        <div className="it">
-          <button type="button" className="swr" onClick={onOpenBoard}>
-            <span className="lead">
-              <SwarmIcon size={13} /> 协作
-            </span>
-            <span className="smem">
-              {tl.boardMembers.slice(0, 4).map((m) => (
-                <span key={m.memberName}>
-                  <span className={`sd ${m.state === 'working' ? 'run' : m.state === 'waiting' ? 'wait' : 'done'}`} />
-                  {m.memberName}
-                </span>
-              ))}
-            </span>
-            <span className="go">消息板 →</span>
-          </button>
-        </div>
-      )}
-
-      {live && attempt.state !== 'waiting_approval' && attempt.state !== 'waiting_resource' && (
+      {live && attempt.state !== 'waiting_approval' && attempt.state !== 'waiting_resource' && !hasActiveToolStep && (
         <div className="it running">
           <span className="spin" />
-          <span className="shim ell">{step ? `${step.verb} · ${step.title}` : attemptStateLabel(attempt.state)}</span>
+          <span className="shim ell">{attemptStateLabel(attempt.state)}</span>
         </div>
       )}
 
       {delivery && (
-        <div className="it dline">
-          <span className="sd done" />
-          <span>产出 v{deliveryIdx + 1}</span>
-          <span className="mono faint">{shortSha(delivery.headSha)}</span>
+        <div className="it dline" title={shortSha(delivery.headSha) || undefined}>
+          <span>{tl.deliveries.length >= 2 ? `产出 v${deliveryIdx + 1}` : '产出'}</span>
           {delivery.manifest.filesChanged > 0 && (
             <span className="mono">
               <span className="add">+{delivery.manifest.insertions}</span> <span className="del">−{delivery.manifest.deletions}</span>
             </span>
           )}
-          <button type="button" className="lk" onClick={() => openReview('code', delivery.taskId, delivery.deliveryId)}>
-            <DiffIcon size={12} /> 审阅代码
+          <button type="button" className="lk" onClick={() => openReview(deliveryTab, delivery.taskId, delivery.deliveryId)}>
+            查看
           </button>
-          {(delivery.ryugiBindings?.length ?? 0) > 0 && (
-            <button type="button" className="lk" onClick={() => openReview('art', delivery.taskId, delivery.deliveryId)}>
-              <ArtIcon size={12} /> 设计稿
-            </button>
-          )}
         </div>
       )}
 
@@ -228,11 +207,10 @@ export function Turn({
         <RetryNotice attempt={attempt} taskId={tl.task.taskId} needsVerify={attempt.state === 'needs_verification'} />
       )}
 
-      {!live && (
+      {!live && attempt.state !== 'succeeded' && (
         <div className="it done-line">
-          {attempt.state === 'succeeded'
-            ? `已结束 · ${hhmm(attempt.finishedAt)}`
-            : `${attemptStateLabel(attempt.state)} · ${hhmm(attempt.finishedAt)}`}
+          {attemptStateLabel(attempt.state)}
+          {attempt.finishedAt ? ` · ${hhmm(attempt.finishedAt)}` : ''}
         </div>
       )}
     </div>

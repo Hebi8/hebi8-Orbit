@@ -4,36 +4,27 @@ import { ArrowUpRight, Plus } from 'lucide-react';
 import type { BootstrapResponse, DeliveryView, TaskSummary } from '../generated/protocol';
 import { ArtIcon, CursorIcon, DiffIcon } from '../components/Icons';
 import { PageHeader } from '../components/PageHeader';
+import { StatusMark } from '../components/StatusMark';
 import { useProjectTasks } from '../hooks/queries';
 import { api } from '../lib/api';
-import { buildIDEJump, buildProjectIDEJump, launchIDE } from '../lib/ide';
 import {
-  attentionTaskIds,
-  projectInitial,
+  displayMarkRank,
+  indexInboxByTask,
   relTime,
+  rootSessionMark,
   shortSha,
-  taskDot,
-  taskSimpleState,
-  taskStateLabel,
   taskTitle,
-  type SimpleSessionState,
+  type SessionMark,
 } from '../lib/format';
+import { buildIDEJump, buildProjectIDEJump, launchIDE } from '../lib/ide';
 import { navigate, paths, type ProjectTab } from '../lib/router';
 import { toast, useWorkbenchStore } from '../store/useWorkbenchStore';
 
-const GROUPS: { key: SimpleSessionState; label: string }[] = [
-  { key: 'attention', label: '需要注意' },
-  { key: 'running', label: '运行中' },
-  { key: 'finished', label: '已结束' },
-];
-
-function ThreadRow({ t, hasAttention }: { t: TaskSummary; hasAttention: boolean }) {
+function ThreadRow({ t, mark }: { t: TaskSummary; mark: SessionMark }) {
   return (
     <button type="button" className="srow" onClick={() => navigate(paths.session(t.taskId))}>
-      <span className={`sd ${taskDot(t.state, t.activeAttemptState, hasAttention)}`} />
       <span className="t">{taskTitle(t)}</span>
-      <span className="st">{taskStateLabel(t, hasAttention)}</span>
-      <span className="st">{relTime(t.updatedAt)}</span>
+      {mark ? <StatusMark mark={mark} /> : <span className="st">{relTime(t.updatedAt)}</span>}
     </button>
   );
 }
@@ -49,18 +40,18 @@ export function ProjectPage({ boot, projectId, tab }: { boot: BootstrapResponse;
 
   const allTasks = useMemo(() => tasksQ.data ?? [], [tasksQ.data]);
   const threads = useMemo(() => allTasks.filter((t) => !t.parentTaskId), [allTasks]);
-  const attentionSet = useMemo(() => attentionTaskIds(boot.openInboxItems), [boot.openInboxItems]);
+  const inboxByTask = useMemo(() => indexInboxByTask(boot.openInboxItems), [boot.openInboxItems]);
 
-  const rootHasAttention = (root: TaskSummary): boolean => {
-    if (attentionSet.has(root.taskId)) return true;
-    return allTasks.some((c) => c.parentTaskId === root.taskId && attentionSet.has(c.taskId));
-  };
-
-  const filtered = useMemo(() => {
+  const ranked = useMemo(() => {
     const k = q.trim().toLowerCase();
-    if (!k) return threads;
-    return threads.filter((t) => `${t.title} ${t.goal}`.toLowerCase().includes(k));
-  }, [threads, q]);
+    const list = k ? threads.filter((t) => `${t.title} ${t.goal}`.toLowerCase().includes(k)) : threads;
+    return list
+      .map((t) => ({ t, mark: rootSessionMark(t, allTasks, inboxByTask) }))
+      .sort((a, b) => displayMarkRank(a.mark) - displayMarkRank(b.mark) || b.t.updatedAt - a.t.updatedAt);
+  }, [threads, allTasks, inboxByTask, q]);
+
+  const markedRows = ranked.filter((r) => r.mark !== null);
+  const restingRows = ranked.filter((r) => r.mark === null);
 
   const withDeliveries = tab === 'deliveries' ? threads.filter((t) => t.deliveryCount > 0) : [];
   const timelines = useQueries({
@@ -95,6 +86,8 @@ export function ProjectPage({ boot, projectId, tab }: { boot: BootstrapResponse;
     launchIDE(j.uri);
   };
 
+  const nonDefaultBranch = project.defaultBranch && project.defaultBranch !== 'main' && project.defaultBranch !== 'master';
+
   return (
     <main className="main">
       <PageHeader>
@@ -107,22 +100,23 @@ export function ProjectPage({ boot, projectId, tab }: { boot: BootstrapResponse;
       <div className="page-scroll">
         <div className="page">
           <div className="phead">
-            <span className="pl">{projectInitial(project)}</span>
             <div style={{ minWidth: 0 }}>
               <h1>{project.displayName}</h1>
               <div className="meta">
                 <span className="mono">{project.repoIdentity}</span>
-                <span>
-                  默认分支 <span className="mono">{project.defaultBranch}</span>
-                </span>
+                {nonDefaultBranch && (
+                  <span>
+                    分支 <span className="mono">{project.defaultBranch}</span>
+                  </span>
+                )}
               </div>
             </div>
             <div className="r">
-              <button type="button" className="btn pri" onClick={() => navigate(paths.newThread('project', project.projectId))}>
-                <Plus size={13} strokeWidth={1.6} /> 新建项目线程
+              <button type="button" className="btn ghost" onClick={() => navigate(paths.newThread('project', project.projectId))}>
+                <Plus size={13} strokeWidth={1.6} /> 新线程
               </button>
-              <button type="button" className="btn" onClick={openRepo}>
-                <CursorIcon size={13} /> 在 Cursor 打开
+              <button type="button" className="ib" title="在 Cursor 打开" onClick={openRepo}>
+                <CursorIcon size={14} />
               </button>
             </div>
           </div>
@@ -134,7 +128,7 @@ export function ProjectPage({ boot, projectId, tab }: { boot: BootstrapResponse;
             <button type="button" className={tab === 'deliveries' ? 'on' : ''} onClick={() => navigate(paths.project(projectId, 'deliveries'))}>
               交付
             </button>
-            {tab === 'threads' && (
+            {tab === 'threads' && threads.length > 10 && (
               <span className="sp">
                 <input className="field" placeholder="搜索线程…" value={q} onChange={(e) => setQ(e.target.value)} aria-label="搜索线程" />
               </span>
@@ -144,23 +138,18 @@ export function ProjectPage({ boot, projectId, tab }: { boot: BootstrapResponse;
           {tab === 'threads' &&
             (tasksQ.isLoading ? (
               <div className="quiet">载入线程…</div>
-            ) : filtered.length === 0 ? (
+            ) : ranked.length === 0 ? (
               <div className="quiet">{q ? '没有匹配的线程' : '这个项目还没有线程'}</div>
             ) : (
-              GROUPS.map((g) => {
-                const rows = filtered
-                  .filter((t) => taskSimpleState(t, rootHasAttention(t)) === g.key)
-                  .sort((a, b) => b.updatedAt - a.updatedAt);
-                if (!rows.length) return null;
-                return (
-                  <div key={g.key}>
-                    <div className="grp-h">{g.label}</div>
-                    {rows.map((t) => (
-                      <ThreadRow key={t.taskId} t={t} hasAttention={rootHasAttention(t)} />
-                    ))}
-                  </div>
-                );
-              })
+              <>
+                {markedRows.map(({ t, mark }) => (
+                  <ThreadRow key={t.taskId} t={t} mark={mark} />
+                ))}
+                {markedRows.length > 0 && restingRows.length > 0 && <div className="home-sep" role="separator" />}
+                {restingRows.map(({ t, mark }) => (
+                  <ThreadRow key={t.taskId} t={t} mark={mark} />
+                ))}
+              </>
             ))}
 
           {tab === 'deliveries' &&

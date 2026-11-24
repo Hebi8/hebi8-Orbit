@@ -47,15 +47,16 @@ const PROMPT_CACHE_MAX = 400;
 const REVIEW_RATIO_MIN = 36;
 const REVIEW_RATIO_MAX = 78;
 
+function readRatio(key: string, fallback: number): number {
+  const n = Number(readLS(key, String(fallback)));
+  return Number.isFinite(n) ? Math.min(REVIEW_RATIO_MAX, Math.max(REVIEW_RATIO_MIN, n)) : fallback;
+}
+
 export function applyThemeToDocument(mode: ThemeMode) {
   document.documentElement.setAttribute('data-mode', mode);
 }
 
 const initialTheme: ThemeMode = readLS('orbit.theme', 'dark') === 'light' ? 'light' : 'dark';
-const initialRatio = (() => {
-  const n = Number(readLS('orbit.reviewRatio', '64'));
-  return Number.isFinite(n) ? Math.min(REVIEW_RATIO_MAX, Math.max(REVIEW_RATIO_MIN, n)) : 64;
-})();
 
 interface WorkbenchState {
   theme: ThemeMode;
@@ -66,7 +67,7 @@ interface WorkbenchState {
   cmdkOpen: boolean;
   machinesOpen: boolean;
   review: ReviewState | null;
-  reviewRatio: number;
+  reviewRatios: Record<ReviewTab, number>;
   reviewSessionHidden: boolean;
   wsStatus: WSConnectionStatus;
   lastSeq: number;
@@ -88,7 +89,7 @@ interface WorkbenchState {
   closeReview: () => void;
   setReviewTab: (tab: ReviewTab) => void;
   setReviewDelivery: (deliveryId: string) => void;
-  setReviewRatio: (ratio: number) => void;
+  setReviewRatio: (tab: ReviewTab, ratio: number) => void;
   setReviewSessionHidden: (hidden: boolean) => void;
   setWSStatus: (status: WSConnectionStatus) => void;
   setLastSeq: (seq: number) => void;
@@ -112,7 +113,10 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
   cmdkOpen: false,
   machinesOpen: false,
   review: null,
-  reviewRatio: initialRatio,
+  reviewRatios: {
+    code: readRatio('orbit.reviewRatio.code', 72),
+    art: readRatio('orbit.reviewRatio.art', 60),
+  },
   reviewSessionHidden: false,
   wsStatus: 'connecting',
   lastSeq: 0,
@@ -153,10 +157,10 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
     set((s) => (s.review ? { review: { ...s.review, tab } } : s)),
   setReviewDelivery: (deliveryId) =>
     set((s) => (s.review ? { review: { ...s.review, deliveryId } } : s)),
-  setReviewRatio: (ratio) => {
+  setReviewRatio: (tab, ratio) => {
     const clamped = Math.min(REVIEW_RATIO_MAX, Math.max(REVIEW_RATIO_MIN, Math.round(ratio)));
-    writeLS('orbit.reviewRatio', String(clamped));
-    set({ reviewRatio: clamped });
+    writeLS(`orbit.reviewRatio.${tab}`, String(clamped));
+    set((s) => ({ reviewRatios: { ...s.reviewRatios, [tab]: clamped } }));
   },
   setReviewSessionHidden: (hidden) => set({ reviewSessionHidden: hidden }),
   setWSStatus: (wsStatus) => set({ wsStatus }),

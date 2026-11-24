@@ -2,17 +2,27 @@ import { useMemo } from 'react';
 import { ArrowRight, Plus } from 'lucide-react';
 import type { BootstrapResponse } from '../generated/protocol';
 import { PageHeader } from '../components/PageHeader';
-import { useProjectTasks } from '../hooks/queries';
-import { SCRATCH_PROJECT_ID, attentionTaskIds, projectInitial, taskDot, taskStateLabel, taskTitle } from '../lib/format';
+import { StatusMark } from '../components/StatusMark';
+import { useManyProjectTasks } from '../hooks/queries';
+import {
+  SCRATCH_PROJECT_ID,
+  indexInboxByTask,
+  mergeSessionMarks,
+  relTime,
+  rootSessionMark,
+  sessionMark,
+  taskTitle,
+} from '../lib/format';
 import { navigate, paths } from '../lib/router';
 
 /** Project index (mobile "项目" tab); threads never expand into workers here either. */
 export function ProjectsListPage({ boot }: { boot: BootstrapResponse }) {
   const projects = boot.projects.filter((p) => p.projectId !== SCRATCH_PROJECT_ID && !p.archived);
-  const hasScratch = boot.projects.some((p) => p.projectId === SCRATCH_PROJECT_ID);
-  const scratchQ = useProjectTasks(SCRATCH_PROJECT_ID, hasScratch);
-  const scratch = (scratchQ.data ?? []).filter((t) => !t.parentTaskId).sort((a, b) => b.updatedAt - a.updatedAt);
-  const attentionSet = useMemo(() => attentionTaskIds(boot.openInboxItems), [boot.openInboxItems]);
+  const tasksByProject = useManyProjectTasks(boot.projects);
+  const scratch = (tasksByProject[SCRATCH_PROJECT_ID] ?? [])
+    .filter((t) => !t.parentTaskId)
+    .sort((a, b) => b.updatedAt - a.updatedAt);
+  const inboxByTask = useMemo(() => indexInboxByTask(boot.openInboxItems), [boot.openInboxItems]);
 
   return (
     <main className="main">
@@ -28,28 +38,31 @@ export function ProjectsListPage({ boot }: { boot: BootstrapResponse }) {
       <div className="page-scroll">
         <div className="page">
           {projects.length === 0 && <div className="quiet">还没有注册项目</div>}
-          {projects.map((p) => (
-            <button type="button" key={p.projectId} className="srow" onClick={() => navigate(paths.project(p.projectId))}>
-              <span className="pl">{projectInitial(p)}</span>
-              <span className="t">{p.displayName}</span>
-              <span className="st">{p.blockedTaskCount > 0 ? '需要注意' : p.activeTaskCount > 0 ? '运行中' : ''}</span>
-              <span className="go">
-                <ArrowRight size={12} strokeWidth={1.6} />
-              </span>
-            </button>
-          ))}
+          {projects.map((p) => {
+            const pTasks = tasksByProject[p.projectId] ?? [];
+            const roots = pTasks.filter((t) => !t.parentTaskId);
+            const mark = mergeSessionMarks(...roots.map((r) => rootSessionMark(r, pTasks, inboxByTask)));
+            return (
+              <button type="button" key={p.projectId} className="srow" onClick={() => navigate(paths.project(p.projectId))}>
+                <span className="t">{p.displayName}</span>
+                <StatusMark mark={mark} />
+                <span className="go">
+                  <ArrowRight size={12} strokeWidth={1.6} />
+                </span>
+              </button>
+            );
+          })}
           {scratch.length > 0 && (
             <section className="sec">
               <div className="sec-h">
                 <span className="t">自由 Chat</span>
               </div>
               {scratch.map((t) => {
-                const attn = attentionSet.has(t.taskId);
+                const mark = sessionMark(t, inboxByTask.get(t.taskId));
                 return (
                   <button type="button" key={t.taskId} className="srow" onClick={() => navigate(paths.session(t.taskId))}>
-                    <span className={`sd ${taskDot(t.state, t.activeAttemptState, attn)}`} />
                     <span className="t">{taskTitle(t)}</span>
-                    <span className="st">{taskStateLabel(t, attn)}</span>
+                    {mark ? <StatusMark mark={mark} /> : <span className="st">{relTime(t.updatedAt)}</span>}
                   </button>
                 );
               })}

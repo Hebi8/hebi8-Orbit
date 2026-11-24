@@ -15,14 +15,16 @@ import {
   type RenderToken,
   type ViewType,
 } from 'react-diff-view';
-import { ArrowUpRight } from 'lucide-react';
+import { Columns2, PanelLeft, Rows2 } from 'lucide-react';
 import type { AnnotationView, BootstrapResponse, DiffFileStat, TaskTimelineResponse } from '../generated/protocol';
+import { CursorIcon } from '../components/Icons';
 import { useDelivery } from '../hooks/queries';
 import { api, errMsg, makeIdempotencyKey } from '../lib/api';
 import { shortSha } from '../lib/format';
 import { buildIDEJump, launchIDE } from '../lib/ide';
 import { tokenizeHunksWithShiki } from '../lib/shikiDiff';
 import { toast, useWorkbenchStore } from '../store/useWorkbenchStore';
+import { ReviewFooter } from './ReviewFooter';
 
 const CODE_KINDS = new Set(['code_diff', 'mixed', 'workspace_snapshot']);
 
@@ -73,6 +75,8 @@ export function CodeReviewPane({
   tl,
   boot,
   onClose,
+  tabSwitch,
+  headerEnd,
 }: {
   taskId: string;
   deliveryId: string;
@@ -80,26 +84,25 @@ export function CodeReviewPane({
   tl?: TaskTimelineResponse;
   boot: BootstrapResponse;
   onClose: () => void;
+  tabSwitch?: ReactNode;
+  headerEnd?: ReactNode;
 }) {
   const qc = useQueryClient();
   const theme = useWorkbenchStore((s) => s.theme);
   const localMachineId = useWorkbenchStore((s) => s.localMachineId);
-  const deselectedArr = useWorkbenchStore((s) => s.deselectedAnnotations[taskId]);
-  const toggleAnnSelected = useWorkbenchStore((s) => s.toggleAnnotationSelected);
-  const clearDeselected = useWorkbenchStore((s) => s.clearDeselectedAnnotations);
-  const deselected = useMemo(() => new Set(deselectedArr ?? []), [deselectedArr]);
   const [file, setFile] = useState('');
   const [viewType, setViewType] = useState<ViewType>('unified');
+  const [treeOverride, setTreeOverride] = useState<boolean | null>(null);
   const [draft, setDraft] = useState<LineDraft | null>(null);
   const [body, setBody] = useState('');
   const [tokens, setTokens] = useState<HunkTokens | null>(null);
-  const [verifiedSite, setVerifiedSite] = useState(false);
   const [lastLine, setLastLine] = useState<{ path: string; line?: number } | null>(null);
 
   useEffect(() => {
     setFile('');
     setDraft(null);
     setBody('');
+    setTreeOverride(null);
   }, [deliveryId]);
 
   const versions = (tl?.deliveries ?? []).filter((d) => CODE_KINDS.has(d.kind));
@@ -112,9 +115,10 @@ export function CodeReviewPane({
   const detail = dq.data;
   const files = detail?.diffFiles ?? [];
   const activeFile = (file && files.some((f) => f.path === file) ? file : files[0]?.path) || '';
-  const lastAtt = tl?.attempts?.[tl.attempts.length - 1];
-  const needsVerifyAttemptId = !tl?.task.activeAttemptId && lastAtt?.state === 'needs_verification' ? lastAtt.attemptId : undefined;
-  useEffect(() => setVerifiedSite(false), [needsVerifyAttemptId]);
+  const isNarrow = typeof window !== 'undefined' && window.innerWidth < 768;
+  const defaultTreeOpen = !isNarrow && files.length > 2;
+  const treeOpen = treeOverride ?? defaultTreeOpen;
+  const effectiveViewType: ViewType = isNarrow ? 'unified' : viewType;
 
   const diffQ = useQuery({
     queryKey: ['delivery-diff', effectiveDeliveryId, activeFile],
@@ -144,23 +148,6 @@ export function CodeReviewPane({
   }, [parsed, activeFile, theme]);
 
   const annotations = (detail?.annotations ?? []).filter(isDiffAnnotation);
-  const openAnns = annotations.filter((a) => a.status === 'open');
-  const localSelectedIds = openAnns.filter((a) => !deselected.has(a.annotationId)).map((a) => a.annotationId);
-  const { selDiffIds, selRyugiIds, combinedSelectedIds } = useMemo(() => {
-    const byId = new Map<string, AnnotationView>();
-    for (const a of tl?.annotations ?? []) byId.set(a.annotationId, a);
-    for (const a of detail?.annotations ?? []) byId.set(a.annotationId, a);
-    const allOpen = [...byId.values()].filter((a) => a.status === 'open');
-    const openDiff = allOpen.filter(isDiffAnnotation);
-    const openRyugi = allOpen.filter((a) => a.source === 'ryugi');
-    const diffIds = openDiff.filter((a) => !deselected.has(a.annotationId)).map((a) => a.annotationId);
-    const ryugiIds = openRyugi.filter((a) => !deselected.has(a.annotationId)).map((a) => a.annotationId);
-    return {
-      selDiffIds: diffIds,
-      selRyugiIds: ryugiIds,
-      combinedSelectedIds: [...diffIds, ...ryugiIds],
-    };
-  }, [tl?.annotations, detail?.annotations, deselected]);
   const fileAnns = annotations.filter((a) => a.anchor.path === activeFile);
 
   const refresh = () => {
@@ -191,34 +178,6 @@ export function CodeReviewPane({
     onSuccess: () => {
       setDraft(null);
       setBody('');
-      refresh();
-    },
-    onError: (e) => toast(errMsg(e), 'err'),
-  });
-
-  const dispatch = useMutation({
-    mutationFn: (ids: string[]) =>
-      api.dispatchAnnotations(taskId, {
-        annotationIds: ids,
-        mode: 'queue',
-        verifiedSite: needsVerifyAttemptId ? verifiedSite : undefined,
-        verifiedAttemptId: needsVerifyAttemptId,
-      }),
-    onSuccess: (res) => {
-      toast(res.pendingInput ? `已送入队列（${res.queuedCount} 条批注）` : `已发给会话（${res.queuedCount} 条批注）`);
-      clearDeselected(taskId);
-      setVerifiedSite(false);
-      refresh();
-      void qc.invalidateQueries({ queryKey: ['bootstrap'] });
-    },
-    onError: (e) => toast(errMsg(e), 'err'),
-  });
-
-  const complete = useMutation({
-    mutationFn: () => api.completeDeliveryReview(effectiveDeliveryId),
-    onSuccess: () => {
-      toast('已标记审阅完成');
-      void qc.invalidateQueries({ queryKey: ['bootstrap'] });
       refresh();
     },
     onError: (e) => toast(errMsg(e), 'err'),
@@ -268,9 +227,8 @@ export function CodeReviewPane({
       if (!ck) continue;
       (map[ck] ??= []).push(
         <div className="cmsaved" key={a.annotationId}>
-          <span className="who">行评</span>
           <span style={{ whiteSpace: 'pre-wrap', minWidth: 0 }}>{a.body}</span>
-          <span className="stt">{a.status === 'open' ? '未发' : a.status === 'queued' ? '已入队' : a.status}</span>
+          {a.status !== 'open' && <span className="stt">{a.status === 'queued' ? '待发出' : a.status}</span>}
         </div>,
       );
     }
@@ -278,12 +236,12 @@ export function CodeReviewPane({
       (map[draft.changeKey] ??= []).push(
         <div className="cmbox" key="__draft">
           <div className="loc mono">
-            {draft.path}:{draft.line} ({draft.side === 'old' ? '旧' : '新'})
+            {draft.path}:{draft.line}
           </div>
           <textarea
             autoFocus
             value={body}
-            placeholder="写下针对这一行的修改意见…"
+            placeholder="写下修改意见…"
             onChange={(e) => {
               setBody(e.target.value);
               setDraft((d) => (d ? { ...d, idempotencyKey: makeIdempotencyKey() } : d));
@@ -325,7 +283,7 @@ export function CodeReviewPane({
       <button
         type="button"
         className="gbtn"
-        title={`在第 ${ln} 行留行评`}
+        title={`点击第 ${ln} 行留批注`}
         onClick={(e) => {
           e.stopPropagation();
           openComposer(change, side);
@@ -364,94 +322,91 @@ export function CodeReviewPane({
 
   return (
     <>
-      <div className="vtabs">
-        {versions.map((v, i) => (
+      <div className="rev-h">
+        {files.length > 0 && (
           <button
             type="button"
-            key={v.deliveryId}
-            className={v.deliveryId === effectiveDeliveryId ? 'on' : ''}
-            onClick={() => onSelectDelivery(v.deliveryId)}
+            className={`ib ${treeOpen ? 'on' : ''}`}
+            title={treeOpen ? '收起文件树' : '展开文件树'}
+            onClick={() => setTreeOverride(!treeOpen)}
           >
-            v{i + 1}
-            <span className="mono faint">{shortSha(v.headSha)}</span>
-            {v.lateArrival && <span className="faint"> (迟到)</span>}
+            <PanelLeft size={14} strokeWidth={1.6} />
           </button>
-        ))}
+        )}
+        {tabSwitch}
+        {versions.length >= 2 && (
+          <select
+            className="rev-ver mono"
+            value={effectiveDeliveryId}
+            onChange={(e) => onSelectDelivery(e.target.value)}
+            aria-label="版本"
+          >
+            {versions.map((v, i) => (
+              <option key={v.deliveryId} value={v.deliveryId}>
+                v{i + 1} · {shortSha(v.headSha)}
+              </option>
+            ))}
+          </select>
+        )}
         {d && (
-          <span className="mono faint" style={{ marginLeft: 4 }}>
-            {d.manifest.filesChanged} 文件 <span className="add">+{d.manifest.insertions}</span>{' '}
-            <span className="del">−{d.manifest.deletions}</span>
+          <span className="rev-stat mono no-mobile">
+            <span className="add">+{d.manifest.insertions}</span> <span className="del">−{d.manifest.deletions}</span>
           </span>
         )}
-        <span className="sp" />
-        {ide && (
-          <button type="button" className="btn ghost" onClick={() => launchIDE(ide.uri)} title={ide.resolvedPath}>
-            <ArrowUpRight size={13} strokeWidth={1.6} /> Cursor
+        <div className="rev-h-acts">
+          <button
+            type="button"
+            className="ib no-mobile"
+            title={viewType === 'unified' ? '切换为分栏 Diff' : '切换为统一 Diff'}
+            onClick={() => setViewType(viewType === 'unified' ? 'split' : 'unified')}
+          >
+            {viewType === 'unified' ? <Columns2 size={14} strokeWidth={1.6} /> : <Rows2 size={14} strokeWidth={1.6} />}
           </button>
-        )}
-        <div className="seg">
-          <button type="button" className={viewType === 'unified' ? 'on' : ''} onClick={() => setViewType('unified')}>
-            Unified
-          </button>
-          <button type="button" className={viewType === 'split' ? 'on' : ''} onClick={() => setViewType('split')}>
-            Split
-          </button>
+          {ide && (
+            <button type="button" className="ib no-mobile" onClick={() => launchIDE(ide.uri)} title={`在 Cursor 打开 · ${ide.resolvedPath}`}>
+              <CursorIcon size={14} />
+            </button>
+          )}
+          {headerEnd}
         </div>
       </div>
 
-      <div className="cr-body">
-        <div className="ftree">
-          {dq.isLoading && <div className="fdir">载入文件…</div>}
-          {groupByDir(files).map(([dir, fs]) => (
-            <div key={dir || '/'}>
-              {dir && <div className="fdir mono">{dir}/</div>}
-              {fs.map((f) => (
-                <button
-                  type="button"
-                  key={f.path}
-                  className={`ff ${f.path === activeFile ? 'on' : ''}`}
-                  onClick={() => {
-                    setFile(f.path);
-                    setDraft(null);
-                  }}
-                  title={f.path}
-                >
-                  <span className="fn">{f.path.split('/').pop()}</span>
-                  {annCount(f.path) > 0 && <span className="cc">●</span>}
-                  <span className="fs mono">
-                    {f.binary ? (
-                      <span className="faint">bin</span>
-                    ) : (
-                      <>
-                        <span className="add">+{f.insertions}</span> <span className="del">−{f.deletions}</span>
-                      </>
-                    )}
-                  </span>
-                </button>
-              ))}
-            </div>
-          ))}
-          {openAnns.length > 0 && (
-            <div className="pend">
-              <div className="fdir">待发送行评</div>
-              {openAnns.map((a) => (
-                <label className="pend-i" key={a.annotationId}>
-                  <input
-                    type="checkbox"
-                    checked={!deselected.has(a.annotationId)}
-                    onChange={(e) => toggleAnnSelected(taskId, a.annotationId, e.target.checked)}
-                  />
-                  <span style={{ minWidth: 0 }}>
-                    <span className="loc mono">
-                      {a.anchor.path}:{a.anchor.startLine}
+      <div className={`cr-body ${treeOpen ? '' : 'tree-collapsed'}`}>
+        {treeOpen && (
+          <div className="ftree">
+            {dq.isLoading && <div className="fdir">载入文件…</div>}
+            {groupByDir(files).map(([dir, fs]) => (
+              <div key={dir || '/'}>
+                {dir && <div className="fdir mono">{dir}/</div>}
+                {fs.map((f) => (
+                  <button
+                    type="button"
+                    key={f.path}
+                    className={`ff ${f.path === activeFile ? 'on' : ''}`}
+                    onClick={() => {
+                      setFile(f.path);
+                      setDraft(null);
+                      if (isNarrow) setTreeOverride(false);
+                    }}
+                    title={f.path}
+                  >
+                    <span className="fn">{f.path.split('/').pop()}</span>
+                    {annCount(f.path) > 0 && <span className="cc">●</span>}
+                    <span className="fs mono">
+                      {f.binary ? (
+                        <span className="faint">bin</span>
+                      ) : (
+                        <>
+                          <span className="add">+{f.insertions}</span> <span className="del">−{f.deletions}</span>
+                        </>
+                      )}
                     </span>
-                    <span className="txt">{a.body}</span>
-                  </span>
-                </label>
-              ))}
-            </div>
-          )}
-        </div>
+                  </button>
+                ))}
+              </div>
+            ))}
+          </div>
+        )}
         <div className="diffpane orbit-diff">
           {dq.isError ? (
             <div className="empty bad-t">
@@ -461,12 +416,29 @@ export function CodeReviewPane({
               </button>
             </div>
           ) : files.length === 0 && !dq.isLoading ? (
-            <div className="empty">这次交付相对基线没有文本差异</div>
+            <div className="empty">没有文本差异</div>
           ) : (
             <>
               <div className="dhead">
-                <span className="p mono">{activeFile}</span>
-                <span className="r faint">点行号留行评</span>
+                {!treeOpen && files.length > 1 ? (
+                  <select
+                    className="dhead-sel mono"
+                    value={activeFile}
+                    onChange={(e) => {
+                      setFile(e.target.value);
+                      setDraft(null);
+                    }}
+                    aria-label="切换文件"
+                  >
+                    {files.map((f) => (
+                      <option key={f.path} value={f.path}>
+                        {f.path} (+{f.insertions} −{f.deletions})
+                      </option>
+                    ))}
+                  </select>
+                ) : (
+                  <span className="p mono">{activeFile}</span>
+                )}
               </div>
               {diffQ.isLoading ? (
                 <div className="empty">载入 Diff…</div>
@@ -474,7 +446,7 @@ export function CodeReviewPane({
                 <div className="empty">该文件为二进制或无文本差异</div>
               ) : (
                 <Diff
-                  viewType={viewType}
+                  viewType={effectiveViewType}
                   diffType={parsed.type}
                   hunks={parsed.hunks}
                   tokens={tokens}
@@ -490,44 +462,12 @@ export function CodeReviewPane({
         </div>
       </div>
 
-      <div className="wf">
-        <span className="l">
-          {combinedSelectedIds.length > 0
-            ? `已选 ${combinedSelectedIds.length} 条批注`
-            : '点行号留行评，攒好后一次送进右侧会话'}
-        </span>
-        <span className="r">
-          {needsVerifyAttemptId && (
-            <label className="chk" style={{ color: 'var(--warn)', marginRight: 4 }}>
-              <input type="checkbox" checked={verifiedSite} onChange={(e) => setVerifiedSite(e.target.checked)} />
-              已核对现场
-            </label>
-          )}
-          <button type="button" className="btn" disabled={complete.isPending || !d} onClick={() => complete.mutate()}>
-            审阅完成
-          </button>
-          {selRyugiIds.length > 0 && localSelectedIds.length > 0 && (
-            <button
-              type="button"
-              className="btn ghost"
-              disabled={dispatch.isPending || (!!needsVerifyAttemptId && !verifiedSite)}
-              onClick={() => dispatch.mutate(localSelectedIds)}
-            >
-              仅发代码 ({localSelectedIds.length})
-            </button>
-          )}
-          <button
-            type="button"
-            className="btn pri"
-            disabled={combinedSelectedIds.length === 0 || dispatch.isPending || (!!needsVerifyAttemptId && !verifiedSite)}
-            onClick={() => dispatch.mutate(combinedSelectedIds)}
-          >
-            {selDiffIds.length > 0 && selRyugiIds.length > 0
-              ? `合并发送 ${combinedSelectedIds.length} 条批注`
-              : `发送 ${combinedSelectedIds.length} 条批注`}
-          </button>
-        </span>
-      </div>
+      <ReviewFooter
+        taskId={taskId}
+        deliveryId={d?.deliveryId}
+        tl={tl}
+        extraAnnotations={detail?.annotations}
+      />
     </>
   );
 }

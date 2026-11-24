@@ -6,6 +6,7 @@ import { Sidebar } from './components/Sidebar';
 import { useBootstrap } from './hooks/queries';
 import { useRealtimeSync } from './hooks/useRealtimeSync';
 import { errMsg } from './lib/api';
+import { hasUrgentSession } from './lib/format';
 import { navigate, parseHash, paths, useRoute } from './lib/router';
 import { HomePage } from './pages/HomePage';
 import { NewThreadPage } from './pages/NewThreadPage';
@@ -148,7 +149,7 @@ export function App() {
       <div className={`app ${collapsed ? 'side-collapsed' : ''}`}>
         <Sidebar boot={boot} route={route} />
         {page}
-        <MobileTabs route={route} hasAttention={boot.openInboxItems.length > 0} />
+        <MobileTabs route={route} hasUrgent={hasUrgentSession(boot.openInboxItems, boot.activeTasks)} />
       </div>
       <ReviewOverlay boot={boot} />
       {cmdkOpen && <CommandPalette boot={boot} />}

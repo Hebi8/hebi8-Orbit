@@ -2,12 +2,11 @@ import { useEffect, useState } from 'react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { ArrowLeft, ChevronDown, Link2 } from 'lucide-react';
 import type { BootstrapResponse } from '../generated/protocol';
-import { BranchIcon, CardIcon, CursorIcon, DiffIcon, SwarmIcon } from '../components/Icons';
+import { CardIcon, DiffIcon } from '../components/Icons';
 import { PageHeader } from '../components/PageHeader';
 import { useBoard, useTimeline } from '../hooks/queries';
 import { api, errMsg } from '../lib/api';
-import { SCRATCH_PROJECT_ID, attentionTaskIds, basename, memberStateLabel, shortSha, taskStateLabel, taskTitle } from '../lib/format';
-import { buildIDEJump, buildProjectIDEJump, launchIDE } from '../lib/ide';
+import { SCRATCH_PROJECT_ID, memberStateLabel, taskTitle } from '../lib/format';
 import { navigate, paths } from '../lib/router';
 import { toast, useWorkbenchStore } from '../store/useWorkbenchStore';
 import { BoardPanel } from './BoardPanel';
@@ -32,9 +31,9 @@ function BindMenu({ boot, taskId }: { boot: BootstrapResponse; taskId: string })
     onError: (e) => toast(errMsg(e), 'err'),
   });
   return (
-    <div className="relpos" style={{ flex: 'none' }}>
-      <button type="button" className="bind-btn" style={{ cursor: 'pointer' }} onClick={() => setOpen(!open)}>
-        <Link2 size={12} strokeWidth={1.6} /> 绑定到项目… <ChevronDown size={11} strokeWidth={1.6} />
+    <div className="relpos bind-wrap" style={{ flex: 'none' }}>
+      <button type="button" className="bind-btn" onClick={() => setOpen(!open)}>
+        <Link2 size={12} strokeWidth={1.6} /> 绑定到项目 <ChevronDown size={11} strokeWidth={1.6} />
       </button>
       {open && (
         <>
@@ -43,7 +42,6 @@ function BindMenu({ boot, taskId }: { boot: BootstrapResponse; taskId: string })
             <div className="mh">迁移为项目线程</div>
             {projects.map((p) => (
               <button type="button" key={p.projectId} disabled={bind.isPending} onClick={() => bind.mutate(p.projectId)}>
-                <span className="pl">{p.displayName.slice(0, 1)}</span>
                 <span className="ell">{p.displayName}</span>
               </button>
             ))}
@@ -70,16 +68,16 @@ export function SessionPage({ boot, taskId, worker }: { boot: BootstrapResponse;
   const setMobileDock = useWorkbenchStore((s) => s.setMobileDockOpen);
   const expandedProjects = useWorkbenchStore((s) => s.expandedProjects);
   const setProjectExpanded = useWorkbenchStore((s) => s.setProjectExpanded);
-  const localMachineId = useWorkbenchStore((s) => s.localMachineId);
   const openReview = useWorkbenchStore((s) => s.openReview);
+  const [manualCardOpen, setManualCardOpen] = useState(false);
 
   const members = tl?.boardMembers ?? [];
   const hasSwarm = members.length > 0 || (task?.workerCount ?? 0) > 0;
   const boardQ = useBoard(taskId, hasSwarm || boardOpen || !!worker);
-  const attentionSet = attentionTaskIds(boot.openInboxItems);
 
   useEffect(() => {
     setMobileDock(false);
+    setManualCardOpen(false);
   }, [taskId, setMobileDock]);
 
   useEffect(() => {
@@ -110,36 +108,24 @@ export function SessionPage({ boot, taskId, worker }: { boot: BootstrapResponse;
     );
   }
 
+  const formalDeliveries = tl.deliveries.filter((d) => !d.lateArrival);
   const codeDeliveries = tl.deliveries.filter((d) => CODE_KINDS.has(d.kind));
-  const formalCodeDeliveries = codeDeliveries.filter((d) => !d.lateArrival);
+  const formalCodeDeliveries = formalDeliveries.filter((d) => CODE_KINDS.has(d.kind) && d.manifest.filesChanged > 0);
   const latestCode =
     formalCodeDeliveries.find((d) => d.deliveryId === task.latestDeliveryId) ??
     formalCodeDeliveries[formalCodeDeliveries.length - 1] ??
     codeDeliveries[codeDeliveries.length - 1];
   const artDelivery = [...tl.deliveries].reverse().find((d) => (d.ryugiBindings?.length ?? 0) > 0);
-  const primaryReview = latestCode ? { tab: 'code' as const, deliveryId: latestCode.deliveryId } : artDelivery ? { tab: 'art' as const, deliveryId: artDelivery.deliveryId } : null;
+  const primaryReview = latestCode
+    ? { tab: 'code' as const, deliveryId: latestCode.deliveryId }
+    : artDelivery
+      ? { tab: 'art' as const, deliveryId: artDelivery.deliveryId }
+      : null;
 
-  const lastAttempt = tl.attempts[tl.attempts.length - 1];
-  const branchText = latestCode
-    ? `${basename(latestCode.manifest.worktreePath) || 'worktree'} · ${shortSha(latestCode.headSha)}`
-    : lastAttempt?.worktreePath
-      ? `${basename(lastAttempt.worktreePath)}${lastAttempt.baseSha ? ` · ${shortSha(lastAttempt.baseSha)}` : ''}`
-      : '';
-  const ide = project
-    ? latestCode
-      ? buildIDEJump({ scheme: project.ideScheme, localMachineId, delivery: latestCode, project, machines: boot.machines })
-      : buildProjectIDEJump({
-          project,
-          machines: boot.machines,
-          localMachineId,
-          worktreePath: lastAttempt?.worktreePath,
-          worktreeMachineId: lastAttempt?.machineId,
-        })
-    : null;
+  const hasCardContent = formalCodeDeliveries.length > 0 || !!artDelivery || hasSwarm || tl.sources.length > 0;
+  const cardVisible = hasCardContent ? cardOpen : manualCardOpen;
   const drilledMember = worker ? (boardQ.data?.members ?? members).find((m) => m.memberName === worker) : undefined;
-  const showBoardBtn = hasSwarm || boardOpen;
-  const dockMode: 'board' | 'card' | null = boardOpen ? 'board' : cardOpen ? 'card' : null;
-  const stateLabel = taskStateLabel(task, attentionSet.has(task.taskId));
+  const dockMode: 'board' | 'card' | null = boardOpen ? 'board' : cardVisible ? 'card' : null;
 
   return (
     <main className="main">
@@ -150,41 +136,27 @@ export function SessionPage({ boot, taskId, worker }: { boot: BootstrapResponse;
               <button
                 type="button"
                 className="hb"
-                title="打开产出审阅（左产物 / 右会话）"
+                title="审阅产出"
                 onClick={() => openReview(primaryReview.tab, taskId, primaryReview.deliveryId)}
               >
                 <DiffIcon size={13} />
                 <span className="no-mobile">审阅</span>
               </button>
             )}
-            {ide && !isScratch && (
-              <button type="button" className="ib no-mobile" title={`在 Cursor 打开 · ${ide.targetLabel}`} onClick={() => launchIDE(ide.uri)}>
-                <CursorIcon />
-              </button>
-            )}
-            {showBoardBtn && (
-              <button
-                type="button"
-                className={`hb ${boardOpen ? 'on' : ''}`}
-                title="协作消息板"
-                onClick={() => {
-                  setBoardOpen(!boardOpen);
-                  setMobileDock(!boardOpen);
-                }}
-              >
-                <SwarmIcon />
-                <span className="no-mobile">协作</span>
-              </button>
-            )}
             <button
               type="button"
-              className={`ib ${cardOpen && !boardOpen ? 'on' : ''} no-mobile`}
+              className={`ib ${cardVisible && !boardOpen ? 'on' : ''} no-mobile`}
               title="右侧浮卡"
               onClick={() => {
                 if (boardOpen) {
                   setBoardOpen(false);
-                  setCardOpen(true);
-                } else setCardOpen(!cardOpen);
+                  if (hasCardContent) setCardOpen(true);
+                  else setManualCardOpen(true);
+                } else if (hasCardContent) {
+                  setCardOpen(!cardOpen);
+                } else {
+                  setManualCardOpen(!manualCardOpen);
+                }
               }}
             >
               <CardIcon />
@@ -229,19 +201,7 @@ export function SessionPage({ boot, taskId, worker }: { boot: BootstrapResponse;
                 {taskTitle(task)}
               </span>
             </div>
-            {isScratch ? (
-              <BindMenu boot={boot} taskId={taskId} />
-            ) : (
-              branchText && (
-                <span className="branch mono" title={latestCode?.gitRef ?? lastAttempt?.worktreePath}>
-                  <BranchIcon size={12} />
-                  {branchText}
-                </span>
-              )
-            )}
-            <span className="faint no-mobile" style={{ fontSize: 11.5, whiteSpace: 'nowrap' }}>
-              {stateLabel}
-            </span>
+            {isScratch && <BindMenu boot={boot} taskId={taskId} />}
           </>
         )}
       </PageHeader>
@@ -252,7 +212,6 @@ export function SessionPage({ boot, taskId, worker }: { boot: BootstrapResponse;
           tl={tl}
           worker={worker}
           drilledMember={drilledMember}
-          onOpenBoard={() => setBoardOpen(true)}
         />
         {(dockMode || mobileDock) && (
           <div
@@ -278,9 +237,7 @@ export function SessionPage({ boot, taskId, worker }: { boot: BootstrapResponse;
                 project={project}
                 machines={boot.machines}
                 board={boardQ.data}
-                onOpenBoard={() => {
-                  setBoardOpen(true);
-                }}
+                onOpenBoard={() => setBoardOpen(true)}
               />
             )}
           </div>

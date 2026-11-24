@@ -1,20 +1,28 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { ArrowUpRight, FolderGit2, LayoutGrid, MessageSquare, Plus, Search, Zap } from 'lucide-react';
+import { ArrowUpRight, FolderGit2, LayoutGrid, MessageSquare, Plus, SunMoon, Zap } from 'lucide-react';
 import type { BootstrapResponse, PABriefResponse, PAChatResponse } from '../generated/protocol';
 import { useManyProjectTasks } from '../hooks/queries';
-import { SCRATCH_PROJECT_ID, attentionTaskIds, taskDot, taskStateLabel, taskTitle } from '../lib/format';
+import {
+  SCRATCH_PROJECT_ID,
+  displayMarkRank,
+  indexInboxByTask,
+  relTime,
+  rootSessionMark,
+  taskTitle,
+} from '../lib/format';
 import { navigate, paths } from '../lib/router';
 import { useWorkbenchStore } from '../store/useWorkbenchStore';
 import { PAIcon } from './Icons';
 import { Md } from './Md';
 import { ActionCards, BriefView, usePABrief, usePAChat } from './PAViews';
+import { StatusMark } from './StatusMark';
 
 interface Item {
   key: string;
   group: string;
-  icon: ReactNode;
+  icon?: ReactNode;
   label: string;
-  detail?: string;
+  trail?: ReactNode;
   run: () => void;
 }
 
@@ -30,7 +38,7 @@ export function CommandPalette({ boot }: { boot: BootstrapResponse }) {
   const tasksBy = useManyProjectTasks(boot.projects);
   const chat = usePAChat((res) => setOut({ kind: 'chat', res }));
   const brief = usePABrief((res) => setOut({ kind: 'brief', res }));
-  const attentionSet = useMemo(() => attentionTaskIds(boot.openInboxItems), [boot.openInboxItems]);
+  const inboxByTask = useMemo(() => indexInboxByTask(boot.openInboxItems), [boot.openInboxItems]);
 
   useEffect(() => inputRef.current?.focus(), []);
 
@@ -43,24 +51,41 @@ export function CommandPalette({ boot }: { boot: BootstrapResponse }) {
     const k = q.trim().toLowerCase();
     const match = (s: string) => !k || s.toLowerCase().includes(k);
     const list: Item[] = [];
+
     if (k) {
       list.push({
         key: 'ask',
         group: 'PA',
         icon: <PAIcon />,
         label: `问 PA：${q.trim()}`,
-        detail: '↵',
+        trail: <span className="d">↵</span>,
         run: () => chat.mutate({ message: q.trim(), threadId: boot.paState.activePaThreadId || undefined }),
       });
     }
-    const actions: Item[] = [
-      { key: 'brief', group: '动作', icon: <Zap size={14} strokeWidth={1.6} />, label: 'Brief Me · 今日摘要', run: () => brief.mutate() },
-      { key: 'new', group: '动作', icon: <Plus size={14} strokeWidth={1.6} />, label: '新建线程', detail: '⌘N', run: () => go(paths.newThread()) },
-      { key: 'home', group: '动作', icon: <LayoutGrid size={14} strokeWidth={1.6} />, label: '打开总览', run: () => go(paths.home()) },
-      { key: 'pa', group: '动作', icon: <PAIcon />, label: '打开 PA', run: () => go(paths.pa()) },
-      { key: 'theme', group: '动作', icon: <Search size={14} strokeWidth={1.6} />, label: '切换深 / 浅色', run: () => toggleTheme() },
-    ];
-    list.push(...actions.filter((a) => match(a.label)));
+
+    // Recent threads first (so opening ⌘K jumps straight to active/recent sessions)
+    const allTasks = Object.values(tasksBy).flat();
+    const threads = allTasks
+      .filter((t) => !t.parentTaskId)
+      .filter((t) => (k ? match(`${t.title} ${t.goal}`) : true))
+      .map((t) => ({ t, mark: rootSessionMark(t, allTasks, inboxByTask) }))
+      .sort((a, b) => displayMarkRank(a.mark) - displayMarkRank(b.mark) || b.t.updatedAt - a.t.updatedAt)
+      .slice(0, k ? 10 : 6);
+
+    for (const { t, mark } of threads) {
+      const pn =
+        t.projectId === SCRATCH_PROJECT_ID
+          ? '自由 Chat'
+          : boot.projects.find((p) => p.projectId === t.projectId)?.displayName ?? t.projectId;
+      list.push({
+        key: `t:${t.taskId}`,
+        group: k ? '线程' : '最近线程',
+        label: `${pn} / ${taskTitle(t)}`,
+        trail: mark ? <StatusMark mark={mark} /> : <span className="d">{relTime(t.updatedAt)}</span>,
+        run: () => go(paths.session(t.taskId)),
+      });
+    }
+
     for (const p of boot.projects) {
       if (p.projectId === SCRATCH_PROJECT_ID || p.archived) continue;
       if (!match(`${p.displayName} ${p.repoIdentity}`)) continue;
@@ -69,32 +94,23 @@ export function CommandPalette({ boot }: { boot: BootstrapResponse }) {
         group: '项目',
         icon: <FolderGit2 size={14} strokeWidth={1.6} />,
         label: p.displayName,
-        detail: p.blockedTaskCount > 0 ? '需要注意' : p.activeTaskCount > 0 ? '运行中' : undefined,
         run: () => go(paths.project(p.projectId)),
       });
     }
-    const threads = Object.values(tasksBy)
-      .flat()
-      .filter((t) => !t.parentTaskId)
-      .filter((t) => (k ? match(`${t.title} ${t.goal}`) : t.state !== 'done' && t.state !== 'cancelled'))
-      .sort((a, b) => b.updatedAt - a.updatedAt)
-      .slice(0, k ? 10 : 6);
-    for (const t of threads) {
-      const pn = t.projectId === SCRATCH_PROJECT_ID ? '自由 Chat' : boot.projects.find((p) => p.projectId === t.projectId)?.displayName ?? t.projectId;
-      const attn = attentionSet.has(t.taskId);
-      list.push({
-        key: `t:${t.taskId}`,
-        group: k ? '线程' : '最近线程',
-        icon: <span className={`sd ${taskDot(t.state, t.activeAttemptState, attn)}`} style={{ margin: '0 4px' }} />,
-        label: `${pn} / ${taskTitle(t)}`,
-        detail: taskStateLabel(t, attn),
-        run: () => go(paths.session(t.taskId)),
-      });
-    }
+
+    const actions: Item[] = [
+      { key: 'brief', group: '动作', icon: <Zap size={14} strokeWidth={1.6} />, label: '今日摘要', run: () => brief.mutate() },
+      { key: 'new', group: '动作', icon: <Plus size={14} strokeWidth={1.6} />, label: '新建线程', trail: <span className="d">⌘N</span>, run: () => go(paths.newThread()) },
+      { key: 'home', group: '动作', icon: <LayoutGrid size={14} strokeWidth={1.6} />, label: '总览', run: () => go(paths.home()) },
+      { key: 'pa', group: '动作', icon: <PAIcon />, label: 'PA', run: () => go(paths.pa()) },
+      { key: 'theme', group: '动作', icon: <SunMoon size={14} strokeWidth={1.6} />, label: '切换深 / 浅色', run: () => toggleTheme() },
+    ];
+    list.push(...actions.filter((a) => match(a.label)));
+
     return list;
     // chat/brief mutate fns are stable per hook instance
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [q, boot, tasksBy, attentionSet]);
+  }, [q, boot, tasksBy, inboxByTask]);
 
   useEffect(() => setAct(0), [q]);
   const groups: string[] = [];
@@ -110,7 +126,7 @@ export function CommandPalette({ boot }: { boot: BootstrapResponse }) {
           <input
             ref={inputRef}
             value={q}
-            placeholder="问 PA、跳线程，或搜索项目…"
+            placeholder="跳线程、搜项目，或问 PA…"
             onChange={(e) => setQ(e.target.value)}
             onKeyDown={(e) => {
               if (e.nativeEvent.isComposing) return;
@@ -170,7 +186,7 @@ export function CommandPalette({ boot }: { boot: BootstrapResponse }) {
                   >
                     {it.icon}
                     <span className="ell">{it.label}</span>
-                    {it.detail && <span className="d">{it.detail}</span>}
+                    {it.trail && <span className="ck-trail">{it.trail}</span>}
                   </button>
                 ))}
             </div>
@@ -180,11 +196,6 @@ export function CommandPalette({ boot }: { boot: BootstrapResponse }) {
               <MessageSquare size={14} strokeWidth={1.6} /> 没有匹配项
             </div>
           )}
-        </div>
-        <div className="ck-foot no-mobile">
-          <span>↑↓ 选择</span>
-          <span>↵ 执行</span>
-          <span>esc 关闭</span>
         </div>
       </section>
     </>

@@ -1,6 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { BoardMemberCursor, PendingInput, TaskTimelineResponse } from '../generated/protocol';
-import { taskStateLabel } from '../lib/format';
 import { useWorkbenchStore } from '../store/useWorkbenchStore';
 import { Composer } from './Composer';
 import { Minimap } from './Minimap';
@@ -17,14 +16,12 @@ export function SessionConversation({
   tl,
   worker,
   drilledMember,
-  onOpenBoard,
   compact = false,
 }: {
   taskId: string;
   tl: TaskTimelineResponse;
   worker?: string;
   drilledMember?: BoardMemberCursor;
-  onOpenBoard?: () => void;
   compact?: boolean;
 }) {
   const remember = useWorkbenchStore((s) => s.rememberPrompt);
@@ -83,7 +80,7 @@ export function SessionConversation({
                   </div>
                   <div className="it running">
                     <span className="spin" />
-                    <span className="shim">{taskStateLabel(task)}</span>
+                    <span className="shim">准备中…</span>
                   </div>
                 </>
               )}
@@ -94,7 +91,7 @@ export function SessionConversation({
                   index={i}
                   isLast={i === tl.attempts.length - 1}
                   tl={tl}
-                  onOpenBoard={onOpenBoard}
+                  compact={compact}
                 />
               ))}
               <QueueBubbles

@@ -1,6 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
-import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { ArrowRight, ArrowUpRight, X, Zap } from 'lucide-react';
+import { useMemo, useRef, useState } from 'react';
+import { ArrowUpRight, X, Zap } from 'lucide-react';
 import type {
   ApprovalView,
   BootstrapResponse,
@@ -11,24 +10,25 @@ import type {
   TaskSummary,
 } from '../generated/protocol';
 import { ApprovalButtons } from '../components/ApprovalNotice';
-import { DiffIcon, SendUpIcon } from '../components/Icons';
+import { SendUpIcon } from '../components/Icons';
 import { Md } from '../components/Md';
 import { PageHeader } from '../components/PageHeader';
 import { ActionCards, BriefView, usePABrief, usePAChat } from '../components/PAViews';
-import { useManyProjectTasks, useRecentApprovals, useTimeline } from '../hooks/queries';
-import { api, errMsg } from '../lib/api';
+import { StatusMark } from '../components/StatusMark';
+import { useRecentApprovals } from '../hooks/queries';
 import {
   SCRATCH_PROJECT_ID,
   approvalPreview,
-  attentionTaskIds,
-  relTime,
-  taskDot,
-  taskStateLabel,
+  displayMarkRank,
+  inboxItemsMark,
+  indexInboxByTask,
+  sessionMark,
+  shortSha,
   taskTitle,
-  todayLabel,
+  type SessionMark,
 } from '../lib/format';
 import { navigate, paths } from '../lib/router';
-import { toast, useWorkbenchStore } from '../store/useWorkbenchStore';
+import { useWorkbenchStore } from '../store/useWorkbenchStore';
 
 export function projectName(projects: ProjectView[], pid: string): string {
   if (pid === SCRATCH_PROJECT_ID) return '自由 Chat';
@@ -67,22 +67,12 @@ function PAQuickBar({ boot }: { boot: BootstrapResponse }) {
 
   return (
     <>
-      <div className="hello">
-        <h1>{todayLabel().greet}</h1>
-        <span className="d">{todayLabel().date}</span>
-        <div className="r">
-          <button type="button" className="btn" disabled={brief.isPending} onClick={() => brief.mutate()}>
-            <Zap size={13} strokeWidth={1.6} />
-            {brief.isPending ? '汇总中…' : 'Brief Me'}
-          </button>
-        </div>
-      </div>
       <div className="ask">
         <textarea
           ref={ref}
           value={text}
           rows={1}
-          placeholder="问 PA：今天有什么要处理？"
+          placeholder="问 PA…"
           onChange={(e) => {
             setText(e.target.value);
             grow();
@@ -95,14 +85,24 @@ function PAQuickBar({ boot }: { boot: BootstrapResponse }) {
           }}
           aria-label="问 PA"
         />
-        <button type="button" className="send" title="发送 ↵" disabled={!text.trim() || chat.isPending} onClick={send}>
+        <button
+          type="button"
+          className="ib"
+          title="今日摘要"
+          aria-label="今日摘要"
+          disabled={brief.isPending}
+          onClick={() => brief.mutate()}
+        >
+          {brief.isPending ? <span className="spin" /> : <Zap size={14} strokeWidth={1.6} />}
+        </button>
+        <button type="button" className="send" title="发送 ↵" aria-label="发送" disabled={!text.trim() || chat.isPending} onClick={send}>
           {chat.isPending ? <span className="spin" /> : <SendUpIcon />}
         </button>
       </div>
       {out && (
         <div className="reply">
           <div className="reply-h">
-            <span className="ell">{out.kind === 'chat' ? 'PA' : `过去 ${out.res.sinceHours} 小时摘要`}</span>
+            <span className="ell">{out.kind === 'chat' ? 'PA' : '今日摘要'}</span>
             <span className="r">
               <button type="button" className="btn ghost" onClick={() => navigate(paths.pa(threadId || undefined))}>
                 在 PA 页继续 <ArrowUpRight size={12} strokeWidth={1.6} />
@@ -126,15 +126,6 @@ function PAQuickBar({ boot }: { boot: BootstrapResponse }) {
   );
 }
 
-interface AttentionGroup {
-  key: string;
-  taskId?: string;
-  projectId: string;
-  primary: InboxItemView;
-  items: InboxItemView[];
-  updatedAt: number;
-}
-
 const CAT_RANK: Record<string, number> = {
   approval_pending: 0,
   task_blocked: 1,
@@ -142,196 +133,175 @@ const CAT_RANK: Record<string, number> = {
   memory_conflict: 3,
 };
 
-function groupInboxBySession(items: InboxItemView[]): AttentionGroup[] {
-  const byKey = new Map<string, InboxItemView[]>();
-  for (const it of items) {
-    const key = it.taskId || it.inboxId;
-    const list = byKey.get(key) ?? [];
-    list.push(it);
-    byKey.set(key, list);
+interface HomeEntry {
+  key: string;
+  taskId?: string;
+  projectId: string;
+  title: string;
+  mark: Exclude<SessionMark, null>;
+  updatedAt: number;
+  primaryInbox?: InboxItemView;
+  inboxItems: InboxItemView[];
+}
+
+function buildHomeEntries(boot: BootstrapResponse): HomeEntry[] {
+  const inboxByTask = indexInboxByTask(boot.openInboxItems);
+  const taskById = new Map<string, TaskSummary>();
+  for (const t of boot.activeTasks) {
+    if (!t.parentTaskId) taskById.set(t.taskId, t);
   }
-  const groups: AttentionGroup[] = [];
-  for (const [key, list] of byKey.entries()) {
+
+  const seenKeys = new Set<string>();
+  const entries: HomeEntry[] = [];
+
+  // 1. All root active tasks (merged with any open inbox items for that task)
+  for (const t of boot.activeTasks) {
+    if (t.parentTaskId) continue;
+    const inbox = [...(inboxByTask.get(t.taskId) ?? [])].sort(
+      (a, b) => (CAT_RANK[a.category] ?? 9) - (CAT_RANK[b.category] ?? 9) || b.updatedAt - a.updatedAt,
+    );
+    const mark = sessionMark(t, inbox);
+    if (!mark) continue;
+    seenKeys.add(t.taskId);
+    entries.push({
+      key: t.taskId,
+      taskId: t.taskId,
+      projectId: t.projectId,
+      title: taskTitle(t),
+      mark,
+      updatedAt: Math.max(t.updatedAt, ...inbox.map((i) => i.updatedAt)),
+      primaryInbox: inbox[0],
+      inboxItems: inbox,
+    });
+  }
+
+  // 2. Open inbox items whose task wasn't in activeTasks (e.g. standalone or child-only)
+  const extraByKey = new Map<string, InboxItemView[]>();
+  for (const it of boot.openInboxItems) {
+    const key = it.taskId || it.inboxId;
+    if (seenKeys.has(key)) continue;
+    const list = extraByKey.get(key) ?? [];
+    list.push(it);
+    extraByKey.set(key, list);
+  }
+  for (const [key, list] of extraByKey.entries()) {
     list.sort((a, b) => (CAT_RANK[a.category] ?? 9) - (CAT_RANK[b.category] ?? 9) || b.updatedAt - a.updatedAt);
     const primary = list[0];
-    groups.push({
+    const mark = inboxItemsMark(list);
+    if (!mark) continue;
+    entries.push({
       key,
       taskId: primary.taskId,
       projectId: primary.projectId,
-      primary,
-      items: list,
-      updatedAt: Math.max(...list.map((x) => x.updatedAt)),
+      title: primary.title,
+      mark,
+      updatedAt: Math.max(...list.map((i) => i.updatedAt)),
+      primaryInbox: primary,
+      inboxItems: list,
     });
   }
-  groups.sort((a, b) => (CAT_RANK[a.primary.category] ?? 9) - (CAT_RANK[b.primary.category] ?? 9) || b.updatedAt - a.updatedAt);
-  return groups;
+
+  entries.sort((a, b) => displayMarkRank(a.mark) - displayMarkRank(b.mark) || b.updatedAt - a.updatedAt);
+  return entries;
 }
 
-function BlockedSessionRow({ item, projects }: { item: InboxItemView; projects: ProjectView[] }) {
-  const qc = useQueryClient();
-  const tl = useTimeline(item.taskId);
-  const [verified, setVerified] = useState(false);
-  const attempts = tl.data?.attempts ?? [];
-  const latest = attempts[attempts.length - 1];
-  const needsVerify = latest?.state === 'needs_verification';
-  const latestAttemptId = latest?.attemptId;
-  useEffect(() => {
-    setVerified(false);
-  }, [latestAttemptId]);
-  const canRetry = !!latest && (latest.state === 'needs_verification' || latest.state === 'failed' || latest.state === 'expired');
-  const retry = useMutation({
-    mutationFn: () =>
-      api.retryTask(item.taskId!, {
-        verifiedSite: needsVerify ? verified : undefined,
-        verifiedAttemptId: needsVerify ? latestAttemptId : undefined,
-      }),
-    onSuccess: () => {
-      toast('已发起重试');
-      void qc.invalidateQueries({ queryKey: ['bootstrap'] });
-      void qc.invalidateQueries({ queryKey: ['task-timeline', item.taskId] });
-    },
-    onError: (e) => toast(errMsg(e), 'err'),
-  });
-  return (
-    <div className="inbox-row k-blocked">
-      <div className="h">
-        <span className="sd wait" />
-        <span className="kind ell">{item.title}</span>
-        <span className="pj">{projectName(projects, item.projectId)}</span>
-        <span className="tm">{relTime(item.updatedAt)}</span>
-      </div>
-      {item.summary && <div className="b">{item.summary}</div>}
-      <div className="acts">
-        {needsVerify && (
-          <label className="chk">
-            <input type="checkbox" checked={verified} onChange={(e) => setVerified(e.target.checked)} />
-            我已核对现场
-          </label>
-        )}
-        {canRetry && item.taskId && (
-          <button type="button" className="btn pri" disabled={retry.isPending || (needsVerify && !verified)} onClick={() => retry.mutate()}>
-            重试
-          </button>
-        )}
-        {item.taskId && (
-          <button type="button" className="btn ghost" onClick={() => navigate(paths.session(item.taskId!))}>
-            进入会话 <ArrowRight size={12} strokeWidth={1.6} />
-          </button>
-        )}
-      </div>
-    </div>
-  );
-}
-
-function AttentionSessionRow({
-  group,
+function HomeRow({
+  entry,
   approvalById,
   projects,
 }: {
-  group: AttentionGroup;
+  entry: HomeEntry;
   approvalById: Map<string, ApprovalView>;
   projects: ProjectView[];
 }) {
-  const qc = useQueryClient();
   const openReview = useWorkbenchStore((s) => s.openReview);
-  const reviewItem = group.items.find((i) => i.category === 'delivery_review');
-  const complete = useMutation({
-    mutationFn: () => api.completeDeliveryReview(reviewItem!.refId),
-    onSuccess: () => {
-      toast('已标记审阅完成');
-      void qc.invalidateQueries({ queryKey: ['bootstrap'] });
-      if (reviewItem) void qc.invalidateQueries({ queryKey: ['delivery', reviewItem.refId] });
-    },
-    onError: (e) => toast(errMsg(e), 'err'),
-  });
+  const openSession = () => {
+    if (entry.taskId) navigate(paths.session(entry.taskId));
+  };
 
-  // Single blocked item gets dedicated retry / site-verify affordance.
-  if (group.items.length === 1 && group.primary.category === 'task_blocked') {
-    return <BlockedSessionRow item={group.primary} projects={projects} />;
+  // Running background row: single clean clickable row, zero buttons or subtitle
+  if (entry.mark === 'running') {
+    return (
+      <button type="button" className="hrow hrow-slim" onClick={openSession}>
+        <span className="t ell">{entry.title}</span>
+        <span className="pj ell">{projectName(projects, entry.projectId)}</span>
+        <StatusMark mark={entry.mark} />
+      </button>
+    );
   }
 
+  const primary = entry.primaryInbox;
   const singleApproval =
-    group.items.length === 1 && group.primary.category === 'approval_pending'
-      ? approvalById.get(group.primary.refId)
+    entry.inboxItems.length === 1 && primary?.category === 'approval_pending'
+      ? approvalById.get(primary.refId)
       : undefined;
+  const reviewItem = entry.inboxItems.find((i) => i.category === 'delivery_review');
   const cmd = singleApproval ? approvalPreview(singleApproval.payload) : '';
-  const summary =
-    singleApproval && singleApproval.state === 'pending'
-      ? cmd || singleApproval.actionName
-      : group.items.length === 1
-        ? group.primary.summary
-        : '当前会话需要注意';
+
+  let detail = '';
+  if (singleApproval && singleApproval.state === 'pending') {
+    const bits = [singleApproval.actionName];
+    if (singleApproval.targetEnv) bits.push(singleApproval.targetEnv);
+    if (singleApproval.inputSha) bits.push(shortSha(singleApproval.inputSha));
+    detail = bits.filter(Boolean).join(' · ');
+  } else if (primary?.summary) {
+    detail = primary.summary;
+  }
+
+  const hasActions = (singleApproval && singleApproval.state === 'pending') || (!!reviewItem && !!entry.taskId);
 
   return (
-    <div className="inbox-row k-approval">
-      <div className="h">
-        <span className="sd wait" />
-        <span className="kind ell">{group.primary.title}</span>
-        <span className="pj">{projectName(projects, group.projectId)}</span>
-        <span className="tm">{relTime(group.updatedAt)}</span>
-      </div>
-      {summary && <div className="b">{summary}</div>}
-      <div className="acts">
-        {singleApproval && singleApproval.state === 'pending' && <ApprovalButtons approval={singleApproval} big />}
-        {reviewItem && group.taskId && (
-          <button type="button" className="btn pri" onClick={() => openReview('code', group.taskId!, reviewItem.refId)}>
-            <DiffIcon size={13} /> 审阅
-          </button>
-        )}
-        {reviewItem && group.items.length === 1 && (
-          <button type="button" className="btn" disabled={complete.isPending} onClick={() => complete.mutate()}>
-            审阅完成
-          </button>
-        )}
-        {group.taskId && (
-          <button type="button" className="btn ghost" onClick={() => navigate(paths.session(group.taskId!))}>
-            进入会话 <ArrowRight size={12} strokeWidth={1.6} />
-          </button>
-        )}
-      </div>
+    <div className="hrow">
+      <button type="button" className="hrow-top" onClick={openSession} disabled={!entry.taskId}>
+        <span className="t ell">{entry.title}</span>
+        <span className="pj ell">{projectName(projects, entry.projectId)}</span>
+        <StatusMark mark={entry.mark} />
+      </button>
+      {(detail || hasActions) && (
+        <div className="hrow-sub">
+          <div className="hrow-desc">
+            {detail && <div className="b">{detail}</div>}
+            {cmd && (
+              <details className="cmd-fold">
+                <summary>查看命令</summary>
+                <code className="mono">{cmd}</code>
+              </details>
+            )}
+          </div>
+          {hasActions && (
+            <div className="hrow-acts">
+              {singleApproval && singleApproval.state === 'pending' && <ApprovalButtons approval={singleApproval} />}
+              {reviewItem && entry.taskId && (
+                <button
+                  type="button"
+                  className="btn pri"
+                  onClick={() => openReview('code', entry.taskId!, reviewItem.refId)}
+                >
+                  看产出
+                </button>
+              )}
+            </div>
+          )}
+        </div>
+      )}
     </div>
-  );
-}
-
-function SessionRow({ t, projects, hasAttention }: { t: TaskSummary; projects: ProjectView[]; hasAttention: boolean }) {
-  return (
-    <button type="button" className="srow" onClick={() => navigate(paths.session(t.taskId))}>
-      <span className={`sd ${taskDot(t.state, t.activeAttemptState, hasAttention)}`} />
-      <span className="pj">{projectName(projects, t.projectId)}</span>
-      <span className="sep">/</span>
-      <span className="t">{taskTitle(t)}</span>
-      <span className="st">{taskStateLabel(t, hasAttention)}</span>
-      <span className="go no-mobile">
-        <ArrowRight size={12} strokeWidth={1.6} />
-      </span>
-    </button>
   );
 }
 
 export function HomePage({ boot }: { boot: BootstrapResponse }) {
-  const [scope, setScope] = useState<'active' | 'all'>('active');
-  const items = boot.openInboxItems;
-  const groups = useMemo(() => groupInboxBySession(items), [items]);
-  const attentionSet = useMemo(() => attentionTaskIds(items), [items]);
-  const hasSingleApproval = groups.some((g) => g.items.length === 1 && g.primary.category === 'approval_pending');
+  const entries = useMemo(() => buildHomeEntries(boot), [boot]);
+  const hasSingleApproval = entries.some(
+    (e) => e.inboxItems.length === 1 && e.primaryInbox?.category === 'approval_pending',
+  );
   const approvals = useRecentApprovals(hasSingleApproval);
   const approvalById = useMemo(() => {
     const m = new Map<string, ApprovalView>();
     for (const a of approvals.data ?? []) m.set(a.approvalId, a);
     return m;
   }, [approvals.data]);
-  const allTasks = useManyProjectTasks(boot.projects, scope === 'all');
 
-  const sessions = useMemo(() => {
-    if (scope === 'active') {
-      return boot.activeTasks.filter((t) => !t.parentTaskId).sort((a, b) => b.updatedAt - a.updatedAt);
-    }
-    return Object.values(allTasks)
-      .flat()
-      .filter((t) => !t.parentTaskId)
-      .sort((a, b) => b.updatedAt - a.updatedAt)
-      .slice(0, 40);
-  }, [scope, boot.activeTasks, allTasks]);
+  const actionable = entries.filter((e) => e.mark !== 'running');
+  const running = entries.filter((e) => e.mark === 'running');
 
   return (
     <main className="main">
@@ -339,46 +309,22 @@ export function HomePage({ boot }: { boot: BootstrapResponse }) {
         <span className="ttl">总览</span>
       </PageHeader>
       <div className="page-scroll">
-        <div className="page">
+        <div className="page home-page">
           <PAQuickBar boot={boot} />
 
-          <section className="sec">
-            <div className="sec-h">
-              <span className="t">需要注意</span>
-            </div>
-            {groups.length === 0 ? (
-              <div className="quiet">
-                <span className="sd done" /> 当前没有需要处理的会话
-              </div>
+          <section className="home-list" aria-label="当前会话">
+            {entries.length === 0 ? (
+              <div className="quiet-alone">都安静着</div>
             ) : (
-              groups.map((g) => (
-                <AttentionSessionRow key={g.key} group={g} approvalById={approvalById} projects={boot.projects} />
-              ))
-            )}
-          </section>
-
-          <section className="sec">
-            <div className="sec-h">
-              <span className="t">会话</span>
-              <div className="r">
-                <div className="seg" role="tablist">
-                  <button type="button" className={scope === 'active' ? 'on' : ''} onClick={() => setScope('active')}>
-                    活跃中
-                  </button>
-                  <button type="button" className={scope === 'all' ? 'on' : ''} onClick={() => setScope('all')}>
-                    全部
-                  </button>
-                </div>
-              </div>
-            </div>
-            {sessions.length === 0 ? (
-              <div className="quiet">
-                <span className="sd done" /> {scope === 'active' ? '当前没有活跃会话' : '还没有任何会话'}
-              </div>
-            ) : (
-              sessions.map((t) => (
-                <SessionRow key={t.taskId} t={t} projects={boot.projects} hasAttention={attentionSet.has(t.taskId)} />
-              ))
+              <>
+                {actionable.map((e) => (
+                  <HomeRow key={e.key} entry={e} approvalById={approvalById} projects={boot.projects} />
+                ))}
+                {actionable.length > 0 && running.length > 0 && <div className="home-sep" role="separator" />}
+                {running.map((e) => (
+                  <HomeRow key={e.key} entry={e} approvalById={approvalById} projects={boot.projects} />
+                ))}
+              </>
             )}
           </section>
         </div>
