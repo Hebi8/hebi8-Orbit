@@ -327,13 +327,13 @@ type CreateAnnotationResponse struct {
 
 // RyugiSyncResponse summarizes a manual or scheduled Ryugi sync operation.
 type RyugiSyncResponse struct {
-	DeliveryID       string             `json:"deliveryId"`
-	RyugiSyncState   RyugiSyncState     `json:"ryugiSyncState"`
-	BindingsSynced   int                `json:"bindingsSynced"`
-	NewAnnotations   int                `json:"newAnnotations"`
-	ReceiptsAcked    int                `json:"receiptsAcked"`
-	RyugiBindings    []RyugiBindingView `json:"ryugiBindings"`
-	Errors           []string           `json:"errors,omitempty"`
+	DeliveryID     string             `json:"deliveryId"`
+	RyugiSyncState RyugiSyncState     `json:"ryugiSyncState"`
+	BindingsSynced int                `json:"bindingsSynced"`
+	NewAnnotations int                `json:"newAnnotations"`
+	ReceiptsAcked  int                `json:"receiptsAcked"`
+	RyugiBindings  []RyugiBindingView `json:"ryugiBindings"`
+	Errors         []string           `json:"errors,omitempty"`
 }
 
 // ReloadConfigResponse reports counts after reloading YAML registries.
@@ -664,12 +664,12 @@ type DispatchAnnotationsRequest struct {
 
 // DispatchAnnotationsResponse reports the resulting attempt or queued pending input.
 type DispatchAnnotationsResponse struct {
-	TaskID         string        `json:"taskId"`
-	QueuedCount    int           `json:"queuedCount"`
-	Attempt        *AttemptView  `json:"attempt,omitempty"`
-	PendingInput   *PendingInput `json:"pendingInput,omitempty"`
-	ForkedTaskID   string        `json:"forkedTaskId,omitempty"`
-	Dispatched     bool          `json:"dispatched"`
+	TaskID       string        `json:"taskId"`
+	QueuedCount  int           `json:"queuedCount"`
+	Attempt      *AttemptView  `json:"attempt,omitempty"`
+	PendingInput *PendingInput `json:"pendingInput,omitempty"`
+	ForkedTaskID string        `json:"forkedTaskId,omitempty"`
+	Dispatched   bool          `json:"dispatched"`
 }
 
 // PostBoardMessageRequest posts a message (optionally with @worker mention) to a task's board.
@@ -689,8 +689,8 @@ type DecideApprovalRequest struct {
 
 // DecideApprovalResponse returns the updated approval and whether delivery to runner started.
 type DecideApprovalResponse struct {
-	Approval      ApprovalView `json:"approval"`
-	SentToRunner  bool         `json:"sentToRunner"`
+	Approval     ApprovalView `json:"approval"`
+	SentToRunner bool         `json:"sentToRunner"`
 }
 
 // CreatePAThreadRequest starts a new PA conversation thread.

@@ -76,11 +76,11 @@ type CreateTaskParams struct {
 
 // CreateTaskResult returns created (or idempotently found) entities and events.
 type CreateTaskResult struct {
-	Task      protocol.TaskSummary
-	Attempt   *AttemptRecord
-	Sources   []protocol.TaskSource
-	Created   bool
-	Events    []protocol.EventRecord
+	Task    protocol.TaskSummary
+	Attempt *AttemptRecord
+	Sources []protocol.TaskSource
+	Created bool
+	Events  []protocol.EventRecord
 }
 
 // CreateTask atomically inserts a new Task (including _scratch), optional TaskSources,
@@ -919,10 +919,10 @@ func (s *Store) ListAttemptRawEvents(ctx context.Context, attemptID string, afte
 
 // CancelTaskResult reports how a cancel request was handled.
 type CancelTaskResult struct {
-	Attempt          AttemptRecord
-	CancelledNow     bool
-	NeedsRunnerSend  bool
-	Events           []protocol.EventRecord
+	Attempt         AttemptRecord
+	CancelledNow    bool
+	NeedsRunnerSend bool
+	Events          []protocol.EventRecord
 }
 
 // CancelTaskActiveAttempt either immediately cancels an unstarted/disconnected attempt

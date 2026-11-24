@@ -33,23 +33,23 @@ import (
 // supporting scripted tool calls, unsolicited Swarm tail updates, permission prompts,
 // session close hooks, and config option calibration testing.
 type FakeAcpDriver struct {
-	mu               sync.Mutex
-	onUpdate         runner.SessionUpdateHandler
-	onPerm           runner.PermissionHandler
-	supportsResume   bool
-	supportsLoad     bool
-	supportsMetaSP   bool
-	nextSessSeq      int
-	liveSessions     map[acp.SessionId]bool
-	sessionCWD       map[acp.SessionId]string
-	sessionConfig    map[acp.SessionId]map[string]string
-	newCalls         []string
-	resumeCalls      []acp.SessionId
-	closeCalls       []acp.SessionId
-	configCalls      []string // "sid:key=val"
-	promptCalls      []string // "sid:prompt"
-	cancelCalls      []acp.SessionId
-	systemPrompts    []string
+	mu             sync.Mutex
+	onUpdate       runner.SessionUpdateHandler
+	onPerm         runner.PermissionHandler
+	supportsResume bool
+	supportsLoad   bool
+	supportsMetaSP bool
+	nextSessSeq    int
+	liveSessions   map[acp.SessionId]bool
+	sessionCWD     map[acp.SessionId]string
+	sessionConfig  map[acp.SessionId]map[string]string
+	newCalls       []string
+	resumeCalls    []acp.SessionId
+	closeCalls     []acp.SessionId
+	configCalls    []string // "sid:key=val"
+	promptCalls    []string // "sid:prompt"
+	cancelCalls    []acp.SessionId
+	systemPrompts  []string
 
 	OnCloseSession    func(ctx context.Context, sid acp.SessionId) error
 	OnSetConfigOption func(ctx context.Context, sid acp.SessionId, key, val string) (acp.SetSessionConfigOptionResponse, error)
@@ -205,16 +205,16 @@ func (f *FakeAcpDriver) Cancel(ctx context.Context, sid acp.SessionId) error {
 // --- Test Harness Helpers ---
 
 type testEnv struct {
-	t          *testing.T
-	tmpDir     string
-	repoDir    string
-	dataDir    string
-	cfgDir     string
-	st         *store.Store
-	srv        *hub.Server
-	ts         *httptest.Server
-	hubWSURL   string
-	remoteTok  string
+	t         *testing.T
+	tmpDir    string
+	repoDir   string
+	dataDir   string
+	cfgDir    string
+	st        *store.Store
+	srv       *hub.Server
+	ts        *httptest.Server
+	hubWSURL  string
+	remoteTok string
 }
 
 func newTestEnv(t *testing.T) *testEnv {

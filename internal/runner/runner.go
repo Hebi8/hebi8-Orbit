@@ -72,23 +72,23 @@ type pendingApprovalHandle struct {
 }
 
 type attemptContext struct {
-	mu                 sync.Mutex
-	dispatch           protocol.AttemptDispatchFrame
-	worktreePath       string
-	baseSHA            string
-	state              protocol.AttemptState
-	resumeState        protocol.ResumeState
-	providerSessionID  acp.SessionId
-	promptReturned     bool
-	finalized          bool
-	heldResources      []string
-	tracker            *ActiveSwarmTracker
-	pendingApprovals   map[string]*pendingApprovalHandle
-	ackPendingWG       sync.WaitGroup
-	swarmIdleTimeout   time.Duration
-	swarmIdleTimer     *time.Timer
-	cancelFn           context.CancelFunc
-	doneCh             chan struct{}
+	mu                sync.Mutex
+	dispatch          protocol.AttemptDispatchFrame
+	worktreePath      string
+	baseSHA           string
+	state             protocol.AttemptState
+	resumeState       protocol.ResumeState
+	providerSessionID acp.SessionId
+	promptReturned    bool
+	finalized         bool
+	heldResources     []string
+	tracker           *ActiveSwarmTracker
+	pendingApprovals  map[string]*pendingApprovalHandle
+	ackPendingWG      sync.WaitGroup
+	swarmIdleTimeout  time.Duration
+	swarmIdleTimer    *time.Timer
+	cancelFn          context.CancelFunc
+	doneCh            chan struct{}
 }
 
 // Runner is the pure-Go thin ACP runner bridging Hub (/ws/runner) and AcpAdapterDriver.

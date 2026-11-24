@@ -269,10 +269,10 @@ type ReconcileRunnerHelloResult struct {
 }
 
 // ReconcileRunnerHello performs liveness reconciliation when orbit-runner connects or reconnects:
-// 1. Updates machine liveness & resources.
-// 2. Absorbs handledApprovalDecisions (preserving allow vs reject).
-// 3. Distinguishes same-instance transient reconnect (renew lease, redeliver pending_delivery approvals)
-//    from changed runnerInstanceId process restart (pending/rejected -> expired; approved_pending_delivery -> uncertain + needs_verification).
+//  1. Updates machine liveness & resources.
+//  2. Absorbs handledApprovalDecisions (preserving allow vs reject).
+//  3. Distinguishes same-instance transient reconnect (renew lease, redeliver pending_delivery approvals)
+//     from changed runnerInstanceId process restart (pending/rejected -> expired; approved_pending_delivery -> uncertain + needs_verification).
 func (s *Store) ReconcileRunnerHello(ctx context.Context, hello protocol.RunnerHelloFrame, leaseTTLMs int64) (ReconcileRunnerHelloResult, error) {
 	var res ReconcileRunnerHelloResult
 	res.Reconcile = protocol.HubWelcomeReconcile{
