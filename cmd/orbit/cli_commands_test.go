@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -119,5 +121,19 @@ func TestCLICommands_VersionTasksApprovalsPAArtifactsDoctor(t *testing.T) {
 	}
 	if out := runCmd("open", "--hub", ts.URL, "--print"); strings.TrimSpace(out) != ts.URL {
 		t.Fatalf("expected %q from open --print, got %q", ts.URL, out)
+	}
+}
+
+func TestResolveHubDefaultsReadsClientYAML(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "client.yaml")
+	if err := os.WriteFile(cfgPath, []byte("hubUrl: https://orbit.example.ts.net/\n"), 0o600); err != nil {
+		t.Fatalf("write client.yaml: %v", err)
+	}
+	t.Setenv("ORBIT_HUB_URL", "")
+	t.Setenv("ORBIT_DEV_TOKEN", "")
+	hubURL, _, _ := resolveHubDefaults(dir, "", "", "")
+	if hubURL != "https://orbit.example.ts.net" {
+		t.Fatalf("expected client.yaml hubUrl, got %q", hubURL)
 	}
 }

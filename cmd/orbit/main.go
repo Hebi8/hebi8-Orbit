@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/oklog/ulid/v2"
+	"gopkg.in/yaml.v3"
 
 	"github.com/Hebi8/hebi8-Orbit/internal/gitops"
 	"github.com/Hebi8/hebi8-Orbit/internal/protocol"
@@ -135,6 +136,13 @@ func resolveHubDefaults(configDirFlag, dataDirFlag, hubURLFlag, tokenFlag string
 	cfgDir = protocol.ExpandPath(cfgDir)
 
 	hubCfg, _ := protocol.LoadHubConfig(filepath.Join(cfgDir, "hub.yaml"))
+	var clientCfg struct {
+		HubURL   string `yaml:"hubUrl"`
+		DevToken string `yaml:"devToken"`
+	}
+	if raw, err := os.ReadFile(filepath.Join(cfgDir, "client.yaml")); err == nil {
+		_ = yaml.Unmarshal(raw, &clientCfg)
+	}
 
 	dataDir = dataDirFlag
 	if dataDir == "" {
@@ -148,6 +156,9 @@ func resolveHubDefaults(configDirFlag, dataDirFlag, hubURLFlag, tokenFlag string
 	hubURL = hubURLFlag
 	if hubURL == "" {
 		hubURL = os.Getenv("ORBIT_HUB_URL")
+	}
+	if hubURL == "" && strings.TrimSpace(clientCfg.HubURL) != "" {
+		hubURL = strings.TrimSpace(clientCfg.HubURL)
 	}
 	if hubURL == "" {
 		addr := hubCfg.ListenAddr
@@ -165,6 +176,9 @@ func resolveHubDefaults(configDirFlag, dataDirFlag, hubURLFlag, tokenFlag string
 	devToken = tokenFlag
 	if devToken == "" {
 		devToken = os.Getenv("ORBIT_DEV_TOKEN")
+	}
+	if devToken == "" && strings.TrimSpace(clientCfg.DevToken) != "" {
+		devToken = strings.TrimSpace(clientCfg.DevToken)
 	}
 	if devToken == "" {
 		devToken = hubCfg.DevToken
