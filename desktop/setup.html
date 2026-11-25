@@ -122,6 +122,17 @@
       font-size: 11.5px; color: var(--muted); margin-bottom: 6px;
     }
     .picked-bar b { color: var(--fg); font-weight: 500; }
+    .pair-tip {
+      margin-top: 7px; font-size: 11.5px; color: var(--muted);
+      display: flex; align-items: center; flex-wrap: wrap; gap: 4px; line-height: 1.5;
+    }
+    .pair-tip b { color: var(--fg); font-weight: 500; }
+    .cmd-chip {
+      display: inline-flex; align-items: center; padding: 0 6px; height: 20px; border-radius: 5px;
+      border: 1px solid var(--line); background: var(--raised); color: var(--fg);
+      font: 11.5px ui-monospace, Menlo, monospace; cursor: pointer;
+    }
+    .cmd-chip:hover { border-color: var(--line-on); }
     .status {
       margin-top: 14px; min-height: 20px; font-size: 12px; color: var(--muted);
       display: flex; align-items: center; gap: 8px;
@@ -177,6 +188,11 @@
             <button type="button" class="ghost" id="btnClearPick">改用手动输入</button>
           </div>
           <input id="joinInput" type="text" placeholder="粘贴邀请命令或配对链接" autocomplete="off" spellcheck="false" />
+          <div class="pair-tip" id="pairTip">
+            <span>在 <b id="pairTipHost">已有设备</b> 运行</span>
+            <button type="button" class="cmd-chip" id="btnCopyPairCmd" title="点击复制">orbit pair</button>
+            <span>或在设置中点「添加机器」获取</span>
+          </div>
           <label class="chk">
             <input id="asRunner" type="checkbox" checked />
             <span>同时作为执行节点</span>
@@ -208,6 +224,8 @@
     const discList = document.getElementById('discList');
     const pickedBar = document.getElementById('pickedBar');
     const pickedLabel = document.getElementById('pickedLabel');
+    const pairTipHost = document.getElementById('pairTipHost');
+    const btnCopyPairCmd = document.getElementById('btnCopyPairCmd');
     const statusEl = document.getElementById('status');
 
     function setMode(next) {
@@ -256,10 +274,12 @@
         pickedLabel.textContent = pickedHub.discoveryId
           ? (pickedHub.hostName + ' (' + pickedHub.discoveryId + ')')
           : (pickedHub.hostName || pickedHub.origin);
+        pairTipHost.textContent = pickedHub.hostName || pickedHub.dnsName || pickedHub.origin;
         joinInput.placeholder = '输入配对码（如 XXXX-XXXX）';
       } else {
         pickedBar.style.display = 'none';
         pickedLabel.textContent = '';
+        pairTipHost.textContent = '已有设备';
         joinInput.placeholder = '粘贴邀请命令或配对链接';
       }
       Array.from(discList.querySelectorAll('.disc-item')).forEach(el => {
@@ -394,6 +414,12 @@
     btnLocal.addEventListener('click', startLocal);
     btnJoin.addEventListener('click', joinRemote);
     btnScan.addEventListener('click', scanNetworks);
+    btnCopyPairCmd.addEventListener('click', () => {
+      navigator.clipboard?.writeText('orbit pair').then(() => {
+        btnCopyPairCmd.textContent = '已复制';
+        setTimeout(() => { btnCopyPairCmd.textContent = 'orbit pair'; }, 1200);
+      }).catch(() => {});
+    });
     btnClearPick.addEventListener('click', () => {
       pickedHub = null;
       updatePickedUI();

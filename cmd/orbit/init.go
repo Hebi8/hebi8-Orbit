@@ -153,6 +153,7 @@ func runInit(ctx context.Context, args []string, stdin io.Reader, stdout, stderr
 			return runJoin(ctx, []string{"--config-dir", cfgDirAbs, "--data-dir", dataDir, raw}, stdout, stderr)
 		}
 		if pErr == nil && hubURL != "" {
+			fmt.Fprintln(stdout, "  在目标设备运行 orbit pair 或在设置中点「添加机器」获取配对码。")
 			pairCode, err := promptLine(reader, stdout, "配对码（XXXX-XXXX，留空仅保存地址）", "")
 			if err != nil {
 				return err
