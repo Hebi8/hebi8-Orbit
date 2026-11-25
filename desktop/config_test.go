@@ -181,3 +181,11 @@ machines:
 		t.Fatalf("expected runner.token to be created: %v", err)
 	}
 }
+
+func TestJoinRemoteRequiresPairingCode(t *testing.T) {
+	mgr := NewRuntimeManager()
+	_, err := mgr.JoinRemote(t.Context(), t.TempDir(), "https://orbit.example.ts.net", true)
+	if err == nil {
+		t.Fatalf("expected JoinRemote without pairing code to return error")
+	}
+}

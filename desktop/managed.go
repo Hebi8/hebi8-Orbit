@@ -320,8 +320,16 @@ type JoinResult struct {
 }
 
 // JoinRemote connects this desktop app (and optionally registers this machine as an execution node)
-// to an existing Orbit Hub via pairing code or direct URL.
+// to an existing Orbit Hub via pairing code (or plain URL only when allowCodeFree is true).
 func (m *RuntimeManager) JoinRemote(ctx context.Context, configDir, rawInput string, asRunner bool) (JoinResult, error) {
+	return m.joinRemote(ctx, configDir, rawInput, asRunner, false)
+}
+
+func (m *RuntimeManager) ConnectDirect(ctx context.Context, configDir, rawInput string) (JoinResult, error) {
+	return m.joinRemote(ctx, configDir, rawInput, false, true)
+}
+
+func (m *RuntimeManager) joinRemote(ctx context.Context, configDir, rawInput string, asRunner, allowCodeFree bool) (JoinResult, error) {
 	if configDir == "" {
 		configDir = defaultConfigDir()
 	}
@@ -338,13 +346,15 @@ func (m *RuntimeManager) JoinRemote(ctx context.Context, configDir, rawInput str
 		asRunner = false
 	}
 	if runnerOnlyHint {
-		return JoinResult{}, fmt.Errorf("该邀请命令仅限终端执行节点（--runner-only），请在这台机器终端运行该命令，或在源机器重新生成包含客户端权限的配对码")
+		return JoinResult{}, fmt.Errorf("该邀请命令仅限终端执行节点（--runner-only）")
 	}
 
-	// Plain Hub URL without pairing code (e.g. Tailscale Serve direct connection)
 	if code == "" {
+		if !allowCodeFree {
+			return JoinResult{}, fmt.Errorf("请输入配对码或完整的邀请命令")
+		}
 		if !isOrbitHealthOK(ctx, hubURL) {
-			return JoinResult{}, fmt.Errorf("无法连接到 %s，请检查网络或地址是否正确", hubURL)
+			return JoinResult{}, fmt.Errorf("无法连接到 %s", hubURL)
 		}
 		if err := SaveClientConfig(expCfgDir, ClientConfig{
 			HubURL:         hubURL,

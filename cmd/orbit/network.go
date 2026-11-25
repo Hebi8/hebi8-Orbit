@@ -337,8 +337,7 @@ func runPair(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	fmt.Fprintln(stdout, "在要加入的机器上运行：")
 	fmt.Fprintf(stdout, "  %s\n\n", resp.JoinCommand)
 	if resp.LoopbackOnly {
-		fmt.Fprintln(stdout, "提示：当前 Hub 仅监听本机地址（127.0.0.1），其他设备无法直连。")
-		fmt.Fprintln(stdout, "      请在「设置 → 网络 → 外部接入」开启 Tailscale 共享后再生成邀请命令。")
+		fmt.Fprintln(stdout, "提示：当前仅本机可访问（127.0.0.1），请先在设置中开启外部接入。")
 		fmt.Fprintln(stdout)
 	}
 	if scope == protocol.PairingScopeRunner {
@@ -413,15 +412,12 @@ func runDiscover(ctx context.Context, args []string, stdout, stderr io.Writer) e
 		enc, _ := json.MarshalIndent(res, "", "  ")
 		return writeRawJSON(stdout, enc)
 	}
-	if !res.TailscaleAvailable {
-		fmt.Fprintln(stdout, "未检测到 Tailscale，仅扫描了本机回环端口。")
-	} else if !res.TailscaleOnline {
-		fmt.Fprintln(stdout, "Tailscale 未连接，仅扫描了本机回环端口。")
-	} else {
-		fmt.Fprintf(stdout, "已扫描 %d 台 Tailscale 在线设备（耗时 %dms）：\n", res.ScannedPeers, res.DurationMs)
-	}
 	if len(res.Hubs) == 0 {
-		fmt.Fprintln(stdout, "  未发现可访问的 Orbit 网络。")
+		if res.TailscaleAvailable && !res.TailscaleOnline {
+			fmt.Fprintln(stdout, "Tailscale 未连接，未发现可用网络。")
+		} else {
+			fmt.Fprintln(stdout, "未发现可用网络。")
+		}
 		return nil
 	}
 	for _, h := range res.Hubs {
@@ -429,11 +425,11 @@ func runDiscover(ctx context.Context, args []string, stdout, stderr io.Writer) e
 		if h.DiscoveryID != "" {
 			idPart = "  [" + h.DiscoveryID + "]"
 		}
-		viaPart := h.Via
+		selfPart := ""
 		if h.IsSelf {
-			viaPart += ", 本机"
+			selfPart = "  (当前)"
 		}
-		fmt.Fprintf(stdout, "  • %s%s  (%s · %dms)\n", h.Origin, idPart, viaPart, h.LatencyMs)
+		fmt.Fprintf(stdout, "  • %s%s%s\n", h.Origin, idPart, selfPart)
 	}
 	return nil
 }

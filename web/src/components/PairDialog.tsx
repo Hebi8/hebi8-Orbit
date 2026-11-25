@@ -210,7 +210,7 @@ export function PairDialog({
                 <Laptop size={14} strokeWidth={1.75} />
                 <div>
                   <div className="pair-role-t">完整设备</div>
-                  <div className="pair-role-d">可参与主控接力，同步工作区配置</div>
+                  <div className="pair-role-d">同步配置，可接管主控</div>
                 </div>
               </button>
               <button
@@ -229,7 +229,7 @@ export function PairDialog({
                 <Server size={14} strokeWidth={1.75} />
                 <div>
                   <div className="pair-role-t">受限节点</div>
-                  <div className="pair-role-d">如云端服务器，仅执行任务，不接管主控</div>
+                  <div className="pair-role-d">仅执行任务</div>
                 </div>
               </button>
             </div>
@@ -267,7 +267,7 @@ export function PairDialog({
                 <div className="pair-warn-box">
                   <div className="pair-warn-hd">
                     <AlertTriangle size={14} strokeWidth={1.8} />
-                    <span>当前地址仅限本机访问（127.0.0.1），其他设备无法直连</span>
+                    <span>当前仅本机可访问</span>
                   </div>
                   {net?.tailscaleAvailable ? (
                     <div className="pair-warn-body">
@@ -276,8 +276,8 @@ export function PairDialog({
                           <div className="muted" style={{ fontSize: 12 }}>
                             {tsConfirm.conflictDetail ||
                               (tsConfirm.targetOrigin
-                                ? `将通过 Tailscale HTTPS 共享到 ${tsConfirm.targetOrigin}，开启后会自动更新上方邀请命令。`
-                                : `将通过 Tailscale 端口 ${tsConfirm.suggestedPort} 共享本机 Orbit。`)}
+                                ? `开启后将通过 ${tsConfirm.targetOrigin} 加入。`
+                                : `将通过端口 ${tsConfirm.suggestedPort} 开启外部接入。`)}
                           </div>
                           <div className="set-inline" style={{ marginTop: 6 }}>
                             <button
@@ -306,19 +306,19 @@ export function PairDialog({
                           onClick={() => void enableTailscaleAndRefresh(false)}
                         >
                           <Globe size={12} strokeWidth={1.7} />
-                          {tsEnabling ? '检查中…' : '一键开启 Tailscale 共享'}
+                          {tsEnabling ? '检查中…' : '开启外部接入'}
                         </button>
                       )}
                     </div>
                   ) : (
                     <div className="muted" style={{ fontSize: 11.5 }}>
-                      {net?.tailscaleHint || '请先在这台机器安装并登录 Tailscale，开启外部接入后再添加其他机器。'}
+                      {net?.tailscaleHint || '请先登录 Tailscale'}
                     </div>
                   )}
                 </div>
               )}
 
-              <div className="pair-label">在目标设备的终端运行，或粘贴到 Orbit 桌面端：</div>
+              <div className="pair-label">在目标设备运行或粘贴：</div>
               <div className="pair-cmd-box">
                 <code className="mono ell">{codeResp.joinCommand}</code>
                 <button type="button" className="btn ghost sm" onClick={() => void copyCommand()}>
@@ -352,7 +352,7 @@ export function PairDialog({
                         regenerate(next, role);
                       }}
                     />
-                    <span>同时作为执行节点运行任务</span>
+                    <span>同时作为执行节点</span>
                   </label>
                 ) : (
                   <span className="muted">

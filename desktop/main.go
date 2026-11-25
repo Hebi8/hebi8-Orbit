@@ -442,7 +442,7 @@ func startSetupServer(
 			_ = json.NewEncoder(w).Encode(map[string]string{"error": "无效的请求格式"})
 			return
 		}
-		res, err := runtimeMgr.JoinRemote(r.Context(), configDir, body.HubURL, false)
+		res, err := runtimeMgr.ConnectDirect(r.Context(), configDir, body.HubURL)
 		if err != nil {
 			w.WriteHeader(http.StatusBadGateway)
 			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})

@@ -327,36 +327,29 @@ export function SettingsPage({ boot }: { boot: BootstrapResponse }) {
               <div className="set-k">外部接入</div>
               <div className="set-v">
                 {net?.tailscaleShared ? (
-                  <div className="set-col">
-                    <div className="set-inline">
-                      <span className="ok-t">已开启</span>
-                      <span className="mono muted ell">{net.tailscaleOrigin || net.hubOrigin}</span>
-                      <button
-                        type="button"
-                        className="btn ghost sm"
-                        onClick={() => void copyValue(net.tailscaleOrigin || net.hubOrigin, '接入地址')}
-                      >
-                        <Copy size={11.5} strokeWidth={1.7} /> 复制
-                      </button>
-                      <button
-                        type="button"
-                        className="btn ghost sm"
-                        disabled={tsLoading}
-                        onClick={() => void triggerTailscaleDisable()}
-                      >
-                        关闭
-                      </button>
-                    </div>
-                    <div className="faint" style={{ fontSize: 11.5 }}>
-                      同 Tailscale 网络内的其他设备与手机可通过此 HTTPS 地址接入并加入。
-                    </div>
+                  <div className="set-inline">
+                    <span className="ok-t">已开启</span>
+                    <span className="mono muted ell">{net.tailscaleOrigin || net.hubOrigin}</span>
+                    <button
+                      type="button"
+                      className="btn ghost sm"
+                      onClick={() => void copyValue(net.tailscaleOrigin || net.hubOrigin, '接入地址')}
+                    >
+                      <Copy size={11.5} strokeWidth={1.7} /> 复制
+                    </button>
+                    <button
+                      type="button"
+                      className="btn ghost sm"
+                      disabled={tsLoading}
+                      onClick={() => void triggerTailscaleDisable()}
+                    >
+                      关闭
+                    </button>
                   </div>
                 ) : net?.tailscaleAvailable ? (
                   <div className="set-col">
                     <div className="set-inline">
-                      <span className="muted">
-                        仅本机访问（<span className="mono">{net.hubOrigin || 'http://127.0.0.1:4310'}</span>）
-                      </span>
+                      <span className="muted">仅本机</span>
                       <button
                         type="button"
                         className="btn ghost sm"
@@ -364,7 +357,7 @@ export function SettingsPage({ boot }: { boot: BootstrapResponse }) {
                         onClick={() => void triggerTailscaleShare(false)}
                       >
                         <Globe size={12} strokeWidth={1.7} />
-                        {tsLoading ? '检查中…' : '开启 Tailscale 共享'}
+                        {tsLoading ? '检查中…' : '开启外部接入'}
                       </button>
                     </div>
                     {tsConfirm && (
@@ -372,16 +365,8 @@ export function SettingsPage({ boot }: { boot: BootstrapResponse }) {
                         <div className="muted">
                           {tsConfirm.conflictDetail ||
                             (tsConfirm.targetOrigin
-                              ? `将通过 Tailscale HTTPS 共享到 ${tsConfirm.targetOrigin}，其他设备即可直连并加入。`
-                              : `将通过 Tailscale 开启端口 ${tsConfirm.suggestedPort} 供其他设备接入。`)}
-                        </div>
-                        {tsConfirm.targetOrigin && (
-                          <div className="mono" style={{ fontSize: 12, marginTop: 4 }}>
-                            {tsConfirm.targetOrigin}
-                          </div>
-                        )}
-                        <div className="mono faint" style={{ fontSize: 11, marginTop: 3 }}>
-                          {tsConfirm.command}
+                              ? `开启后将通过 ${tsConfirm.targetOrigin} 接入。`
+                              : `将使用端口 ${tsConfirm.suggestedPort} 开启外部接入。`)}
                         </div>
                         <div className="set-inline" style={{ marginTop: 8 }}>
                           <button
@@ -400,9 +385,7 @@ export function SettingsPage({ boot }: { boot: BootstrapResponse }) {
                     )}
                   </div>
                 ) : (
-                  <span className="muted">
-                    {net?.tailscaleHint || '安装并登录 Tailscale 后即可为其他设备与手机开启多机共享'}
-                  </span>
+                  <span className="muted">{net?.tailscaleHint || '登录 Tailscale 后可开启'}</span>
                 )}
               </div>
             </div>
@@ -419,15 +402,11 @@ export function SettingsPage({ boot }: { boot: BootstrapResponse }) {
                       onClick={() => void scanNetworks()}
                     >
                       <Radar size={12} strokeWidth={1.7} className={discovering ? 'spin-ico' : ''} />
-                      {discovering ? '扫描中…' : '扫描 Tailscale / 局域网'}
+                      {discovering ? '扫描中…' : '扫描网络'}
                     </button>
-                    {discoveryRes && (
+                    {discoveryRes && discoveryRes.tailscaleAvailable && !discoveryRes.tailscaleOnline && (
                       <span className="faint" style={{ fontSize: 11.5 }}>
-                        {!discoveryRes.tailscaleAvailable
-                          ? '未检测到 Tailscale，仅扫描了本机端口'
-                          : !discoveryRes.tailscaleOnline
-                            ? 'Tailscale 未连接，仅扫描了本机端口'
-                            : `已扫 ${discoveryRes.scannedPeers} 台在线设备 · ${discoveryRes.durationMs}ms`}
+                        Tailscale 未连接
                       </span>
                     )}
                   </div>
@@ -435,7 +414,7 @@ export function SettingsPage({ boot }: { boot: BootstrapResponse }) {
                   {discoveryRes && (
                     discoveryRes.hubs.length === 0 ? (
                       <div className="faint" style={{ fontSize: 12, marginTop: 4 }}>
-                        未发现其他可访问的 Orbit 网络。
+                        未发现其他网络
                       </div>
                     ) : (
                       <div className="disc-list">
@@ -445,12 +424,9 @@ export function SettingsPage({ boot }: { boot: BootstrapResponse }) {
                               <div className="disc-hd">
                                 <span className="disc-host ell">{h.hostName || h.dnsName || h.origin}</span>
                                 {h.discoveryId && <span className="disc-id mono">{h.discoveryId}</span>}
-                                <span className="disc-via">{h.via === 'tailscale' ? 'Tailscale' : '本机'}</span>
-                                {h.isSelf && <span className="duty-cur">当前工作区</span>}
+                                {h.isSelf && <span className="duty-cur">当前</span>}
                               </div>
-                              <div className="disc-url mono ell">
-                                {h.origin} · {h.latencyMs}ms
-                              </div>
+                              <div className="disc-url mono ell">{h.origin}</div>
                             </div>
                             <div className="disc-acts">
                               <button
@@ -476,10 +452,6 @@ export function SettingsPage({ boot }: { boot: BootstrapResponse }) {
                       </div>
                     )
                   )}
-
-                  <div className="faint" style={{ fontSize: 11.5 }}>
-                    桌面端也可在菜单「hebi8-Orbit → 切换网络或重新连接…」扫描并切换到其他 Orbit 网络。
-                  </div>
                 </div>
               </div>
             </div>
