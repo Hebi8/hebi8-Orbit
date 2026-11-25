@@ -677,12 +677,21 @@ var AllWSMessageTypes = []WSMessageType{
 	WSMessagePing,
 }
 
-// Built-in virtual project identifiers for project-less free chat sessions.
+// Built-in virtual project identifiers for project-less free chat and PA sessions.
 const (
 	ScratchProjectID           = "_scratch"
 	ScratchProjectDisplayName  = "自由 Chat"
 	ScratchProjectRepoIdentity = "scratch:local"
+
+	PAProjectID           = "_pa"
+	PAProjectDisplayName  = "PA 助手"
+	PAProjectRepoIdentity = "pa:local"
 )
+
+// IsVirtualProjectID reports whether projectID is a built-in non-repository virtual project (_scratch or _pa).
+func IsVirtualProjectID(projectID string) bool {
+	return projectID == ScratchProjectID || projectID == PAProjectID
+}
 
 // RunnerWSMessageType identifies bidirectional Hub <-> Runner WebSocket frame kinds.
 type RunnerWSMessageType string

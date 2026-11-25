@@ -62,7 +62,7 @@ func (s *Store) SyncRegistry(ctx context.Context, dataDir string, projects proto
 		}
 
 		for projectID, p := range projects.Projects {
-			if projectID == protocol.ScratchProjectID {
+			if protocol.IsVirtualProjectID(projectID) {
 				continue
 			}
 			branch := p.DefaultBranch
@@ -822,6 +822,73 @@ func extractBoundedPromptText(triggerPayloadJSON string) string {
 	return truncatePromptText(prompt)
 }
 
+func extractReferencedTasks(triggerPayloadJSON string) []protocol.ReferencedTaskMeta {
+	if strings.TrimSpace(triggerPayloadJSON) == "" {
+		return nil
+	}
+	var doc struct {
+		RefTasks []protocol.ReferencedTaskMeta `json:"refTasks"`
+	}
+	if err := json.Unmarshal([]byte(triggerPayloadJSON), &doc); err != nil || len(doc.RefTasks) == 0 {
+		return nil
+	}
+	return doc.RefTasks
+}
+
+// ListRecentTasks returns recent non-archived tasks across all projects ordered by recency.
+func (s *Store) ListRecentTasks(ctx context.Context, limit int) ([]protocol.TaskSummary, error) {
+	return s.ListRecentTasksFiltered(ctx, limit, "", "")
+}
+
+// ListRecentTasksFiltered returns recent non-archived tasks filtered by optional search keyword
+// (matching title, goal, project_id, or project display_name) and optional excluded project ID.
+func (s *Store) ListRecentTasksFiltered(ctx context.Context, limit int, query, excludeProject string) ([]protocol.TaskSummary, error) {
+	if limit <= 0 {
+		limit = 80
+	}
+	if limit > 200 {
+		limit = 200
+	}
+	q := strings.ToLower(strings.TrimSpace(query))
+	excludeProject = strings.TrimSpace(excludeProject)
+
+	out := []protocol.TaskSummary{}
+	err := s.WithReadTx(ctx, func(tx *sql.Tx) error {
+		var sb strings.Builder
+		sb.WriteString(taskSummarySelectSQL)
+		sb.WriteString(` LEFT JOIN projects p ON p.project_id = t.project_id`)
+		sb.WriteString(` WHERE t.archived_at IS NULL`)
+		args := []any{}
+		if excludeProject != "" {
+			sb.WriteString(` AND t.project_id != ?`)
+			args = append(args, excludeProject)
+		}
+		if q != "" {
+			escaped := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(q)
+			like := "%" + escaped + "%"
+			sb.WriteString(` AND (LOWER(t.title) LIKE ? ESCAPE '\' OR LOWER(t.goal) LIKE ? ESCAPE '\' OR LOWER(t.project_id) LIKE ? ESCAPE '\' OR LOWER(COALESCE(p.display_name, '')) LIKE ? ESCAPE '\')`)
+			args = append(args, like, like, like, like)
+		}
+		sb.WriteString(` ORDER BY t.updated_at DESC LIMIT ?`)
+		args = append(args, limit)
+
+		rows, err := tx.QueryContext(ctx, sb.String(), args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			ts, err := scanTaskSummary(rows)
+			if err != nil {
+				return err
+			}
+			out = append(out, ts)
+		}
+		return rows.Err()
+	})
+	return out, err
+}
+
 func truncatePromptText(prompt string) string {
 	prompt = strings.TrimSpace(prompt)
 	if prompt == "" {
@@ -867,6 +934,7 @@ func scanAttemptView(scanner interface{ Scan(...any) error }) (protocol.AttemptV
 	}
 	a.TriggerKind = protocol.TriggerKind(trigger)
 	a.PromptText = extractBoundedPromptText(triggerPayloadJSON)
+	a.RefTasks = extractReferencedTasks(triggerPayloadJSON)
 	a.State = protocol.AttemptState(state)
 	if worktree.Valid {
 		a.WorktreePath = worktree.String

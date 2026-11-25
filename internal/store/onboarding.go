@@ -68,6 +68,8 @@ type ClaimPairingCodeParams struct {
 	CodeHash       string
 	WantRunner     bool
 	WantClient     bool
+	ClientName     string
+	ClientScope    string
 	Machine        *protocol.ClaimMachineInfo
 	YAMLMachineIDs map[string]bool
 	NowMs          int64
@@ -75,12 +77,14 @@ type ClaimPairingCodeParams struct {
 
 // ClaimPairingCodeResult returns the claimed pairing record, allocated machineId, minted tokens, and events.
 type ClaimPairingCodeResult struct {
-	CodeID      string
-	MachineID   string
-	DisplayName string
-	RunnerToken string
-	ClientToken string
-	Events      []protocol.EventRecord
+	CodeID        string
+	MachineID     string
+	DisplayName   string
+	RunnerToken   string
+	ClientToken   string
+	ClientTokenID string
+	ClientName    string
+	Events        []protocol.EventRecord
 }
 
 // ErrPairingInvalid is returned when a pairing code is unknown, already claimed, revoked, or expired.
@@ -227,9 +231,9 @@ func (s *Store) CreateClientToken(ctx context.Context, name, scope, machineID st
 
 	err = s.WithWriteTx(ctx, func(tx *sql.Tx) error {
 		_, err := tx.ExecContext(ctx, `
-			INSERT INTO client_tokens (id, name, token_hash, scope, machine_id, created_at)
-			VALUES (?, ?, ?, ?, ?, ?)
-		`, tokenID, name, tokenHash, scope, strings.TrimSpace(machineID), now)
+			INSERT INTO client_tokens (id, name, token_hash, scope, machine_id, created_at, last_used_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?)
+		`, tokenID, name, tokenHash, scope, strings.TrimSpace(machineID), now, now)
 		return err
 	})
 	if err != nil {
@@ -261,6 +265,99 @@ func (s *Store) VerifyClientToken(ctx context.Context, rawToken string) (ClientT
 		return info, false, nil
 	}
 	return info, true, nil
+}
+
+// IsClientTokenActive reports whether the given client token ID exists and has not been revoked.
+func (s *Store) IsClientTokenActive(ctx context.Context, tokenID string) (bool, error) {
+	tokenID = strings.TrimSpace(tokenID)
+	if tokenID == "" {
+		return false, nil
+	}
+	var revoked sql.NullInt64
+	err := s.ro.QueryRowContext(ctx, `
+		SELECT revoked_at FROM client_tokens WHERE id = ?
+	`, tokenID).Scan(&revoked)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return !revoked.Valid, nil
+}
+
+// TouchClientTokenLastUsed updates last_used_at for an active client token.
+func (s *Store) TouchClientTokenLastUsed(ctx context.Context, tokenID string) error {
+	tokenID = strings.TrimSpace(tokenID)
+	if tokenID == "" {
+		return nil
+	}
+	now := time.Now().UnixMilli()
+	return s.WithWriteTx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `
+			UPDATE client_tokens SET last_used_at = ?
+			WHERE id = ? AND revoked_at IS NULL
+		`, now, tokenID)
+		return err
+	})
+}
+
+// ListActiveClientTokens returns all non-revoked logged-in client device sessions.
+func (s *Store) ListActiveClientTokens(ctx context.Context) ([]protocol.ClientDeviceView, error) {
+	rows, err := s.ro.QueryContext(ctx, `
+		SELECT id, name, scope, machine_id, created_at, last_used_at
+		FROM client_tokens
+		WHERE revoked_at IS NULL
+		ORDER BY COALESCE(last_used_at, created_at) DESC, created_at DESC
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []protocol.ClientDeviceView{}
+	for rows.Next() {
+		var item protocol.ClientDeviceView
+		var lastUsed sql.NullInt64
+		if err := rows.Scan(&item.ID, &item.Name, &item.Scope, &item.MachineID, &item.CreatedAt, &lastUsed); err != nil {
+			return nil, err
+		}
+		if lastUsed.Valid {
+			v := lastUsed.Int64
+			item.LastUsedAt = &v
+		}
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}
+
+// RevokeClientToken revokes one logged-in client token immediately.
+func (s *Store) RevokeClientToken(ctx context.Context, tokenID string) (bool, error) {
+	tokenID = strings.TrimSpace(tokenID)
+	if tokenID == "" {
+		return false, ErrNotFound
+	}
+	now := time.Now().UnixMilli()
+	var revoked bool
+	err := s.WithWriteTx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `
+			UPDATE client_tokens SET revoked_at = ?
+			WHERE id = ? AND revoked_at IS NULL
+		`, now, tokenID)
+		if err != nil {
+			return err
+		}
+		aff, _ := res.RowsAffected()
+		if aff == 0 {
+			var exists string
+			if err := tx.QueryRowContext(ctx, `SELECT id FROM client_tokens WHERE id = ?`, tokenID).Scan(&exists); errors.Is(err, sql.ErrNoRows) {
+				return ErrNotFound
+			}
+			return nil
+		}
+		revoked = true
+		return nil
+	})
+	return revoked, err
 }
 
 // VerifyMachineCredential checks whether rawToken matches an active DB credential for machineID.
@@ -642,20 +739,29 @@ func (s *Store) ClaimPairingCode(ctx context.Context, p ClaimPairingCodeParams) 
 				return err
 			}
 			out.ClientToken = "ock_" + clientSecret
-			clientName := displayName
+			clientName := strings.TrimSpace(p.ClientName)
+			if clientName == "" {
+				clientName = displayName
+			}
 			if clientName == "" && p.Machine != nil {
 				clientName = strings.TrimSpace(p.Machine.Hostname)
 			}
 			if clientName == "" {
 				clientName = "paired-client"
 			}
+			clientScope := strings.TrimSpace(p.ClientScope)
+			if clientScope == "" {
+				clientScope = "client"
+			}
 			ctkID := newID("ctk")
 			if _, err := tx.ExecContext(ctx, `
-				INSERT INTO client_tokens (id, name, token_hash, scope, machine_id, created_at)
-				VALUES (?, ?, ?, 'client', ?, ?)
-			`, ctkID, clientName, HashSecret(out.ClientToken), out.MachineID, now); err != nil {
+				INSERT INTO client_tokens (id, name, token_hash, scope, machine_id, created_at, last_used_at)
+				VALUES (?, ?, ?, ?, ?, ?, ?)
+			`, ctkID, clientName, HashSecret(out.ClientToken), clientScope, out.MachineID, now, now); err != nil {
 				return fmt.Errorf("insert client token: %w", err)
 			}
+			out.ClientTokenID = ctkID
+			out.ClientName = clientName
 		}
 
 		ev, err := insertEventTx(ctx, tx, eventInsert{
@@ -865,9 +971,11 @@ func (s *Store) UpdateMachineAlias(ctx context.Context, machineID, alias, actorI
 }
 
 // RemovePairedMachine revokes credentials and soft-removes a paired machine (YAML machines must be checked by caller).
-func (s *Store) RemovePairedMachine(ctx context.Context, machineID, actorID string) (protocol.EventRecord, error) {
+// Returns the emitted event and all revoked client token IDs so Hub can immediately close their active WebSockets.
+func (s *Store) RemovePairedMachine(ctx context.Context, machineID, actorID string) (protocol.EventRecord, []string, error) {
 	now := time.Now().UnixMilli()
 	var ev protocol.EventRecord
+	var revokedClientIDs []string
 	err := s.WithWriteTx(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx, `
 			UPDATE registry_machines SET removed_at = ?
@@ -889,6 +997,25 @@ func (s *Store) RemovePairedMachine(ctx context.Context, machineID, actorID stri
 		`, now, machineID); err != nil {
 			return err
 		}
+		rows, err := tx.QueryContext(ctx, `
+			SELECT id FROM client_tokens WHERE machine_id = ? AND revoked_at IS NULL
+		`, machineID)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var cid string
+			if err := rows.Scan(&cid); err != nil {
+				rows.Close()
+				return err
+			}
+			revokedClientIDs = append(revokedClientIDs, cid)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return err
+		}
+		rows.Close()
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE client_tokens SET revoked_at = ? WHERE machine_id = ? AND revoked_at IS NULL
 		`, now, machineID); err != nil {
@@ -914,7 +1041,7 @@ func (s *Store) RemovePairedMachine(ctx context.Context, machineID, actorID stri
 		})
 		return err2
 	})
-	return ev, err
+	return ev, revokedClientIDs, err
 }
 
 // SaveMachineAgentProbes stores the latest AgentProbes reported by a Runner and updates ready adapters.
@@ -1141,8 +1268,8 @@ func (s *Store) ListDynamicProjects(ctx context.Context) (map[string]protocol.Pr
 	out := map[string]protocol.ProjectConfig{}
 	rows, err := s.ro.QueryContext(ctx, `
 		SELECT project_id, config_json FROM projects
-		WHERE source = 'ui' AND archived = 0 AND project_id != ?
-	`, protocol.ScratchProjectID)
+		WHERE source = 'ui' AND archived = 0 AND project_id NOT IN (?, ?)
+	`, protocol.ScratchProjectID, protocol.PAProjectID)
 	if err != nil {
 		return out, err
 	}
@@ -1193,7 +1320,7 @@ func (s *Store) CreateDynamicProject(
 	var pv protocol.ProjectView
 	var ev protocol.EventRecord
 	now := time.Now().UnixMilli()
-	if strings.TrimSpace(projectID) == "" || projectID == protocol.ScratchProjectID {
+	if strings.TrimSpace(projectID) == "" || protocol.IsVirtualProjectID(projectID) {
 		return pv, ev, fmt.Errorf("%w: invalid projectId", ErrInvalidInput)
 	}
 	if cfg.DefaultBranch == "" {
@@ -1339,9 +1466,9 @@ func (s *Store) CreateClientTokenChecked(ctx context.Context, name, scope, machi
 			}
 		}
 		_, err := tx.ExecContext(ctx, `
-			INSERT INTO client_tokens (id, name, token_hash, scope, machine_id, created_at)
-			VALUES (?, ?, ?, ?, ?, ?)
-		`, tokenID, name, tokenHash, scope, trimmedMachineID, now)
+			INSERT INTO client_tokens (id, name, token_hash, scope, machine_id, created_at, last_used_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?)
+		`, tokenID, name, tokenHash, scope, trimmedMachineID, now, now)
 		return err
 	})
 	if err != nil {

@@ -64,8 +64,17 @@ type Server struct {
 	wsTicketsMu sync.Mutex
 	wsTickets   map[string]wsTicketEntry
 
+	clientWSMu              sync.Mutex
+	clientWSConns           map[*clientWSConn]struct{}
+	inFlightRevokes         map[string]chan struct{}
+	wsBeforeReplayWriteHook func()
+	wsInsideWriteHook       func()
+
 	handoffMu    sync.Mutex
 	handoffCodes map[string]authHandoffEntry
+
+	clientTouchMu   sync.Mutex
+	clientLastTouch map[string]time.Time
 
 	pairLimiter *pairingRateLimiter
 
@@ -191,8 +200,9 @@ func (s *Server) SetPABeforeCommitHook(fn func(fromSeq, highSeq int64)) {
 	s.paMu.Unlock()
 }
 
-// Shutdown closes active runner WebSocket connections and waits for background tasks.
+// Shutdown closes active runner/client WebSocket connections and waits for background tasks.
 func (s *Server) Shutdown() {
+	s.closeAllClientWS()
 	s.runners.CloseAll()
 	s.bgWG.Wait()
 }
@@ -292,6 +302,7 @@ func (s *Server) buildRouter() http.Handler {
 	// One-time code claim endpoints (self-authenticated via code, strict origin/rate limits)
 	r.Post("/api/pairing/claim", s.handleClaimPairingCode)
 	r.Post("/api/auth/handoff/claim", s.handleClaimAuthHandoff)
+	r.Post("/api/auth/pair-client", s.handlePairClient)
 
 	// WebSocket endpoints handle their own auth prior to upgrade
 	r.Get("/ws/client", s.handleClientWS)
@@ -319,6 +330,9 @@ func (s *Server) buildRouter() http.Handler {
 
 		api.Post("/ws-ticket", s.handleCreateWSTicket)
 		api.Post("/auth/handoff", s.handleCreateAuthHandoff)
+		api.Post("/auth/logout", s.handleLogoutClient)
+		api.Get("/clients", s.handleListClients)
+		api.Delete("/clients/{clientId}", s.handleRevokeClient)
 		api.Get("/bootstrap", s.handleBootstrap)
 		api.Post("/onboarding/complete", s.handleCompleteOnboarding)
 
@@ -354,6 +368,7 @@ func (s *Server) buildRouter() http.Handler {
 		api.Post("/network/tailscale-enable", s.handleTailscaleEnable)
 		api.Post("/network/tailscale-disable", s.handleTailscaleDisable)
 
+		api.Get("/tasks", s.handleListAllTasks)
 		api.Get("/projects/{projectId}/tasks", s.handleListProjectTasks)
 		api.Post("/projects/{projectId}/tasks", s.handleCreateTask)
 
@@ -366,6 +381,7 @@ func (s *Server) buildRouter() http.Handler {
 		api.Post("/tasks/{taskId}/folder-changes/promote", s.handlePromoteFolderChanges)
 
 		api.Get("/tasks/{taskId}/queue", s.handleListQueue)
+		api.Get("/tasks/{taskId}/queue/{inputId}", s.handleGetQueueInput)
 		api.Post("/tasks/{taskId}/queue", s.handleEnqueueInput)
 		api.Patch("/tasks/{taskId}/queue/{inputId}", s.handleUpdateQueueInput)
 		api.Delete("/tasks/{taskId}/queue/{inputId}", s.handleDeleteQueueInput)
@@ -425,6 +441,7 @@ func (s *Server) handleBootstrap(w http.ResponseWriter, r *http.Request) {
 	resp.WorkspaceName = s.effectiveWorkspaceName()
 	resp.Machines = s.enrichMachineViews(r.Context(), resp.Machines)
 	setup := s.buildSetupStatus(r.Context(), resp.Machines, clientMachineIDFromContext(r.Context()))
+	setup.CurrentClientID = clientTokenIDFromContext(r.Context())
 	resp.Setup = &setup
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -457,6 +474,23 @@ func (s *Server) handleDeleteAnnotation(w http.ResponseWriter, r *http.Request) 
 		s.broker.Broadcast(*ev)
 	}
 	writeJSON(w, http.StatusOK, res)
+}
+
+func (s *Server) handleListAllTasks(w http.ResponseWriter, r *http.Request) {
+	limit := 80
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		if v, err := strconv.Atoi(raw); err == nil && v > 0 {
+			limit = v
+		}
+	}
+	excludeProj := strings.TrimSpace(r.URL.Query().Get("excludeProject"))
+	searchQuery := strings.TrimSpace(r.URL.Query().Get("q"))
+	tasks, err := s.store.ListRecentTasksFiltered(r.Context(), limit, searchQuery, excludeProj)
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, "ERR_LIST_TASKS_FAILED", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"tasks": tasks})
 }
 
 func (s *Server) handleListProjectTasks(w http.ResponseWriter, r *http.Request) {

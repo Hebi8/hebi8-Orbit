@@ -495,8 +495,6 @@ func applyStateFrameTx(
 	sessionLocked := boolField(item.Payload, "sessionLocked")
 	unresolvedRejected := int64Field(item.Payload, "unresolvedRejectedToolCount")
 	unresolvedNonZero := int64Field(item.Payload, "unresolvedNonZeroExitCount")
-	rejectedToolCount := int64Field(item.Payload, "rejectedToolCount")
-	nonZeroExitCount := int64Field(item.Payload, "nonZeroExitCount")
 
 	// B1: Hub-side authoritative adjudication of succeeded claims.
 	// - Abnormal ACP stop_reason (e.g. refusal / max_tokens / max_turn_requests) cannot succeed.
@@ -519,8 +517,7 @@ func applyStateFrameTx(
 				WHERE triggered_attempt_id = ? AND status = 'queued'
 			`, att.AttemptID).Scan(&queuedAnnCount)
 
-			requiresDelivery := (att.ProjectID != protocol.ScratchProjectID && att.Isolation != protocol.IsolationInPlace) ||
-				queuedAnnCount > 0 ||
+			requiresDelivery := queuedAnnCount > 0 ||
 				att.TriggerKind == protocol.TriggerAnnotationBatch
 			if requiresDelivery && att.OutputDeliveryID == "" {
 				newState = protocol.AttemptFailed
@@ -528,10 +525,9 @@ func applyStateFrameTx(
 					errCode = "NO_VERIFIED_DELIVERY"
 				}
 				if errDetail == "" {
-					errDetail = "项目交付/批注轮未产出已核验交付，已拒判成功并释放未处理批注"
+					errDetail = "批注修订轮未产出已核验变更，已释放未处理批注"
 				}
-			} else if unresolvedRejected > 0 || unresolvedNonZero > 0 ||
-				(compSrc == string(protocol.CompletionPromptEndTurn) && (rejectedToolCount > 0 || nonZeroExitCount > 0)) {
+			} else if unresolvedRejected > 0 || unresolvedNonZero > 0 {
 				newState = protocol.AttemptNeedsVerification
 				if errCode == "" {
 					errCode = "UNRESOLVED_TOOL_FAILURE"
@@ -892,7 +888,7 @@ func verifyDeliveryPayloadTx(
 	}
 
 	outManifest := manifest
-	if projectID != protocol.ScratchProjectID && strings.TrimSpace(mirrorBarePath) != "" {
+	if !protocol.IsVirtualProjectID(projectID) && strings.TrimSpace(mirrorBarePath) != "" {
 		if strings.TrimSpace(baseSHA) == "" {
 			return outManifest, fmt.Errorf("%w: baseSha is required for project delivery %s", ErrDeliveryVerifyFailed, deliveryID)
 		}

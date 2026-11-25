@@ -1,6 +1,8 @@
 package main
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -187,5 +189,180 @@ func TestJoinRemoteRequiresPairingCode(t *testing.T) {
 	_, err := mgr.JoinRemote(t.Context(), t.TempDir(), "https://orbit.example.ts.net", true)
 	if err == nil {
 		t.Fatalf("expected JoinRemote without pairing code to return error")
+	}
+}
+
+func TestMultiNetworkProfilesPreserveLocalAndSwitch(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("ORBIT_HUB_URL", "")
+	t.Setenv("ORBIT_CLIENT_TOKEN", "")
+	t.Setenv("ORBIT_DEV_TOKEN", "")
+
+	var cfg ClientConfig
+	cfg.PAShortcut = "CmdOrCtrl+Shift+O"
+	cfg.UpsertNetwork(NetworkProfile{
+		ID:       "local",
+		Name:     "本机工作区",
+		Mode:     "local",
+		HubURL:   "http://127.0.0.1:4310",
+		DevToken: "local_dev_tok",
+	})
+	remote := cfg.UpsertNetwork(NetworkProfile{
+		Mode:        "remote",
+		Name:        "lab-hub",
+		HubURL:      "https://lab.example.ts.net",
+		ClientToken: "ock_remote_tok",
+		MachineID:   "laptop-1",
+	})
+	cfg.ActivateNetwork(remote.ID)
+	if err := SaveClientConfig(dir, cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := LoadClientConfig(dir, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded.Networks) != 2 {
+		t.Fatalf("expected 2 saved networks, got %d", len(loaded.Networks))
+	}
+	if loaded.ActiveNetworkID != remote.ID || loaded.ClientToken != "ock_remote_tok" {
+		t.Fatalf("expected active remote profile, got %+v", loaded)
+	}
+
+	// Switching to local preserves remote and restores local dev token
+	if _, ok := loaded.ActivateNetwork("local"); !ok {
+		t.Fatalf("expected local profile to activate")
+	}
+	if loaded.HubURL != "http://127.0.0.1:4310" || loaded.DevToken != "local_dev_tok" || loaded.ClientToken != "" {
+		t.Fatalf("unexpected local profile state: %+v", loaded)
+	}
+
+	// Origin override to saved remote resolves its token, while unknown Hub C strips tokens
+	cfgRemote, err := LoadClientConfig(dir, "https://lab.example.ts.net")
+	if err != nil || cfgRemote.ClientToken != "ock_remote_tok" {
+		t.Fatalf("expected saved remote token on origin match, got %+v err=%v", cfgRemote, err)
+	}
+	cfgUnknown, err := LoadClientConfig(dir, "https://other.example.ts.net")
+	if err != nil || cfgUnknown.ClientToken != "" || cfgUnknown.DevToken != "" {
+		t.Fatalf("expected stripped credentials on unknown origin, got %+v err=%v", cfgUnknown, err)
+	}
+
+	// Removing remote network keeps local intact
+	if !loaded.RemoveNetwork(remote.ID) {
+		t.Fatalf("expected RemoveNetwork to succeed")
+	}
+	if loaded.RemoveNetwork("local") {
+		t.Fatalf("expected local network to be protected from removal")
+	}
+	if len(loaded.Networks) != 1 || loaded.Networks[0].ID != "local" {
+		t.Fatalf("unexpected networks after removal: %+v", loaded.Networks)
+	}
+}
+
+func TestRuntimeManagerSwitchNetworkSavesConfigFirstAndSerializes(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("ORBIT_HUB_URL", "")
+	t.Setenv("ORBIT_CLIENT_TOKEN", "")
+	t.Setenv("ORBIT_DEV_TOKEN", "")
+
+	fakeHub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/health" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"ok":true,"service":"hebi8-orbit-hub"}`))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer fakeHub.Close()
+
+	var cfg ClientConfig
+	cfg.PAShortcut = "CmdOrCtrl+Shift+O"
+	cfg.UpsertNetwork(NetworkProfile{
+		ID:       "local",
+		Name:     "本机工作区",
+		Mode:     "local",
+		HubURL:   "http://127.0.0.1:4310",
+		DevToken: "local_dev",
+	})
+	remote := cfg.UpsertNetwork(NetworkProfile{
+		Mode:           "remote",
+		Name:           "remote-hub",
+		HubURL:         fakeHub.URL,
+		ClientToken:    "ock_test_switch",
+		RunLocalRunner: false,
+	})
+	cfg.ActivateNetwork("local")
+	if err := SaveClientConfig(dir, cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	mgr := NewRuntimeManager()
+	prof, err := mgr.SwitchNetwork(t.Context(), dir, remote.ID)
+	if err != nil {
+		t.Fatalf("SwitchNetwork failed: %v", err)
+	}
+	if prof.ID != remote.ID || prof.HubURL != fakeHub.URL {
+		t.Fatalf("unexpected switched profile: %+v", prof)
+	}
+
+	afterSwitch, err := LoadClientConfig(dir, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterSwitch.ActiveNetworkID != remote.ID {
+		t.Fatalf("expected activeNetworkId=%q, got %q", remote.ID, afterSwitch.ActiveNetworkID)
+	}
+
+	// RemoveNetwork serialized via switchMu cleanly removes active remote profile
+	afterRemove, err := mgr.RemoveNetwork(dir, remote.ID)
+	if err != nil {
+		t.Fatalf("RemoveNetwork failed: %v", err)
+	}
+	if len(afterRemove.Networks) != 1 || afterRemove.Networks[0].ID != "local" {
+		t.Fatalf("unexpected networks after RemoveNetwork: %+v", afterRemove.Networks)
+	}
+}
+
+func TestStartOrAttachLocalFailsWithoutStoppingRemoteRunnerWhenSaveFails(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("ORBIT_HUB_URL", "")
+	t.Setenv("ORBIT_CLIENT_TOKEN", "")
+	t.Setenv("ORBIT_DEV_TOKEN", "")
+
+	// Fake healthy local Hub so StartOrAttachLocal takes the attach path
+	fakeLocalHub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/health" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"ok":true,"service":"hebi8-orbit-hub"}`))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer fakeLocalHub.Close()
+
+	listenAddr := strings.TrimPrefix(fakeLocalHub.URL, "http://")
+	if err := os.WriteFile(filepath.Join(dir, "hub.yaml"), []byte("listenAddr: "+listenAddr+"\ndataDir: "+filepath.Join(dir, "data")+"\ndevToken: localdev\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Make client.yaml.tmp a directory so SaveClientConfig deterministically fails (even under root)
+	if err := os.MkdirAll(filepath.Join(dir, "client.yaml.tmp"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	// Register a synthetic managed remote runner entry to assert it is NOT stopped when save fails
+	mgr := NewRuntimeManager()
+	fakeDone := make(chan struct{})
+	mgr.mu.Lock()
+	mgr.procs = append(mgr.procs, &managedProc{name: "orbit-runner-remote", done: fakeDone})
+	mgr.mu.Unlock()
+
+	_, err := mgr.SwitchNetwork(t.Context(), dir, "local")
+	if err == nil {
+		t.Fatalf("expected SwitchNetwork('local') to return error when SaveClientConfig fails")
+	}
+	if !mgr.hasManaged("orbit-runner-remote") {
+		t.Fatalf("expected existing orbit-runner-remote to remain untouched when SaveClientConfig fails")
 	}
 }

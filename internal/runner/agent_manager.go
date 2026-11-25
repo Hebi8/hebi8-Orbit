@@ -30,6 +30,20 @@ type AgentManagerConfig struct {
 	FileConfigs   map[protocol.Adapter]protocol.AdapterConfig
 }
 
+type cachedAgentCaps struct {
+	models        []string
+	defaultModel  string
+	modes         []protocol.AgentModeOption
+	defaultMode   string
+	modeViaLegacy bool
+	efforts       []string
+	defaultEffort string
+	authChecked   bool
+	needsLogin    bool
+	detail        string
+	cachedAt      time.Time
+}
+
 // AgentManager discovers, probes, tests, installs pinned bridges for, and constructs ACP drivers.
 type AgentManager struct {
 	cfg        AgentManagerConfig
@@ -39,6 +53,7 @@ type AgentManager struct {
 	configRev  int64
 	hubConfigs map[string]protocol.RunnerAgentConfig
 	probes     map[protocol.Adapter]protocol.AgentProbe
+	capCache   map[string]cachedAgentCaps
 	installMu  sync.Mutex
 }
 
@@ -62,6 +77,7 @@ func NewAgentManager(cfg AgentManagerConfig) *AgentManager {
 		mergedPATH: resolveLoginShellPATH(cfg.DataDir, cfg.OrbitBinDir),
 		hubConfigs: map[string]protocol.RunnerAgentConfig{},
 		probes:     map[protocol.Adapter]protocol.AgentProbe{},
+		capCache:   map[string]cachedAgentCaps{},
 	}
 }
 
@@ -201,16 +217,52 @@ func (m *AgentManager) probeOneForRev(ctx context.Context, adp protocol.Adapter,
 	}
 
 	probe.BridgeBin = binPath
-	ver, initErr := m.probeACPInitialize(ctx, adp, binPath, args)
+	capKey := string(adp) + "\x00" + binPath + "\x00" + strings.Join(args, "\x00")
+	m.mu.RLock()
+	cached, hasCached := m.capCache[capKey]
+	m.mu.RUnlock()
+	useCache := hasCached && !cached.needsLogin && time.Since(cached.cachedAt) < 10*time.Minute
+
+	ver, freshCaps, initErr := m.probeACPCapabilities(ctx, adp, binPath, args, !useCache)
 	if initErr != nil {
 		probe.State = protocol.AgentStateError
 		probe.HintCode = "init_error"
 		probe.Detail = sanitizeOneLine(initErr.Error(), 200)
 	} else {
-		probe.State = protocol.AgentStateReady
 		probe.BridgeVersion = ver
 		if probe.BridgeVersion == "" {
 			probe.BridgeVersion = m.readManagedPackageVersion(adp)
+		}
+		var effCaps *cachedAgentCaps
+		if freshCaps != nil {
+			effCaps = freshCaps
+			m.mu.Lock()
+			m.capCache[capKey] = *freshCaps
+			m.mu.Unlock()
+		} else if useCache {
+			c := cached
+			effCaps = &c
+		}
+		if effCaps != nil {
+			probe.Models = append([]string(nil), effCaps.models...)
+			probe.Modes = append([]protocol.AgentModeOption(nil), effCaps.modes...)
+			probe.DefaultMode = effCaps.defaultMode
+			probe.ModeViaLegacy = effCaps.modeViaLegacy
+			probe.Efforts = append([]string(nil), effCaps.efforts...)
+			probe.DefaultEffort = effCaps.defaultEffort
+			probe.AuthChecked = effCaps.authChecked
+			if probe.DefaultModel == "" && effCaps.defaultModel != "" {
+				probe.DefaultModel = effCaps.defaultModel
+			}
+			if effCaps.needsLogin {
+				probe.State = protocol.AgentStateNeedsLogin
+				probe.HintCode = "needs_login"
+				probe.Detail = effCaps.detail
+			} else {
+				probe.State = protocol.AgentStateReady
+			}
+		} else {
+			probe.State = protocol.AgentStateReady
 		}
 	}
 
@@ -222,15 +274,21 @@ func (m *AgentManager) probeOneForRev(ctx context.Context, adp protocol.Adapter,
 // bound to the configRev observed at start so concurrent disable/config changes are never overwritten.
 func (m *AgentManager) TestAgent(ctx context.Context, adp protocol.Adapter) (protocol.AgentProbe, int64, error) {
 	startRev := m.ConfigRev()
-	probe := m.probeOneForRev(ctx, adp, startRev)
-	if probe.State != protocol.AgentStateReady {
-		return probe, startRev, fmt.Errorf("agent %s is not ready (%s)", adp, probe.State)
-	}
-
 	m.mu.RLock()
 	hubCfg := m.hubConfigs[string(adp)]
 	m.mu.RUnlock()
 	binPath, args, _, _ := m.resolveBridgeBinary(adp, hubCfg)
+	if binPath != "" {
+		capKey := string(adp) + "\x00" + binPath + "\x00" + strings.Join(args, "\x00")
+		m.mu.Lock()
+		delete(m.capCache, capKey)
+		m.mu.Unlock()
+	}
+
+	probe := m.probeOneForRev(ctx, adp, startRev)
+	if probe.State != protocol.AgentStateReady && probe.State != protocol.AgentStateNeedsLogin {
+		return probe, startRev, fmt.Errorf("agent %s is not ready (%s)", adp, probe.State)
+	}
 
 	tmpDir, err := os.MkdirTemp("", "orbit-agent-test-*")
 	if err != nil {
@@ -242,16 +300,19 @@ func (m *AgentManager) TestAgent(ctx context.Context, adp protocol.Adapter) (pro
 	testCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
 	defer cancel()
 
-	drv := m.buildDriver(adp, binPath, args)
+	drv := m.buildDriver(adp, binPath, args, nil)
 	err = drv.Start(testCtx, func(context.Context, acp.SessionNotification) error { return nil },
 		func(context.Context, acp.RequestPermissionRequest) (acp.RequestPermissionResponse, error) {
 			return acp.RequestPermissionResponse{Outcome: acp.NewRequestPermissionOutcomeCancelled()}, nil
 		})
+	var caps cachedAgentCaps
 	if err == nil {
 		var sessResp acp.NewSessionResponse
 		sessResp, err = drv.NewSession(testCtx, tmpDir, "")
 		if err == nil {
-			probe.Models = extractModelsFromSession(sessResp)
+			caps = extractSessionCapabilities(sessResp)
+			caps.authChecked = true
+			caps.cachedAt = time.Now()
 			_ = drv.CloseSession(testCtx, sessResp.SessionId)
 		}
 		_ = drv.Close(context.Background())
@@ -259,6 +320,7 @@ func (m *AgentManager) TestAgent(ctx context.Context, adp protocol.Adapter) (pro
 	latencyMs := time.Since(start).Milliseconds()
 
 	now := time.Now().UnixMilli()
+	capKey := string(adp) + "\x00" + binPath + "\x00" + strings.Join(args, "\x00")
 	if err != nil {
 		detail := sanitizeOneLine(err.Error(), 200)
 		isAuth := looksLikeAuthError(err.Error())
@@ -271,10 +333,14 @@ func (m *AgentManager) TestAgent(ctx context.Context, adp protocol.Adapter) (pro
 			LatencyMs: latencyMs,
 			Error:     detail,
 		}
+		probe.AuthChecked = true
 		if isAuth {
 			probe.State = protocol.AgentStateNeedsLogin
 			probe.HintCode = "needs_login"
 			probe.Detail = detail
+			m.mu.Lock()
+			m.capCache[capKey] = cachedAgentCaps{authChecked: true, needsLogin: true, detail: detail, cachedAt: time.Now()}
+			m.mu.Unlock()
 		} else {
 			probe.State = protocol.AgentStateError
 			probe.HintCode = "test_error"
@@ -288,12 +354,27 @@ func (m *AgentManager) TestAgent(ctx context.Context, adp protocol.Adapter) (pro
 	probe.State = protocol.AgentStateReady
 	probe.HintCode = ""
 	probe.Detail = ""
+	probe.Models = append([]string(nil), caps.models...)
+	probe.Modes = append([]protocol.AgentModeOption(nil), caps.modes...)
+	probe.DefaultMode = caps.defaultMode
+	probe.ModeViaLegacy = caps.modeViaLegacy
+	probe.Efforts = append([]string(nil), caps.efforts...)
+	probe.DefaultEffort = caps.defaultEffort
+	probe.AuthChecked = true
+	if hubCfg.DefaultModel != "" {
+		probe.DefaultModel = hubCfg.DefaultModel
+	} else if caps.defaultModel != "" {
+		probe.DefaultModel = caps.defaultModel
+	}
 	probe.LastTest = &protocol.AgentTestResult{
 		OK:        true,
 		At:        now,
 		LatencyMs: latencyMs,
 	}
 	probe.ProbedAt = now
+	m.mu.Lock()
+	m.capCache[capKey] = caps
+	m.mu.Unlock()
 	m.storeProbeIfRev(adp, probe, startRev)
 	return probe, startRev, nil
 }
@@ -362,6 +443,11 @@ func (m *AgentManager) InstallBridge(ctx context.Context, adp protocol.Adapter) 
 // BuildDriverFor constructs an AgyAcpDriver for adp using the currently resolved executable and settings,
 // returning the driver along with a full launch signature (bin + args) for change detection.
 func (m *AgentManager) BuildDriverFor(adp protocol.Adapter) (*AgyAcpDriver, string, bool) {
+	return m.BuildDriverWithEnvFor(adp, nil)
+}
+
+// BuildDriverWithEnvFor constructs an AgyAcpDriver with optional per-project environment overrides.
+func (m *AgentManager) BuildDriverWithEnvFor(adp protocol.Adapter, projectEnv map[string]string) (*AgyAcpDriver, string, bool) {
 	m.mu.RLock()
 	hubCfg := m.hubConfigs[string(adp)]
 	m.mu.RUnlock()
@@ -373,10 +459,16 @@ func (m *AgentManager) BuildDriverFor(adp protocol.Adapter) (*AgyAcpDriver, stri
 		return nil, "", false
 	}
 	sig := binPath + "\x00" + strings.Join(args, "\x00")
-	return m.buildDriver(adp, binPath, args), sig, true
+	return m.buildDriver(adp, binPath, args, projectEnv), sig, true
 }
 
-func (m *AgentManager) buildDriver(adp protocol.Adapter, binPath string, args []string) *AgyAcpDriver {
+func (m *AgentManager) buildDriver(adp protocol.Adapter, binPath string, args []string, projectEnv map[string]string) *AgyAcpDriver {
+	extraEnv := []string{"PATH=" + m.mergedPATH}
+	for k, v := range projectEnv {
+		if key := strings.TrimSpace(k); key != "" {
+			extraEnv = append(extraEnv, key+"="+v)
+		}
+	}
 	return NewAdapterDriver(adp, AgyDriverConfig{
 		Adapter:       adp,
 		Bin:           binPath,
@@ -384,7 +476,7 @@ func (m *AgentManager) buildDriver(adp protocol.Adapter, binPath string, args []
 		RunnerSock:    m.cfg.SocketPath,
 		OrbitBinDir:   m.cfg.OrbitBinDir,
 		RunnerVersion: m.cfg.RunnerVersion,
-		ExtraEnv:      []string{"PATH=" + m.mergedPATH},
+		ExtraEnv:      extraEnv,
 	})
 }
 
@@ -495,8 +587,12 @@ func (b *lockedBuffer) String() string {
 	return b.buf.String()
 }
 
-func (m *AgentManager) probeACPInitialize(ctx context.Context, adp protocol.Adapter, binPath string, args []string) (string, error) {
-	pctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+func (m *AgentManager) probeACPCapabilities(ctx context.Context, adp protocol.Adapter, binPath string, args []string, probeSession bool) (string, *cachedAgentCaps, error) {
+	timeout := 12 * time.Second
+	if probeSession {
+		timeout = 22 * time.Second
+	}
+	pctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	drvArgs := args
@@ -511,17 +607,17 @@ func (m *AgentManager) probeACPInitialize(ctx context.Context, adp protocol.Adap
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		_ = stdin.Close()
-		return "", err
+		return "", nil, err
 	}
 	if err := cmd.Start(); err != nil {
 		_ = stdin.Close()
 		_ = stdout.Close()
-		return "", err
+		return "", nil, err
 	}
 	defer func() {
 		_ = stdin.Close()
@@ -553,14 +649,54 @@ func (m *AgentManager) probeACPInitialize(ctx context.Context, adp protocol.Adap
 	if err != nil {
 		stderrLine := lastNonEmptyLine(stderrBuf.String())
 		if stderrLine != "" {
-			return "", fmt.Errorf("%v (%s)", err, stderrLine)
+			return "", nil, fmt.Errorf("%v (%s)", err, stderrLine)
 		}
-		return "", err
+		return "", nil, err
 	}
+	ver := ""
 	if initResp.AgentInfo != nil && strings.TrimSpace(initResp.AgentInfo.Version) != "" {
-		return strings.TrimSpace(initResp.AgentInfo.Version), nil
+		ver = strings.TrimSpace(initResp.AgentInfo.Version)
 	}
-	return "", nil
+
+	if !probeSession {
+		return ver, nil, nil
+	}
+
+	tmpDir, err := os.MkdirTemp("", "orbit-acp-probe-*")
+	if err != nil {
+		return ver, nil, fmt.Errorf("create probe temp dir: %w", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	sessResp, sErr := conn.NewSession(pctx, acp.NewSessionRequest{
+		Cwd:        tmpDir,
+		McpServers: []acp.McpServer{},
+	})
+	if sErr != nil {
+		if looksLikeAuthError(sErr.Error()) {
+			return ver, &cachedAgentCaps{
+				authChecked: true,
+				needsLogin:  true,
+				detail:      "尚未登录，请先在该机器终端完成登录认证",
+				cachedAt:    time.Now(),
+			}, nil
+		}
+		stderrLine := lastNonEmptyLine(stderrBuf.String())
+		if stderrLine != "" {
+			return ver, nil, fmt.Errorf("session/new failed: %v (%s)", sErr, stderrLine)
+		}
+		return ver, nil, fmt.Errorf("session/new failed: %w", sErr)
+	}
+
+	caps := extractSessionCapabilities(sessResp)
+	caps.authChecked = true
+	caps.cachedAt = time.Now()
+	if initResp.AgentCapabilities.SessionCapabilities.Close != nil {
+		cctx, ccancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_, _ = conn.CloseSession(cctx, acp.CloseSessionRequest{SessionId: sessResp.SessionId})
+		ccancel()
+	}
+	return ver, &caps, nil
 }
 
 func (m *AgentManager) readManagedPackageVersion(adp protocol.Adapter) string {
@@ -735,29 +871,93 @@ func looksLikeAuthError(msg string) bool {
 	return false
 }
 
-func extractModelsFromSession(resp acp.NewSessionResponse) []string {
-	var models []string
+func extractSessionCapabilities(resp acp.NewSessionResponse) cachedAgentCaps {
+	var out cachedAgentCaps
+	appendSelectValues := func(opts acp.SessionConfigSelectOptions) []acp.SessionConfigSelectOption {
+		var list []acp.SessionConfigSelectOption
+		if opts.Ungrouped != nil {
+			list = append(list, (*opts.Ungrouped)...)
+		}
+		if opts.Grouped != nil {
+			for _, g := range *opts.Grouped {
+				list = append(list, g.Options...)
+			}
+		}
+		return list
+	}
+
 	for _, opt := range resp.ConfigOptions {
 		if opt.Select == nil {
 			continue
 		}
-		if string(opt.Select.Id) != "model" {
-			continue
+		sel := opt.Select
+		id := string(sel.Id)
+		cat := ""
+		if sel.Category != nil {
+			cat = string(*sel.Category)
 		}
-		if opt.Select.Options.Ungrouped != nil {
-			for _, o := range *opt.Select.Options.Ungrouped {
-				models = append(models, string(o.Value))
+		items := appendSelectValues(sel.Options)
+		switch {
+		case id == "model" || cat == "model":
+			for _, item := range items {
+				out.models = append(out.models, string(item.Value))
 			}
-		}
-		if opt.Select.Options.Grouped != nil {
-			for _, g := range *opt.Select.Options.Grouped {
-				for _, o := range g.Options {
-					models = append(models, string(o.Value))
+			if cur := string(sel.CurrentValue); cur != "" {
+				out.defaultModel = cur
+			}
+		case id == "mode" || cat == "mode":
+			for _, item := range items {
+				desc := ""
+				if item.Description != nil {
+					desc = strings.TrimSpace(*item.Description)
 				}
+				name := strings.TrimSpace(item.Name)
+				if name == "" {
+					name = string(item.Value)
+				}
+				out.modes = append(out.modes, protocol.AgentModeOption{
+					ID:          string(item.Value),
+					Name:        name,
+					Description: desc,
+				})
+			}
+			if cur := string(sel.CurrentValue); cur != "" {
+				out.defaultMode = cur
+			}
+		case id == "thought_level" || id == "effort" || id == "reasoning_effort" || cat == "thought_level":
+			for _, item := range items {
+				out.efforts = append(out.efforts, string(item.Value))
+			}
+			if cur := string(sel.CurrentValue); cur != "" {
+				out.defaultEffort = cur
 			}
 		}
 	}
-	return models
+
+	if len(out.modes) == 0 && resp.Modes != nil {
+		for _, m := range resp.Modes.AvailableModes {
+			desc := ""
+			if m.Description != nil {
+				desc = strings.TrimSpace(*m.Description)
+			}
+			name := strings.TrimSpace(m.Name)
+			if name == "" {
+				name = string(m.Id)
+			}
+			out.modes = append(out.modes, protocol.AgentModeOption{
+				ID:          string(m.Id),
+				Name:        name,
+				Description: desc,
+			})
+		}
+		if len(out.modes) > 0 {
+			out.modeViaLegacy = true
+		}
+		if cur := string(resp.Modes.CurrentModeId); cur != "" {
+			out.defaultMode = cur
+		}
+	}
+	return out
 }
 
 // noopProbeClient implements minimal acp.Client for lightweight initialize probes.

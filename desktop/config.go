@@ -1,32 +1,55 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
 
-// ClientConfig persists user preferences for the desktop shell in ~/.config/hebi8-orbit/client.yaml.
-type ClientConfig struct {
-	HubURL         string `yaml:"hubUrl"`
-	DevToken       string `yaml:"devToken,omitempty"`
-	ClientToken    string `yaml:"clientToken,omitempty"`
-	MachineID      string `yaml:"machineId,omitempty"`
-	Mode           string `yaml:"mode,omitempty"` // local | remote
-	RunLocalRunner bool   `yaml:"runLocalRunner,omitempty"`
-	PAShortcut     string `yaml:"paShortcut,omitempty"`
+// NetworkProfile represents one saved Orbit network (local workspace or paired remote Hub).
+// Tokens and local paths are persisted in client.yaml (0600) but never serialized into setup JSON responses.
+type NetworkProfile struct {
+	ID              string `yaml:"id" json:"id"`
+	Name            string `yaml:"name,omitempty" json:"name,omitempty"`
+	Mode            string `yaml:"mode" json:"mode"` // local | remote
+	HubURL          string `yaml:"hubUrl" json:"hubUrl"`
+	DiscoveryID     string `yaml:"discoveryId,omitempty" json:"discoveryId,omitempty"`
+	ClientToken     string `yaml:"clientToken,omitempty" json:"-"`
+	DevToken        string `yaml:"devToken,omitempty" json:"-"`
+	MachineID       string `yaml:"machineId,omitempty" json:"machineId,omitempty"`
+	RunLocalRunner  bool   `yaml:"runLocalRunner,omitempty" json:"runLocalRunner,omitempty"`
+	RunnerConfigDir string `yaml:"runnerConfigDir,omitempty" json:"-"`
+	UpdatedAt       int64  `yaml:"updatedAt,omitempty" json:"updatedAt,omitempty"`
 }
 
-// hubConfigFallback reads hub.yaml when client.yaml is absent.
+// ClientConfig persists user preferences and saved networks for the desktop shell
+// in ~/.config/hebi8-orbit/client.yaml.
+type ClientConfig struct {
+	HubURL          string           `yaml:"hubUrl"`
+	DevToken        string           `yaml:"devToken,omitempty"`
+	ClientToken     string           `yaml:"clientToken,omitempty"`
+	MachineID       string           `yaml:"machineId,omitempty"`
+	Mode            string           `yaml:"mode,omitempty"` // local | remote
+	RunLocalRunner  bool             `yaml:"runLocalRunner,omitempty"`
+	PAShortcut      string           `yaml:"paShortcut,omitempty"`
+	ActiveNetworkID string           `yaml:"activeNetworkId,omitempty"`
+	Networks        []NetworkProfile `yaml:"networks,omitempty"`
+}
+
+// hubConfigFallback reads hub.yaml when client.yaml is absent or local workspace info is needed.
 type hubConfigFallback struct {
-	HubOrigin  string `yaml:"hubOrigin"`
-	ListenAddr string `yaml:"listenAddr"`
-	DevToken   string `yaml:"devToken"`
-	DataDir    string `yaml:"dataDir"`
+	HubOrigin     string `yaml:"hubOrigin"`
+	ListenAddr    string `yaml:"listenAddr"`
+	DevToken      string `yaml:"devToken"`
+	DataDir       string `yaml:"dataDir"`
+	WorkspaceName string `yaml:"workspaceName"`
 }
 
 func defaultConfigDir() string {
@@ -57,6 +80,139 @@ func clientConfigPath(configDir string) string {
 		configDir = defaultConfigDir()
 	}
 	return filepath.Join(expandHome(configDir), "client.yaml")
+}
+
+func networkIDFor(mode, hubURL string) string {
+	if strings.EqualFold(strings.TrimSpace(mode), "local") {
+		return "local"
+	}
+	norm, err := NormalizeHubURL(hubURL)
+	if err != nil {
+		norm = strings.ToLower(strings.TrimSpace(hubURL))
+	} else {
+		norm = strings.ToLower(norm)
+	}
+	sum := sha256.Sum256([]byte(norm))
+	return "net_" + hex.EncodeToString(sum[:4])
+}
+
+func defaultNetworkName(mode, hubURL string) string {
+	if strings.EqualFold(strings.TrimSpace(mode), "local") {
+		return "本机工作区"
+	}
+	if u, err := url.Parse(hubURL); err == nil && u.Hostname() != "" {
+		return strings.Split(u.Hostname(), ".")[0]
+	}
+	return hubURL
+}
+
+func (c *ClientConfig) FindNetworkByID(id string) (NetworkProfile, bool) {
+	id = strings.TrimSpace(id)
+	for _, n := range c.Networks {
+		if n.ID == id {
+			return n, true
+		}
+	}
+	return NetworkProfile{}, false
+}
+
+func (c *ClientConfig) FindNetworkByOrigin(origin string) (NetworkProfile, bool) {
+	for _, n := range c.Networks {
+		if n.HubURL != "" && sameOriginStrings(n.HubURL, origin) {
+			return n, true
+		}
+	}
+	return NetworkProfile{}, false
+}
+
+// UpsertNetwork inserts or updates a saved network profile (keyed by ID or matching Hub origin).
+func (c *ClientConfig) UpsertNetwork(p NetworkProfile) NetworkProfile {
+	if p.Mode == "" {
+		p.Mode = "remote"
+	}
+	if norm, err := NormalizeHubURL(p.HubURL); err == nil {
+		p.HubURL = norm
+	}
+	if p.ID == "" {
+		p.ID = networkIDFor(p.Mode, p.HubURL)
+	}
+	if strings.TrimSpace(p.Name) == "" {
+		p.Name = defaultNetworkName(p.Mode, p.HubURL)
+	}
+	p.UpdatedAt = time.Now().UnixMilli()
+
+	for i, existing := range c.Networks {
+		if existing.ID == p.ID || (p.HubURL != "" && existing.HubURL != "" && sameOriginStrings(existing.HubURL, p.HubURL)) {
+			// Preserve fields that weren't supplied on update.
+			if p.DiscoveryID == "" {
+				p.DiscoveryID = existing.DiscoveryID
+			}
+			if p.RunnerConfigDir == "" {
+				p.RunnerConfigDir = existing.RunnerConfigDir
+			}
+			if p.ClientToken == "" && existing.ClientToken != "" && p.Mode == existing.Mode {
+				p.ClientToken = existing.ClientToken
+			}
+			if p.DevToken == "" && existing.DevToken != "" && p.Mode == existing.Mode {
+				p.DevToken = existing.DevToken
+			}
+			c.Networks[i] = p
+			return p
+		}
+	}
+	c.Networks = append(c.Networks, p)
+	return p
+}
+
+// ActivateNetwork switches the active profile and syncs legacy top-level fields for compatibility.
+func (c *ClientConfig) ActivateNetwork(id string) (NetworkProfile, bool) {
+	prof, ok := c.FindNetworkByID(id)
+	if !ok {
+		return NetworkProfile{}, false
+	}
+	c.ActiveNetworkID = prof.ID
+	c.HubURL = prof.HubURL
+	c.DevToken = prof.DevToken
+	c.ClientToken = prof.ClientToken
+	c.MachineID = prof.MachineID
+	c.Mode = prof.Mode
+	c.RunLocalRunner = prof.RunLocalRunner
+	return prof, true
+}
+
+// RemoveNetwork deletes a saved remote network profile by ID (never removes "local").
+func (c *ClientConfig) RemoveNetwork(id string) bool {
+	id = strings.TrimSpace(id)
+	if id == "" || id == "local" {
+		return false
+	}
+	next := make([]NetworkProfile, 0, len(c.Networks))
+	removed := false
+	for _, n := range c.Networks {
+		if n.ID == id {
+			removed = true
+			continue
+		}
+		next = append(next, n)
+	}
+	if !removed {
+		return false
+	}
+	c.Networks = next
+	if c.ActiveNetworkID == id {
+		c.ActiveNetworkID = ""
+		if len(c.Networks) > 0 {
+			c.ActivateNetwork(c.Networks[0].ID)
+		} else {
+			c.HubURL = ""
+			c.ClientToken = ""
+			c.DevToken = ""
+			c.MachineID = ""
+			c.Mode = ""
+			c.RunLocalRunner = false
+		}
+	}
+	return true
 }
 
 // LoadClientConfig resolves the desktop client configuration using precedence:
@@ -94,6 +250,22 @@ func LoadClientConfig(configDir, explicitURLFlag string) (ClientConfig, error) {
 		if strings.TrimSpace(saved.PAShortcut) != "" {
 			cfg.PAShortcut = strings.TrimSpace(saved.PAShortcut)
 		}
+		cfg.ActiveNetworkID = strings.TrimSpace(saved.ActiveNetworkID)
+		for _, n := range saved.Networks {
+			if strings.TrimSpace(n.HubURL) == "" {
+				continue
+			}
+			if norm, nErr := NormalizeHubURL(n.HubURL); nErr == nil {
+				n.HubURL = norm
+			}
+			if n.ID == "" {
+				n.ID = networkIDFor(n.Mode, n.HubURL)
+			}
+			if n.Name == "" {
+				n.Name = defaultNetworkName(n.Mode, n.HubURL)
+			}
+			cfg.Networks = append(cfg.Networks, n)
+		}
 	}
 
 	if cfg.HubURL == "" {
@@ -112,6 +284,29 @@ func LoadClientConfig(configDir, explicitURLFlag string) (ClientConfig, error) {
 					cfg.Mode = "local"
 				}
 			}
+		}
+	}
+
+	// Auto-migrate legacy single-network config into Networks slice.
+	if len(cfg.Networks) == 0 && cfg.HubURL != "" {
+		if norm, err := NormalizeHubURL(cfg.HubURL); err == nil {
+			mode := cfg.Mode
+			if mode == "" {
+				mode = "remote"
+			}
+			p := cfg.UpsertNetwork(NetworkProfile{
+				Mode:           mode,
+				HubURL:         norm,
+				ClientToken:    cfg.ClientToken,
+				DevToken:       cfg.DevToken,
+				MachineID:      cfg.MachineID,
+				RunLocalRunner: cfg.RunLocalRunner,
+			})
+			cfg.ActiveNetworkID = p.ID
+		}
+	} else if cfg.ActiveNetworkID != "" {
+		if prof, ok := cfg.FindNetworkByID(cfg.ActiveNetworkID); ok && cfg.HubURL == "" {
+			cfg.ActivateNetwork(prof.ID)
 		}
 	}
 
@@ -139,13 +334,24 @@ func LoadClientConfig(configDir, explicitURLFlag string) (ClientConfig, error) {
 			return cfg, err
 		}
 		cfg.HubURL = norm
-		// Origin-scope saved credentials: never leak Hub A's token when overriding to Hub B!
-		if overrideURL != "" && savedNormOrigin != "" && !sameOriginStrings(norm, savedNormOrigin) {
-			cfg.ClientToken = ""
-			cfg.DevToken = ""
-			cfg.MachineID = ""
-			cfg.Mode = "remote"
-			cfg.RunLocalRunner = false
+		// Origin-scope saved credentials: resolve matching saved profile, otherwise strip credentials
+		// so we never leak Hub A's token when overriding to Hub B!
+		if overrideURL != "" {
+			if prof, ok := cfg.FindNetworkByOrigin(norm); ok {
+				cfg.ActiveNetworkID = prof.ID
+				cfg.ClientToken = prof.ClientToken
+				cfg.DevToken = prof.DevToken
+				cfg.MachineID = prof.MachineID
+				cfg.Mode = prof.Mode
+				cfg.RunLocalRunner = prof.RunLocalRunner
+			} else if savedNormOrigin != "" && !sameOriginStrings(norm, savedNormOrigin) {
+				cfg.ActiveNetworkID = ""
+				cfg.ClientToken = ""
+				cfg.DevToken = ""
+				cfg.MachineID = ""
+				cfg.Mode = "remote"
+				cfg.RunLocalRunner = false
+			}
 		}
 	}
 

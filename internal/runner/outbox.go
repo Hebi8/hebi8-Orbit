@@ -21,22 +21,25 @@ import (
 // PendingDelivery persists fixed checkpoint metadata locally before pushing so network retries
 // ALWAYS push the exact same deliveryId and headSha (never re-running commit-tree).
 type PendingDelivery struct {
-	DeliveryID     string
-	AttemptID      string
-	LeaseToken     string
-	TaskID         string
-	ProjectID      string
-	RepoRoot       string
-	MirrorBarePath string
-	ReviewBaseSHA  string
-	HeadSHA        string
-	Summary        string
-	Manifest       protocol.DeliveryManifest
-	StagedBlobs    []gitops.PackagedBlob
-	IsFinal        bool
-	Pushed         bool
-	Emitted        bool
-	CreatedAt      int64
+	DeliveryID          string
+	AttemptID           string
+	LeaseToken          string
+	TaskID              string
+	ProjectID           string
+	RepoRoot            string
+	MirrorBarePath      string
+	ReviewBaseSHA       string
+	HeadSHA             string
+	Summary             string
+	Manifest            protocol.DeliveryManifest
+	StagedBlobs         []gitops.PackagedBlob
+	IsFinal             bool
+	TerminalState       protocol.AttemptState
+	TerminalErrorCode   string
+	TerminalErrorDetail string
+	Pushed              bool
+	Emitted             bool
+	CreatedAt           int64
 }
 
 // LocalOutbox is a single-writer WAL SQLite store (ncruces/go-sqlite3) for strictly ordered
@@ -108,22 +111,25 @@ CREATE TABLE IF NOT EXISTS handled_approvals (
 CREATE INDEX IF NOT EXISTS idx_handled_approvals_time ON handled_approvals(created_at DESC);
 
 CREATE TABLE IF NOT EXISTS pending_deliveries (
-  delivery_id      TEXT PRIMARY KEY,
-  attempt_id       TEXT NOT NULL,
-  lease_token      TEXT NOT NULL DEFAULT '',
-  task_id          TEXT NOT NULL,
-  project_id       TEXT NOT NULL,
-  repo_root        TEXT NOT NULL,
-  mirror_bare_path TEXT NOT NULL,
-  review_base_sha  TEXT NOT NULL,
-  head_sha         TEXT NOT NULL,
-  summary          TEXT NOT NULL,
-  manifest_json    TEXT NOT NULL,
-  blobs_json       TEXT NOT NULL DEFAULT '[]',
-  is_final         INTEGER NOT NULL DEFAULT 0,
-  pushed           INTEGER NOT NULL DEFAULT 0,
-  emitted          INTEGER NOT NULL DEFAULT 0,
-  created_at       INTEGER NOT NULL
+  delivery_id           TEXT PRIMARY KEY,
+  attempt_id            TEXT NOT NULL,
+  lease_token           TEXT NOT NULL DEFAULT '',
+  task_id               TEXT NOT NULL,
+  project_id            TEXT NOT NULL,
+  repo_root             TEXT NOT NULL,
+  mirror_bare_path      TEXT NOT NULL,
+  review_base_sha       TEXT NOT NULL,
+  head_sha              TEXT NOT NULL,
+  summary               TEXT NOT NULL,
+  manifest_json         TEXT NOT NULL,
+  blobs_json            TEXT NOT NULL DEFAULT '[]',
+  is_final              INTEGER NOT NULL DEFAULT 0,
+  terminal_state        TEXT NOT NULL DEFAULT '',
+  terminal_error_code   TEXT NOT NULL DEFAULT '',
+  terminal_error_detail TEXT NOT NULL DEFAULT '',
+  pushed                INTEGER NOT NULL DEFAULT 0,
+  emitted               INTEGER NOT NULL DEFAULT 0,
+  created_at            INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS cancelled_attempts (
@@ -140,6 +146,9 @@ CREATE TABLE IF NOT EXISTS cancelled_attempts (
 	for _, alter := range []string{
 		`ALTER TABLE pending_deliveries ADD COLUMN lease_token TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE pending_deliveries ADD COLUMN blobs_json TEXT NOT NULL DEFAULT '[]'`,
+		`ALTER TABLE pending_deliveries ADD COLUMN terminal_state TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE pending_deliveries ADD COLUMN terminal_error_code TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE pending_deliveries ADD COLUMN terminal_error_detail TEXT NOT NULL DEFAULT ''`,
 	} {
 		if _, err := db.ExecContext(ctx, alter); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
 			_ = db.Close()
@@ -424,26 +433,30 @@ func (o *LocalOutbox) SavePendingDelivery(ctx context.Context, d PendingDelivery
 	_, err = o.db.ExecContext(ctx, `
 		INSERT OR IGNORE INTO pending_deliveries (
 			delivery_id, attempt_id, lease_token, task_id, project_id, repo_root, mirror_bare_path,
-			review_base_sha, head_sha, summary, manifest_json, blobs_json, is_final, pushed, emitted, created_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?)
+			review_base_sha, head_sha, summary, manifest_json, blobs_json, is_final,
+			terminal_state, terminal_error_code, terminal_error_detail, pushed, emitted, created_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?)
 	`, d.DeliveryID, d.AttemptID, d.LeaseToken, d.TaskID, d.ProjectID, d.RepoRoot, d.MirrorBarePath,
-		d.ReviewBaseSHA, d.HeadSHA, d.Summary, string(manifestBytes), string(blobsBytes), isFinal, d.CreatedAt)
+		d.ReviewBaseSHA, d.HeadSHA, d.Summary, string(manifestBytes), string(blobsBytes), isFinal,
+		string(d.TerminalState), d.TerminalErrorCode, d.TerminalErrorDetail, d.CreatedAt)
 	return err
 }
 
 // GetPendingDelivery fetches one locally persisted pending delivery by deliveryID (B13).
 func (o *LocalOutbox) GetPendingDelivery(ctx context.Context, deliveryID string) (PendingDelivery, bool, error) {
 	var d PendingDelivery
-	var mJSON, bJSON string
+	var mJSON, bJSON, termState string
 	var isFinal, pushed, emitted int
 	err := o.db.QueryRowContext(ctx, `
 		SELECT delivery_id, attempt_id, lease_token, task_id, project_id, repo_root, mirror_bare_path,
-		       review_base_sha, head_sha, summary, manifest_json, blobs_json, is_final, pushed, emitted, created_at
+		       review_base_sha, head_sha, summary, manifest_json, blobs_json, is_final,
+		       terminal_state, terminal_error_code, terminal_error_detail, pushed, emitted, created_at
 		FROM pending_deliveries
 		WHERE delivery_id = ?
 	`, deliveryID).Scan(
 		&d.DeliveryID, &d.AttemptID, &d.LeaseToken, &d.TaskID, &d.ProjectID, &d.RepoRoot, &d.MirrorBarePath,
-		&d.ReviewBaseSHA, &d.HeadSHA, &d.Summary, &mJSON, &bJSON, &isFinal, &pushed, &emitted, &d.CreatedAt,
+		&d.ReviewBaseSHA, &d.HeadSHA, &d.Summary, &mJSON, &bJSON, &isFinal,
+		&termState, &d.TerminalErrorCode, &d.TerminalErrorDetail, &pushed, &emitted, &d.CreatedAt,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return d, false, nil
@@ -452,6 +465,7 @@ func (o *LocalOutbox) GetPendingDelivery(ctx context.Context, deliveryID string)
 		return d, false, err
 	}
 	d.IsFinal = isFinal != 0
+	d.TerminalState = protocol.AttemptState(termState)
 	d.Pushed = pushed != 0
 	d.Emitted = emitted != 0
 	_ = json.Unmarshal([]byte(mJSON), &d.Manifest)
@@ -575,7 +589,8 @@ func (o *LocalOutbox) EmitPendingDeliveryAtomically(
 func (o *LocalOutbox) ListUnemittedDeliveries(ctx context.Context) ([]PendingDelivery, error) {
 	rows, err := o.db.QueryContext(ctx, `
 		SELECT delivery_id, attempt_id, lease_token, task_id, project_id, repo_root, mirror_bare_path,
-		       review_base_sha, head_sha, summary, manifest_json, blobs_json, is_final, pushed, emitted, created_at
+		       review_base_sha, head_sha, summary, manifest_json, blobs_json, is_final,
+		       terminal_state, terminal_error_code, terminal_error_detail, pushed, emitted, created_at
 		FROM pending_deliveries
 		WHERE emitted = 0
 		ORDER BY created_at ASC
@@ -587,15 +602,17 @@ func (o *LocalOutbox) ListUnemittedDeliveries(ctx context.Context) ([]PendingDel
 	var out []PendingDelivery
 	for rows.Next() {
 		var d PendingDelivery
-		var mJSON, bJSON string
+		var mJSON, bJSON, termState string
 		var isFinal, pushed, emitted int
 		if err := rows.Scan(
 			&d.DeliveryID, &d.AttemptID, &d.LeaseToken, &d.TaskID, &d.ProjectID, &d.RepoRoot, &d.MirrorBarePath,
-			&d.ReviewBaseSHA, &d.HeadSHA, &d.Summary, &mJSON, &bJSON, &isFinal, &pushed, &emitted, &d.CreatedAt,
+			&d.ReviewBaseSHA, &d.HeadSHA, &d.Summary, &mJSON, &bJSON, &isFinal,
+			&termState, &d.TerminalErrorCode, &d.TerminalErrorDetail, &pushed, &emitted, &d.CreatedAt,
 		); err != nil {
 			return nil, err
 		}
 		d.IsFinal = isFinal != 0
+		d.TerminalState = protocol.AttemptState(termState)
 		d.Pushed = pushed != 0
 		d.Emitted = emitted != 0
 		_ = json.Unmarshal([]byte(mJSON), &d.Manifest)

@@ -7,6 +7,7 @@ import { useManyProjectTasks } from '../hooks/queries';
 import {
   SCRATCH_PROJECT_ID,
   indexInboxByTask,
+  isVirtualProject,
   mergeSessionMarks,
   relTime,
   rootSessionMark,
@@ -17,7 +18,7 @@ import { navigate, paths } from '../lib/router';
 
 /** Project index (mobile "项目" tab); threads never expand into workers here either. */
 export function ProjectsListPage({ boot }: { boot: BootstrapResponse }) {
-  const projects = boot.projects.filter((p) => p.projectId !== SCRATCH_PROJECT_ID && !p.archived);
+  const projects = boot.projects.filter((p) => !isVirtualProject(p.projectId) && !p.archived);
   const tasksByProject = useManyProjectTasks(boot.projects);
   const scratch = (tasksByProject[SCRATCH_PROJECT_ID] ?? [])
     .filter((t) => !t.parentTaskId)

@@ -63,7 +63,7 @@ func (s *Server) resolveExecutionRouteWithLocation(
 	explicitLoc := strings.TrimSpace(reqLocationID)
 
 	// 3-level Part -> Location resolution when explicit part/location is requested, or for standard non-deploy tasks with bound parts.
-	if proj.ProjectID != protocol.ScratchProjectID && len(proj.Parts) > 0 && strings.TrimSpace(reqCap) != "deploy-node" {
+	if !protocol.IsVirtualProjectID(proj.ProjectID) && len(proj.Parts) > 0 && strings.TrimSpace(reqCap) != "deploy-node" {
 		var matchedPart *protocol.ProjectPartView
 		var matchedLoc *protocol.ProjectLocationView
 
@@ -160,7 +160,7 @@ func (s *Server) resolveExecutionRouteWithLocation(
 				}
 			}
 			iso := matchedLoc.Isolation
-			isPlain := matchedPart.Kind == protocol.ProjectPartFolder || iso == protocol.IsolationInPlace
+			isPlain := matchedPart.Kind == protocol.ProjectPartFolder
 			if isPlain {
 				iso = protocol.IsolationInPlace
 			} else if iso == "" {
@@ -204,7 +204,7 @@ func (s *Server) resolveExecutionRouteWithLocation(
 		}
 		machineID = explicitMachine
 		mCfg = cfg
-		if proj.ProjectID != protocol.ScratchProjectID && len(proj.Anchors) > 0 {
+		if !protocol.IsVirtualProjectID(proj.ProjectID) && len(proj.Anchors) > 0 {
 			if strings.TrimSpace(reqCap) != "" {
 				a, ok := proj.Anchors[capName]
 				if !ok || a.Machine != explicitMachine {
@@ -267,6 +267,29 @@ func (s *Server) resolveExecutionRouteWithLocation(
 		}
 	}
 
+	// For virtual projects (_scratch / _pa), prefer online machines with at least one ready adapter (local_ws first).
+	if machineID == "" && protocol.IsVirtualProjectID(proj.ProjectID) {
+		for _, preferLocal := range []bool{true, false} {
+			for _, id := range sortedIDs {
+				m := machines[id]
+				if m.Transport == protocol.TransportSSHOutbound || !s.runners.IsConnected(id) {
+					continue
+				}
+				if preferLocal && m.Transport != protocol.TransportLocalWS {
+					continue
+				}
+				if len(s.runners.ReportedAdapters(id)) > 0 {
+					machineID = id
+					mCfg = m
+					break
+				}
+			}
+			if machineID != "" {
+				break
+			}
+		}
+	}
+
 	if machineID == "" {
 		// Find first machine advertising capName (prefer online)
 		for _, onlyOnline := range []bool{true, false} {
@@ -320,6 +343,19 @@ func (s *Server) resolveExecutionRouteWithLocation(
 			adapter = protocol.AdapterSSHDeploy
 		} else if mCfg.Transport == protocol.TransportSSHOutbound || capName == "deploy-node" {
 			adapter = protocol.AdapterSSHDeploy
+		} else if protocol.IsVirtualProjectID(proj.ProjectID) {
+			reported := s.runners.ReportedAdapters(machineID)
+			if len(reported) > 0 {
+				if proj.DefaultAdapter != "" && slices.Contains(reported, proj.DefaultAdapter) {
+					adapter = proj.DefaultAdapter
+				} else {
+					adapter = reported[0]
+				}
+			} else if proj.DefaultAdapter != "" {
+				adapter = proj.DefaultAdapter
+			} else {
+				adapter = protocol.AdapterAgy
+			}
 		} else if proj.DefaultAdapter != "" {
 			adapter = proj.DefaultAdapter
 		} else if reported := s.runners.ReportedAdapters(machineID); len(reported) > 0 {
@@ -333,14 +369,88 @@ func (s *Server) resolveExecutionRouteWithLocation(
 		adapter = protocol.AdapterSSHDeploy
 	}
 
-	return resolvedRoute{
+	route := resolvedRoute{
 		MachineID:  machineID,
 		MachineCfg: mCfg,
 		Capability: capName,
 		Adapter:    adapter,
 		Anchor:     anchor,
 		HasAnchor:  hasAnchor,
-	}, nil
+	}
+	// Populate matching PartID/LocationID/Isolation from project_parts when routing via capability/anchor.
+	if !protocol.IsVirtualProjectID(proj.ProjectID) && len(proj.Parts) > 0 {
+		var matchedPart *protocol.ProjectPartView
+		var matchedLoc *protocol.ProjectLocationView
+		wantPath := ""
+		if hasAnchor && strings.TrimSpace(anchor.RepoPath) != "" {
+			wantPath = filepath.Clean(protocol.ExpandPath(anchor.RepoPath))
+		}
+		for i := range proj.Parts {
+			for j := range proj.Parts[i].Locations {
+				loc := &proj.Parts[i].Locations[j]
+				if loc.MachineID != machineID {
+					continue
+				}
+				if wantPath != "" {
+					// When target anchor specifies an explicit RepoPath, ONLY match locations with
+					// that exact normalized path — never borrow an unrelated location on the same machine.
+					if filepath.Clean(protocol.ExpandPath(loc.AbsPath)) == wantPath {
+						matchedPart = &proj.Parts[i]
+						matchedLoc = loc
+						break
+					}
+					continue
+				}
+				if matchedLoc == nil || loc.IsDefault {
+					matchedPart = &proj.Parts[i]
+					matchedLoc = loc
+				}
+			}
+			if matchedLoc != nil && wantPath != "" {
+				break
+			}
+		}
+		if matchedPart != nil && matchedLoc != nil {
+			iso := matchedLoc.Isolation
+			isPlain := matchedPart.Kind == protocol.ProjectPartFolder
+			if isPlain {
+				iso = protocol.IsolationInPlace
+			} else if iso == "" {
+				iso = protocol.IsolationWorktree
+			}
+			route.PartID = matchedPart.PartID
+			route.LocationID = matchedLoc.LocationID
+			route.Isolation = iso
+			route.IsPlainFolder = isPlain
+			if !route.HasAnchor {
+				route.Anchor = protocol.ProjectAnchorConfig{
+					Machine:  matchedLoc.MachineID,
+					RepoPath: matchedLoc.AbsPath,
+				}
+				route.HasAnchor = true
+			}
+		} else if wantPath != "" {
+			// Anchor had an explicit path with no matching bound location on machineID:
+			// keep PartID/LocationID empty and use project-level Git isolation preference (default worktree).
+			iso := protocol.IsolationWorktree
+			for i := range proj.Parts {
+				if proj.Parts[i].Kind == protocol.ProjectPartFolder {
+					continue
+				}
+				for j := range proj.Parts[i].Locations {
+					if proj.Parts[i].Locations[j].Isolation.IsValid() {
+						iso = proj.Parts[i].Locations[j].Isolation
+						break
+					}
+				}
+				if iso != protocol.IsolationWorktree {
+					break
+				}
+			}
+			route.Isolation = iso
+		}
+	}
+	return route, nil
 }
 
 // enforcePostRouteGuard blocks non-human callers (such as PA) from directly launching ssh_deploy.
@@ -396,25 +506,41 @@ func (s *Server) resolveWorktreeRoot(proj protocol.ProjectView, anchor protocol.
 	if proj.ProjectID == protocol.ScratchProjectID {
 		return filepath.Join(cfg.DataDir, "scratch")
 	}
+	if proj.ProjectID == protocol.PAProjectID {
+		return filepath.Join(cfg.DataDir, "pa")
+	}
 	return filepath.Join(cfg.DataDir, "worktrees", proj.ProjectID)
 }
 
 func buildOrbitSystemPromptAppend(taskID, projectID, attemptID string, isPlainFolder bool, projectSystemPrompt string) string {
 	var base string
-	if isPlainFolder {
+	switch {
+	case projectID == protocol.ScratchProjectID:
 		base = fmt.Sprintf(
-			"hebi8-Orbit Execution Contract: project=%s task=%s attempt=%s. "+
-				"Your working directory is a local project folder (in-place execution, NOT a Git worktree; do NOT initialize a .git repository or run `orbit deliver`). "+
-				"Edit or create files directly in place as requested and summarize your changes clearly.",
+			"hebi8-Orbit Chat Session: task=%s attempt=%s. "+
+				"Answer directly and concisely. You are in a standalone scratch workspace (not bound to a Git project).",
+			taskID, attemptID,
+		)
+	case projectID == protocol.PAProjectID:
+		base = fmt.Sprintf(
+			"hebi8-Orbit Personal Assistant (PA): task=%s attempt=%s. "+
+				"You are the user's Personal Assistant inside Orbit. "+
+				"When referenced conversations (<referenced_conversations>) or workspace context (<orbit_workspace>) are provided, "+
+				"read and synthesize them faithfully, cite specific facts/decisions/files, and answer in the user's language.",
+			taskID, attemptID,
+		)
+	case isPlainFolder:
+		base = fmt.Sprintf(
+			"hebi8-Orbit Execution Context: project=%s task=%s attempt=%s. "+
+				"Your working directory is synced directly with the user's local project directory (in-place mode). "+
+				"Edit or read files directly as requested; Orbit automatically tracks file changes when your turn finishes.",
 			projectID, taskID, attemptID,
 		)
-	} else {
+	default:
 		base = fmt.Sprintf(
-			"hebi8-Orbit Execution Contract: project=%s task=%s attempt=%s. "+
-				"Your working directory is an isolated task worktree. "+
-				"Keep architectural decisions in repository docs/decisions/ (never write AGENTS.md/CLAUDE.md). "+
-				"When your work is ready to deliver, run `orbit deliver --summary \"<concise summary>\" --final` "+
-				"(if using native swarm, kill all workers before passing `--final`; omit `--final` only for intermediate preview snapshots).",
+			"hebi8-Orbit Execution Context: project=%s task=%s attempt=%s. "+
+				"Your working directory is an isolated Git worktree. "+
+				"Orbit automatically packages and syncs any file changes when your turn finishes—no manual delivery command is required.",
 			projectID, taskID, attemptID,
 		)
 	}
@@ -433,16 +559,23 @@ func (s *Server) buildAttemptDispatchFrame(
 	swarmIdleTimeoutMs int64,
 ) protocol.AttemptDispatchFrame {
 	prompt := strings.TrimSpace(promptOverride)
-	if prompt == "" && att.TriggerPayloadJSON != "" {
+	usedOverride := prompt != ""
+	explicitFullPermission := false
+	if att.TriggerPayloadJSON != "" {
 		var tp map[string]any
 		if err := json.Unmarshal([]byte(att.TriggerPayloadJSON), &tp); err == nil {
-			if p, ok := tp["prompt"].(string); ok {
-				prompt = p
+			if prompt == "" {
+				if p, ok := tp["prompt"].(string); ok {
+					prompt = p
+				}
 			}
 			if swarmIdleTimeoutMs <= 0 {
 				if v, ok := tp["swarmIdleTimeoutMs"].(float64); ok && v > 0 {
 					swarmIdleTimeoutMs = int64(v)
 				}
+			}
+			if ef, ok := tp["explicitFullPermission"].(bool); ok && ef {
+				explicitFullPermission = true
 			}
 		}
 	}
@@ -450,6 +583,9 @@ func (s *Server) buildAttemptDispatchFrame(
 		if task, err := s.store.GetTask(ctx, att.TaskID); err == nil {
 			prompt = task.Goal
 		}
+	}
+	if !usedOverride && (len(att.RefTasks) > 0 || proj.ProjectID == protocol.PAProjectID) {
+		prompt = s.decorateAttemptPrompt(ctx, proj.ProjectID, prompt, att.RefTasks, proj.ProjectID == protocol.PAProjectID && att.AttemptNo == 1)
 	}
 
 	var inputDlv *protocol.InputDeliveryRef
@@ -504,7 +640,7 @@ func (s *Server) buildAttemptDispatchFrame(
 		}
 	}
 
-	isPlainFolder := att.Isolation == protocol.IsolationInPlace || strings.HasPrefix(strings.ToLower(strings.TrimSpace(proj.RepoIdentity)), "folder:")
+	isPlainFolder := strings.HasPrefix(strings.ToLower(strings.TrimSpace(proj.RepoIdentity)), "folder:")
 	if !isPlainFolder && att.PartID != "" {
 		for _, p := range proj.Parts {
 			if p.PartID == att.PartID && p.Kind == protocol.ProjectPartFolder {
@@ -519,18 +655,19 @@ func (s *Server) buildAttemptDispatchFrame(
 	} else if isolation == "" {
 		isolation = protocol.IsolationWorktree
 	}
+	isInPlace := isPlainFolder || isolation == protocol.IsolationInPlace
 
 	repoPath := strings.TrimSpace(effAnchor.RepoPath)
 	if !isRemoteMachine {
 		repoPath = protocol.ExpandPath(repoPath)
 	}
 	mirrorBarePath := proj.MirrorBarePath
-	if isPlainFolder {
+	if isInPlace {
 		mirrorBarePath = ""
 		if repoPath != "" {
 			worktreePath = repoPath
 		}
-	} else if isRemoteMachine && proj.ProjectID != protocol.ScratchProjectID && strings.TrimSpace(proj.MirrorBarePath) != "" {
+	} else if isRemoteMachine && !protocol.IsVirtualProjectID(proj.ProjectID) && strings.TrimSpace(proj.MirrorBarePath) != "" {
 		// Only switch to Hub HTTP bundle transport when the connected Runner negotiates bundle.v1,
 		// so older Runners with pre-configured remote mirror paths continue working cleanly.
 		if s.runners.HasCapability(att.MachineID, protocol.RunnerCapBundleV1) {
@@ -567,10 +704,11 @@ func (s *Server) buildAttemptDispatchFrame(
 		WorktreePath:       worktreePath,
 		MirrorBarePath:     mirrorBarePath,
 		BaseSHA:            att.BaseSHA,
-		DefaultBranch:      proj.DefaultBranch,
-		DesiredConfig:      att.DesiredConfig,
-		ProjectEnv:         projectEnv,
-		SystemPromptAppend: buildOrbitSystemPromptAppend(att.TaskID, att.ProjectID, att.AttemptID, isPlainFolder, proj.SystemPrompt),
+		DefaultBranch:          proj.DefaultBranch,
+		DesiredConfig:          att.DesiredConfig,
+		ExplicitFullPermission: explicitFullPermission,
+		ProjectEnv:             projectEnv,
+		SystemPromptAppend: buildOrbitSystemPromptAppend(att.TaskID, att.ProjectID, att.AttemptID, isInPlace, proj.SystemPrompt),
 		InputDelivery:      inputDlv,
 		Prompt:             prompt,
 		RequiredResources:  att.RequiredResources,

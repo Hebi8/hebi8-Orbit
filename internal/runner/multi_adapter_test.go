@@ -16,17 +16,25 @@ type stubAdapterDriver struct {
 	closed         bool
 	metaSP         bool
 	sessionOpts    []acp.SessionConfigOption
+	sessionModes   *acp.SessionModeState
 	newSessions    int
 	prompts        []string
 	setConfigCalls []struct{ id, val string }
+	setModeCalls   []string
 	live           map[acp.SessionId]bool
+	sessionCWD     map[acp.SessionId]string
+	onPrompt       func(ctx context.Context, sid acp.SessionId, cwd, prompt string) (acp.PromptResponse, error)
+	updateHandler  SessionUpdateHandler
+	permHandler    PermissionHandler
 	nextSeq        int
 }
 
-func (s *stubAdapterDriver) Start(_ context.Context, _ SessionUpdateHandler, _ PermissionHandler) error {
+func (s *stubAdapterDriver) Start(_ context.Context, onUpdate SessionUpdateHandler, onPerm PermissionHandler) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.started = true
+	s.updateHandler = onUpdate
+	s.permHandler = onPerm
 	if s.live == nil {
 		s.live = map[acp.SessionId]bool{}
 	}
@@ -49,28 +57,35 @@ func (s *stubAdapterDriver) IsSessionLiveInMemory(sid acp.SessionId) bool {
 	return s.live[sid]
 }
 
-func (s *stubAdapterDriver) NewSession(_ context.Context, _, _ string) (acp.NewSessionResponse, error) {
+func (s *stubAdapterDriver) NewSession(_ context.Context, cwd, _ string) (acp.NewSessionResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.newSessions++
 	s.nextSeq++
 	sid := acp.SessionId("sid_" + string(rune('a'+s.nextSeq)))
+	if s.live == nil {
+		s.live = map[acp.SessionId]bool{}
+	}
+	if s.sessionCWD == nil {
+		s.sessionCWD = map[acp.SessionId]string{}
+	}
 	s.live[sid] = true
-	return acp.NewSessionResponse{SessionId: sid, ConfigOptions: s.sessionOpts}, nil
+	s.sessionCWD[sid] = cwd
+	return acp.NewSessionResponse{SessionId: sid, ConfigOptions: s.sessionOpts, Modes: s.sessionModes}, nil
 }
 
 func (s *stubAdapterDriver) ResumeSession(_ context.Context, sid acp.SessionId, _ string) (acp.ResumeSessionResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.live[sid] = true
-	return acp.ResumeSessionResponse{ConfigOptions: s.sessionOpts}, nil
+	return acp.ResumeSessionResponse{ConfigOptions: s.sessionOpts, Modes: s.sessionModes}, nil
 }
 
 func (s *stubAdapterDriver) LoadSession(_ context.Context, sid acp.SessionId, _ string) (acp.LoadSessionResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.live[sid] = true
-	return acp.LoadSessionResponse{ConfigOptions: s.sessionOpts}, nil
+	return acp.LoadSessionResponse{ConfigOptions: s.sessionOpts, Modes: s.sessionModes}, nil
 }
 
 func (s *stubAdapterDriver) CloseSession(_ context.Context, sid acp.SessionId) error {
@@ -97,10 +112,25 @@ func (s *stubAdapterDriver) SetConfigOption(_ context.Context, _ acp.SessionId, 
 	return acp.SetSessionConfigOptionResponse{ConfigOptions: updated}, nil
 }
 
-func (s *stubAdapterDriver) Prompt(_ context.Context, _ acp.SessionId, promptText string) (acp.PromptResponse, error) {
+func (s *stubAdapterDriver) SetSessionMode(_ context.Context, _ acp.SessionId, modeID string) (acp.SetSessionModeResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.setModeCalls = append(s.setModeCalls, modeID)
+	if s.sessionModes != nil {
+		s.sessionModes.CurrentModeId = acp.SessionModeId(modeID)
+	}
+	return acp.SetSessionModeResponse{}, nil
+}
+
+func (s *stubAdapterDriver) Prompt(ctx context.Context, sid acp.SessionId, promptText string) (acp.PromptResponse, error) {
+	s.mu.Lock()
 	s.prompts = append(s.prompts, promptText)
+	cwd := s.sessionCWD[sid]
+	hook := s.onPrompt
+	s.mu.Unlock()
+	if hook != nil {
+		return hook(ctx, sid, cwd, promptText)
+	}
 	return acp.PromptResponse{StopReason: acp.StopReasonEndTurn}, nil
 }
 
@@ -137,23 +167,23 @@ func TestResolveConfigOptionTarget_CrossAdapterMapping(t *testing.T) {
 		makeSelectOpt("mode", catMode, "agent", "read-only", "workspace-write", "agent", "agent-full-access"),
 	}
 
-	id, val := resolveConfigOptionTarget(claudeOpts, "thought_level", "high")
+	_, id, val := resolveConfigOptionTarget(claudeOpts, "thought_level", "high")
 	if id != "effort" || val != "high" {
 		t.Fatalf("claude thought_level -> got (%q,%q), want (effort,high)", id, val)
 	}
-	id, val = resolveConfigOptionTarget(claudeOpts, "mode", "full")
+	_, id, val = resolveConfigOptionTarget(claudeOpts, "mode", "full")
 	if id != "mode" || val != "bypassPermissions" {
 		t.Fatalf("claude mode=full -> got (%q,%q), want (mode,bypassPermissions)", id, val)
 	}
-	id, val = resolveConfigOptionTarget(codexOpts, "thought_level", "high")
+	_, id, val = resolveConfigOptionTarget(codexOpts, "thought_level", "high")
 	if id != "reasoning_effort" || val != "high" {
 		t.Fatalf("codex thought_level -> got (%q,%q), want (reasoning_effort,high)", id, val)
 	}
-	id, val = resolveConfigOptionTarget(codexOpts, "mode", "auto")
+	_, id, val = resolveConfigOptionTarget(codexOpts, "mode", "auto")
 	if id != "mode" || val != "agent" {
 		t.Fatalf("codex mode=auto -> got (%q,%q), want (mode,agent)", id, val)
 	}
-	id, val = resolveConfigOptionTarget(codexOpts, "mode", "full")
+	_, id, val = resolveConfigOptionTarget(codexOpts, "mode", "full")
 	if id != "mode" || val != "agent-full-access" {
 		t.Fatalf("codex mode=full -> got (%q,%q), want (mode,agent-full-access)", id, val)
 	}

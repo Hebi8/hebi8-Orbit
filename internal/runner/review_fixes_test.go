@@ -52,8 +52,17 @@ func TestB1_E2E_StopReasonsAndScratchVsProjectDelivery(t *testing.T) {
 				},
 			})
 			return acp.PromptResponse{StopReason: acp.StopReasonEndTurn}, nil
+		case 5:
+			// demo-app read-only project turn without file edits -> MUST succeed cleanly without manual orbit deliver!
+			return acp.PromptResponse{StopReason: acp.StopReasonEndTurn}, nil
 		default:
-			// demo-app project turn without delivery -> MUST fail with NO_VERIFIED_DELIVERY!
+			// demo-app project turn that modifies a file WITHOUT calling orbit deliver -> Orbit auto-packages a delivery!
+			d.mu.Lock()
+			cwd := d.sessionCWD[sid]
+			d.mu.Unlock()
+			if cwd != "" {
+				_ = os.WriteFile(filepath.Join(cwd, "auto_wrapup.txt"), []byte("wrapped by orbit infra\n"), 0o644)
+			}
 			return acp.PromptResponse{StopReason: acp.StopReasonEndTurn}, nil
 		}
 	}
@@ -110,14 +119,23 @@ func TestB1_E2E_StopReasonsAndScratchVsProjectDelivery(t *testing.T) {
 		return err == nil && rec.State == protocol.AttemptNeedsVerification
 	}, "_scratch rejected tool did not land in needs_verification")
 
-	// 5. Real project demo-app without delivery -> failed (NO_VERIFIED_DELIVERY)
-	_, raw = env.apiReq(http.MethodPost, "/api/projects/demo-app/tasks", protocol.CreateTaskRequest{Goal: "forgot deliver"}, nil)
+	// 5. Real project demo-app read-only turn without file edits -> succeeds cleanly without manual orbit deliver
+	_, raw = env.apiReq(http.MethodPost, "/api/projects/demo-app/tasks", protocol.CreateTaskRequest{Goal: "explain architecture"}, nil)
 	var c5 protocol.CreateTaskResponse
 	_ = json.Unmarshal(raw, &c5)
 	eventually(t, 3*time.Second, func() bool {
 		rec, err := env.st.GetAttemptRecord(context.Background(), c5.Attempt.AttemptID)
-		return err == nil && rec.State == protocol.AttemptFailed && rec.ErrorCode == "NO_VERIFIED_DELIVERY"
-	}, "demo-app without delivery did not fail with NO_VERIFIED_DELIVERY")
+		return err == nil && rec.State == protocol.AttemptSucceeded
+	}, "demo-app read-only turn did not succeed cleanly")
+
+	// 6. Real project demo-app editing a file WITHOUT running orbit deliver -> Orbit infra auto-packages delivery & succeeds!
+	_, raw = env.apiReq(http.MethodPost, "/api/projects/demo-app/tasks", protocol.CreateTaskRequest{Goal: "create auto_wrapup.txt"}, nil)
+	var c6 protocol.CreateTaskResponse
+	_ = json.Unmarshal(raw, &c6)
+	eventually(t, 5*time.Second, func() bool {
+		rec, err := env.st.GetAttemptRecord(context.Background(), c6.Attempt.AttemptID)
+		return err == nil && rec.State == protocol.AttemptSucceeded && rec.OutputDeliveryID != ""
+	}, "demo-app edit turn did not auto-package delivery and succeed")
 }
 
 // ============================================================================

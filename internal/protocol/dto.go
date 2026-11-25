@@ -120,6 +120,7 @@ type SetupStatusView struct {
 	ReadyAgents         int      `json:"readyAgents"`
 	OnlineMachines      int      `json:"onlineMachines"`
 	CurrentMachineID    string   `json:"currentMachineId,omitempty"`
+	CurrentClientID     string   `json:"currentClientId,omitempty"`
 	DiscoveryID         string   `json:"discoveryId,omitempty"`
 	DutyPriority        []string `json:"dutyPriority,omitempty"`
 	ActiveDutyMachineID string   `json:"activeDutyMachineId,omitempty"`
@@ -272,6 +273,14 @@ type FolderChangesSummary struct {
 	Promoted  bool               `json:"promoted,omitempty"`
 }
 
+// ReferencedTaskMeta identifies another conversation referenced by a turn (e.g. in PA).
+type ReferencedTaskMeta struct {
+	TaskID      string `json:"taskId"`
+	Title       string `json:"title"`
+	ProjectID   string `json:"projectId"`
+	ProjectName string `json:"projectName,omitempty"`
+}
+
 // AttemptView represents one execution attempt of a task.
 type AttemptView struct {
 	AttemptID        string                `json:"attemptId"`
@@ -285,6 +294,7 @@ type AttemptView struct {
 	Isolation        LocationIsolation     `json:"isolation,omitempty"`
 	TriggerKind      TriggerKind           `json:"triggerKind"`
 	PromptText       string                `json:"promptText,omitempty"`
+	RefTasks         []ReferencedTaskMeta  `json:"refTasks,omitempty"`
 	WorktreePath     string                `json:"worktreePath,omitempty"`
 	BaseSHA          string                `json:"baseSha,omitempty"`
 	OutputDeliveryID string                `json:"outputDeliveryId,omitempty"`
@@ -700,7 +710,7 @@ type CreateTaskSourceInput struct {
 	URIOrRef string         `json:"uriOrRef"`
 }
 
-// CreateTaskRequest creates a new task under a real project or virtual _scratch project.
+// CreateTaskRequest creates a new task under a real project or virtual _scratch/_pa project.
 type CreateTaskRequest struct {
 	Title                string                  `json:"title,omitempty"`
 	Goal                 string                  `json:"goal"`
@@ -708,11 +718,14 @@ type CreateTaskRequest struct {
 	MachineID            string                  `json:"machineId,omitempty"`
 	PartID               string                  `json:"partId,omitempty"`
 	LocationID           string                  `json:"locationId,omitempty"`
+	UseWorktree          *bool                   `json:"useWorktree,omitempty"`
+	ReferencedTaskIDs    []string                `json:"referencedTaskIds,omitempty"`
 	RequiredCapability   string                  `json:"requiredCapability,omitempty"`
 	RequiredResources    []string                `json:"requiredResources,omitempty"`
-	Adapter              Adapter                 `json:"adapter,omitempty"`
-	Config               map[string]string       `json:"config,omitempty"`
-	ImportDirtyWorkspace bool                    `json:"importDirtyWorkspace,omitempty"`
+	Adapter                Adapter                 `json:"adapter,omitempty"`
+	Config                 map[string]string       `json:"config,omitempty"`
+	ExplicitFullPermission bool                    `json:"explicitFullPermission,omitempty"`
+	ImportDirtyWorkspace   bool                    `json:"importDirtyWorkspace,omitempty"`
 	Sources              []CreateTaskSourceInput `json:"sources,omitempty"`
 	IdempotencyKey       string                  `json:"idempotencyKey,omitempty"`
 	SwarmIdleTimeoutMs   int64                   `json:"swarmIdleTimeoutMs,omitempty"`
@@ -743,11 +756,13 @@ type BindScratchTaskResponse struct {
 type FollowupTaskRequest struct {
 	Message            string            `json:"message"`
 	Mode               FollowupMode      `json:"mode,omitempty"`
+	ReferencedTaskIDs  []string          `json:"referencedTaskIds,omitempty"`
 	RequiredCapability string            `json:"requiredCapability,omitempty"`
 	RequiredResources  []string          `json:"requiredResources,omitempty"`
-	Adapter            Adapter           `json:"adapter,omitempty"`
-	Config             map[string]string `json:"config,omitempty"`
-	VerifiedSite       bool              `json:"verifiedSite,omitempty"`
+	Adapter                Adapter           `json:"adapter,omitempty"`
+	Config                 map[string]string `json:"config,omitempty"`
+	ExplicitFullPermission bool              `json:"explicitFullPermission,omitempty"`
+	VerifiedSite           bool              `json:"verifiedSite,omitempty"`
 	VerifiedAttemptID  string            `json:"verifiedAttemptId,omitempty"`
 }
 
@@ -982,6 +997,47 @@ type ClaimAuthHandoffRequest struct {
 type ClaimAuthHandoffResponse struct {
 	ClientToken string `json:"clientToken"`
 	MachineID   string `json:"machineId,omitempty"`
+}
+
+// PairClientRequest redeems a one-time pairing code from a browser/client into a persistent client-only login session.
+type PairClientRequest struct {
+	Code       string `json:"code"`
+	DeviceName string `json:"deviceName,omitempty"`
+}
+
+// PairClientResponse returns a persistent client-only bearer token (ock_) for a logged-in client device.
+type PairClientResponse struct {
+	ClientToken   string `json:"clientToken"`
+	TokenID       string `json:"tokenId"`
+	DeviceName    string `json:"deviceName"`
+	WorkspaceName string `json:"workspaceName,omitempty"`
+}
+
+// ClientDeviceView represents one logged-in client device session (not an execution host/runner).
+type ClientDeviceView struct {
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	Scope      string `json:"scope"`
+	MachineID  string `json:"machineId,omitempty"`
+	CreatedAt  int64  `json:"createdAt"`
+	LastUsedAt *int64 `json:"lastUsedAt,omitempty"`
+	IsCurrent  bool   `json:"isCurrent,omitempty"`
+}
+
+// ListClientsResponse lists all active logged-in client device sessions.
+type ListClientsResponse struct {
+	Clients []ClientDeviceView `json:"clients"`
+}
+
+// RevokeClientResponse confirms revocation of a client device token.
+type RevokeClientResponse struct {
+	ClientID string `json:"clientId"`
+	Revoked  bool   `json:"revoked"`
+}
+
+// LogoutClientResponse confirms logout of the caller's current client session.
+type LogoutClientResponse struct {
+	LoggedOut bool `json:"loggedOut"`
 }
 
 // ListMachinesResponse returns the full merged machine & agent status list.

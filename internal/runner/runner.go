@@ -59,6 +59,7 @@ type Config struct {
 	PermissionPolicy        PermissionDecisionPolicy
 	ResourceProbe           ResourceProbeFunc
 	AgentManager            *AgentManager
+	ScopedDriverFactory     func(adapter protocol.Adapter, projectEnv map[string]string) (AcpAdapterDriver, error)
 	AllowedBrowseRoots      []string
 	// Test hooks for deterministic R3 crash simulation
 	OnAfterACPApprovalWrite func(approvalID string) bool
@@ -69,7 +70,12 @@ type sessionSlot struct {
 	wbSessionID          string
 	adapter              protocol.Adapter
 	driver               AcpAdapterDriver
+	scopedDriver         bool
+	projectEnvHash       string
 	providerSessionID    acp.SessionId
+	sessionOpts          []acp.SessionConfigOption
+	sessionModes         *acp.SessionModeState
+	appliedMode          string
 	cwd                  string
 	runtimeState         protocol.SessionRuntimeState
 	inFlightPrompt       bool
@@ -98,13 +104,15 @@ type attemptContext struct {
 	beforeFolderSnap        *gitops.FolderSnapshot
 	state                   protocol.AttemptState
 	resumeState             protocol.ResumeState
-	providerSessionID       acp.SessionId
-	promptReturned          bool
+	providerSessionID        acp.SessionId
+	appliedMode              string
+	promptReturned           bool
 	inFlightPrompts         int
 	lastStopReason          acp.StopReason
 	promptDoneCh            chan struct{}
 	promptDoneOnce          sync.Once
 	hasDelivery             bool
+	lastDeliveredFingerprint string
 	finalRequested          bool
 	explicitFinalDeliveryID string
 	finalizing              bool
@@ -527,6 +535,27 @@ func (r *Runner) closeAllDrivers(ctx context.Context) error {
 	r.retiredDrivers = nil
 	r.driverMu.Unlock()
 
+	// Also collect and close any project-scoped drivers owned by live or dead session slots.
+	r.mu.Lock()
+	slots := make([]*sessionSlot, 0, len(r.sessions))
+	for _, slot := range r.sessions {
+		slots = append(slots, slot)
+	}
+	r.mu.Unlock()
+	for _, slot := range slots {
+		slot.mu.Lock()
+		if slot.scopedDriver && slot.driver != nil {
+			if !seen[slot.driver] {
+				seen[slot.driver] = true
+				toClose = append(toClose, slot.driver)
+			}
+			slot.driver = nil
+			slot.scopedDriver = false
+			slot.projectEnvHash = ""
+		}
+		slot.mu.Unlock()
+	}
+
 	var errs []error
 	for _, drv := range toClose {
 		if err := drv.Close(ctx); err != nil {
@@ -690,11 +719,12 @@ func (r *Runner) executeAttempt(ctx context.Context, att *attemptContext) {
 	}()
 
 	// B18: Reject unsupported session adapters explicitly instead of silently running agy.
-	if protocol.SessionAdapter(dispatch.Adapter).IsValid() && !slices.Contains(r.cfg.SupportedAdapters, dispatch.Adapter) {
+	supported := r.supportedAdapters()
+	if protocol.SessionAdapter(dispatch.Adapter).IsValid() && !slices.Contains(supported, dispatch.Adapter) {
 		r.finalizeAttemptDurable(att, protocol.AttemptFailed, map[string]any{
 			"state":       string(protocol.AttemptFailed),
 			"errorCode":   "UNSUPPORTED_ADAPTER",
-			"errorDetail": fmt.Sprintf("runner %s does not support adapter %q (supported: %v)", r.cfg.MachineID, dispatch.Adapter, r.cfg.SupportedAdapters),
+			"errorDetail": fmt.Sprintf("runner %s does not support adapter %q (supported: %v)", r.cfg.MachineID, dispatch.Adapter, supported),
 		})
 		return
 	}
@@ -1034,29 +1064,118 @@ func (r *Runner) executeAttempt(ctx context.Context, att *attemptContext) {
 	_, _, rejCount, nonZeroCount := att.tracker.Stats()
 	unresRej, unresNonZero := att.tracker.UnresolvedCounts()
 
-	// B1 & B13: Non-_scratch Git project turns MUST have a verified delivery before succeeding.
-	// Plain-folder / in-place turns skip shadow Git and instead capture a lightweight before/after file diff!
-	if dispatch.ProjectID != protocol.ScratchProjectID && !hasDelivery && !isInPlace {
+	// Orbit infra auto-wrapup: for isolated Git worktree turns, automatically package and publish
+	// a checkpoint delivery whenever files changed vs baseSHA — including follow-up edits made
+	// AFTER an earlier mid-turn `orbit deliver`. Never treat worktree check failures as clean!
+	autoDeliveryID := ""
+	if !protocol.IsVirtualProjectID(dispatch.ProjectID) && !isInPlace && strings.TrimSpace(dispatch.MirrorBarePath) != "" {
 		if hasPendingFinal, err := r.outbox.HasUnemittedFinalDelivery(ctx, dispatch.AttemptID); err == nil && hasPendingFinal {
 			go r.retryPendingDeliveries(r.runCtx)
 			<-ctx.Done()
 			return
 		}
-		r.finalizeAttemptDurable(att, protocol.AttemptFailed, map[string]any{
-			"state":                       string(protocol.AttemptFailed),
-			"stopReason":                  string(acp.StopReasonEndTurn),
-			"errorCode":                   "NO_VERIFIED_DELIVERY",
-			"errorDetail":                 "项目交付轮未运行 `orbit deliver` 产出已核验交付，不能标记为成功",
-			"rejectedToolCount":           rejCount,
-			"nonZeroExitCount":            nonZeroCount,
-			"unresolvedRejectedToolCount": unresRej,
-			"unresolvedNonZeroExitCount":  unresNonZero,
-		})
-		return
+		att.mu.Lock()
+		lastDeliveredFP := att.lastDeliveredFingerprint
+		att.mu.Unlock()
+
+		var (
+			changed bool
+			chkErr  error
+		)
+		if !hasDelivery {
+			changed, chkErr = worktreeHasChanges(ctx, worktreePath, baseSHA)
+		} else {
+			curFP, fpErr := worktreeStateFingerprint(ctx, worktreePath)
+			if fpErr != nil {
+				chkErr = fpErr
+			} else {
+				changed = (lastDeliveredFP == "" || curFP != lastDeliveredFP)
+			}
+		}
+		if chkErr != nil {
+			r.finalizeAttemptDurable(att, protocol.AttemptFailed, map[string]any{
+				"state":                       string(protocol.AttemptFailed),
+				"stopReason":                  string(acp.StopReasonEndTurn),
+				"errorCode":                   "WORKTREE_CHECK_FAILED",
+				"errorDetail":                 fmt.Sprintf("检查工作树状态失败: %v", chkErr),
+				"rejectedToolCount":           rejCount,
+				"nonZeroExitCount":            nonZeroCount,
+				"unresolvedRejectedToolCount": unresRej,
+				"unresolvedNonZeroExitCount":  unresNonZero,
+			})
+			return
+		}
+		if changed {
+			termState := protocol.AttemptSucceeded
+			termErrCode := ""
+			termErrDetail := ""
+			var finalPayload map[string]any
+			if unresRej > 0 || unresNonZero > 0 {
+				termState = protocol.AttemptNeedsVerification
+				termErrCode = "UNRESOLVED_TOOL_FAILURE"
+				termErrDetail = "本轮存在未解决的工具拒绝或非零失败，请人工核对后再决定是否续跑"
+				finalPayload = map[string]any{
+					"state":                       string(protocol.AttemptNeedsVerification),
+					"stopReason":                  string(acp.StopReasonEndTurn),
+					"completionSource":            string(protocol.CompletionPromptEndTurn),
+					"sessionLocked":               true,
+					"errorCode":                   termErrCode,
+					"errorDetail":                 termErrDetail,
+					"rejectedToolCount":           rejCount,
+					"nonZeroExitCount":            nonZeroCount,
+					"unresolvedRejectedToolCount": unresRej,
+					"unresolvedNonZeroExitCount":  unresNonZero,
+				}
+			} else {
+				finalPayload = map[string]any{
+					"state":                       string(protocol.AttemptSucceeded),
+					"stopReason":                  string(acp.StopReasonEndTurn),
+					"completionSource":            string(protocol.CompletionPromptEndTurn),
+					"rejectedToolCount":           rejCount,
+					"nonZeroExitCount":            nonZeroCount,
+					"unresolvedRejectedToolCount": unresRej,
+					"unresolvedNonZeroExitCount":  unresNonZero,
+				}
+				if promptResp.Usage != nil {
+					finalPayload["tokenUsage"] = map[string]any{
+						"input":      promptResp.Usage.InputTokens,
+						"output":     promptResp.Usage.OutputTokens,
+						"cachedRead": promptResp.Usage.CachedReadTokens,
+						"thought":    promptResp.Usage.ThoughtTokens,
+					}
+				}
+			}
+			dlvID, pendingRetry, finalizedAtomically, dlvErr := r.autoDeliverWorktree(ctx, att, slot, sid, hasDelivery, termState, termErrCode, termErrDetail, finalPayload)
+			if dlvErr != nil {
+				r.finalizeAttemptDurable(att, protocol.AttemptFailed, map[string]any{
+					"state":                       string(protocol.AttemptFailed),
+					"stopReason":                  string(acp.StopReasonEndTurn),
+					"errorCode":                   "AUTO_DELIVERY_FAILED",
+					"errorDetail":                 fmt.Sprintf("自动打包工作树变更失败: %v", dlvErr),
+					"rejectedToolCount":           rejCount,
+					"nonZeroExitCount":            nonZeroCount,
+					"unresolvedRejectedToolCount": unresRej,
+					"unresolvedNonZeroExitCount":  unresNonZero,
+				})
+				return
+			}
+			if pendingRetry {
+				// Transient network failure after checkpoint was durably saved to pending_deliveries:
+				// wait for retryPendingDeliveries to publish the delivery FIRST and then emit the
+				// persisted terminal state (succeeded OR needs_verification) atomically.
+				go r.retryPendingDeliveries(r.runCtx)
+				<-ctx.Done()
+				return
+			}
+			if finalizedAtomically {
+				return
+			}
+			autoDeliveryID = dlvID
+		}
 	}
 	if unresRej > 0 || unresNonZero > 0 {
 		r.isolateAndCloseSession(slot, sid)
-		r.finalizeAttemptDurable(att, protocol.AttemptNeedsVerification, map[string]any{
+		nvPayload := map[string]any{
 			"state":                       string(protocol.AttemptNeedsVerification),
 			"stopReason":                  string(acp.StopReasonEndTurn),
 			"completionSource":            string(protocol.CompletionPromptEndTurn),
@@ -1067,7 +1186,11 @@ func (r *Runner) executeAttempt(ctx context.Context, att *attemptContext) {
 			"nonZeroExitCount":            nonZeroCount,
 			"unresolvedRejectedToolCount": unresRej,
 			"unresolvedNonZeroExitCount":  unresNonZero,
-		})
+		}
+		if autoDeliveryID != "" {
+			nvPayload["deliveryId"] = autoDeliveryID
+		}
+		r.finalizeAttemptDurable(att, protocol.AttemptNeedsVerification, nvPayload)
 		return
 	}
 
@@ -1079,6 +1202,9 @@ func (r *Runner) executeAttempt(ctx context.Context, att *attemptContext) {
 		"nonZeroExitCount":            nonZeroCount,
 		"unresolvedRejectedToolCount": unresRej,
 		"unresolvedNonZeroExitCount":  unresNonZero,
+	}
+	if autoDeliveryID != "" {
+		payload["deliveryId"] = autoDeliveryID
 	}
 	if isInPlace {
 		att.mu.Lock()
@@ -1126,13 +1252,19 @@ func (r *Runner) syncSlotMetaLocked(slot *sessionSlot) {
 func (r *Runner) isolateAndCloseSession(slot *sessionSlot, sid acp.SessionId) {
 	var adapter protocol.Adapter
 	var pinnedDrv AcpAdapterDriver
+	var isScoped bool
 	if slot != nil {
 		slot.mu.Lock()
 		slot.locked = true
 		slot.runtimeState = protocol.SessionDead
 		adapter = slot.adapter
 		pinnedDrv = slot.driver
+		isScoped = slot.scopedDriver
 		slot.driver = nil
+		slot.scopedDriver = false
+		slot.projectEnvHash = ""
+		slot.sessionOpts = nil
+		slot.sessionModes = nil
 		if sid == "" {
 			sid = slot.providerSessionID
 		}
@@ -1149,6 +1281,11 @@ func (r *Runner) isolateAndCloseSession(slot *sessionSlot, sid acp.SessionId) {
 			_ = drv.CloseSession(cctx, sid)
 			cancel()
 		}
+	}
+	if isScoped && pinnedDrv != nil {
+		cctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_ = pinnedDrv.Close(cctx)
+		cancel()
 	}
 	r.sweepRetiredDrivers()
 }
@@ -1314,11 +1451,6 @@ func (r *Runner) ensureSessionReadyLocked(ctx context.Context, att *attemptConte
 	if adapter == "" {
 		adapter = protocol.AdapterAgy
 	}
-	drv, err := r.ensureDriverStarted(ctx, adapter)
-	if err != nil {
-		return "", "", err
-	}
-
 	att.mu.Lock()
 	worktreePath := att.worktreePath
 	att.mu.Unlock()
@@ -1330,6 +1462,7 @@ func (r *Runner) ensureSessionReadyLocked(ctx context.Context, att *attemptConte
 		expectedCWD = slot.cwd
 	}
 
+	desiredEnvHash := hashProjectEnv(d.ProjectEnv)
 	sameAdapter := slot.adapter == "" || slot.adapter == adapter
 	canReuse := !slot.locked &&
 		sameAdapter &&
@@ -1337,20 +1470,102 @@ func (r *Runner) ensureSessionReadyLocked(ctx context.Context, att *attemptConte
 		expectedCWD != "" &&
 		filepath.Clean(expectedCWD) == filepath.Clean(worktreePath)
 
-	// If reusing a live session whose original driver is still pinned and matches current driver, keep using it.
-	if canReuse && slot.driver != nil && slot.driver == drv {
+	envChanged := slot.driver != nil && slot.projectEnvHash != desiredEnvHash
+	needReplaceScoped := slot.scopedDriver && slot.driver != nil && (!canReuse || envChanged)
+	if envChanged || needReplaceScoped {
+		oldDrv := slot.driver
+		oldScoped := slot.scopedDriver
+		oldSID := slot.providerSessionID
+		slot.driver = nil
+		slot.scopedDriver = false
+		slot.projectEnvHash = ""
+		slot.sessionOpts = nil
+		slot.sessionModes = nil
+		if oldSID != "" && oldDrv != nil {
+			cctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			_ = oldDrv.CloseSession(cctx, oldSID)
+			cancel()
+		}
+		if oldScoped && oldDrv != nil {
+			cctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			_ = oldDrv.Close(cctx)
+			cancel()
+		}
+	}
+
+	var drv AcpAdapterDriver
+	var err error
+	createdScoped := false
+	if canReuse && !envChanged && slot.driver != nil && slot.scopedDriver {
 		drv = slot.driver
+	} else if len(d.ProjectEnv) > 0 && (r.cfg.ScopedDriverFactory != nil || r.agentMgr != nil) {
+		var scopedDrv AcpAdapterDriver
+		if r.cfg.ScopedDriverFactory != nil {
+			scopedDrv, err = r.cfg.ScopedDriverFactory(adapter, d.ProjectEnv)
+			if err != nil {
+				return "", "", fmt.Errorf("build %s acp driver with project env: %w", adapter, err)
+			}
+		} else {
+			var ok bool
+			scopedDrv, _, ok = r.agentMgr.BuildDriverWithEnvFor(adapter, d.ProjectEnv)
+			if !ok || scopedDrv == nil {
+				return "", "", fmt.Errorf("adapter %q is not configured or disabled on runner %s", adapter, r.cfg.MachineID)
+			}
+		}
+		startCtx := r.runCtx
+		if startCtx == nil {
+			startCtx = ctx
+		}
+		if err := scopedDrv.Start(startCtx, r.handleSessionUpdate, r.handlePermissionRequest); err != nil {
+			cctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			_ = scopedDrv.Close(cctx)
+			cancel()
+			return "", "", fmt.Errorf("start %s acp driver with project env: %w", adapter, err)
+		}
+		drv = scopedDrv
+		slot.scopedDriver = true
+		createdScoped = true
+	} else {
+		drv, err = r.ensureDriverStarted(ctx, adapter)
+		if err != nil {
+			return "", "", err
+		}
+		if canReuse && !envChanged && slot.driver != nil && slot.driver == drv {
+			drv = slot.driver
+		}
+		slot.scopedDriver = false
 	}
 	slot.driver = drv
+	slot.projectEnvHash = desiredEnvHash
 	att.mu.Lock()
 	att.driver = drv
 	att.mu.Unlock()
+
+	cleanupNewScoped := func() {
+		if !createdScoped || drv == nil {
+			return
+		}
+		slot.driver = nil
+		slot.scopedDriver = false
+		slot.projectEnvHash = ""
+		slot.sessionOpts = nil
+		slot.sessionModes = nil
+		att.mu.Lock()
+		if att.driver == drv {
+			att.driver = nil
+		}
+		att.mu.Unlock()
+		cctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_ = drv.Close(cctx)
+		cancel()
+	}
 
 	promptText := d.Prompt
 	prependContract := false
 
 	var sid acp.SessionId
-	var sessionOpts []acp.SessionConfigOption
+	sessionOpts := slot.sessionOpts
+	sessionModes := slot.sessionModes
 	switch {
 	case !canReuse:
 		sysAppend := d.SystemPromptAppend
@@ -1360,10 +1575,12 @@ func (r *Runner) ensureSessionReadyLocked(ctx context.Context, att *attemptConte
 		}
 		resp, err := drv.NewSession(ctx, worktreePath, sysAppend)
 		if err != nil {
+			cleanupNewScoped()
 			return "", "", fmt.Errorf("new session (%s): %w", adapter, err)
 		}
 		sid = resp.SessionId
 		sessionOpts = resp.ConfigOptions
+		sessionModes = resp.Modes
 
 	case !drv.IsSessionLiveInMemory(expectedSID):
 		resumed := false
@@ -1371,6 +1588,7 @@ func (r *Runner) ensureSessionReadyLocked(ctx context.Context, att *attemptConte
 			if resp, err := drv.ResumeSession(ctx, expectedSID, worktreePath); err == nil {
 				sid = expectedSID
 				sessionOpts = resp.ConfigOptions
+				sessionModes = resp.Modes
 				resumed = true
 			}
 		}
@@ -1378,6 +1596,7 @@ func (r *Runner) ensureSessionReadyLocked(ctx context.Context, att *attemptConte
 			if resp, err := drv.LoadSession(ctx, expectedSID, worktreePath); err == nil {
 				sid = expectedSID
 				sessionOpts = resp.ConfigOptions
+				sessionModes = resp.Modes
 				resumed = true
 			}
 		}
@@ -1389,29 +1608,84 @@ func (r *Runner) ensureSessionReadyLocked(ctx context.Context, att *attemptConte
 			}
 			resp, err := drv.NewSession(ctx, worktreePath, sysAppend)
 			if err != nil {
+				cleanupNewScoped()
 				return "", "", fmt.Errorf("fallback new session (%s): %w", adapter, err)
 			}
 			sid = resp.SessionId
 			sessionOpts = resp.ConfigOptions
+			sessionModes = resp.Modes
 		}
 
 	default:
 		sid = expectedSID
 	}
+	slot.sessionOpts = sessionOpts
+	slot.sessionModes = sessionModes
 
 	// IRON LAW: Re-apply and strictly verify every desired config option before sending prompt
-	if err := r.applyAndVerifyConfig(ctx, drv, sid, d.DesiredConfig, sessionOpts); err != nil {
-		// S1: Close the leaked ACP session on config failure so workers don't accumulate.
+	updatedOpts, appliedMode, err := r.applyAndVerifyConfig(ctx, drv, sid, d.DesiredConfig, sessionOpts, sessionModes)
+	if err != nil {
+		// S1: Close the leaked ACP session (and any newly created project-scoped driver) on config failure.
 		cctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		_ = drv.CloseSession(cctx, sid)
 		cancel()
+		cleanupNewScoped()
 		return "", "", fmt.Errorf("CONFIG_APPLY_FAILED: %w", err)
 	}
+	if len(updatedOpts) > 0 {
+		slot.sessionOpts = updatedOpts
+	}
+	slot.appliedMode = appliedMode
+	att.mu.Lock()
+	att.appliedMode = appliedMode
+	att.mu.Unlock()
 
 	if prependContract && strings.TrimSpace(d.SystemPromptAppend) != "" {
 		promptText = "<orbit_contract>\n" + d.SystemPromptAppend + "\n</orbit_contract>\n\n" + promptText
 	}
 	return sid, promptText, nil
+}
+
+func hashProjectEnv(env map[string]string) string {
+	if len(env) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(env))
+	for k := range env {
+		if tk := strings.TrimSpace(k); tk != "" {
+			keys = append(keys, k)
+		}
+	}
+	if len(keys) == 0 {
+		return ""
+	}
+	sort.Strings(keys)
+	h := sha256.New()
+	for _, k := range keys {
+		tk := strings.TrimSpace(k)
+		v := env[k]
+		_, _ = fmt.Fprintf(h, "%d:%s=%d:%s\n", len(tk), tk, len(v), v)
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func currentSessionMode(opts []acp.SessionConfigOption, modes *acp.SessionModeState) string {
+	for _, opt := range opts {
+		if opt.Select == nil {
+			continue
+		}
+		cat := ""
+		if opt.Select.Category != nil {
+			cat = configCategoryString(*opt.Select.Category)
+		}
+		if cat == "mode" || string(opt.Select.Id) == "mode" {
+			return strings.TrimSpace(string(opt.Select.CurrentValue))
+		}
+	}
+	if modes != nil && strings.TrimSpace(string(modes.CurrentModeId)) != "" {
+		return strings.TrimSpace(string(modes.CurrentModeId))
+	}
+	return ""
 }
 
 func (r *Runner) applyAndVerifyConfig(
@@ -1420,9 +1694,11 @@ func (r *Runner) applyAndVerifyConfig(
 	sid acp.SessionId,
 	desired map[string]string,
 	sessionOpts []acp.SessionConfigOption,
-) error {
+	sessionModes *acp.SessionModeState,
+) ([]acp.SessionConfigOption, string, error) {
+	appliedMode := currentSessionMode(sessionOpts, sessionModes)
 	if len(desired) == 0 {
-		return nil
+		return sessionOpts, appliedMode, nil
 	}
 	keys := make([]string, 0, len(desired))
 	for k, v := range desired {
@@ -1434,30 +1710,80 @@ func (r *Runner) applyAndVerifyConfig(
 
 	currentOpts := sessionOpts
 	for _, k := range keys {
-		want := desired[k]
-		resolvedID, resolvedVal := resolveConfigOptionTarget(currentOpts, k, want)
+		want := strings.TrimSpace(desired[k])
+		matched, resolvedID, resolvedVal := resolveConfigOptionTarget(currentOpts, k, want)
+
+		// Legacy ACP native Modes fallback (session/set_mode) when mode is not advertised in configOptions
+		if matched == nil && k == "mode" && sessionModes != nil && len(sessionModes.AvailableModes) > 0 {
+			modeID, ok := resolveLegacySessionMode(sessionModes.AvailableModes, want)
+			if !ok {
+				return currentOpts, appliedMode, fmt.Errorf("mode %q is not supported by session", want)
+			}
+			optCtx, cancel := context.WithTimeout(ctx, r.cfg.ConfigApplyTimeout)
+			_, err := drv.SetSessionMode(optCtx, sid, modeID)
+			cancel()
+			if err != nil {
+				return currentOpts, appliedMode, fmt.Errorf("set session mode %q (resolved %q) failed: %w", want, modeID, err)
+			}
+			sessionModes.CurrentModeId = acp.SessionModeId(modeID)
+			appliedMode = modeID
+			continue
+		}
+
+		// If the session explicitly advertised configOptions (or legacy modes) and this explicit key doesn't exist, fail clearly instead of silently swallowing.
+		if matched == nil && (len(currentOpts) > 0 || (k == "mode" && sessionModes != nil)) {
+			return currentOpts, appliedMode, fmt.Errorf("config option %q=%q is not supported by session", k, want)
+		}
+
 		optCtx, cancel := context.WithTimeout(ctx, r.cfg.ConfigApplyTimeout)
 		resp, err := drv.SetConfigOption(optCtx, sid, resolvedID, resolvedVal)
 		cancel()
 		if err != nil {
-			return fmt.Errorf("configId %q (resolved %q=%q) failed: %w", k, resolvedID, resolvedVal, err)
+			return currentOpts, appliedMode, fmt.Errorf("configId %q (resolved %q=%q) failed: %w", k, resolvedID, resolvedVal, err)
 		}
 		if len(resp.ConfigOptions) > 0 {
 			currentOpts = resp.ConfigOptions
 		}
 		if !verifyConfigOptionApplied(resp.ConfigOptions, resolvedID, resolvedVal) {
-			return fmt.Errorf("configId %q (resolved %q) verification mismatch (expected %q)", k, resolvedID, resolvedVal)
+			return currentOpts, appliedMode, fmt.Errorf("configId %q (resolved %q) verification mismatch (expected %q)", k, resolvedID, resolvedVal)
+		}
+		isModeOpt := k == "mode" || resolvedID == "mode" || (matched != nil && matched.Category != nil && configCategoryString(*matched.Category) == "mode")
+		if isModeOpt {
+			appliedMode = resolvedVal
 		}
 	}
-	return nil
+	if cur := currentSessionMode(currentOpts, sessionModes); cur != "" {
+		appliedMode = cur
+	}
+	return currentOpts, appliedMode, nil
+}
+
+func resolveLegacySessionMode(avail []acp.SessionMode, want string) (string, bool) {
+	if len(avail) == 0 {
+		return "", false
+	}
+	ids := make([]string, 0, len(avail))
+	for _, m := range avail {
+		id := string(m.Id)
+		ids = append(ids, id)
+		if id == want {
+			return id, true
+		}
+	}
+	for _, cand := range normalizedModeCandidates(want) {
+		if slices.Contains(ids, cand) {
+			return cand, true
+		}
+	}
+	return "", false
 }
 
 // resolveConfigOptionTarget maps logical Orbit config keys/values (e.g. thought_level, mode=auto/ask/full)
 // onto the active ACP server's advertised configOptions (e.g. Claude's `effort` / `bypassPermissions`,
 // Codex's `reasoning_effort` / `agent` / `agent-full-access`, Agy's `thought_level` / `accept-edits`).
-func resolveConfigOptionTarget(opts []acp.SessionConfigOption, desiredKey, desiredVal string) (string, string) {
+func resolveConfigOptionTarget(opts []acp.SessionConfigOption, desiredKey, desiredVal string) (*acp.SessionConfigOptionSelect, string, string) {
 	if len(opts) == 0 {
-		return desiredKey, desiredVal
+		return nil, desiredKey, desiredVal
 	}
 	var matched *acp.SessionConfigOptionSelect
 	// 1. Exact ID match first
@@ -1480,13 +1806,26 @@ func resolveConfigOptionTarget(opts []acp.SessionConfigOption, desiredKey, desir
 			}
 		}
 	}
+	// 3. Alias ID match when ACP adapter omits category (must mirror extractSessionCapabilities)
+	if matched == nil && (desiredKey == "thought_level" || desiredKey == "effort" || desiredKey == "reasoning_effort") {
+		for _, o := range opts {
+			if o.Select == nil {
+				continue
+			}
+			id := string(o.Select.Id)
+			if id == "thought_level" || id == "effort" || id == "reasoning_effort" {
+				matched = o.Select
+				break
+			}
+		}
+	}
 	if matched == nil {
-		return desiredKey, desiredVal
+		return nil, desiredKey, desiredVal
 	}
 
 	allowed := collectSelectOptionValues(matched.Options)
 	if len(allowed) == 0 || slices.Contains(allowed, desiredVal) {
-		return string(matched.Id), desiredVal
+		return matched, string(matched.Id), desiredVal
 	}
 
 	// Normalized cross-adapter alias mapping ONLY when the option explicitly advertises the mapped value
@@ -1497,11 +1836,11 @@ func resolveConfigOptionTarget(opts []acp.SessionConfigOption, desiredKey, desir
 	if cat == "mode" || string(matched.Id) == "mode" {
 		for _, cand := range normalizedModeCandidates(desiredVal) {
 			if slices.Contains(allowed, cand) {
-				return string(matched.Id), cand
+				return matched, string(matched.Id), cand
 			}
 		}
 	}
-	return string(matched.Id), desiredVal
+	return matched, string(matched.Id), desiredVal
 }
 
 func configCategoryString(cat acp.SessionConfigOptionCategory) string {
@@ -1567,10 +1906,19 @@ func (r *Runner) CloseSessionSafely(ctx context.Context, wbSessionID string) (bo
 	slot.mu.Lock()
 	defer slot.mu.Unlock()
 
-	if slot.providerSessionID == "" || slot.runtimeState == protocol.SessionIdleClosed || slot.runtimeState == protocol.SessionDead {
+	if slot.inFlightPrompt {
 		return false, nil
 	}
-	if slot.inFlightPrompt {
+	if slot.providerSessionID == "" || slot.runtimeState == protocol.SessionIdleClosed || slot.runtimeState == protocol.SessionDead {
+		if slot.scopedDriver && slot.driver != nil {
+			drv := slot.driver
+			slot.driver = nil
+			slot.scopedDriver = false
+			slot.projectEnvHash = ""
+			cctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			_ = drv.Close(cctx)
+			cancel()
+		}
 		return false, nil
 	}
 
@@ -1595,7 +1943,9 @@ func (r *Runner) CloseSessionSafely(ctx context.Context, wbSessionID string) (bo
 	// Mark 'closing' INSIDE the per-session lock before calling CloseSession
 	slot.runtimeState = protocol.SessionClosing
 	drv := slot.driver
+	isScoped := slot.scopedDriver
 	slot.driver = nil
+	slot.scopedDriver = false
 	if drv == nil {
 		var err error
 		drv, err = r.driverFor(slot.adapter)
@@ -1605,6 +1955,11 @@ func (r *Runner) CloseSessionSafely(ctx context.Context, wbSessionID string) (bo
 		}
 	}
 	err := drv.CloseSession(ctx, slot.providerSessionID)
+	if isScoped {
+		cctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_ = drv.Close(cctx)
+		cancel()
+	}
 	if err != nil {
 		slot.runtimeState = protocol.SessionDead
 		r.syncSlotMetaLocked(slot)
@@ -1791,7 +2146,7 @@ func (r *Runner) HandleLocalDeliver(ctx context.Context, req LocalDeliverRequest
 		summary = "Agent delivery"
 	}
 
-	if dispatch.ProjectID == protocol.ScratchProjectID || dispatch.MirrorBarePath == "" {
+	if protocol.IsVirtualProjectID(dispatch.ProjectID) || dispatch.MirrorBarePath == "" {
 		dlvID := strings.TrimSpace(req.DeliveryID)
 		if dlvID == "" {
 			dlvID = "dlv_" + ulid.Make().String()
@@ -2040,8 +2395,12 @@ func (r *Runner) HandleLocalDeliver(ctx context.Context, req LocalDeliverRequest
 		r.completeInMemoryFinalize(att, protocol.AttemptSucceeded)
 		finalized = true
 	} else {
+		deliveredFP, _ := commitTreeHash(ctx, pd.RepoRoot, pd.HeadSHA)
 		att.mu.Lock()
 		att.hasDelivery = true
+		if deliveredFP != "" {
+			att.lastDeliveredFingerprint = deliveredFP
+		}
 		if !noInFlightPrompt && (req.Final || pd.IsFinal) {
 			att.finalRequested = true
 			att.explicitFinalDeliveryID = pd.DeliveryID
@@ -2063,6 +2422,184 @@ func (r *Runner) HandleLocalDeliver(ctx context.Context, req LocalDeliverRequest
 		Deletions:    pd.Manifest.Deletions,
 	}
 	return resp, nil
+}
+
+// worktreeHasChanges reports whether an isolated Git worktree has uncommitted edits, untracked files
+// (even when status.showUntrackedFiles=no is set), or commits ahead of baseSHA.
+// Any git error is returned (never silently treated as clean).
+func worktreeHasChanges(ctx context.Context, worktreePath, baseSHA string) (bool, error) {
+	if strings.TrimSpace(worktreePath) == "" {
+		return false, nil
+	}
+	if strings.TrimSpace(baseSHA) != "" {
+		curTree, err := worktreeTreeHash(ctx, worktreePath)
+		if err != nil {
+			return false, err
+		}
+		baseTree, err := commitTreeHash(ctx, worktreePath, baseSHA)
+		if err != nil {
+			return false, err
+		}
+		if curTree != baseTree {
+			return true, nil
+		}
+		head, err := runGitCmdTrim(ctx, worktreePath, "rev-parse", "--verify", "HEAD^{commit}")
+		if err != nil {
+			return false, err
+		}
+		if head != "" && head != strings.TrimSpace(baseSHA) {
+			return true, nil
+		}
+		return false, nil
+	}
+	status, err := runGitCmdTrim(ctx, worktreePath, "status", "--porcelain", "--untracked-files=all")
+	if err != nil {
+		return false, err
+	}
+	return status != "", nil
+}
+
+// autoDeliverWorktree automatically packages, uploads, pushes, and emits a checkpoint delivery
+// for an isolated Git worktree turn when files changed (either with no manual deliver or after a mid-turn deliver).
+// Returns (deliveryID, pendingRetry, finalizedAtomically, err):
+// - When pendingRetry is true, the checkpoint has been saved durably in pending_deliveries with its target terminalState.
+// - When finalizedAtomically is true, BOTH delivery_published AND the terminal state frame were written in ONE atomic outbox tx.
+func (r *Runner) autoDeliverWorktree(
+	ctx context.Context,
+	att *attemptContext,
+	slot *sessionSlot,
+	sid acp.SessionId,
+	hasMidDelivery bool,
+	termState protocol.AttemptState,
+	termErrCode, termErrDetail string,
+	finalPayload map[string]any,
+) (string, bool, bool, error) {
+	r.deliverMu.Lock()
+	defer r.deliverMu.Unlock()
+
+	att.mu.Lock()
+	dispatch := att.dispatch
+	worktreePath := att.worktreePath
+	baseSHA := att.baseSHA
+	att.mu.Unlock()
+
+	dlvID := "dlv_" + ulid.Make().String()
+	pkg, err := gitops.PackageCheckpoint(ctx, gitops.PackageOptions{
+		RepoDir:       worktreePath,
+		DeliveryID:    dlvID,
+		TaskID:        dispatch.TaskID,
+		AttemptID:     dispatch.AttemptID,
+		ReviewBaseSHA: baseSHA,
+	})
+	if err != nil {
+		return "", false, false, fmt.Errorf("package checkpoint: %w", err)
+	}
+	// When no mid-turn delivery occurred and working tree matches baseSHA with zero diff, skip publishing.
+	// When a mid-turn delivery ALREADY occurred and the working tree was later reverted back to baseSHA,
+	// we MUST still publish this final empty-diff snapshot so latest_delivery_id reflects the clean final state!
+	if !hasMidDelivery && pkg.Manifest.FilesChanged == 0 && len(pkg.Manifest.Blobs) == 0 && len(pkg.Manifest.RyugiArtifacts) == 0 && pkg.HeadSHA == pkg.ReviewBaseSHA {
+		return "", false, false, nil
+	}
+
+	stagedBlobs, err := r.stagePackagedBlobs(pkg.Blobs)
+	if err != nil {
+		return "", false, false, fmt.Errorf("stage delivery attachments: %w", err)
+	}
+	summary := fmt.Sprintf("自动保存变更（%d 个文件）", pkg.Manifest.FilesChanged)
+	if pkg.Manifest.FilesChanged == 0 {
+		if hasMidDelivery && pkg.HeadSHA == pkg.ReviewBaseSHA {
+			summary = "自动保存工作树最终状态（已恢复基线）"
+		} else {
+			summary = "自动保存工作树变更"
+		}
+	}
+	if termState == "" {
+		termState = protocol.AttemptSucceeded
+	}
+	pd := PendingDelivery{
+		DeliveryID:          dlvID,
+		AttemptID:           dispatch.AttemptID,
+		LeaseToken:          dispatch.LeaseToken,
+		TaskID:              dispatch.TaskID,
+		ProjectID:           dispatch.ProjectID,
+		RepoRoot:            pkg.RepoRoot,
+		MirrorBarePath:      dispatch.MirrorBarePath,
+		ReviewBaseSHA:       pkg.ReviewBaseSHA,
+		HeadSHA:             pkg.HeadSHA,
+		Summary:             summary,
+		Manifest:            pkg.Manifest,
+		StagedBlobs:         stagedBlobs,
+		IsFinal:             true,
+		TerminalState:       termState,
+		TerminalErrorCode:   termErrCode,
+		TerminalErrorDetail: termErrDetail,
+	}
+	if err := r.outbox.SavePendingDelivery(ctx, pd); err != nil {
+		return "", false, false, fmt.Errorf("save pending delivery: %w", err)
+	}
+	if err := r.uploadStagedBlobs(ctx, pd.StagedBlobs); err != nil {
+		if isPermanentBundleErr(err) {
+			_ = r.outbox.MarkDeliveryEmitted(ctx, pd.DeliveryID)
+			return "", false, false, fmt.Errorf("upload delivery blobs: %w", err)
+		}
+		return pd.DeliveryID, true, false, nil
+	}
+	if err := r.pushDeliveryRefOrBundle(ctx, pd.ProjectID, pd.RepoRoot, pd.MirrorBarePath, pd.DeliveryID, pd.HeadSHA); err != nil {
+		if isPermanentBundleErr(err) || !isHubBundleMirror(pd.MirrorBarePath) {
+			_ = r.outbox.MarkDeliveryEmitted(ctx, pd.DeliveryID)
+			return "", false, false, fmt.Errorf("push delivery ref: %w", err)
+		}
+		return pd.DeliveryID, true, false, nil
+	}
+	if err := r.outbox.MarkDeliveryPushed(ctx, pd.DeliveryID); err != nil {
+		return "", false, false, fmt.Errorf("mark delivery pushed: %w", err)
+	}
+
+	dlvPayload := map[string]any{
+		"deliveryId": pd.DeliveryID,
+		"baseSha":    pd.ReviewBaseSHA,
+		"headSha":    pd.HeadSHA,
+		"gitRef":     "refs/orbit/deliveries/" + pd.DeliveryID,
+		"summary":    pd.Summary,
+		"manifest":   pd.Manifest,
+	}
+
+	if termState == protocol.AttemptNeedsVerification {
+		r.isolateAndCloseSession(slot, sid)
+	}
+	if finalPayload == nil {
+		finalPayload = map[string]any{
+			"state": string(termState),
+		}
+	}
+	finalPayload["deliveryId"] = pd.DeliveryID
+
+	emitted, err := r.outbox.EmitPendingDeliveryAtomically(
+		context.Background(),
+		pd.DeliveryID,
+		dispatch.AttemptID,
+		dispatch.LeaseToken,
+		"evt_"+ulid.Make().String(),
+		dlvPayload,
+		true,
+		"evt_"+ulid.Make().String(),
+		finalPayload,
+	)
+	if err != nil {
+		return "", false, false, fmt.Errorf("emit delivery atomically: %w", err)
+	}
+	if emitted {
+		r.wakeOutboxPump()
+	}
+	deliveredFP, _ := commitTreeHash(ctx, pd.RepoRoot, pd.HeadSHA)
+	att.mu.Lock()
+	att.hasDelivery = true
+	if deliveredFP != "" {
+		att.lastDeliveredFingerprint = deliveredFP
+	}
+	att.mu.Unlock()
+	r.completeInMemoryFinalize(att, termState)
+	return pd.DeliveryID, false, true, nil
 }
 
 func (r *Runner) stagePackagedBlobs(blobs []gitops.PackagedBlob) ([]gitops.PackagedBlob, error) {
@@ -2145,9 +2682,21 @@ func (r *Runner) uploadStagedBlobs(ctx context.Context, blobs []gitops.PackagedB
 		if headResp.StatusCode == http.StatusOK {
 			continue
 		}
+		if headResp.StatusCode == http.StatusBadRequest || headResp.StatusCode == http.StatusForbidden || headResp.StatusCode == http.StatusRequestEntityTooLarge || headResp.StatusCode == http.StatusConflict {
+			return errBundlePermanent{
+				status: headResp.StatusCode,
+				msg:    fmt.Sprintf("head blob %s rejected (%d)", b.Item.SHA256, headResp.StatusCode),
+			}
+		}
 
 		f, err := os.Open(b.LocalPath)
 		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return errBundlePermanent{
+					status: http.StatusGone,
+					msg:    fmt.Sprintf("staged blob missing %s: %v", b.LocalPath, err),
+				}
+			}
 			return fmt.Errorf("open staged blob %s: %w", b.LocalPath, err)
 		}
 		putReq, err := http.NewRequestWithContext(ctx, http.MethodPut, blobURL, f)
@@ -2165,6 +2714,12 @@ func (r *Runner) uploadStagedBlobs(ctx context.Context, blobs []gitops.PackagedB
 		}
 		raw, _ := io.ReadAll(putResp.Body)
 		_ = putResp.Body.Close()
+		if putResp.StatusCode == http.StatusBadRequest || putResp.StatusCode == http.StatusForbidden || putResp.StatusCode == http.StatusRequestEntityTooLarge || putResp.StatusCode == http.StatusConflict {
+			return errBundlePermanent{
+				status: putResp.StatusCode,
+				msg:    fmt.Sprintf("put blob %s rejected (%d): %s", b.Item.SHA256, putResp.StatusCode, strings.TrimSpace(string(raw))),
+			}
+		}
 		if putResp.StatusCode < 200 || putResp.StatusCode >= 300 {
 			return fmt.Errorf("put blob %s failed (%d): %s", b.Item.SHA256, putResp.StatusCode, strings.TrimSpace(string(raw)))
 		}
@@ -2320,6 +2875,40 @@ func (r *Runner) handleSessionUpdate(ctx context.Context, note acp.SessionNotifi
 		})
 		r.emitSwarmProjections(attemptID, leaseToken, proj)
 
+	case u.CurrentModeUpdate != nil:
+		newMode := strings.TrimSpace(string(u.CurrentModeUpdate.CurrentModeId))
+		att.mu.Lock()
+		att.appliedMode = newMode
+		slot := att.slot
+		att.mu.Unlock()
+		if slot != nil {
+			slot.mu.Lock()
+			slot.appliedMode = newMode
+			if slot.sessionModes != nil {
+				slot.sessionModes.CurrentModeId = u.CurrentModeUpdate.CurrentModeId
+			}
+			slot.mu.Unlock()
+		}
+
+	case u.ConfigOptionUpdate != nil:
+		newMode := currentSessionMode(u.ConfigOptionUpdate.ConfigOptions, nil)
+		att.mu.Lock()
+		slot := att.slot
+		att.mu.Unlock()
+		effectiveMode := newMode
+		if slot != nil {
+			slot.mu.Lock()
+			slot.sessionOpts = u.ConfigOptionUpdate.ConfigOptions
+			if effectiveMode == "" && slot.sessionModes != nil && strings.TrimSpace(string(slot.sessionModes.CurrentModeId)) != "" {
+				effectiveMode = strings.TrimSpace(string(slot.sessionModes.CurrentModeId))
+			}
+			slot.appliedMode = effectiveMode
+			slot.mu.Unlock()
+		}
+		att.mu.Lock()
+		att.appliedMode = effectiveMode
+		att.mu.Unlock()
+
 	case u.UsageUpdate != nil:
 		r.coalescer.FlushAttempt(attemptID)
 		kind := protocol.EventACPUsage
@@ -2364,12 +2953,21 @@ func (r *Runner) handlePermissionRequest(ctx context.Context, req acp.RequestPer
 
 	att.mu.Lock()
 	worktreePath := att.worktreePath
-	desiredMode := att.dispatch.DesiredConfig["mode"]
+	explicitFull := att.dispatch.ExplicitFullPermission
+	appliedMode := att.appliedMode
 	leaseToken := att.dispatch.LeaseToken
 	baseSHA := att.baseSHA
 	att.mu.Unlock()
 
-	if autoOpt, allow := r.cfg.PermissionPolicy(worktreePath, desiredMode, req); allow && autoOpt != "" {
+	// P0: Auto-approve ONLY when the current turn was explicitly authorized with ExplicitFullPermission
+	// AND the mode that actually took effect on the ACP session is a full-bypass mode (never inherited
+	// from old turns or downgraded from full -> auto by the bridge).
+	policyMode := ""
+	if explicitFull && isFullBypassMode(appliedMode) {
+		policyMode = appliedMode
+	}
+
+	if autoOpt, allow := r.cfg.PermissionPolicy(worktreePath, policyMode, req); allow && autoOpt != "" {
 		r.coalescer.FlushAttempt(attemptID)
 		_, _ = r.enqueueOutbox(r.runCtx, attemptID, leaseToken, protocol.OutboxFrameEvents, map[string]any{
 			"kind":       string(protocol.EventApprovalConsumed),
@@ -2664,86 +3262,35 @@ func (r *Runner) HandleApprovalDecision(dec protocol.ApprovalDecisionPayload) {
 	})
 }
 
-// defaultPermissionPolicy implements B5 strict verifiable worktree allowlist:
-// - Explicit mode=default -> always human approval.
-// - Missing kind, kind=other, delete/move/fetch/switch_mode -> ALWAYS human approval.
-// - read / search / edit -> ONLY auto-allowed when worktreePath is set, non-empty locations are
-//   present, and EVERY location resolves strictly inside worktreePath (excluding .git internals).
-// - execute -> ALWAYS human approval EXCEPT strict single non-chained whitelisted local commands
-//   (orbit deliver, read-only git, go test/vet/build/list) with any declared locations inside worktree.
-// - think -> safe to auto-allow.
-func defaultPermissionPolicy(worktreePath, desiredMode string, req acp.RequestPermissionRequest) (string, bool) {
-	if strings.EqualFold(desiredMode, "default") {
-		return "", false
+func isFullBypassMode(mode string) bool {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "full", "bypass", "bypasspermissions", "agent-full-access", "yolo":
+		return true
+	default:
+		return false
 	}
+}
 
-	allowOptID := ""
-	for _, opt := range req.Options {
-		if opt.Kind == acp.PermissionOptionKindAllowOnce {
-			allowOptID = string(opt.OptionId)
-			break
-		}
-	}
-	if allowOptID == "" {
-		return "", false
-	}
-
-	kind, hasKind := req.ToolCall.Kind.Value()
-	if !hasKind || kind == "" || kind == acp.ToolKindOther {
-		return "", false
-	}
-
-	canonWT := ""
-	if strings.TrimSpace(worktreePath) != "" {
-		canonWT = canonicalWorktreeCheckPath(worktreePath)
-	}
-	locs, hasLocs := req.ToolCall.Locations.Value()
-	allLocationsInWorktree := func(requireNonEmpty bool, forbidGitInternals bool) bool {
-		if canonWT == "" {
-			return false
-		}
-		if requireNonEmpty && (!hasLocs || len(locs) == 0) {
-			return false
-		}
-		if !hasLocs || len(locs) == 0 {
-			return true
-		}
-		for _, loc := range locs {
-			if !isPathWithinWorktree(canonWT, loc.Path, forbidGitInternals) {
-				return false
+// defaultPermissionPolicy defers permission gating to the ACP agent's own configured `mode`
+// (default, accept-edits, auto, agent, plan, read-only, workspace-write, bypassPermissions, agent-full-access).
+// Whenever the ACP agent sends `session/request_permission`, Orbit forwards the real request & options
+// to the human operator, EXCEPT when the user explicitly authorized full-bypass mode AND that mode
+// actually took effect on the session.
+func defaultPermissionPolicy(_ string, effectiveFullMode string, req acp.RequestPermissionRequest) (string, bool) {
+	if isFullBypassMode(effectiveFullMode) {
+		for _, opt := range req.Options {
+			if opt.Kind == acp.PermissionOptionKindAllowOnce {
+				return string(opt.OptionId), true
 			}
 		}
-		return true
-	}
-
-	switch kind {
-	case acp.ToolKindThink:
-		return allowOptID, true
-
-	case acp.ToolKindRead, acp.ToolKindSearch:
-		if allLocationsInWorktree(true, false) {
-			return allowOptID, true
+		for _, opt := range req.Options {
+			if opt.Kind == acp.PermissionOptionKindAllowAlways {
+				return string(opt.OptionId), true
+			}
 		}
-		return "", false
-
-	case acp.ToolKindEdit:
-		if allLocationsInWorktree(true, true) {
-			return allowOptID, true
-		}
-		return "", false
-
-	case acp.ToolKindExecute:
-		if !allLocationsInWorktree(false, false) {
-			return "", false
-		}
-		if isWhitelistedLocalCommand(req, canonWT) {
-			return allowOptID, true
-		}
-		return "", false
-
-	default:
 		return "", false
 	}
+	return "", false
 }
 
 // canonicalWorktreeCheckPath resolves symlinks even when multiple parent directories of a new file
@@ -4012,6 +4559,31 @@ func (r *Runner) buildHeartbeat(ctx context.Context) protocol.RunnerHeartbeatFra
 	}
 }
 
+func (r *Runner) failPermanentPendingDelivery(ctx context.Context, pd PendingDelivery, errorCode string, cause error) {
+	r.mu.Lock()
+	attFail := r.attempts[pd.AttemptID]
+	r.mu.Unlock()
+
+	leaseToken := pd.LeaseToken
+	if leaseToken == "" && attFail != nil {
+		leaseToken = attFail.dispatch.LeaseToken
+	}
+	if leaseToken == "" && pd.AttemptID != "" {
+		leaseToken, _, _ = r.outbox.ReadUnacked(ctx, pd.AttemptID, 0, 1)
+	}
+	if pd.AttemptID != "" && leaseToken != "" {
+		_, _ = r.enqueueOutbox(ctx, pd.AttemptID, leaseToken, protocol.OutboxFrameState, map[string]any{
+			"state":       string(protocol.AttemptFailed),
+			"errorCode":   errorCode,
+			"errorDetail": cause.Error(),
+		})
+	}
+	_ = r.outbox.MarkDeliveryEmitted(ctx, pd.DeliveryID)
+	if attFail != nil {
+		r.completeInMemoryFinalize(attFail, protocol.AttemptFailed)
+	}
+}
+
 func (r *Runner) retryPendingDeliveries(ctx context.Context) {
 	r.deliverMu.Lock()
 	defer r.deliverMu.Unlock()
@@ -4023,20 +4595,16 @@ func (r *Runner) retryPendingDeliveries(ctx context.Context) {
 	for _, pd := range list {
 		// B12: Upload any staged blobs first before pushing / emitting.
 		if err := r.uploadStagedBlobs(ctx, pd.StagedBlobs); err != nil {
+			if isPermanentBundleErr(err) {
+				r.failPermanentPendingDelivery(ctx, pd, "DELIVERY_BLOB_REJECTED", err)
+			}
 			continue
 		}
 		if !pd.Pushed {
 			if err := r.pushDeliveryRefOrBundle(ctx, pd.ProjectID, pd.RepoRoot, pd.MirrorBarePath, pd.DeliveryID, pd.HeadSHA); err != nil {
 				if isPermanentBundleErr(err) {
 					// Surface permanent size/conflict failure instead of retrying forever (#8)
-					if pd.AttemptID != "" && pd.LeaseToken != "" {
-						_, _ = r.enqueueOutbox(ctx, pd.AttemptID, pd.LeaseToken, protocol.OutboxFrameState, map[string]any{
-							"state":       string(protocol.AttemptFailed),
-							"errorCode":   "DELIVERY_BUNDLE_REJECTED",
-							"errorDetail": err.Error(),
-						})
-					}
-					_ = r.outbox.MarkDeliveryEmitted(ctx, pd.DeliveryID)
+					r.failPermanentPendingDelivery(ctx, pd, "DELIVERY_BUNDLE_REJECTED", err)
 				}
 				continue
 			}
@@ -4069,14 +4637,32 @@ func (r *Runner) retryPendingDeliveries(ctx context.Context) {
 		}
 
 		emitFinal := false
+		termState := pd.TerminalState
+		if termState == "" {
+			termState = protocol.AttemptSucceeded
+		}
 		var finalPayload map[string]any
 		if pd.IsFinal {
 			if att == nil {
 				emitFinal = true
 				finalPayload = map[string]any{
-					"state":            string(protocol.AttemptSucceeded),
+					"state":            string(termState),
 					"completionSource": string(protocol.CompletionExplicitDeliver),
 					"deliveryId":       pd.DeliveryID,
+				}
+				if termState == protocol.AttemptNeedsVerification {
+					finalPayload["completionSource"] = string(protocol.CompletionPromptEndTurn)
+					finalPayload["sessionLocked"] = true
+					errCode := pd.TerminalErrorCode
+					if errCode == "" {
+						errCode = "UNRESOLVED_TOOL_FAILURE"
+					}
+					errDetail := pd.TerminalErrorDetail
+					if errDetail == "" {
+						errDetail = "本轮存在未解决的工具拒绝或非零失败，请人工核对后再决定是否续跑"
+					}
+					finalPayload["errorCode"] = errCode
+					finalPayload["errorDetail"] = errDetail
 				}
 			} else {
 				att.mu.Lock()
@@ -4088,22 +4674,40 @@ func (r *Runner) retryPendingDeliveries(ctx context.Context) {
 				if noInFlightPrompt && !alreadyFinal {
 					emitFinal = true
 					sessionLocked := false
-					if att.tracker.ActiveWorkerCount() > 0 {
+					if termState == protocol.AttemptNeedsVerification || att.tracker.ActiveWorkerCount() > 0 {
 						r.isolateAndCloseSession(slot, sid)
 						sessionLocked = true
 					}
 					_, _, rejCount, nonZeroCount := att.tracker.Stats()
 					unresRej, unresNonZero := att.tracker.UnresolvedCounts()
+					compSrc := protocol.CompletionPromptEndTurn
+					att.mu.Lock()
+					if att.finalRequested {
+						compSrc = protocol.CompletionExplicitDeliver
+					}
+					att.mu.Unlock()
 					finalPayload = map[string]any{
-						"state":                       string(protocol.AttemptSucceeded),
+						"state":                       string(termState),
 						"stopReason":                  string(acp.StopReasonEndTurn),
-						"completionSource":            string(protocol.CompletionExplicitDeliver),
+						"completionSource":            string(compSrc),
 						"deliveryId":                  pd.DeliveryID,
 						"sessionLocked":               sessionLocked,
 						"rejectedToolCount":           rejCount,
 						"nonZeroExitCount":            nonZeroCount,
 						"unresolvedRejectedToolCount": unresRej,
 						"unresolvedNonZeroExitCount":  unresNonZero,
+					}
+					if termState == protocol.AttemptNeedsVerification {
+						errCode := pd.TerminalErrorCode
+						if errCode == "" {
+							errCode = "UNRESOLVED_TOOL_FAILURE"
+						}
+						errDetail := pd.TerminalErrorDetail
+						if errDetail == "" {
+							errDetail = "本轮存在未解决的工具拒绝或非零失败，请人工核对后再决定是否续跑"
+						}
+						finalPayload["errorCode"] = errCode
+						finalPayload["errorDetail"] = errDetail
 					}
 				}
 			}
@@ -4128,10 +4732,14 @@ func (r *Runner) retryPendingDeliveries(ctx context.Context) {
 		}
 		if att != nil {
 			if emitFinal {
-				r.completeInMemoryFinalize(att, protocol.AttemptSucceeded)
+				r.completeInMemoryFinalize(att, termState)
 			} else {
+				deliveredFP, _ := commitTreeHash(ctx, pd.RepoRoot, pd.HeadSHA)
 				att.mu.Lock()
 				att.hasDelivery = true
+				if deliveredFP != "" {
+					att.lastDeliveredFingerprint = deliveredFP
+				}
 				if pd.IsFinal && !att.promptReturned {
 					att.finalRequested = true
 					att.explicitFinalDeliveryID = pd.DeliveryID

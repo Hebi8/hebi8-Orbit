@@ -3,32 +3,30 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>开始使用 hebi8-Orbit</title>
+  <title>连接与切换网络 · hebi8-Orbit</title>
   <style>
     :root {
       --bg: #0f0f11; --panel: #151518; --raised: #1c1c20; --line: rgba(255,255,255,.09); --line-on: rgba(163,184,255,.45);
-      --fg: #ececef; --muted: #8a8a93; --accent: #a3b8ff; --bad: #ef7f7f; --ok: #72cf98;
+      --fg: #ececef; --muted: #8a8a93; --accent: #a3b8ff; --bad: #ef7f7f; --ok: #72cf98; --warn: #e5b869;
       color-scheme: dark light;
     }
     @media (prefers-color-scheme: light) {
       :root {
         --bg: #fcfcfb; --panel: #ffffff; --raised: #f4f4f2; --line: rgba(0,0,0,.1); --line-on: rgba(53,85,208,.45);
-        --fg: #18181b; --muted: #6e6e77; --accent: #3555d0; --bad: #d24646; --ok: #177a41;
+        --fg: #18181b; --muted: #6e6e77; --accent: #3555d0; --bad: #d24646; --ok: #177a41; --warn: #9a6700;
       }
     }
     * { box-sizing: border-box; }
     html, body {
-      margin: 0; height: 100%; background: var(--bg); color: var(--fg);
+      margin: 0; min-height: 100%; background: var(--bg); color: var(--fg);
       font: 13px/1.5 -apple-system, BlinkMacSystemFont, "Inter", "PingFang SC", sans-serif;
-      display: grid; place-items: center;
+      display: grid; place-items: center; padding: 20px 0;
       -webkit-font-smoothing: antialiased;
     }
-    .wrap {
-      width: min(440px, calc(100vw - 32px));
-    }
+    .wrap { width: min(468px, calc(100vw - 32px)); }
     .brand {
       display: flex; align-items: center; gap: 9px; font-weight: 600; font-size: 14px;
-      margin-bottom: 22px; letter-spacing: -.01em;
+      margin-bottom: 18px; letter-spacing: -.01em;
     }
     .mark {
       width: 18px; height: 18px; border-radius: 50%; border: 1.5px solid var(--fg); position: relative;
@@ -36,6 +34,38 @@
     .mark::after {
       content: ""; position: absolute; width: 5px; height: 5px; border-radius: 50%;
       background: var(--accent); top: -2px; right: 0;
+    }
+    .sec-box {
+      background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+      padding: 13px 15px; margin-bottom: 12px;
+    }
+    .sec-hd {
+      display: flex; align-items: center; justify-content: space-between; gap: 8px;
+      font-size: 12px; font-weight: 600; color: var(--muted); margin-bottom: 9px;
+    }
+    .saved-list { display: flex; flex-direction: column; gap: 6px; }
+    .saved-row {
+      display: flex; align-items: center; gap: 8px; padding: 8px 10px;
+      border-radius: 8px; border: 1px solid var(--line); background: var(--raised);
+    }
+    .saved-row.active { border-color: var(--line-on); }
+    .saved-main { min-width: 0; flex: 1; }
+    .saved-title { font-size: 13px; font-weight: 600; display: flex; align-items: center; gap: 6px; }
+    .saved-url {
+      font: 11px ui-monospace, Menlo, monospace; color: var(--muted);
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .tag-ok {
+      font-size: 10.5px; color: var(--ok); padding: 1px 6px; border-radius: 999px;
+      background: rgba(114,207,152,.14); flex-shrink: 0;
+    }
+    .tag-warn {
+      font-size: 10.5px; color: var(--warn); padding: 1px 6px; border-radius: 999px;
+      background: rgba(229,184,105,.15); flex-shrink: 0;
+    }
+    .tag-muted {
+      font-size: 10.5px; color: var(--muted); padding: 1px 6px; border-radius: 999px;
+      background: rgba(138,138,147,.14); flex-shrink: 0;
     }
     .cards { display: flex; flex-direction: column; gap: 10px; }
     .opt {
@@ -62,6 +92,17 @@
     .opt-sub { font-size: 12px; color: var(--muted); margin-top: 2px; }
     .opt-body { margin-top: 13px; padding-left: 25px; display: none; }
     .opt.on .opt-body { display: block; }
+    .agent-strip {
+      display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px;
+    }
+    .agent-pill {
+      display: inline-flex; align-items: center; gap: 5px; height: 24px; padding: 0 8px;
+      border-radius: 6px; border: 1px solid var(--line); background: var(--raised);
+      font-size: 11.5px; color: var(--fg);
+    }
+    .agent-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--muted); }
+    .agent-dot.ok { background: var(--ok); }
+    .agent-dot.warn { background: var(--warn); }
     input[type="text"] {
       width: 100%; height: 35px; border-radius: 8px; border: 1px solid var(--line);
       background: var(--raised); color: var(--fg); padding: 0 11px;
@@ -74,15 +115,16 @@
     }
     .chk input { margin: 0; accent-color: var(--accent); }
     .foot {
-      display: flex; align-items: center; justify-content: flex-end; gap: 8px; margin-top: 14px;
+      display: flex; align-items: center; justify-content: flex-end; gap: 8px; margin-top: 12px;
     }
     button.pri {
-      height: 32px; padding: 0 15px; border-radius: 8px; border: 0; cursor: pointer;
+      height: 31px; padding: 0 14px; border-radius: 8px; border: 0; cursor: pointer;
       font: 500 12.5px inherit; background: var(--fg); color: var(--bg);
     }
+    button.pri.sm { height: 25px; padding: 0 10px; font-size: 11.5px; border-radius: 6px; }
     button.pri:disabled { opacity: .45; cursor: default; }
     button.ghost {
-      height: 24px; padding: 0 9px; border-radius: 6px; border: 1px solid var(--line);
+      height: 25px; padding: 0 9px; border-radius: 6px; border: 1px solid var(--line);
       background: transparent; color: var(--muted); cursor: pointer; font: 500 11.5px inherit;
     }
     button.ghost:hover:not(:disabled) { color: var(--fg); border-color: var(--line-on); }
@@ -114,9 +156,6 @@
       font: 10.5px ui-monospace, Menlo, monospace; color: var(--accent);
       padding: 1px 5px; border-radius: 4px; background: rgba(163,184,255,.12); flex-shrink: 0;
     }
-    .disc-clear {
-      font-size: 11px; color: var(--muted); flex-shrink: 0;
-    }
     .picked-bar {
       display: flex; align-items: center; justify-content: space-between; gap: 8px;
       font-size: 11.5px; color: var(--muted); margin-bottom: 6px;
@@ -147,18 +186,28 @@
   <div class="wrap">
     <div class="brand"><span class="mark"></span>hebi8-Orbit</div>
 
+    <!-- Saved networks switcher -->
+    <div class="sec-box" id="savedBox" style="display:none">
+      <div class="sec-hd">
+        <span>已保存的网络</span>
+        <span style="font-weight:400">一键切换</span>
+      </div>
+      <div class="saved-list" id="savedList"></div>
+    </div>
+
     <div class="cards" id="cards">
       <div class="opt on" data-mode="local" tabindex="0" role="radio" aria-checked="true">
         <div class="opt-head">
           <span class="radio"></span>
           <div class="opt-head-main">
-            <div class="opt-title">就在这台机器用</div>
-            <div class="opt-sub">新建本机工作区</div>
+            <div class="opt-title">使用本机工作区</div>
+            <div class="opt-sub">启动或连接到这台机器上的 Orbit 服务</div>
           </div>
         </div>
         <div class="opt-body">
+          <div class="agent-strip" id="localAgentsStrip"></div>
           <div class="foot">
-            <button type="button" class="pri" id="btnLocal">开始使用</button>
+            <button type="button" class="pri" id="btnLocal">进入本机工作区</button>
           </div>
         </div>
       </div>
@@ -168,10 +217,10 @@
           <span class="radio"></span>
           <div class="opt-head-main">
             <div class="opt-title-row">
-              <span class="opt-title">加入已有网络</span>
+              <span class="opt-title">配对加入其他网络</span>
               <span class="opt-badge" id="remoteBadge" style="display:none"></span>
             </div>
-            <div class="opt-sub">选择发现的网络或粘贴邀请命令</div>
+            <div class="opt-sub">远程网络需通过配对码验证身份后才可访问</div>
           </div>
         </div>
         <div class="opt-body">
@@ -187,18 +236,18 @@
             <span>目标：<b id="pickedLabel"></b></span>
             <button type="button" class="ghost" id="btnClearPick">改用手动输入</button>
           </div>
-          <input id="joinInput" type="text" placeholder="粘贴邀请命令或配对链接" autocomplete="off" spellcheck="false" />
+          <input id="joinInput" type="text" placeholder="粘贴邀请命令、配对链接或先在上方选择目标网络" autocomplete="off" spellcheck="false" />
           <div class="pair-tip" id="pairTip">
-            <span>在 <b id="pairTipHost">已有设备</b> 运行</span>
-            <button type="button" class="cmd-chip" id="btnCopyPairCmd" title="点击复制">orbit pair</button>
-            <span>或在设置中点「添加机器」获取</span>
+            <span>在 <b id="pairTipHost">目标主机</b> 运行</span>
+            <button type="button" class="cmd-chip" id="btnCopyPairCmd" title="点击复制">orbit pair --client</button>
+            <span>或在设置中点「添加机器」获取配对码</span>
           </div>
           <label class="chk">
-            <input id="asRunner" type="checkbox" checked />
-            <span>同时作为执行节点</span>
+            <input id="asRunner" type="checkbox" />
+            <span>同时把本机加入对方网络作为执行节点（不勾选则仅作为客户端访问）</span>
           </label>
           <div class="foot">
-            <button type="button" class="pri" id="btnJoin">加入</button>
+            <button type="button" class="pri" id="btnJoin">配对并进入</button>
           </div>
         </div>
       </div>
@@ -212,7 +261,13 @@
     let busy = false;
     let scanning = false;
     let pickedHub = null;
+    let savedNetworks = [];
+    let activeNetworkId = '';
+
     const cards = Array.from(document.querySelectorAll('.opt'));
+    const savedBox = document.getElementById('savedBox');
+    const savedList = document.getElementById('savedList');
+    const localAgentsStrip = document.getElementById('localAgentsStrip');
     const joinInput = document.getElementById('joinInput');
     const asRunner = document.getElementById('asRunner');
     const btnLocal = document.getElementById('btnLocal');
@@ -258,14 +313,134 @@
       btnClearPick.disabled = on;
       joinInput.disabled = on;
       asRunner.disabled = on;
+      Array.from(savedList.querySelectorAll('button')).forEach(b => b.disabled = on);
       statusEl.className = 'status' + (cls ? ' ' + cls : '');
-      statusEl.innerHTML = on
-        ? '<span class="dots"><span></span><span></span><span></span></span><span>' + text + '</span>'
-        : text;
+      statusEl.replaceChildren();
+      const msg = String(text ?? '');
+      if (on) {
+        const dots = document.createElement('span');
+        dots.className = 'dots';
+        for (let i = 0; i < 3; i++) {
+          dots.appendChild(document.createElement('span'));
+        }
+        const label = document.createElement('span');
+        label.textContent = msg;
+        statusEl.appendChild(dots);
+        statusEl.appendChild(label);
+      } else {
+        statusEl.textContent = msg;
+      }
     }
 
     function escapeHtml(s) {
       return String(s || '').replace(/[&<>"']/g, (ch) => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[ch]));
+    }
+
+    function normOrigin(u) {
+      return String(u || '').trim().replace(/\/+$/, '').toLowerCase();
+    }
+
+    function findSavedByOrigin(origin) {
+      const target = normOrigin(origin);
+      return savedNetworks.find(n => normOrigin(n.hubUrl) === target);
+    }
+
+    function renderSavedNetworks() {
+      savedList.innerHTML = '';
+      if (!savedNetworks || savedNetworks.length === 0) {
+        savedBox.style.display = 'none';
+        return;
+      }
+      savedBox.style.display = 'block';
+      savedNetworks.forEach(net => {
+        const isActive = net.id === activeNetworkId;
+        const row = document.createElement('div');
+        row.className = 'saved-row' + (isActive ? ' active' : '');
+        row.innerHTML =
+          '<div class="saved-main">' +
+            '<div class="saved-title"><span>' + escapeHtml(net.name || net.hubUrl) + '</span>' +
+              (isActive ? '<span class="tag-ok">当前</span>' : '') +
+              (net.mode === 'remote' && net.runLocalRunner ? '<span class="tag-muted">含执行节点</span>' : '') +
+            '</div>' +
+            '<div class="saved-url">' + escapeHtml(net.hubUrl) + '</div>' +
+          '</div>';
+
+        const switchBtn = document.createElement('button');
+        switchBtn.type = 'button';
+        switchBtn.className = isActive ? 'ghost' : 'pri sm';
+        switchBtn.textContent = isActive ? '进入' : '切换';
+        switchBtn.addEventListener('click', () => switchToNetwork(net.id, net.name || net.hubUrl));
+        row.appendChild(switchBtn);
+
+        if (net.mode === 'remote') {
+          const rmBtn = document.createElement('button');
+          rmBtn.type = 'button';
+          rmBtn.className = 'ghost';
+          rmBtn.textContent = '移除';
+          rmBtn.addEventListener('click', () => removeNetwork(net.id));
+          row.appendChild(rmBtn);
+        }
+        savedList.appendChild(row);
+      });
+    }
+
+    async function loadSavedNetworks() {
+      try {
+        const res = await fetch('/api/networks');
+        const data = await res.json();
+        savedNetworks = data.networks || [];
+        activeNetworkId = data.activeNetworkId || '';
+        renderSavedNetworks();
+      } catch {}
+    }
+
+    async function loadLocalAgents() {
+      try {
+        const res = await fetch('/api/local-agents');
+        const data = await res.json();
+        const agents = data.agents || [];
+        localAgentsStrip.innerHTML = '';
+        agents.forEach(a => {
+          const pill = document.createElement('span');
+          pill.className = 'agent-pill';
+          const dotCls = a.status === 'ready' ? 'ok' : (a.status === 'needs_adapter' ? 'warn' : '');
+          const stText = a.status === 'ready' ? '已就绪' : (a.status === 'needs_adapter' ? '待装适配器' : '未安装');
+          pill.innerHTML = '<span class="agent-dot ' + dotCls + '"></span><span>' + escapeHtml(a.name) + '</span><span style="color:var(--muted)">' + stText + '</span>';
+          localAgentsStrip.appendChild(pill);
+        });
+      } catch {}
+    }
+
+    async function switchToNetwork(networkId, label) {
+      if (busy) return;
+      setBusy(true, '正在切换到 ' + String(label || '') + '…');
+      try {
+        const res = await fetch('/api/switch', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-Orbit-Setup': '1' },
+          body: JSON.stringify({ networkId }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
+        setBusy(false, '已切换，正在进入…', 'ok');
+        window.location.href = data.openUrl || (data.hubUrl + '/?orbitDesktop=1');
+      } catch (err) {
+        setBusy(false, err.message || String(err), 'err');
+      }
+    }
+
+    async function removeNetwork(networkId) {
+      if (busy) return;
+      try {
+        const res = await fetch('/api/remove-network', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-Orbit-Setup': '1' },
+          body: JSON.stringify({ networkId }),
+        });
+        if (res.ok) {
+          await loadSavedNetworks();
+        }
+      } catch {}
     }
 
     function updatePickedUI() {
@@ -279,7 +454,7 @@
       } else {
         pickedBar.style.display = 'none';
         pickedLabel.textContent = '';
-        pairTipHost.textContent = '已有设备';
+        pairTipHost.textContent = '目标主机';
         joinInput.placeholder = '粘贴邀请命令或配对链接';
       }
       Array.from(discList.querySelectorAll('.disc-item')).forEach(el => {
@@ -288,11 +463,15 @@
     }
 
     function toggleDiscoveredHub(h) {
+      const saved = findSavedByOrigin(h.origin);
+      if (saved) {
+        switchToNetwork(saved.id, saved.name || h.hostName || h.origin);
+        return;
+      }
       if (pickedHub && pickedHub.origin === h.origin) {
         pickedHub = null;
       } else {
         pickedHub = h;
-        // Clear any bare URL previously filled so the user types the pairing code cleanly
         if (/^https?:\/\//i.test(joinInput.value.trim()) && !/\s/.test(joinInput.value.trim())) {
           joinInput.value = '';
         }
@@ -315,21 +494,23 @@
           headers: { 'X-Orbit-Setup': '1' },
         });
         const data = await res.json();
-        const hubs = (data.hubs || []).filter(h => h.via === 'tailscale' && !h.isSelf);
+        const hubs = (data.hubs || []).filter(h => !h.isSelf);
         discList.innerHTML = '';
         if (hubs.length > 0) {
           remoteBadge.style.display = 'inline-block';
           remoteBadge.textContent = '发现 ' + hubs.length + ' 个';
           discSummary.textContent = '发现的网络';
           hubs.forEach(h => {
+            const saved = findSavedByOrigin(h.origin);
             const btn = document.createElement('button');
             btn.type = 'button';
             btn.className = 'disc-item' + (pickedHub && pickedHub.origin === h.origin ? ' picked' : '');
             btn.dataset.origin = h.origin;
             btn.innerHTML =
               '<div class="disc-main">' +
-                '<div class="disc-host"><span>' + escapeHtml(h.hostName || h.dnsName) + '</span>' +
+                '<div class="disc-host"><span>' + escapeHtml(h.hostName || h.dnsName || h.origin) + '</span>' +
                 (h.discoveryId ? '<span class="disc-tag">' + escapeHtml(h.discoveryId) + '</span>' : '') +
+                (saved ? '<span class="tag-ok">已配对 · 点击切换</span>' : '<span class="tag-warn">需配对码</span>') +
                 '</div>' +
                 '<div class="disc-url">' + escapeHtml(h.origin) + '</div>' +
               '</div>';
@@ -341,7 +522,7 @@
           if (data.tailscaleAvailable && !data.tailscaleOnline) {
             discSummary.textContent = 'Tailscale 未连接';
           } else {
-            discSummary.textContent = '未发现可用网络';
+            discSummary.textContent = '未发现其他网络';
           }
         }
       } catch (err) {
@@ -355,7 +536,7 @@
 
     async function startLocal() {
       if (busy) return;
-      setBusy(true, '正在准备本机环境…');
+      setBusy(true, '正在准备本机工作区…');
       try {
         const res = await fetch('/api/local-start', {
           method: 'POST',
@@ -364,7 +545,7 @@
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
         setBusy(false, '已就绪，正在进入…', 'ok');
-        window.location.href = data.openUrl || (data.hubUrl + '/');
+        window.location.href = data.openUrl || (data.hubUrl + '/?orbitDesktop=1');
       } catch (err) {
         setBusy(false, err.message || String(err), 'err');
       }
@@ -380,7 +561,6 @@
           joinInput.focus();
           return;
         }
-        // Support either bare pairing code ("XXXX-XXXX") or pasted full command/link
         if (!/^(orbit\s+join\s+|https?:\/\/)/i.test(raw)) {
           payloadInput = pickedHub.origin + ' ' + raw;
         }
@@ -390,7 +570,7 @@
         return;
       }
 
-      setBusy(true, '正在加入…');
+      setBusy(true, '正在验证配对码并连接…');
       try {
         const res = await fetch('/api/join', {
           method: 'POST',
@@ -401,11 +581,11 @@
         if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
         if (data.runnerError) {
           setBusy(false, '客户端已连接，执行节点启动失败：' + data.runnerError, 'err');
-          setTimeout(() => { window.location.href = data.openUrl || (data.hubUrl + '/'); }, 2200);
+          setTimeout(() => { window.location.href = data.openUrl || (data.hubUrl + '/?orbitDesktop=1'); }, 2200);
           return;
         }
-        setBusy(false, '已加入，正在进入…', 'ok');
-        window.location.href = data.openUrl || (data.hubUrl + '/');
+        setBusy(false, '配对成功，正在进入…', 'ok');
+        window.location.href = data.openUrl || (data.hubUrl + '/?orbitDesktop=1');
       } catch (err) {
         setBusy(false, err.message || String(err), 'err');
       }
@@ -415,10 +595,14 @@
     btnJoin.addEventListener('click', joinRemote);
     btnScan.addEventListener('click', scanNetworks);
     btnCopyPairCmd.addEventListener('click', () => {
-      navigator.clipboard?.writeText('orbit pair').then(() => {
+      const cmd = asRunner.checked ? 'orbit pair' : 'orbit pair --client';
+      navigator.clipboard?.writeText(cmd).then(() => {
         btnCopyPairCmd.textContent = '已复制';
-        setTimeout(() => { btnCopyPairCmd.textContent = 'orbit pair'; }, 1200);
+        setTimeout(() => { btnCopyPairCmd.textContent = cmd; }, 1200);
       }).catch(() => {});
+    });
+    asRunner.addEventListener('change', () => {
+      btnCopyPairCmd.textContent = asRunner.checked ? 'orbit pair' : 'orbit pair --client';
     });
     btnClearPick.addEventListener('click', () => {
       pickedHub = null;
@@ -437,12 +621,26 @@
       }
     });
 
-    fetch('/api/current').then(r => r.json()).then(d => {
-      if (d.hubUrl && d.mode === 'remote') {
-        joinInput.value = d.hubUrl;
+    (async () => {
+      await Promise.all([loadSavedNetworks(), loadLocalAgents()]);
+      const sp = new URLSearchParams(window.location.search);
+      const preOrigin = sp.get('origin');
+      if (preOrigin) {
+        const existing = findSavedByOrigin(preOrigin);
+        if (existing) {
+          setBusy(false, '已保存该网络，点击上方「切换」可直接进入。');
+        } else {
+          pickedHub = {
+            origin: preOrigin,
+            hostName: sp.get('host') || preOrigin,
+            discoveryId: sp.get('discoveryId') || '',
+          };
+          setMode('remote');
+          updatePickedUI();
+        }
       }
-    }).catch(() => {});
-    scanNetworks();
+      scanNetworks();
+    })();
   </script>
 </body>
 </html>

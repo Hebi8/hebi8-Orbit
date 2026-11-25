@@ -184,6 +184,17 @@ func (f *FakeAcpDriver) SetConfigOption(ctx context.Context, sid acp.SessionId, 
 	return acp.SetSessionConfigOptionResponse{ConfigOptions: opts}, nil
 }
 
+func (f *FakeAcpDriver) SetSessionMode(_ context.Context, sid acp.SessionId, modeID string) (acp.SetSessionModeResponse, error) {
+	f.mu.Lock()
+	f.configCalls = append(f.configCalls, fmt.Sprintf("%s:mode=%s", sid, modeID))
+	if f.sessionConfig[sid] == nil {
+		f.sessionConfig[sid] = map[string]string{}
+	}
+	f.sessionConfig[sid]["mode"] = modeID
+	f.mu.Unlock()
+	return acp.SetSessionModeResponse{}, nil
+}
+
 func (f *FakeAcpDriver) Prompt(ctx context.Context, sid acp.SessionId, promptText string) (acp.PromptResponse, error) {
 	f.mu.Lock()
 	hook := f.OnPrompt
@@ -1110,7 +1121,7 @@ func TestRegression_R3_ApprovalDisconnectRedeliverAndCrashWindows(t *testing.T) 
 		}
 
 		// Same Runner reconnects automatically -> hub.welcome.reconcile.redeliverApprovals delivers BOTH decisions!
-		// Under B1, demo-app has no verified delivery and had a rejected tool, so attempt settles to failed (NO_VERIFIED_DELIVERY)
+		// Because apReject was rejected and unresolved, attempt settles to needs_verification (UNRESOLVED_TOOL_FAILURE)
 		// while BOTH approvals settle cleanly to consumed_allowed and consumed_rejected!
 		eventually(t, 4*time.Second, func() bool {
 			a1, _ := env.st.GetApproval(context.Background(), apAllow.ApprovalID)
@@ -1118,8 +1129,8 @@ func TestRegression_R3_ApprovalDisconnectRedeliverAndCrashWindows(t *testing.T) 
 			att, _ := env.st.GetAttemptRecord(context.Background(), attID)
 			return a1.State == protocol.ApprovalConsumedAllowed &&
 				a2.State == protocol.ApprovalConsumedRejected &&
-				att.State == protocol.AttemptFailed &&
-				att.ErrorCode == "NO_VERIFIED_DELIVERY"
+				att.State == protocol.AttemptNeedsVerification &&
+				att.ErrorCode == "UNRESOLVED_TOOL_FAILURE"
 		}, "approvals did not redeliver and settle cleanly (allow=consumed_allowed, reject=consumed_rejected)")
 
 		if allowOutcome.Outcome.Selected == nil || allowOutcome.Outcome.Selected.OptionId != "allow_once" {

@@ -21,6 +21,8 @@ func PrepareWorktree(ctx context.Context, dispatch protocol.AttemptDispatchFrame
 	if worktreeRoot == "" {
 		if dispatch.ProjectID == protocol.ScratchProjectID {
 			worktreeRoot = filepath.Join(dataDir, "scratch")
+		} else if dispatch.ProjectID == protocol.PAProjectID {
+			worktreeRoot = filepath.Join(dataDir, "pa")
 		} else {
 			worktreeRoot = filepath.Join(dataDir, "worktrees", dispatch.ProjectID)
 		}
@@ -34,8 +36,8 @@ func PrepareWorktree(ctx context.Context, dispatch protocol.AttemptDispatchFrame
 		return "", "", fmt.Errorf("resolve worktree path: %w", err)
 	}
 
-	// Virtual _scratch project or repo-less task: create clean scratch dir
-	if dispatch.ProjectID == protocol.ScratchProjectID || (strings.TrimSpace(dispatch.RepoPath) == "" && strings.TrimSpace(dispatch.MirrorBarePath) == "") {
+	// Virtual _scratch / _pa project or repo-less task: create clean scratch dir
+	if protocol.IsVirtualProjectID(dispatch.ProjectID) || (strings.TrimSpace(dispatch.RepoPath) == "" && strings.TrimSpace(dispatch.MirrorBarePath) == "") {
 		if err := os.MkdirAll(absWorktree, 0o755); err != nil {
 			return "", "", fmt.Errorf("mkdir scratch dir %s: %w", absWorktree, err)
 		}
@@ -310,16 +312,24 @@ func runGitCmdTrim(ctx context.Context, dir string, args ...string) (string, err
 	return strings.TrimSpace(out), err
 }
 
-// worktreeMatchesCommitTree compares absWorktree's current packable working tree (computed via
-// an isolated temporary GIT_INDEX_FILE, zero mutation to real index/files) against commitSHA^{tree} (B14).
-func worktreeMatchesCommitTree(ctx context.Context, absWorktree, gitSource, commitSHA string) (bool, error) {
-	expectedTree, err := runGitCmdTrim(ctx, gitSource, "rev-parse", "--verify", commitSHA+"^{tree}")
-	if err != nil {
-		return false, err
+// commitTreeHash resolves the immutable Git tree hash of a commit SHA.
+func commitTreeHash(ctx context.Context, gitDir, commitSHA string) (string, error) {
+	if strings.TrimSpace(gitDir) == "" || strings.TrimSpace(commitSHA) == "" {
+		return "", nil
+	}
+	return runGitCmdTrim(ctx, gitDir, "rev-parse", "--verify", strings.TrimSpace(commitSHA)+"^{tree}")
+}
+
+// worktreeTreeHash computes the canonical Git tree hash of absWorktree's current packable
+// working tree (including all untracked non-ignored files, independent of status.showUntrackedFiles)
+// via an isolated temporary GIT_INDEX_FILE with zero mutation to the real index or files.
+func worktreeTreeHash(ctx context.Context, absWorktree string) (string, error) {
+	if strings.TrimSpace(absWorktree) == "" {
+		return "", nil
 	}
 	tmpDir, err := os.MkdirTemp("", "orbit-tree-*")
 	if err != nil {
-		return false, err
+		return "", fmt.Errorf("create temp index dir: %w", err)
 	}
 	defer os.RemoveAll(tmpDir)
 
@@ -332,7 +342,7 @@ func worktreeMatchesCommitTree(ctx context.Context, absWorktree, gitSource, comm
 	var addErr bytes.Buffer
 	addCmd.Stderr = &addErr
 	if err := addCmd.Run(); err != nil {
-		return false, fmt.Errorf("temp index add -A: %w: %s", err, strings.TrimSpace(addErr.String()))
+		return "", fmt.Errorf("temp index add -A: %w: %s", err, strings.TrimSpace(addErr.String()))
 	}
 
 	treeCmd := exec.CommandContext(ctx, "git", "write-tree")
@@ -342,8 +352,28 @@ func worktreeMatchesCommitTree(ctx context.Context, absWorktree, gitSource, comm
 	treeCmd.Stdout = &treeOut
 	treeCmd.Stderr = &treeErr
 	if err := treeCmd.Run(); err != nil {
-		return false, fmt.Errorf("temp index write-tree: %w: %s", err, strings.TrimSpace(treeErr.String()))
+		return "", fmt.Errorf("temp index write-tree: %w: %s", err, strings.TrimSpace(treeErr.String()))
 	}
-	actualTree := strings.TrimSpace(treeOut.String())
+	return strings.TrimSpace(treeOut.String()), nil
+}
+
+// worktreeMatchesCommitTree compares absWorktree's current packable working tree (computed via
+// an isolated temporary GIT_INDEX_FILE, zero mutation to real index/files) against commitSHA^{tree} (B14).
+func worktreeMatchesCommitTree(ctx context.Context, absWorktree, gitSource, commitSHA string) (bool, error) {
+	expectedTree, err := commitTreeHash(ctx, gitSource, commitSHA)
+	if err != nil {
+		return false, err
+	}
+	actualTree, err := worktreeTreeHash(ctx, absWorktree)
+	if err != nil {
+		return false, err
+	}
 	return actualTree == expectedTree, nil
+}
+
+// worktreeStateFingerprint computes the canonical Git tree hash of the working tree
+// (including all untracked files regardless of status.showUntrackedFiles), matching commitSHA^{tree}
+// produced by PackageCheckpoint.
+func worktreeStateFingerprint(ctx context.Context, worktreePath string) (string, error) {
+	return worktreeTreeHash(ctx, worktreePath)
 }

@@ -6,6 +6,7 @@ import { useHubLatency } from '../hooks/useHubLatency';
 import {
   SCRATCH_PROJECT_ID,
   indexInboxByTask,
+  isVirtualProject,
   rootSessionMark,
   sessionMark,
   sessionMarkHint,
@@ -87,7 +88,7 @@ export function Sidebar({
 
   const workspaceName = workspaceNameOverride || boot.workspaceName || 'Home LAN';
 
-  const projects = boot.projects.filter((p) => p.projectId !== SCRATCH_PROJECT_ID && !p.archived);
+  const projects = boot.projects.filter((p) => !isVirtualProject(p.projectId) && !p.archived);
   const scratch = boot.projects.find((p) => p.projectId === SCRATCH_PROJECT_ID);
 
   const isOpen = (p: ProjectView) =>

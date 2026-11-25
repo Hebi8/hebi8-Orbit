@@ -121,21 +121,21 @@ projects:
 }
 
 func TestAuthAndCrossOriginDefense(t *testing.T) {
-	srv, _, _, _ := setupTestHub(t, nil, &fakeRyugiRunner{})
+	srv, st, _, _ := setupTestHub(t, nil, &fakeRyugiRunner{})
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 
-	// 1. Missing Tailscale-User-Login -> 401
+	// 1. Unauthenticated request -> 401
 	resp, err := http.Get(ts.URL + "/api/bootstrap")
 	if err != nil {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("expected 401 without Tailscale header, got %d", resp.StatusCode)
+		t.Fatalf("expected 401 without credentials, got %d", resp.StatusCode)
 	}
 
-	// 2. Non-whitelisted Tailscale login -> 401
+	// 2. Non-whitelisted Tailscale login alone -> 401
 	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/bootstrap", nil)
 	req.Header.Set("Tailscale-User-Login", "intruder@example.com")
 	resp, err = http.DefaultClient.Do(req)
@@ -147,7 +147,7 @@ func TestAuthAndCrossOriginDefense(t *testing.T) {
 		t.Fatalf("expected 401 for non-whitelisted login, got %d", resp.StatusCode)
 	}
 
-	// 3. Whitelisted Tailscale login GET -> 200
+	// 3. Even whitelisted Tailscale-User-Login ALONE MUST return 401 (no pairing bypass!)
 	req, _ = http.NewRequest(http.MethodGet, ts.URL+"/api/bootstrap", nil)
 	req.Header.Set("Tailscale-User-Login", "user@example.com")
 	resp, err = http.DefaultClient.Do(req)
@@ -155,13 +155,45 @@ func TestAuthAndCrossOriginDefense(t *testing.T) {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for standalone Tailscale-User-Login without paired client token, got %d", resp.StatusCode)
+	}
+
+	// Mint a paired client token for subsequent auth / CSRF / Origin checks
+	clientTok, tokenID, err := st.CreateClientToken(context.Background(), "Test Browser", "browser", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 3b. Paired client token with non-whitelisted Tailscale-User-Login -> 401 (extra defense-in-depth)
+	req, _ = http.NewRequest(http.MethodGet, ts.URL+"/api/bootstrap", nil)
+	req.Header.Set("Authorization", "Bearer "+clientTok)
+	req.Header.Set("Tailscale-User-Login", "intruder@example.com")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for paired token with disallowed Tailscale login, got %d", resp.StatusCode)
+	}
+
+	// 3c. Paired client token GET -> 200
+	req, _ = http.NewRequest(http.MethodGet, ts.URL+"/api/bootstrap", nil)
+	req.Header.Set("Authorization", "Bearer "+clientTok)
+	req.Header.Set("Tailscale-User-Login", "user@example.com")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("expected 200 for whitelisted login, got %d", resp.StatusCode)
+		t.Fatalf("expected 200 for paired client token, got %d", resp.StatusCode)
 	}
 
 	// 4. Write without X-Orbit-Request: 1 -> 403
 	req, _ = http.NewRequest(http.MethodPost, ts.URL+"/api/admin/gc-pause", strings.NewReader(`{"paused":true}`))
-	req.Header.Set("Tailscale-User-Login", "user@example.com")
+	req.Header.Set("Authorization", "Bearer "+clientTok)
 	req.Header.Set("Origin", "https://orbit.example.ts.net")
 	resp, err = http.DefaultClient.Do(req)
 	if err != nil {
@@ -174,7 +206,7 @@ func TestAuthAndCrossOriginDefense(t *testing.T) {
 
 	// 5. Write from Ryugi preview origin (:8443) -> 403 even with X-Orbit-Request: 1
 	req, _ = http.NewRequest(http.MethodPost, ts.URL+"/api/admin/gc-pause", strings.NewReader(`{"paused":true}`))
-	req.Header.Set("Tailscale-User-Login", "user@example.com")
+	req.Header.Set("Authorization", "Bearer "+clientTok)
 	req.Header.Set("Origin", "https://orbit.example.ts.net:8443")
 	req.Header.Set("X-Orbit-Request", "1")
 	resp, err = http.DefaultClient.Do(req)
@@ -200,7 +232,7 @@ func TestAuthAndCrossOriginDefense(t *testing.T) {
 
 	// 7. Write with exact Origin + X-Orbit-Request: 1 -> 200
 	req, _ = http.NewRequest(http.MethodPost, ts.URL+"/api/admin/gc-pause", strings.NewReader(`{"paused":true,"reason":"backup"}`))
-	req.Header.Set("Tailscale-User-Login", "user@example.com")
+	req.Header.Set("Authorization", "Bearer "+clientTok)
 	req.Header.Set("Origin", "https://orbit.example.ts.net")
 	req.Header.Set("X-Orbit-Request", "1")
 	resp, err = http.DefaultClient.Do(req)
@@ -216,25 +248,36 @@ func TestAuthAndCrossOriginDefense(t *testing.T) {
 	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/ws/client?sinceSeq=0"
 	_, wsResp, err := websocket.Dial(context.Background(), wsURL, &websocket.DialOptions{
 		HTTPHeader: http.Header{
-			"Tailscale-User-Login": []string{"user@example.com"},
-			"Origin":               []string{"https://orbit.example.ts.net:8443"},
+			"Authorization": []string{"Bearer " + clientTok},
+			"Origin":        []string{"https://orbit.example.ts.net:8443"},
 		},
 	})
 	if err == nil || wsResp == nil || wsResp.StatusCode != http.StatusForbidden {
 		t.Fatalf("expected WS 403 for :8443 origin, got err=%v resp=%v", err, wsResp)
 	}
 
-	// 9. Tailscale-authenticated write WITHOUT Origin header -> 403 (Blocking #6)
-	req, _ = http.NewRequest(http.MethodPost, ts.URL+"/api/admin/gc-pause", strings.NewReader(`{"paused":false}`))
-	req.Header.Set("Tailscale-User-Login", "user@example.com")
+	// 9. Revoking client device token immediately invalidates further requests (401)
+	req, _ = http.NewRequest(http.MethodDelete, ts.URL+"/api/clients/"+tokenID, nil)
+	req.Header.Set("Authorization", "Bearer "+clientTok)
+	req.Header.Set("Origin", "https://orbit.example.ts.net")
 	req.Header.Set("X-Orbit-Request", "1")
 	resp, err = http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusForbidden {
-		t.Fatalf("expected 403 for Tailscale write without Origin header, got %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 revoking client device, got %d", resp.StatusCode)
+	}
+	req, _ = http.NewRequest(http.MethodGet, ts.URL+"/api/bootstrap", nil)
+	req.Header.Set("Authorization", "Bearer "+clientTok)
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 after revoking client token, got %d", resp.StatusCode)
 	}
 
 	// 10. ValidateListenAddr unconditionally rejects non-loopback EVEN when DevOpen == true (Item #6)

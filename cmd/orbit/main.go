@@ -164,11 +164,7 @@ func resolveHubAuth(configDirFlag, dataDirFlag, hubURLFlag, tokenFlag string) (h
 	cfgDir = protocol.ExpandPath(cfgDir)
 
 	hubCfg, _ := protocol.LoadHubConfig(filepath.Join(cfgDir, "hub.yaml"))
-	var clientCfg struct {
-		HubURL      string `yaml:"hubUrl"`
-		DevToken    string `yaml:"devToken"`
-		ClientToken string `yaml:"clientToken"`
-	}
+	var clientCfg cliClientConfig
 	if raw, err := os.ReadFile(filepath.Join(cfgDir, "client.yaml")); err == nil {
 		_ = yaml.Unmarshal(raw, &clientCfg)
 	}
@@ -206,9 +202,16 @@ func resolveHubAuth(configDirFlag, dataDirFlag, hubURLFlag, tokenFlag string) (h
 	}
 	hubURL = strings.TrimRight(hubURL, "/")
 
-	// Bind saved credentials strictly to their normalized origin so overriding --hub / ORBIT_HUB_URL
-	// never leaks tokens from another Orbit Hub.
+	// Bind saved credentials strictly to their normalized origin (checking both top-level and multi-network profiles)
+	// so overriding --hub / ORBIT_HUB_URL never leaks tokens from another Orbit Hub.
 	clientOriginMatch := strings.TrimSpace(clientCfg.HubURL) != "" && sameOriginURL(hubURL, clientCfg.HubURL)
+	var matchedNet *cliNetworkProfile
+	for i := range clientCfg.Networks {
+		if strings.TrimSpace(clientCfg.Networks[i].HubURL) != "" && sameOriginURL(hubURL, clientCfg.Networks[i].HubURL) {
+			matchedNet = &clientCfg.Networks[i]
+			break
+		}
+	}
 	hubOriginMatch := sameOriginURL(hubURL, localHubURL) || (strings.TrimSpace(hubCfg.HubOrigin) != "" && sameOriginURL(hubURL, hubCfg.HubOrigin))
 
 	if strings.HasPrefix(strings.TrimSpace(tokenFlag), "ock_") {
@@ -219,11 +222,17 @@ func resolveHubAuth(configDirFlag, dataDirFlag, hubURLFlag, tokenFlag string) (h
 	if clientToken == "" {
 		clientToken = strings.TrimSpace(os.Getenv("ORBIT_CLIENT_TOKEN"))
 	}
+	if clientToken == "" && matchedNet != nil && strings.TrimSpace(matchedNet.ClientToken) != "" {
+		clientToken = strings.TrimSpace(matchedNet.ClientToken)
+	}
 	if clientToken == "" && clientOriginMatch {
 		clientToken = strings.TrimSpace(clientCfg.ClientToken)
 	}
 	if devToken == "" {
 		devToken = os.Getenv("ORBIT_DEV_TOKEN")
+	}
+	if devToken == "" && matchedNet != nil && strings.TrimSpace(matchedNet.DevToken) != "" {
+		devToken = strings.TrimSpace(matchedNet.DevToken)
 	}
 	if devToken == "" && clientOriginMatch && strings.TrimSpace(clientCfg.DevToken) != "" {
 		devToken = strings.TrimSpace(clientCfg.DevToken)

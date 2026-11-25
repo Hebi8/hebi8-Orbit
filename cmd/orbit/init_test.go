@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"flag"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/Hebi8/hebi8-Orbit/internal/protocol"
+	"gopkg.in/yaml.v3"
 )
 
 func TestInitConnectAndInteractiveWizard(t *testing.T) {
@@ -222,5 +224,222 @@ func TestParseFlagsPermuted(t *testing.T) {
 	}
 	if *flagVal != "" || strings.Join(fsDash.Args(), ",") != "pos1,--machine,literal" {
 		t.Fatalf("unexpected -- parse: machine=%q args=%v", *flagVal, fsDash.Args())
+	}
+}
+
+func TestCLIJoin_PreservesMultiNetworkClientYAMLAndLocalRunnerToken(t *testing.T) {
+	tmp := t.TempDir()
+	cfgDir := filepath.Join(tmp, "cfg")
+	dataDir := filepath.Join(tmp, "data")
+	if err := os.MkdirAll(cfgDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Start with existing local runner.token + local client.yaml profile
+	localRunnerToken := "local-runner-secret-must-not-be-overwritten"
+	if err := os.WriteFile(filepath.Join(cfgDir, "runner.token"), []byte(localRunnerToken+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeClientConfigFull(filepath.Join(cfgDir, "client.yaml"), "http://127.0.0.1:4310", "devtok_local", "", "local-box", "local"); err != nil {
+		t.Fatalf("write initial local client.yaml: %v", err)
+	}
+
+	makeFakeHub := func(wsName, machID, cTok, rTok string) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/api/pairing/claim" && r.Method == http.MethodPost {
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(protocol.ClaimPairingResponse{
+					MachineID:     machID,
+					DisplayName:   machID,
+					WorkspaceName: wsName,
+					ClientToken:   cTok,
+					RunnerToken:   rTok,
+				})
+				return
+			}
+			w.WriteHeader(http.StatusNotFound)
+		}))
+	}
+
+	hubA := makeFakeHub("Hub A", "node-a", "ock_token_a_1234567890", "ort_runner_a_1234567890")
+	defer hubA.Close()
+	hubB := makeFakeHub("Hub B", "node-b", "ock_token_b_1234567890", "ort_runner_b_1234567890")
+	defer hubB.Close()
+
+	var out, errBuf bytes.Buffer
+	if err := runJoin(context.Background(), []string{
+		hubA.URL, "AAAA-BBBB", "--no-start", "--config-dir", cfgDir, "--data-dir", dataDir,
+	}, &out, &errBuf); err != nil {
+		t.Fatalf("join hubA failed: %v (%s)", err, errBuf.String())
+	}
+	if err := runJoin(context.Background(), []string{
+		hubB.URL, "CCCC-DDDD", "--no-start", "--config-dir", cfgDir, "--data-dir", dataDir,
+	}, &out, &errBuf); err != nil {
+		t.Fatalf("join hubB failed: %v (%s)", err, errBuf.String())
+	}
+
+	// Top-level local runner.token MUST remain untouched!
+	gotLocalTok, err := os.ReadFile(filepath.Join(cfgDir, "runner.token"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(gotLocalTok)) != localRunnerToken {
+		t.Fatalf("local runner.token was overwritten! got %q want %q", strings.TrimSpace(string(gotLocalTok)), localRunnerToken)
+	}
+
+	// client.yaml MUST contain all 3 network profiles (local + hubA + hubB) and activeNetworkId == hubB
+	rawClient, err := os.ReadFile(filepath.Join(cfgDir, "client.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg cliClientConfig
+	if err := yaml.Unmarshal(rawClient, &cfg); err != nil {
+		t.Fatalf("parse client.yaml: %v", err)
+	}
+	if len(cfg.Networks) != 3 {
+		t.Fatalf("expected 3 saved networks (local + hubA + hubB), got %d: %+v", len(cfg.Networks), cfg.Networks)
+	}
+	wantNetA := cliNetworkIDFor("remote", hubA.URL)
+	wantNetB := cliNetworkIDFor("remote", hubB.URL)
+	if cfg.ActiveNetworkID != wantNetB {
+		t.Fatalf("expected activeNetworkId=%q, got %q", wantNetB, cfg.ActiveNetworkID)
+	}
+	for _, tc := range []struct {
+		netID, wantTok string
+	}{
+		{wantNetA, "ort_runner_a_1234567890"},
+		{wantNetB, "ort_runner_b_1234567890"},
+	} {
+		tokBytes, err := os.ReadFile(filepath.Join(cfgDir, "remotes", tc.netID, "runner.token"))
+		if err != nil {
+			t.Fatalf("missing isolated remote runner.token for %s: %v", tc.netID, err)
+		}
+		if strings.TrimSpace(string(tokBytes)) != tc.wantTok {
+			t.Fatalf("isolated token mismatch for %s: got %q want %q", tc.netID, strings.TrimSpace(string(tokBytes)), tc.wantTok)
+		}
+		if _, err := os.Stat(filepath.Join(cfgDir, "remotes", tc.netID, "runner.yaml")); err != nil {
+			t.Fatalf("missing isolated remote runner.yaml for %s: %v", tc.netID, err)
+		}
+	}
+
+	// Also verify resolveHubAuth picks up hubA's token when --hub=hubA.URL is passed!
+	_, _, _, tokA := resolveHubAuth(cfgDir, dataDir, hubA.URL, "")
+	if tokA != "ock_token_a_1234567890" {
+		t.Fatalf("resolveHubAuth for hubA returned %q, want ock_token_a_1234567890", tokA)
+	}
+
+	// Running `orbit init --hub --force` afterwards MUST preserve saved remote network profiles!
+	var initOut bytes.Buffer
+	if err := initHubMode(cfgDir, dataDir, "local-box", "Local WS", "127.0.0.1:4310", "", true, &initOut); err != nil {
+		t.Fatalf("initHubMode failed: %v", err)
+	}
+	rawAfterHub, err := os.ReadFile(filepath.Join(cfgDir, "client.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfgAfter cliClientConfig
+	if err := yaml.Unmarshal(rawAfterHub, &cfgAfter); err != nil {
+		t.Fatalf("parse client.yaml after initHubMode: %v", err)
+	}
+	if len(cfgAfter.Networks) != 3 {
+		t.Fatalf("initHubMode wiped remote profiles! expected 3 networks, got %d: %+v", len(cfgAfter.Networks), cfgAfter.Networks)
+	}
+	if cfgAfter.ActiveNetworkID != "local" {
+		t.Fatalf("expected activeNetworkId=local after initHubMode, got %q", cfgAfter.ActiveNetworkID)
+	}
+}
+
+func TestRunPA_QueuedFollowupTracksExactDispatchedAttemptAndHandlesDelete(t *testing.T) {
+	// Case 1: Queued PA follow-up polls GET /api/tasks/{taskId}/queue/{inputId} directly, so even if
+	// timeline has >500 events and omits queue.updated completely, it still resolves exact dispatchedAttemptId!
+	var pollCount int
+	srv1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/tasks/tsk_pa_q/followup":
+			_ = json.NewEncoder(w).Encode(protocol.FollowupTaskResponse{
+				Mode:         protocol.FollowupModeQueue,
+				PendingInput: &protocol.PendingInput{InputID: "inp_mine", State: protocol.PendingInputQueued},
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/api/tasks/tsk_pa_q/queue/inp_mine":
+			pollCount++
+			if pollCount == 1 {
+				_ = json.NewEncoder(w).Encode(protocol.PendingInput{
+					InputID: "inp_mine",
+					TaskID:  "tsk_pa_q",
+					State:   protocol.PendingInputQueued,
+				})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(protocol.PendingInput{
+				InputID:             "inp_mine",
+				TaskID:              "tsk_pa_q",
+				State:               protocol.PendingInputDispatched,
+				DispatchedAttemptID: "att_mine",
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/api/tasks/tsk_pa_q/timeline":
+			// Deliberately return empty Events (simulating >500 events pushing queue.updated off page)
+			_ = json.NewEncoder(w).Encode(protocol.TaskTimelineResponse{
+				Attempts: []protocol.AttemptView{
+					{AttemptID: "att_prev", State: protocol.AttemptSucceeded},
+					{AttemptID: "att_mine", State: protocol.AttemptSucceeded},
+					{AttemptID: "att_unrelated_later", State: protocol.AttemptSucceeded},
+				},
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/api/attempts/att_mine/raw":
+			_ = json.NewEncoder(w).Encode(protocol.AttemptRawEventsResponse{
+				AttemptID: "att_mine",
+				Events: []protocol.EventRecord{
+					{Seq: 1, Kind: protocol.EventACPMessageBatch, Payload: map[string]any{"text": "EXACT_MY_REPLY"}},
+				},
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/api/attempts/att_unrelated_later/raw":
+			_ = json.NewEncoder(w).Encode(protocol.AttemptRawEventsResponse{
+				AttemptID: "att_unrelated_later",
+				Events: []protocol.EventRecord{
+					{Seq: 1, Kind: protocol.EventACPMessageBatch, Payload: map[string]any{"text": "WRONG_UNRELATED_REPLY"}},
+				},
+			})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv1.Close()
+
+	var stdout, stderr bytes.Buffer
+	if err := runPA(context.Background(), []string{
+		"--task", "tsk_pa_q", "--hub", srv1.URL, "--timeout", "5", "my queued question",
+	}, &stdout, &stderr); err != nil {
+		t.Fatalf("runPA queued failed: %v", err)
+	}
+	if !strings.Contains(stdout.String(), "EXACT_MY_REPLY") || strings.Contains(stdout.String(), "WRONG_UNRELATED_REPLY") {
+		t.Fatalf("expected EXACT_MY_REPLY, got %q", stdout.String())
+	}
+
+	// Case 2: Queued PA input deleted before dispatch (404 on /queue/{inputId}) MUST fail cleanly with error
+	srv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/tasks/tsk_pa_del/followup":
+			_ = json.NewEncoder(w).Encode(protocol.FollowupTaskResponse{
+				Mode:         protocol.FollowupModeQueue,
+				PendingInput: &protocol.PendingInput{InputID: "inp_deleted", State: protocol.PendingInputQueued},
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/api/tasks/tsk_pa_del/queue/inp_deleted":
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"code":"ERR_NOT_FOUND","message":"pending input deleted"}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv2.Close()
+
+	stdout.Reset()
+	stderr.Reset()
+	err := runPA(context.Background(), []string{
+		"--task", "tsk_pa_del", "--hub", srv2.URL, "--timeout", "5", "will be deleted",
+	}, &stdout, &stderr)
+	if err == nil || !strings.Contains(err.Error(), "inp_deleted") {
+		t.Fatalf("expected explicit error for deleted queued PA input, got err=%v", err)
 	}
 }

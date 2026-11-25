@@ -134,24 +134,26 @@ function AgentRow({ machine, probe, canControl, showAdvanced, onRefreshDone }: A
     }
   };
 
-  // Clean v3.2 status copy: version only when ready (ZERO ms latency clutter).
   let statusNote = '';
   if (busy === 'install' || probe.state === 'installing') {
-    statusNote = '正在配置…';
+    statusNote = '正在安装 ACP 适配器…';
   } else if (busy === 'test' || probe.state === 'checking') {
-    statusNote = '检查中…';
+    statusNote = '验证连通性中…';
   } else if (probe.state === 'ready') {
-    statusNote = probe.bridgeVersion || '';
+    const modelCnt = probe.models?.length ?? 0;
+    const parts = [probe.bridgeVersion ? `v${probe.bridgeVersion.replace(/^v/i, '')}` : '已就绪'];
+    if (modelCnt > 0) parts.push(`${modelCnt} 个模型`);
+    statusNote = parts.join(' · ');
   } else if (probe.state === 'missing_bridge') {
-    statusNote = probe.hintCode === 'missing_npm' ? '需先安装 Node.js' : '未就绪';
+    statusNote = probe.hintCode === 'missing_npm' ? '已检测到 CLI，需先安装 Node.js' : '已检测到 CLI，缺少 ACP 适配器';
   } else if (probe.state === 'needs_login') {
-    statusNote = '未登录';
+    statusNote = '已安装，未登录';
   } else if (probe.state === 'disabled') {
     statusNote = '已停用';
   } else if (probe.state === 'error') {
     statusNote = probe.detail || '检查未通过';
   } else {
-    statusNote = '未安装';
+    statusNote = '未检测到本地 CLI';
   }
 
   return (
@@ -182,16 +184,28 @@ function AgentRow({ machine, probe, canControl, showAdvanced, onRefreshDone }: A
         <div className="ag-right">
           {probe.state === 'missing_bridge' && probe.hintCode !== 'missing_npm' && online && canControl && (
             <button type="button" className="btn pri sm" disabled={busy !== null} onClick={() => void runInstall()}>
-              {busy === 'install' ? '配置中…' : '一键配置'}
+              {busy === 'install' ? '安装中…' : '一键安装适配器'}
             </button>
           )}
           {probe.state === 'needs_login' && (
-            <button
-              type="button"
-              className="btn ghost sm"
-              onClick={() => void copyText(loginCommandFor(probe.adapter), '登录命令')}
-            >
-              <Copy size={11} strokeWidth={1.7} /> 复制登录命令
+            <>
+              <button
+                type="button"
+                className="btn ghost sm"
+                onClick={() => void copyText(loginCommandFor(probe.adapter), '登录命令')}
+              >
+                <Copy size={11} strokeWidth={1.7} /> 复制登录命令
+              </button>
+              {online && canControl && (
+                <button type="button" className="btn pri sm" disabled={busy !== null} onClick={() => void runTest()}>
+                  {busy === 'test' ? '检测中…' : '重新检测'}
+                </button>
+              )}
+            </>
+          )}
+          {probe.state === 'ready' && online && canControl && !showAdvanced && (
+            <button type="button" className="btn ghost sm" disabled={busy !== null} onClick={() => void runTest()}>
+              {busy === 'test' ? '验证中…' : '验证连通性'}
             </button>
           )}
           {probe.state === 'not_installed' && (

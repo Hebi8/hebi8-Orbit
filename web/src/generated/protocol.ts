@@ -245,6 +245,12 @@ export interface AgentTestResult {
   error?: string;
 }
 
+export interface AgentModeOption {
+  id: string;
+  name: string;
+  description?: string;
+}
+
 export interface AgentProbe {
   adapter: Adapter;
   state: AgentState;
@@ -257,6 +263,12 @@ export interface AgentProbe {
   detail?: string;
   defaultModel?: string;
   models?: string[];
+  defaultMode?: string;
+  modes?: AgentModeOption[];
+  modeViaLegacy?: boolean;
+  defaultEffort?: string;
+  efforts?: string[];
+  authChecked?: boolean;
   maxLiveWorkers?: number;
   lockedFields?: string[];
   lastTest?: AgentTestResult | null;
@@ -292,6 +304,7 @@ export interface SetupStatusView {
   readyAgents: number;
   onlineMachines: number;
   currentMachineId?: string;
+  currentClientId?: string;
   discoveryId?: string;
   dutyPriority?: string[];
   activeDutyMachineId?: string;
@@ -475,6 +488,13 @@ export interface FolderChangesSummary {
   promoted?: boolean;
 }
 
+export interface ReferencedTaskMeta {
+  taskId: string;
+  title: string;
+  projectId: string;
+  projectName?: string;
+}
+
 export interface AttemptView {
   attemptId: string;
   taskId: string;
@@ -487,6 +507,7 @@ export interface AttemptView {
   isolation?: LocationIsolation;
   triggerKind: TriggerKind;
   promptText?: string;
+  refTasks?: ReferencedTaskMeta[];
   worktreePath?: string;
   baseSha?: string;
   outputDeliveryId?: string;
@@ -829,10 +850,13 @@ export interface CreateTaskRequest {
   machineId?: string;
   partId?: string;
   locationId?: string;
+  useWorktree?: boolean | null;
+  referencedTaskIds?: string[];
   requiredCapability?: string;
   requiredResources?: string[];
   adapter?: Adapter;
   config?: Record<string, string>;
+  explicitFullPermission?: boolean;
   importDirtyWorkspace?: boolean;
   sources?: CreateTaskSourceInput[];
   idempotencyKey?: string;
@@ -860,10 +884,12 @@ export interface BindScratchTaskResponse {
 export interface FollowupTaskRequest {
   message: string;
   mode?: FollowupMode;
+  referencedTaskIds?: string[];
   requiredCapability?: string;
   requiredResources?: string[];
   adapter?: Adapter;
   config?: Record<string, string>;
+  explicitFullPermission?: boolean;
   verifiedSite?: boolean;
   verifiedAttemptId?: string;
 }
@@ -1071,6 +1097,41 @@ export interface ClaimAuthHandoffRequest {
 export interface ClaimAuthHandoffResponse {
   clientToken: string;
   machineId?: string;
+}
+
+export interface PairClientRequest {
+  code: string;
+  deviceName?: string;
+}
+
+export interface PairClientResponse {
+  clientToken: string;
+  tokenId: string;
+  deviceName: string;
+  workspaceName?: string;
+}
+
+export interface ClientDeviceView {
+  id: string;
+  name: string;
+  scope: string;
+  machineId?: string;
+  createdAt: number;
+  lastUsedAt?: number | null;
+  isCurrent?: boolean;
+}
+
+export interface ListClientsResponse {
+  clients: ClientDeviceView[];
+}
+
+export interface RevokeClientResponse {
+  clientId: string;
+  revoked: boolean;
+}
+
+export interface LogoutClientResponse {
+  loggedOut: boolean;
 }
 
 export interface ListMachinesResponse {
@@ -1385,6 +1446,7 @@ export interface AttemptDispatchFrame {
   baseSha?: string;
   defaultBranch?: string;
   desiredConfig?: Record<string, string>;
+  explicitFullPermission?: boolean;
   projectEnv?: Record<string, string>;
   systemPromptAppend?: string;
   inputDelivery?: InputDeliveryRef | null;

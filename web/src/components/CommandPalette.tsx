@@ -3,9 +3,11 @@ import { ArrowUpRight, FolderGit2, Layers, LayoutGrid, MessageSquare, Plus, SunM
 import type { BootstrapResponse, PABriefResponse, PAChatResponse } from '../generated/protocol';
 import { useManyProjectTasks } from '../hooks/queries';
 import {
+  PA_PROJECT_ID,
   SCRATCH_PROJECT_ID,
   displayMarkRank,
   indexInboxByTask,
+  isVirtualProject,
   relTime,
   rootSessionMark,
   taskTitle,
@@ -76,18 +78,20 @@ export function CommandPalette({ boot }: { boot: BootstrapResponse }) {
       const pn =
         t.projectId === SCRATCH_PROJECT_ID
           ? '自由 Chat'
-          : boot.projects.find((p) => p.projectId === t.projectId)?.displayName ?? t.projectId;
+          : t.projectId === PA_PROJECT_ID
+            ? 'PA'
+            : boot.projects.find((p) => p.projectId === t.projectId)?.displayName ?? t.projectId;
       list.push({
         key: `t:${t.taskId}`,
         group: k ? '线程' : '最近线程',
         label: `${pn} / ${taskTitle(t)}`,
         trail: mark ? <StatusMark mark={mark} /> : <span className="d">{relTime(t.updatedAt)}</span>,
-        run: () => go(paths.session(t.taskId)),
+        run: () => go(t.projectId === PA_PROJECT_ID ? paths.pa(t.taskId) : paths.session(t.taskId)),
       });
     }
 
     for (const p of boot.projects) {
-      if (p.projectId === SCRATCH_PROJECT_ID || p.archived) continue;
+      if (isVirtualProject(p.projectId) || p.archived) continue;
       if (!match(`${p.displayName} ${p.repoIdentity}`)) continue;
       list.push({
         key: `p:${p.projectId}`,

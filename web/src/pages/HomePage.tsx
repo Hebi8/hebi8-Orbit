@@ -6,6 +6,7 @@ import { PageHeader } from '../components/PageHeader';
 import { StatusMark } from '../components/StatusMark';
 import { useManyProjectTasks } from '../hooks/queries';
 import {
+  PA_PROJECT_ID,
   SCRATCH_PROJECT_ID,
   displayMarkRank,
   inboxItemsMark,
@@ -19,6 +20,7 @@ import { navigate, paths } from '../lib/router';
 
 export function projectName(projects: ProjectView[], pid: string): string {
   if (pid === SCRATCH_PROJECT_ID) return '对话';
+  if (pid === PA_PROJECT_ID) return 'PA';
   return projects.find((p) => p.projectId === pid)?.displayName ?? pid;
 }
 
@@ -116,7 +118,10 @@ function HomeRow({ row, projects }: { row: HomeRowItem; projects: ProjectView[] 
       type="button"
       className={`t-row ${toneClass}`}
       disabled={!row.taskId}
-      onClick={() => row.taskId && navigate(paths.session(row.taskId))}
+      onClick={() =>
+        row.taskId &&
+        navigate(row.projectId === PA_PROJECT_ID ? paths.pa(row.taskId) : paths.session(row.taskId))
+      }
     >
       <span className="t-title">{row.title}</span>
       <span className="t-proj">{projectName(projects, row.projectId)}</span>

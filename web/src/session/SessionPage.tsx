@@ -1,18 +1,19 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { ArrowLeft, Check, ChevronDown, Layers, Link2, MessageSquare } from 'lucide-react';
+import { ArrowLeft, Check, Layers, MessageSquare } from 'lucide-react';
 import type { BootstrapResponse } from '../generated/protocol';
 import { CardIcon, DiffIcon } from '../components/Icons';
 import { IdeOpenButton } from '../components/IdeOpenButton';
 import { PageHeader } from '../components/PageHeader';
 import { StatusMark } from '../components/StatusMark';
 import { useBoard, useTimeline } from '../hooks/queries';
-import { api, errMsg } from '../lib/api';
+import { errMsg } from '../lib/api';
 import { collectSessionArtifacts } from '../lib/artifacts';
 import {
+  PA_PROJECT_ID,
   SCRATCH_PROJECT_ID,
   artifactShortLabel,
   indexInboxByTask,
+  isVirtualProject,
   memberStateLabel,
   sessionMark,
   shortSha,
@@ -20,50 +21,12 @@ import {
 } from '../lib/format';
 import { resolveMachineSshAlias } from '../lib/ide';
 import { navigate, paths } from '../lib/router';
-import { toast, useWorkbenchStore } from '../store/useWorkbenchStore';
+import { useWorkbenchStore } from '../store/useWorkbenchStore';
 import { BoardPanel } from './BoardPanel';
 import { RightCard } from './RightCard';
 import { SessionConversation } from './SessionConversation';
 
 const CODE_KINDS = new Set(['code_diff', 'mixed', 'workspace_snapshot']);
-
-function BindMenu({ boot, taskId }: { boot: BootstrapResponse; taskId: string }) {
-  const qc = useQueryClient();
-  const [open, setOpen] = useState(false);
-  const projects = boot.projects.filter((p) => p.projectId !== SCRATCH_PROJECT_ID && !p.archived);
-  const bind = useMutation({
-    mutationFn: (pid: string) => api.bindProject(taskId, pid),
-    onSuccess: (res) => {
-      toast(`已绑定到 ${boot.projects.find((p) => p.projectId === res.toProjectId)?.displayName ?? res.toProjectId}`);
-      setOpen(false);
-      void qc.invalidateQueries({ queryKey: ['task-timeline', taskId] });
-      void qc.invalidateQueries({ queryKey: ['project-tasks'] });
-      void qc.invalidateQueries({ queryKey: ['bootstrap'] });
-    },
-    onError: (e) => toast(errMsg(e), 'err'),
-  });
-  return (
-    <div className="relpos bind-wrap" style={{ flex: 'none' }}>
-      <button type="button" className="bind-btn" onClick={() => setOpen(!open)}>
-        <Link2 size={11} strokeWidth={1.6} /> 绑定项目 <ChevronDown size={10} strokeWidth={1.6} />
-      </button>
-      {open && (
-        <>
-          <div className="scrim" style={{ background: 'transparent', backdropFilter: 'none', zIndex: 49 }} onClick={() => setOpen(false)} />
-          <div className="menu" style={{ top: 24, left: 0 }}>
-            <div className="mh">迁移为项目线程</div>
-            {projects.map((p) => (
-              <button type="button" key={p.projectId} disabled={bind.isPending} onClick={() => bind.mutate(p.projectId)}>
-                <span className="ell">{p.displayName}</span>
-              </button>
-            ))}
-            {projects.length === 0 && <div className="mh">还没有可绑定的项目</div>}
-          </div>
-        </>
-      )}
-    </div>
-  );
-}
 
 export function SessionPage({ boot, taskId, worker }: { boot: BootstrapResponse; taskId: string; worker?: string }) {
   const tlq = useTimeline(taskId);
@@ -71,6 +34,8 @@ export function SessionPage({ boot, taskId, worker }: { boot: BootstrapResponse;
   const task = tl?.task;
   const project = boot.projects.find((p) => p.projectId === task?.projectId);
   const isScratch = task?.projectId === SCRATCH_PROJECT_ID;
+  const isPA = task?.projectId === PA_PROJECT_ID;
+  const isVirtual = isVirtualProject(task?.projectId);
 
   const boardOpen = useWorkbenchStore((s) => s.boardOpen);
   const setBoardOpen = useWorkbenchStore((s) => s.setBoardOpen);
@@ -102,8 +67,8 @@ export function SessionPage({ boot, taskId, worker }: { boot: BootstrapResponse;
   }, [worker, setBoardOpen]);
 
   useEffect(() => {
-    if (task && !isScratch && expandedProjects[task.projectId] === undefined) setProjectExpanded(task.projectId, true);
-  }, [task, isScratch, expandedProjects, setProjectExpanded]);
+    if (task && !isVirtual && expandedProjects[task.projectId] === undefined) setProjectExpanded(task.projectId, true);
+  }, [task, isVirtual, expandedProjects, setProjectExpanded]);
 
   useEffect(() => {
     if (!artMenuOpen) return;
@@ -176,7 +141,7 @@ export function SessionPage({ boot, taskId, worker }: { boot: BootstrapResponse;
         className={!worker ? 'thead-session' : undefined}
         right={
           <>
-            {!worker && project && (
+            {!worker && project && !isVirtual && (
               <div className="no-mobile">
                 <IdeOpenButton project={project} delivery={latestCode} machines={boot.machines} />
               </div>
@@ -308,25 +273,37 @@ export function SessionPage({ boot, taskId, worker }: { boot: BootstrapResponse;
             </div>
             <div className="topbar-meta">
               {isScratch ? (
-                <>
-                  <span>对话</span>
-                  <BindMenu boot={boot} taskId={taskId} />
-                </>
+                <span>自由对话</span>
+              ) : isPA ? (
+                <button type="button" onClick={() => navigate(paths.pa(taskId))}>
+                  PA 助手
+                </button>
               ) : (
                 <>
                   <button type="button" onClick={() => project && navigate(paths.project(project.projectId))}>
                     {project?.displayName ?? task.projectId}
                   </button>
-                  {hostLabel && (
+                  {lastAttempt?.isolation === 'worktree' ? (
                     <>
                       <span className="topbar-meta-dot">·</span>
-                      <span className="mono">{hostLabel}</span>
+                      <span>Worktree</span>
                     </>
-                  )}
+                  ) : !isPlainFolderTask ? (
+                    <>
+                      <span className="topbar-meta-dot">·</span>
+                      <span>目录同步</span>
+                    </>
+                  ) : null}
                   {gitMeta && (
                     <>
                       <span className="topbar-meta-dot">·</span>
                       <span className="mono">{gitMeta}</span>
+                    </>
+                  )}
+                  {hostLabel && boot.machines.filter((m) => m.transportMode !== 'ssh_outbound').length > 1 && (
+                    <>
+                      <span className="topbar-meta-dot">·</span>
+                      <span className="mono faint">{hostLabel}</span>
                     </>
                   )}
                 </>

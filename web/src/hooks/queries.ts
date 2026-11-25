@@ -15,6 +15,30 @@ export function useNetworkSettings(enabled = true) {
   });
 }
 
+export function useClientDevices(enabled = true) {
+  return useQuery({
+    queryKey: ['client-devices'],
+    queryFn: api.listClients,
+    enabled,
+    staleTime: 15_000,
+  });
+}
+
+export function useAllTasks(opts?: { limit?: number; excludeProject?: string; q?: string; enabled?: boolean }) {
+  const trimmedQ = opts?.q?.trim() ?? '';
+  return useQuery({
+    queryKey: ['all-tasks', opts?.excludeProject ?? '', opts?.limit ?? 80, trimmedQ],
+    queryFn: () =>
+      api.listAllTasks({
+        limit: opts?.limit,
+        excludeProject: opts?.excludeProject,
+        q: trimmedQ || undefined,
+      }),
+    enabled: opts?.enabled ?? true,
+    staleTime: 10_000,
+  });
+}
+
 export function useGlobalArtifacts(enabled = true) {
   return useQuery({
     queryKey: ['global-artifacts'],

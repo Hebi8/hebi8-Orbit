@@ -30,14 +30,14 @@ func TestV6MigrationAndThreeLevelProjects(t *testing.T) {
 				DefaultCapability: "primary-dev",
 				DefaultAdapter:    protocol.AdapterAgy,
 				Anchors: map[string]protocol.ProjectAnchorConfig{
-					"primary-dev": {Machine: "devNuc", RepoPath: "/srv/dev/hebi8-Orbit"},
+					"primary-dev": {Machine: "dev-node", RepoPath: "/srv/dev/hebi8-Orbit"},
 				},
 			},
 		},
 	}, protocol.MachinesConfig{
 		Machines: map[string]protocol.MachineConfig{
-			"devNuc": {
-				DisplayName:  "devNuc",
+			"dev-node": {
+				DisplayName:  "dev-node",
 				Transport:    protocol.TransportLocalWS,
 				Capabilities: []string{"primary-dev"},
 			},
@@ -120,14 +120,14 @@ func TestV6MigrationAndThreeLevelProjects(t *testing.T) {
 	}
 
 	// Dismiss suggestion & verify
-	if err := st.DismissProjectSuggestion(ctx, "orbit", proj.Parts[0].PartID, "homeN100", "/srv/n100/orbit"); err != nil {
+	if err := st.DismissProjectSuggestion(ctx, "orbit", proj.Parts[0].PartID, "home-node", "/srv/home-node/orbit"); err != nil {
 		t.Fatalf("dismiss suggestion: %v", err)
 	}
 	dismissed, err := st.ListDismissedSuggestions(ctx, "orbit")
 	if err != nil {
 		t.Fatalf("list dismissed: %v", err)
 	}
-	if !dismissed[proj.Parts[0].PartID+"|homeN100|/srv/n100/orbit"] {
+	if !dismissed[proj.Parts[0].PartID+"|home-node|/srv/home-node/orbit"] {
 		t.Fatalf("expected dismissed key present, got %+v", dismissed)
 	}
 
@@ -166,7 +166,7 @@ func TestV6MigrationAndThreeLevelProjects(t *testing.T) {
 	taskRes, err := st.CreateTask(ctx, CreateTaskParams{
 		ProjectID:     "orbit",
 		Goal:          "Draft copy",
-		MachineID:     "devNuc",
+		MachineID:     "dev-node",
 		PartID:        part2.PartID,
 		LocationID:    part2.Locations[0].LocationID,
 		Isolation:     protocol.IsolationInPlace,

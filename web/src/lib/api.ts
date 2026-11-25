@@ -7,6 +7,7 @@ import type {
   BootstrapResponse,
   CancelTaskResponse,
   ClaimAuthHandoffResponse,
+  ClientDeviceView,
   CompleteOnboardingRequest,
   CompleteOnboardingResponse,
   CompleteReviewResponse,
@@ -33,8 +34,10 @@ import type {
   FollowupTaskResponse,
   GlobalArtifactView,
   ListArtifactsResponse,
+  ListClientsResponse,
   ListDirsResponse,
   ListMachinesResponse,
+  LogoutClientResponse,
   MachineAgentActionResponse,
   NetworkDiscoverResponse,
   NetworkSettingsView,
@@ -45,6 +48,7 @@ import type {
   PAStateView,
   PAThread,
   PAThreadDetailResponse,
+  PairClientResponse,
   PairingCodeStatusResponse,
   PendingInput,
   PostBoardMessageRequest,
@@ -55,6 +59,7 @@ import type {
   PromoteFolderChangesResponse,
   RetryTaskRequest,
   RetryTaskResponse,
+  RevokeClientResponse,
   RyugiSyncResponse,
   TailscaleDisableResponse,
   TailscaleEnableRequest,
@@ -74,6 +79,42 @@ import type {
 
 const DEV_TOKEN_KEY = 'orbit.devToken';
 const CLIENT_TOKEN_KEY = 'orbit.clientToken';
+const DESKTOP_FLAG_KEY = 'orbit.desktopShell';
+
+export function detectAndRememberDesktopShell(): boolean {
+  try {
+    const sp = new URLSearchParams(window.location.search);
+    if (sp.get('orbitDesktop') === '1') {
+      sessionStorage.setItem(DESKTOP_FLAG_KEY, '1');
+      // Strip query param cleanly without reloading
+      sp.delete('orbitDesktop');
+      const rest = sp.toString();
+      const nextURL = window.location.pathname + (rest ? `?${rest}` : '') + window.location.hash;
+      window.history.replaceState(null, '', nextURL);
+      return true;
+    }
+    return sessionStorage.getItem(DESKTOP_FLAG_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
+
+export function isDesktopShell(): boolean {
+  try {
+    return sessionStorage.getItem(DESKTOP_FLAG_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
+
+export function openDesktopSetup(target?: { origin?: string; hostName?: string; discoveryId?: string }) {
+  const q = new URLSearchParams();
+  if (target?.origin) q.set('origin', target.origin);
+  if (target?.hostName) q.set('host', target.hostName);
+  if (target?.discoveryId) q.set('discoveryId', target.discoveryId);
+  const qs = q.toString();
+  window.location.href = qs ? `orbit-desktop://setup?${qs}` : 'orbit-desktop://setup';
+}
 
 export function getStoredDevToken(): string {
   try {
@@ -187,6 +228,16 @@ export const api = {
 
   bootstrap(): Promise<BootstrapResponse> {
     return apiFetch<BootstrapResponse>('/api/bootstrap');
+  },
+
+  async listAllTasks(opts?: { limit?: number; excludeProject?: string; q?: string }): Promise<TaskSummary[]> {
+    const q = new URLSearchParams();
+    if (opts?.limit) q.set('limit', String(opts.limit));
+    if (opts?.excludeProject) q.set('excludeProject', opts.excludeProject);
+    if (opts?.q && opts.q.trim()) q.set('q', opts.q.trim());
+    const qs = q.toString();
+    const res = await apiFetch<{ tasks: TaskSummary[] }>(`/api/tasks${qs ? `?${qs}` : ''}`);
+    return res.tasks ?? [];
   },
 
   async listProjectTasks(projectId: string): Promise<TaskSummary[]> {
@@ -443,6 +494,31 @@ export const api = {
     return apiFetch<ClaimAuthHandoffResponse>('/api/auth/handoff/claim', {
       method: 'POST',
       json: { code },
+    });
+  },
+
+  pairClient(code: string, deviceName?: string): Promise<PairClientResponse> {
+    return apiFetch<PairClientResponse>('/api/auth/pair-client', {
+      method: 'POST',
+      json: { code, deviceName: deviceName?.trim() || undefined },
+    });
+  },
+
+  async listClients(): Promise<ClientDeviceView[]> {
+    const res = await apiFetch<ListClientsResponse>('/api/clients');
+    return res.clients ?? [];
+  },
+
+  revokeClient(clientId: string): Promise<RevokeClientResponse> {
+    return apiFetch<RevokeClientResponse>(`/api/clients/${enc(clientId)}`, {
+      method: 'DELETE',
+    });
+  },
+
+  logoutClient(): Promise<LogoutClientResponse> {
+    return apiFetch<LogoutClientResponse>('/api/auth/logout', {
+      method: 'POST',
+      json: {},
     });
   },
 

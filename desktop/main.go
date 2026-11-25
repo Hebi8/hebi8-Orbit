@@ -9,6 +9,9 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -98,7 +101,7 @@ func main() {
 					setHubState(hubURL, "local")
 					cfg.HubURL = hubURL
 					cfg.Mode = "local"
-					initialURL = runtimeMgr.BuildOpenURL(context.Background(), *configDir, getHubURL(), "")
+					initialURL = runtimeMgr.BuildDesktopOpenURL(context.Background(), *configDir, getHubURL(), "")
 				} else if sErr != nil {
 					log.Printf("orbit-client: auto-start local hub unavailable (%v); showing setup screen", sErr)
 				}
@@ -119,7 +122,7 @@ func main() {
 					}
 				}
 			}
-			initialURL = runtimeMgr.BuildOpenURL(context.Background(), *configDir, getHubURL(), "")
+			initialURL = runtimeMgr.BuildDesktopOpenURL(context.Background(), *configDir, getHubURL(), "")
 		}
 	}
 
@@ -154,7 +157,11 @@ func main() {
 		page.OnWillNavigate(func(e *mygo.NavigateEvent) {
 			if strings.HasPrefix(e.URL, "orbit-desktop://setup") {
 				e.PreventDefault()
-				_ = page.LoadURL(setupOrigin + "/")
+				target := setupOrigin + "/"
+				if u, pErr := url.Parse(e.URL); pErr == nil && u.RawQuery != "" {
+					target = setupOrigin + "/?" + u.RawQuery
+				}
+				_ = page.LoadURL(target)
 				return
 			}
 			if ShouldOpenExternally(e.URL, getHubURL(), setupOrigin) {
@@ -212,7 +219,7 @@ func main() {
 		if !hasVisibleWindows {
 			hub := getHubURL()
 			if hub != "" {
-				openMainWindow(runtimeMgr.BuildOpenURL(context.Background(), *configDir, hub, ""))
+				openMainWindow(runtimeMgr.BuildDesktopOpenURL(context.Background(), *configDir, hub, ""))
 			} else {
 				openMainWindow(setupOrigin + "/")
 			}
@@ -365,6 +372,99 @@ func startSetupServer(
 			"mode":   getMode(),
 		})
 	})
+	mux.HandleFunc("GET /api/networks", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		cfg, _ := LoadClientConfig(configDir, "")
+		expDir := configDir
+		if expDir == "" {
+			expDir = defaultConfigDir()
+		}
+		expDir = expandHome(expDir)
+		// Surface existing local workspace in the saved networks list even if user joined a remote Hub first.
+		hasLocal := false
+		for _, n := range cfg.Networks {
+			if n.ID == "local" || n.Mode == "local" {
+				hasLocal = true
+				break
+			}
+		}
+		if !hasLocal {
+			if _, statErr := os.Stat(filepath.Join(expDir, "hub.yaml")); statErr == nil {
+				cfg.Networks = append([]NetworkProfile{{
+					ID:     "local",
+					Name:   "本机工作区",
+					Mode:   "local",
+					HubURL: "http://127.0.0.1:4310",
+				}}, cfg.Networks...)
+			}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"activeNetworkId": cfg.ActiveNetworkID,
+			"hubUrl":          getHubURL(),
+			"mode":            getMode(),
+			"networks":        cfg.Networks,
+		})
+	})
+	mux.HandleFunc("GET /api/local-agents", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"agents": ProbeLocalAgentsSummary(),
+		})
+	})
+	mux.HandleFunc("POST /api/switch", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if !checkSetupOrigin(w, r) {
+			return
+		}
+		var body struct {
+			NetworkID string `json:"networkId"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || strings.TrimSpace(body.NetworkID) == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "请指定要切换的网络"})
+			return
+		}
+		prof, err := runtimeMgr.SwitchNetwork(r.Context(), configDir, strings.TrimSpace(body.NetworkID))
+		if err != nil {
+			w.WriteHeader(http.StatusBadGateway)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		onSaved(prof.HubURL, prof.Mode)
+		openURL := runtimeMgr.BuildDesktopOpenURL(r.Context(), configDir, prof.HubURL, "")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"networkId": prof.ID,
+			"hubUrl":    prof.HubURL,
+			"mode":      prof.Mode,
+			"openUrl":   openURL,
+		})
+	})
+	mux.HandleFunc("POST /api/remove-network", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if !checkSetupOrigin(w, r) {
+			return
+		}
+		var body struct {
+			NetworkID string `json:"networkId"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || strings.TrimSpace(body.NetworkID) == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "无效的网络 ID"})
+			return
+		}
+		cfg, err := runtimeMgr.RemoveNetwork(configDir, strings.TrimSpace(body.NetworkID))
+		if err != nil {
+			status := http.StatusInternalServerError
+			if strings.Contains(err.Error(), "无法移除") {
+				status = http.StatusBadRequest
+			}
+			w.WriteHeader(status)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		onSaved(cfg.HubURL, cfg.Mode)
+		_ = json.NewEncoder(w).Encode(map[string]any{"removed": true, "networks": cfg.Networks})
+	})
 	mux.HandleFunc("GET /api/discover", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		res := DiscoverNetworks(r.Context(), true, 4000*time.Millisecond)
@@ -390,7 +490,7 @@ func startSetupServer(
 			return
 		}
 		onSaved(hubURL, "local")
-		openURL := runtimeMgr.BuildOpenURL(r.Context(), configDir, hubURL, "")
+		openURL := runtimeMgr.BuildDesktopOpenURL(r.Context(), configDir, hubURL, "")
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"hubUrl":    hubURL,
 			"openUrl":   openURL,
@@ -419,7 +519,7 @@ func startSetupServer(
 			return
 		}
 		onSaved(res.HubURL, "remote")
-		openURL := runtimeMgr.BuildOpenURL(r.Context(), configDir, res.HubURL, "")
+		openURL := runtimeMgr.BuildDesktopOpenURL(r.Context(), configDir, res.HubURL, "")
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"hubUrl":          res.HubURL,
 			"openUrl":         openURL,
@@ -449,7 +549,7 @@ func startSetupServer(
 			return
 		}
 		onSaved(res.HubURL, "remote")
-		openURL := runtimeMgr.BuildOpenURL(r.Context(), configDir, res.HubURL, "")
+		openURL := runtimeMgr.BuildDesktopOpenURL(r.Context(), configDir, res.HubURL, "")
 		_ = json.NewEncoder(w).Encode(map[string]string{"hubUrl": res.HubURL, "openUrl": openURL})
 	})
 

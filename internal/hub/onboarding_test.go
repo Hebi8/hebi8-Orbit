@@ -9,7 +9,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -335,6 +337,116 @@ func TestPairingRateLimitAndAuthHandoff(t *testing.T) {
 	}
 }
 
+func TestBrowserPairClientAndDeviceManagement(t *testing.T) {
+	_, ts, _, _ := newOnboardingTestServer(t, false)
+	devHdrs := map[string]string{
+		"X-Orbit-Dev-Token": "test-dev-token-secret",
+		"X-Orbit-Request":   "1",
+	}
+
+	// Count machines before browser pairing
+	mBeforeResp := doOnbJSONReq(t, ts, http.MethodGet, "/api/machines", nil, devHdrs)
+	defer mBeforeResp.Body.Close()
+	var mBefore protocol.ListMachinesResponse
+	if err := json.NewDecoder(mBeforeResp.Body).Decode(&mBefore); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create client-only pairing code
+	codeResp := doOnbJSONReq(t, ts, http.MethodPost, "/api/pairing/codes", protocol.CreatePairingCodeRequest{
+		Scope: protocol.PairingScopeClient,
+	}, devHdrs)
+	defer codeResp.Body.Close()
+	if codeResp.StatusCode != http.StatusCreated {
+		t.Fatalf("create code status=%d", codeResp.StatusCode)
+	}
+	var created protocol.CreatePairingCodeResponse
+	if err := json.NewDecoder(codeResp.Body).Decode(&created); err != nil {
+		t.Fatal(err)
+	}
+
+	// Cross-origin pair-client MUST be rejected
+	badOrig := doOnbJSONReq(t, ts, http.MethodPost, "/api/auth/pair-client", protocol.PairClientRequest{
+		Code:       created.Code,
+		DeviceName: "Evil Browser",
+	}, map[string]string{
+		"Origin":          "https://evil.example.com",
+		"X-Orbit-Request": "1",
+	})
+	badOrig.Body.Close()
+	if badOrig.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 for cross-origin pair-client, got %d", badOrig.StatusCode)
+	}
+
+	// Same-origin browser pair-client succeeds and returns ock_ client token
+	pairResp := doOnbJSONReq(t, ts, http.MethodPost, "/api/auth/pair-client", protocol.PairClientRequest{
+		Code:       created.Code,
+		DeviceName: "My MacBook Chrome",
+	}, map[string]string{
+		"Origin":          "https://orbit.example.ts.net",
+		"X-Orbit-Request": "1",
+	})
+	defer pairResp.Body.Close()
+	if pairResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 on pair-client, got %d", pairResp.StatusCode)
+	}
+	var paired protocol.PairClientResponse
+	if err := json.NewDecoder(pairResp.Body).Decode(&paired); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(paired.ClientToken, "ock_") || paired.TokenID == "" || paired.DeviceName != "My MacBook Chrome" {
+		t.Fatalf("unexpected pair-client response: %+v", paired)
+	}
+
+	// Browser pairing MUST NOT register a runner/host machine
+	mAfterResp := doOnbJSONReq(t, ts, http.MethodGet, "/api/machines", nil, devHdrs)
+	defer mAfterResp.Body.Close()
+	var mAfter protocol.ListMachinesResponse
+	if err := json.NewDecoder(mAfterResp.Body).Decode(&mAfter); err != nil {
+		t.Fatal(err)
+	}
+	if len(mAfter.Machines) != len(mBefore.Machines) {
+		t.Fatalf("pair-client should not create execution machines: before=%d after=%d", len(mBefore.Machines), len(mAfter.Machines))
+	}
+
+	// Paired browser can access /api/clients and sees itself marked as isCurrent=true
+	clientHdrs := map[string]string{
+		"Authorization":   "Bearer " + paired.ClientToken,
+		"Origin":          "https://orbit.example.ts.net",
+		"X-Orbit-Request": "1",
+	}
+	cliResp := doOnbJSONReq(t, ts, http.MethodGet, "/api/clients", nil, clientHdrs)
+	defer cliResp.Body.Close()
+	if cliResp.StatusCode != http.StatusOK {
+		t.Fatalf("list clients status=%d", cliResp.StatusCode)
+	}
+	var cliList protocol.ListClientsResponse
+	if err := json.NewDecoder(cliResp.Body).Decode(&cliList); err != nil {
+		t.Fatal(err)
+	}
+	foundCurrent := false
+	for _, c := range cliList.Clients {
+		if c.ID == paired.TokenID && c.IsCurrent && c.Name == "My MacBook Chrome" {
+			foundCurrent = true
+		}
+	}
+	if !foundCurrent {
+		t.Fatalf("expected paired client %s with isCurrent=true in %+v", paired.TokenID, cliList.Clients)
+	}
+
+	// Logout immediately invalidates the client's own token
+	logoutResp := doOnbJSONReq(t, ts, http.MethodPost, "/api/auth/logout", map[string]any{}, clientHdrs)
+	logoutResp.Body.Close()
+	if logoutResp.StatusCode != http.StatusOK {
+		t.Fatalf("logout status=%d", logoutResp.StatusCode)
+	}
+	afterLogout := doOnbJSONReq(t, ts, http.MethodGet, "/api/bootstrap", nil, clientHdrs)
+	afterLogout.Body.Close()
+	if afterLogout.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 after logout, got %d", afterLogout.StatusCode)
+	}
+}
+
 func TestDynamicProjectAndOnboardingFlow(t *testing.T) {
 	_, ts, _, _ := newOnboardingTestServer(t, true)
 	devHdrs := map[string]string{
@@ -513,5 +625,570 @@ func TestCodexReviewInvariants(t *testing.T) {
 	hoClaim.Body.Close()
 	if hoClaim.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("expected 401 claiming handoff after machine delete, got %d", hoClaim.StatusCode)
+	}
+}
+
+func TestClientTokenRevocationDisconnectsWSAndInvalidatesWSTickets(t *testing.T) {
+	_, ts, _, _ := newOnboardingTestServer(t, true)
+	devHdrs := map[string]string{
+		"X-Orbit-Dev-Token": "test-dev-token-secret",
+		"X-Orbit-Request":   "1",
+	}
+
+	pairClient := func(name string) protocol.PairClientResponse {
+		t.Helper()
+		cResp := doOnbJSONReq(t, ts, http.MethodPost, "/api/pairing/codes", protocol.CreatePairingCodeRequest{
+			Scope: protocol.PairingScopeClient,
+		}, devHdrs)
+		defer cResp.Body.Close()
+		if cResp.StatusCode != http.StatusCreated {
+			t.Fatalf("create client pairing code status=%d", cResp.StatusCode)
+		}
+		var created protocol.CreatePairingCodeResponse
+		if err := json.NewDecoder(cResp.Body).Decode(&created); err != nil {
+			t.Fatal(err)
+		}
+		pResp := doOnbJSONReq(t, ts, http.MethodPost, "/api/auth/pair-client", protocol.PairClientRequest{
+			Code:       created.Code,
+			DeviceName: name,
+		}, map[string]string{"X-Orbit-Request": "1"})
+		defer pResp.Body.Close()
+		if pResp.StatusCode != http.StatusOK {
+			t.Fatalf("pair-client status=%d", pResp.StatusCode)
+		}
+		var paired protocol.PairClientResponse
+		if err := json.NewDecoder(pResp.Body).Decode(&paired); err != nil {
+			t.Fatal(err)
+		}
+		return paired
+	}
+
+	issueTicket := func(clientToken string) string {
+		t.Helper()
+		resp := doOnbJSONReq(t, ts, http.MethodPost, "/api/ws-ticket", nil, map[string]string{
+			"Authorization":   "Bearer " + clientToken,
+			"X-Orbit-Request": "1",
+		})
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("ws-ticket status=%d", resp.StatusCode)
+		}
+		var out protocol.WSTicketResponse
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			t.Fatal(err)
+		}
+		return out.Ticket
+	}
+
+	wsBase := "ws" + strings.TrimPrefix(ts.URL, "http")
+
+	// Case 1: DELETE /api/clients/{clientId} immediately disconnects active /ws/client AND invalidates unconsumed tickets.
+	paired1 := pairClient("laptop-browser")
+	ticketLive := issueTicket(paired1.ClientToken)
+	ticketUnused := issueTicket(paired1.ClientToken)
+
+	dialCtx, dialCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer dialCancel()
+	ws1, _, err := websocket.Dial(dialCtx, wsBase+"/ws/client?ticket="+ticketLive, nil)
+	if err != nil {
+		t.Fatalf("dial /ws/client with ticketLive failed: %v", err)
+	}
+	defer ws1.CloseNow()
+
+	// Drain until replay_end so we know the connection is fully registered and streaming.
+	readReplayEnd := func(conn *websocket.Conn) {
+		t.Helper()
+		rctx, rcancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer rcancel()
+		for {
+			_, data, err := conn.Read(rctx)
+			if err != nil {
+				t.Fatalf("reading replay_end: %v", err)
+			}
+			var msg protocol.WSServerMessage
+			if err := json.Unmarshal(data, &msg); err == nil && msg.Type == protocol.WSMessageReplayEnd {
+				return
+			}
+		}
+	}
+	readReplayEnd(ws1)
+
+	// Revoke client token via DELETE /api/clients/{clientId}
+	revResp := doOnbJSONReq(t, ts, http.MethodDelete, "/api/clients/"+paired1.TokenID, nil, devHdrs)
+	revResp.Body.Close()
+	if revResp.StatusCode != http.StatusOK {
+		t.Fatalf("DELETE /api/clients/%s status=%d", paired1.TokenID, revResp.StatusCode)
+	}
+
+	// Active WS MUST be disconnected immediately by server.
+	closeCtx, closeCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer closeCancel()
+	if _, _, readErr := ws1.Read(closeCtx); readErr == nil {
+		t.Fatalf("expected active /ws/client connection to be closed immediately after revoke")
+	}
+
+	// Unconsumed ticket issued BEFORE revocation MUST be rejected on /ws/client.
+	_, httpResp, dialErr := websocket.Dial(dialCtx, wsBase+"/ws/client?ticket="+ticketUnused, nil)
+	if dialErr == nil {
+		t.Fatalf("expected /ws/client dial with revoked pre-issued ticket to fail")
+	}
+	if httpResp != nil && httpResp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for revoked ticket, got %d", httpResp.StatusCode)
+	}
+
+	// Case 2: POST /api/auth/logout also immediately disconnects active /ws/client AND invalidates unconsumed tickets.
+	paired2 := pairClient("phone-browser")
+	ticketLive2 := issueTicket(paired2.ClientToken)
+	ticketUnused2 := issueTicket(paired2.ClientToken)
+
+	ws2, _, err := websocket.Dial(dialCtx, wsBase+"/ws/client?ticket="+ticketLive2, nil)
+	if err != nil {
+		t.Fatalf("dial ws2 failed: %v", err)
+	}
+	defer ws2.CloseNow()
+	readReplayEnd(ws2)
+
+	outResp := doOnbJSONReq(t, ts, http.MethodPost, "/api/auth/logout", nil, map[string]string{
+		"Authorization":   "Bearer " + paired2.ClientToken,
+		"X-Orbit-Request": "1",
+	})
+	outResp.Body.Close()
+	if outResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /api/auth/logout status=%d", outResp.StatusCode)
+	}
+
+	closeCtx2, closeCancel2 := context.WithTimeout(context.Background(), 2*time.Second)
+	defer closeCancel2()
+	if _, _, readErr := ws2.Read(closeCtx2); readErr == nil {
+		t.Fatalf("expected active /ws/client connection to close immediately after logout")
+	}
+	_, httpResp2, dialErr2 := websocket.Dial(dialCtx, wsBase+"/ws/client?ticket="+ticketUnused2, nil)
+	if dialErr2 == nil {
+		t.Fatalf("expected /ws/client dial with pre-logout ticket to fail")
+	}
+	if httpResp2 != nil && httpResp2.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for pre-logout ticket, got %d", httpResp2.StatusCode)
+	}
+}
+
+func TestDeletePairedMachineDisconnectsClientWSAndInvalidatesTicket(t *testing.T) {
+	_, ts, _, _ := newOnboardingTestServer(t, true)
+	devHdrs := map[string]string{
+		"X-Orbit-Dev-Token": "test-dev-token-secret",
+		"X-Orbit-Request":   "1",
+	}
+
+	// 1. Issue pairing code and claim BOTH runner + client tokens for a paired machine
+	codeResp := doOnbJSONReq(t, ts, http.MethodPost, "/api/pairing/codes", protocol.CreatePairingCodeRequest{
+		Scope: protocol.PairingScopeBoth,
+	}, devHdrs)
+	var created protocol.CreatePairingCodeResponse
+	if err := json.NewDecoder(codeResp.Body).Decode(&created); err != nil {
+		t.Fatal(err)
+	}
+	codeResp.Body.Close()
+
+	claimResp := doOnbJSONReq(t, ts, http.MethodPost, "/api/pairing/claim", protocol.ClaimPairingRequest{
+		Code:       created.Code,
+		WantRunner: true,
+		WantClient: true,
+		Machine: &protocol.ClaimMachineInfo{
+			ProposedID:  "paired-ws-node",
+			DisplayName: "Paired WS Node",
+			OS:          "linux",
+			Arch:        "amd64",
+		},
+	}, map[string]string{"X-Orbit-Request": "1"})
+	var claimed protocol.ClaimPairingResponse
+	if err := json.NewDecoder(claimResp.Body).Decode(&claimed); err != nil {
+		t.Fatal(err)
+	}
+	claimResp.Body.Close()
+	if claimResp.StatusCode != http.StatusOK || claimed.ClientToken == "" || claimed.MachineID == "" {
+		t.Fatalf("claim failed: status=%d resp=%+v", claimResp.StatusCode, claimed)
+	}
+
+	issueTicket := func(clientToken string) string {
+		t.Helper()
+		resp := doOnbJSONReq(t, ts, http.MethodPost, "/api/ws-ticket", nil, map[string]string{
+			"Authorization":   "Bearer " + clientToken,
+			"X-Orbit-Request": "1",
+		})
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("POST /api/ws-ticket status=%d", resp.StatusCode)
+		}
+		var out protocol.WSTicketResponse
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			t.Fatal(err)
+		}
+		return out.Ticket
+	}
+
+	ticketLive := issueTicket(claimed.ClientToken)
+	ticketUnused := issueTicket(claimed.ClientToken)
+
+	wsBase := "ws" + strings.TrimPrefix(ts.URL, "http")
+	dialCtx, dialCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer dialCancel()
+
+	wsConn, _, err := websocket.Dial(dialCtx, wsBase+"/ws/client?ticket="+ticketLive, nil)
+	if err != nil {
+		t.Fatalf("dial /ws/client failed: %v", err)
+	}
+	defer wsConn.CloseNow()
+
+	// Wait until replay_end so connection is registered in hub client registry
+	rctx, rcancel := context.WithTimeout(context.Background(), 3*time.Second)
+	for {
+		_, data, err := wsConn.Read(rctx)
+		if err != nil {
+			rcancel()
+			t.Fatalf("reading replay_end: %v", err)
+		}
+		var msg protocol.WSServerMessage
+		if json.Unmarshal(data, &msg) == nil && msg.Type == protocol.WSMessageReplayEnd {
+			break
+		}
+	}
+	rcancel()
+
+	// 2. DELETE /api/machines/{machineId} MUST immediately close the paired client's active WS with 1008
+	//    AND invalidate any unconsumed WS ticket issued before deletion!
+	delResp := doOnbJSONReq(t, ts, http.MethodDelete, "/api/machines/"+claimed.MachineID, nil, devHdrs)
+	delResp.Body.Close()
+	if delResp.StatusCode != http.StatusOK {
+		t.Fatalf("DELETE /api/machines/%s status=%d", claimed.MachineID, delResp.StatusCode)
+	}
+
+	closeCtx, closeCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer closeCancel()
+	_, _, readErr := wsConn.Read(closeCtx)
+	if readErr == nil {
+		t.Fatalf("expected active /ws/client to disconnect immediately on machine deletion")
+	}
+	if status := websocket.CloseStatus(readErr); status != websocket.StatusPolicyViolation {
+		t.Fatalf("expected close status 1008 (StatusPolicyViolation), got %v (err=%v)", status, readErr)
+	}
+
+	_, httpResp, dialErr := websocket.Dial(dialCtx, wsBase+"/ws/client?ticket="+ticketUnused, nil)
+	if dialErr == nil {
+		t.Fatalf("expected unused pre-deletion ticket to fail /ws/client dial")
+	}
+	if httpResp != nil && httpResp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for pre-deletion ticket, got %d", httpResp.StatusCode)
+	}
+}
+
+func TestRevokeClientWSSyncCancelsAndAbortsReplay(t *testing.T) {
+	_, ts, _, dataDir := newOnboardingTestServer(t, true)
+	ctx := context.Background()
+	st, err := store.Open(ctx, dataDir+"/orbit.sqlite")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	devHdrs := map[string]string{
+		"X-Orbit-Dev-Token": "test-dev-token-secret",
+		"X-Orbit-Request":   "1",
+	}
+
+	// Seed 400 timeline events so /ws/client?sinceSeq=0 requires multiple paginated replay batches
+	tx, err := st.WriteDB().BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= 400; i++ {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO events (event_id, stream_id, project_id, actor_kind, actor_id, kind, visibility, payload_json, created_at)
+			VALUES (?, 'global', '_scratch', 'system', 'test', 'machine.state_changed', 'timeline', '{}', ?)
+		`, "evt_replay_abort_"+strings.Repeat("0", 4-len(strconv.Itoa(i)))+strconv.Itoa(i), int64(1700000000000+i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Pair a client
+	codeResp := doOnbJSONReq(t, ts, http.MethodPost, "/api/pairing/codes", protocol.CreatePairingCodeRequest{
+		Scope: protocol.PairingScopeClient,
+	}, devHdrs)
+	var created protocol.CreatePairingCodeResponse
+	_ = json.NewDecoder(codeResp.Body).Decode(&created)
+	codeResp.Body.Close()
+
+	pairResp := doOnbJSONReq(t, ts, http.MethodPost, "/api/auth/pair-client", protocol.PairClientRequest{
+		Code:       created.Code,
+		DeviceName: "replay-abort-client",
+	}, map[string]string{"X-Orbit-Request": "1"})
+	var paired protocol.PairClientResponse
+	_ = json.NewDecoder(pairResp.Body).Decode(&paired)
+	pairResp.Body.Close()
+
+	tResp := doOnbJSONReq(t, ts, http.MethodPost, "/api/ws-ticket", nil, map[string]string{
+		"Authorization":   "Bearer " + paired.ClientToken,
+		"X-Orbit-Request": "1",
+	})
+	var tick protocol.WSTicketResponse
+	_ = json.NewDecoder(tResp.Body).Decode(&tick)
+	tResp.Body.Close()
+
+	wsBase := "ws" + strings.TrimPrefix(ts.URL, "http")
+	dialCtx, dialCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer dialCancel()
+	wsConn, _, err := websocket.Dial(dialCtx, wsBase+"/ws/client?sinceSeq=0&ticket="+tick.Ticket, nil)
+	if err != nil {
+		t.Fatalf("dial /ws/client failed: %v", err)
+	}
+	defer wsConn.CloseNow()
+
+	// Read first replay page, then immediately revoke token while remaining pages are pending!
+	if _, _, err := wsConn.Read(dialCtx); err != nil {
+		t.Fatalf("read first replay page: %v", err)
+	}
+	revStart := time.Now()
+	revResp := doOnbJSONReq(t, ts, http.MethodDelete, "/api/clients/"+paired.TokenID, nil, devHdrs)
+	revResp.Body.Close()
+	if revResp.StatusCode != http.StatusOK {
+		t.Fatalf("revoke status=%d", revResp.StatusCode)
+	}
+	if time.Since(revStart) > 2*time.Second {
+		t.Fatalf("revoke HTTP handler blocked too long: %v", time.Since(revStart))
+	}
+
+	// Drain until connection closes: MUST receive 1008 Policy Violation promptly (never hang).
+	closeCtx, closeCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer closeCancel()
+	var closedErr error
+	for i := 0; i < 20; i++ {
+		_, _, err := wsConn.Read(closeCtx)
+		if err != nil {
+			closedErr = err
+			break
+		}
+	}
+	if closedErr == nil {
+		t.Fatalf("expected WS replay stream to abort and close after revocation")
+	}
+	if st := websocket.CloseStatus(closedErr); st != websocket.StatusPolicyViolation {
+		t.Fatalf("expected 1008 Policy Violation on aborted replay, got %v (err=%v)", st, closedErr)
+	}
+}
+
+func TestRevokeClientWSSyncBarrierBlocksInFlightReplayWrite(t *testing.T) {
+	srv, ts, _, dataDir := newOnboardingTestServer(t, true)
+	ctx := context.Background()
+	st, err := store.Open(ctx, dataDir+"/orbit.sqlite")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	devHdrs := map[string]string{
+		"X-Orbit-Dev-Token": "test-dev-token-secret",
+		"X-Orbit-Request":   "1",
+	}
+
+	// Seed 10 events so replay has a page ready to write
+	for i := 1; i <= 10; i++ {
+		if _, err := st.WriteDB().ExecContext(ctx, `
+			INSERT INTO events (event_id, stream_id, project_id, actor_kind, actor_id, kind, visibility, payload_json, created_at)
+			VALUES (?, 'global', '_scratch', 'system', 'test', 'machine.state_changed', 'timeline', '{}', ?)
+		`, "evt_barrier_"+strconv.Itoa(i), int64(1700000000000+i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	codeResp := doOnbJSONReq(t, ts, http.MethodPost, "/api/pairing/codes", protocol.CreatePairingCodeRequest{
+		Scope: protocol.PairingScopeClient,
+	}, devHdrs)
+	var created protocol.CreatePairingCodeResponse
+	_ = json.NewDecoder(codeResp.Body).Decode(&created)
+	codeResp.Body.Close()
+
+	pairResp := doOnbJSONReq(t, ts, http.MethodPost, "/api/auth/pair-client", protocol.PairClientRequest{
+		Code:       created.Code,
+		DeviceName: "barrier-client",
+	}, map[string]string{"X-Orbit-Request": "1"})
+	var paired protocol.PairClientResponse
+	_ = json.NewDecoder(pairResp.Body).Decode(&paired)
+	pairResp.Body.Close()
+
+	tResp := doOnbJSONReq(t, ts, http.MethodPost, "/api/ws-ticket", nil, map[string]string{
+		"Authorization":   "Bearer " + paired.ClientToken,
+		"X-Orbit-Request": "1",
+	})
+	var tick protocol.WSTicketResponse
+	_ = json.NewDecoder(tResp.Body).Decode(&tick)
+	tResp.Body.Close()
+
+	// Pause replay AFTER passing the revoked check, RIGHT before writeData()!
+	hookEntered := make(chan struct{})
+	releaseHook := make(chan struct{})
+	var enteredOnce sync.Once
+	srv.SetWSBeforeReplayWriteHook(func() {
+		enteredOnce.Do(func() {
+			close(hookEntered)
+			<-releaseHook
+		})
+	})
+	defer srv.SetWSBeforeReplayWriteHook(nil)
+
+	wsBase := "ws" + strings.TrimPrefix(ts.URL, "http")
+	dialCtx, dialCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer dialCancel()
+	wsConn, _, err := websocket.Dial(dialCtx, wsBase+"/ws/client?sinceSeq=0&ticket="+tick.Ticket, nil)
+	if err != nil {
+		t.Fatalf("dial /ws/client failed: %v", err)
+	}
+	defer wsConn.CloseNow()
+
+	select {
+	case <-hookEntered:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("timed out waiting for replay hook")
+	}
+
+	// Revoke token while replay is paused right before writeData, and wait for revoke HTTP 200 to return!
+	revResp := doOnbJSONReq(t, ts, http.MethodDelete, "/api/clients/"+paired.TokenID, nil, devHdrs)
+	revResp.Body.Close()
+	if revResp.StatusCode != http.StatusOK {
+		t.Fatalf("revoke status=%d", revResp.StatusCode)
+	}
+
+	// Now release hook -> writeData() MUST acquire writeMu, see revoked==true, and NEVER write the replay page!
+	close(releaseHook)
+
+	readCtx, readCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer readCancel()
+	_, data, readErr := wsConn.Read(readCtx)
+	if readErr == nil {
+		t.Fatalf("expected ZERO frames written after revoke returned, but received frame: %s", string(data))
+	}
+	if st := websocket.CloseStatus(readErr); st != websocket.StatusPolicyViolation {
+		t.Fatalf("expected direct 1008 Policy Violation without any replay frame, got status=%v err=%v", st, readErr)
+	}
+}
+
+func TestRevokeClientWSConcurrentCallsWaitForSameWriteBarrier(t *testing.T) {
+	srv, ts, _, dataDir := newOnboardingTestServer(t, true)
+	ctx := context.Background()
+	st, err := store.Open(ctx, dataDir+"/orbit.sqlite")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	devHdrs := map[string]string{
+		"X-Orbit-Dev-Token": "test-dev-token-secret",
+		"X-Orbit-Request":   "1",
+	}
+
+	for i := 1; i <= 5; i++ {
+		if _, err := st.WriteDB().ExecContext(ctx, `
+			INSERT INTO events (event_id, stream_id, project_id, actor_kind, actor_id, kind, visibility, payload_json, created_at)
+			VALUES (?, 'global', '_scratch', 'system', 'test', 'machine.state_changed', 'timeline', '{}', ?)
+		`, "evt_concur_rev_"+strconv.Itoa(i), int64(1700000000000+i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	codeResp := doOnbJSONReq(t, ts, http.MethodPost, "/api/pairing/codes", protocol.CreatePairingCodeRequest{
+		Scope: protocol.PairingScopeClient,
+	}, devHdrs)
+	var created protocol.CreatePairingCodeResponse
+	_ = json.NewDecoder(codeResp.Body).Decode(&created)
+	codeResp.Body.Close()
+
+	pairResp := doOnbJSONReq(t, ts, http.MethodPost, "/api/auth/pair-client", protocol.PairClientRequest{
+		Code:       created.Code,
+		DeviceName: "concurrent-revoke-client",
+	}, map[string]string{"X-Orbit-Request": "1"})
+	var paired protocol.PairClientResponse
+	_ = json.NewDecoder(pairResp.Body).Decode(&paired)
+	pairResp.Body.Close()
+
+	tResp := doOnbJSONReq(t, ts, http.MethodPost, "/api/ws-ticket", nil, map[string]string{
+		"Authorization":   "Bearer " + paired.ClientToken,
+		"X-Orbit-Request": "1",
+	})
+	var tick protocol.WSTicketResponse
+	_ = json.NewDecoder(tResp.Body).Decode(&tick)
+	tResp.Body.Close()
+
+	// Pause replay INSIDE writeData() while writeMu is held!
+	insideWrite := make(chan struct{})
+	releaseWrite := make(chan struct{})
+	var once sync.Once
+	srv.SetWSInsideWriteHook(func() {
+		once.Do(func() {
+			close(insideWrite)
+			<-releaseWrite
+		})
+	})
+	defer srv.SetWSInsideWriteHook(nil)
+
+	wsBase := "ws" + strings.TrimPrefix(ts.URL, "http")
+	dialCtx, dialCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer dialCancel()
+	wsConn, _, err := websocket.Dial(dialCtx, wsBase+"/ws/client?sinceSeq=0&ticket="+tick.Ticket, nil)
+	if err != nil {
+		t.Fatalf("dial /ws/client failed: %v", err)
+	}
+	defer wsConn.CloseNow()
+
+	select {
+	case <-insideWrite:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("timed out waiting for writeMu hook")
+	}
+
+	// Launch first revoke (holds inFlightRevokes[tokenID], waits on writeMu barrier)
+	rev1Done := make(chan int, 1)
+	go func() {
+		resp := doOnbJSONReq(t, ts, http.MethodDelete, "/api/clients/"+paired.TokenID, nil, devHdrs)
+		resp.Body.Close()
+		rev1Done <- resp.StatusCode
+	}()
+
+	// Give rev1 a moment to enter inFlightRevokes, then launch a CONCURRENT second revoke for the same tokenID
+	time.Sleep(50 * time.Millisecond)
+	rev2Done := make(chan int, 1)
+	go func() {
+		resp := doOnbJSONReq(t, ts, http.MethodDelete, "/api/clients/"+paired.TokenID, nil, devHdrs)
+		resp.Body.Close()
+		rev2Done <- resp.StatusCode
+	}()
+
+	// NEITHER revoke #1 NOR concurrent revoke #2 may return before writeMu barrier is released!
+	select {
+	case code := <-rev1Done:
+		t.Fatalf("revoke #1 returned early (%d) while writeMu barrier was still held!", code)
+	case code := <-rev2Done:
+		t.Fatalf("concurrent revoke #2 returned early (%d) before in-flight writeMu barrier finished!", code)
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	// Release writeMu barrier -> BOTH revokes now complete cleanly with HTTP 200!
+	close(releaseWrite)
+	for i, ch := range []chan int{rev1Done, rev2Done} {
+		select {
+		case code := <-ch:
+			if code != http.StatusOK {
+				t.Fatalf("revoke #%d status=%d want 200", i+1, code)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("revoke #%d timed out after releasing writeMu barrier", i+1)
+		}
+	}
+
+	// And client receives direct 1008 Policy Violation without receiving the paused replay frame!
+	readCtx, readCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer readCancel()
+	_, data, readErr := wsConn.Read(readCtx)
+	if readErr == nil {
+		t.Fatalf("expected ZERO frames written after revoke, got: %s", string(data))
+	}
+	if st := websocket.CloseStatus(readErr); st != websocket.StatusPolicyViolation {
+		t.Fatalf("expected 1008 Policy Violation, got status=%v err=%v", st, readErr)
 	}
 }

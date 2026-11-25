@@ -71,11 +71,13 @@ type CreateTaskParams struct {
 	CreatedBy          protocol.TaskCreatedBy
 	IdempotencyKey     string
 	Sources            []protocol.CreateTaskSourceInput
-	MachineID          string
-	PartID             string
-	LocationID         string
-	Isolation          protocol.LocationIsolation
-	Anchor             *protocol.ProjectAnchorConfig
+	MachineID           string
+	PartID              string
+	LocationID          string
+	Isolation           protocol.LocationIsolation
+	RouteExplicit       bool
+	ProjectGitIsolation protocol.LocationIsolation
+	Anchor              *protocol.ProjectAnchorConfig
 	AnchorCapability   string
 	WorktreePath       string
 	BaseSHA            string
@@ -176,6 +178,16 @@ func (s *Store) CreateTask(ctx context.Context, p CreateTaskParams) (CreateTaskR
 				return nil
 			} else if !errors.Is(err, sql.ErrNoRows) {
 				return err
+			}
+		}
+
+		// Persist project-wide Git isolation preference atomically inside CreateTask ONLY after
+		// PA receipt and idempotency-key dedup checks confirm this is a genuinely new task.
+		if p.ProjectGitIsolation != "" && !protocol.IsVirtualProjectID(p.ProjectID) {
+			if evProj, changed, isoErr := setProjectGitIsolationTx(ctx, tx, p.ProjectID, p.ProjectGitIsolation, p.ActorID, now); isoErr != nil {
+				return isoErr
+			} else if changed {
+				res.Events = append(res.Events, evProj)
 			}
 		}
 
@@ -302,6 +314,7 @@ func (s *Store) CreateTask(ctx context.Context, p CreateTaskParams) (CreateTaskR
 				PartID:            p.PartID,
 				LocationID:        p.LocationID,
 				Isolation:         p.Isolation,
+				RouteExplicit:     p.RouteExplicit,
 				TriggerKind:       p.TriggerKind,
 				TriggerPayload:    p.TriggerPayload,
 				Prompt:            p.Prompt,
@@ -479,6 +492,7 @@ type CreateNextAttemptParams struct {
 	PartID            string
 	LocationID        string
 	Isolation         protocol.LocationIsolation
+	RouteExplicit     bool
 	TriggerKind       protocol.TriggerKind
 	TriggerPayload    map[string]any
 	Prompt            string
@@ -690,6 +704,7 @@ type createAttemptTxParams struct {
 	PartID            string
 	LocationID        string
 	Isolation         protocol.LocationIsolation
+	RouteExplicit     bool
 	TriggerKind       protocol.TriggerKind
 	TriggerPayload    map[string]any
 	Prompt            string
@@ -845,6 +860,30 @@ func createAttemptInTx(ctx context.Context, tx *sql.Tx, p createAttemptTxParams)
 	}
 	if p.InputDeliveryID != "" {
 		inputDlvVal = p.InputDeliveryID
+	}
+
+	if !p.RouteExplicit && (strings.TrimSpace(p.PartID) == "" || strings.TrimSpace(p.LocationID) == "" || p.Isolation == "") {
+		var prevMachine, prevPart, prevLoc, prevIso sql.NullString
+		_ = tx.QueryRowContext(ctx, `
+			SELECT machine_id, part_id, location_id, isolation
+			FROM attempts
+			WHERE task_id = ?
+			ORDER BY attempt_no DESC
+			LIMIT 1
+		`, p.TaskID).Scan(&prevMachine, &prevPart, &prevLoc, &prevIso)
+		// Only inherit prior location/part/isolation when staying on the same machine.
+		sameMachine := !prevMachine.Valid || prevMachine.String == "" || prevMachine.String == machineID
+		if sameMachine {
+			if strings.TrimSpace(p.PartID) == "" && prevPart.Valid {
+				p.PartID = prevPart.String
+			}
+			if strings.TrimSpace(p.LocationID) == "" && prevLoc.Valid {
+				p.LocationID = prevLoc.String
+			}
+			if p.Isolation == "" && prevIso.Valid && prevIso.String != "" {
+				p.Isolation = protocol.LocationIsolation(prevIso.String)
+			}
+		}
 	}
 
 	var partVal, locVal, isoVal any
@@ -1018,6 +1057,7 @@ func loadAttemptRecordTx(ctx context.Context, tx *sql.Tx, attemptID string) (Att
 	a.TriggerKind = protocol.TriggerKind(trigger)
 	a.State = protocol.AttemptState(state)
 	a.PromptText = extractBoundedPromptText(a.TriggerPayloadJSON)
+	a.RefTasks = extractReferencedTasks(a.TriggerPayloadJSON)
 	a.CancelRequested = cancelRequested != 0
 	if cancelReasonKind.Valid {
 		a.CancelReasonKind = cancelReasonKind.String
@@ -1166,6 +1206,11 @@ func (s *Store) ListLeasedAttemptsForMachine(ctx context.Context, machineID stri
 
 // ListAttemptRawEvents returns raw_acp (and attempt-scoped) events lazily for one attempt.
 func (s *Store) ListAttemptRawEvents(ctx context.Context, attemptID string, afterSeq int64, limit int) ([]protocol.EventRecord, error) {
+	return s.ListAttemptRawEventsByKinds(ctx, attemptID, nil, afterSeq, limit)
+}
+
+// ListAttemptRawEventsByKinds returns raw_acp events for one attempt, optionally filtered to specific event kinds.
+func (s *Store) ListAttemptRawEventsByKinds(ctx context.Context, attemptID string, kinds []protocol.EventKind, afterSeq int64, limit int) ([]protocol.EventRecord, error) {
 	if limit <= 0 || limit > 1000 {
 		limit = 500
 	}
@@ -1178,14 +1223,25 @@ func (s *Store) ListAttemptRawEvents(ctx context.Context, attemptID string, afte
 			}
 			return err
 		}
-		rows, err := tx.QueryContext(ctx, `
+		query := `
 			SELECT seq, event_id, stream_id, project_id, task_id, attempt_id,
 			       actor_kind, actor_id, kind, visibility, payload_json, created_at
 			FROM events
-			WHERE attempt_id = ? AND visibility = 'raw_acp' AND seq > ?
+			WHERE attempt_id = ? AND visibility = 'raw_acp' AND seq > ?`
+		args := []any{attemptID, afterSeq}
+		if len(kinds) > 0 {
+			placeholders := make([]string, len(kinds))
+			for i, k := range kinds {
+				placeholders[i] = "?"
+				args = append(args, string(k))
+			}
+			query += fmt.Sprintf(" AND kind IN (%s)", strings.Join(placeholders, ","))
+		}
+		query += `
 			ORDER BY seq ASC
-			LIMIT ?
-		`, attemptID, afterSeq, limit)
+			LIMIT ?`
+		args = append(args, limit)
+		rows, err := tx.QueryContext(ctx, query, args...)
 		if err != nil {
 			return err
 		}

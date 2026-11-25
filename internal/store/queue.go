@@ -130,6 +130,29 @@ func lookupAnnotationDeliveryIDsTx(ctx context.Context, tx *sql.Tx, taskID strin
 	return out, rows.Err()
 }
 
+// GetPendingInput returns one pending input row for taskID by inputID regardless of state
+// (queued, dispatched, deleted, cancelled) so CLI/UI callers can inspect exact dispatchedAttemptId.
+func (s *Store) GetPendingInput(ctx context.Context, taskID, inputID string) (protocol.PendingInput, error) {
+	var out protocol.PendingInput
+	err := s.WithReadTx(ctx, func(tx *sql.Tx) error {
+		row := tx.QueryRowContext(ctx, `
+			SELECT input_id, task_id, project_id, kind, source, body, payload_json, position, state, created_at, updated_at, dispatched_attempt_id
+			FROM task_pending_inputs
+			WHERE task_id = ? AND input_id = ?
+		`, taskID, inputID)
+		pi, err := scanPendingInput(row)
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("%w: pending input %s on task %s", ErrNotFound, inputID, taskID)
+		}
+		if err != nil {
+			return err
+		}
+		out = pi
+		return nil
+	})
+	return out, err
+}
+
 // ListPendingInputs returns all queued pending inputs for taskID in consumption order.
 func (s *Store) ListPendingInputs(ctx context.Context, taskID string) ([]protocol.PendingInput, error) {
 	out := []protocol.PendingInput{}
@@ -166,25 +189,35 @@ func (s *Store) ListPendingInputs(ctx context.Context, taskID string) ([]protoco
 // PendingInputRoute stores server-resolved, server-validated execution routing metadata
 // in task_pending_inputs.route_json, strictly isolated from user-editable payload_json (NEW-1).
 type PendingInputRoute struct {
-	MachineID         string                      `json:"machineId,omitempty"`
-	Adapter           protocol.Adapter            `json:"adapter,omitempty"`
-	DesiredConfig     map[string]string           `json:"desiredConfig,omitempty"`
-	RequiredResources []string                    `json:"requiredResources,omitempty"`
-	WorktreePath      string                      `json:"worktreePath,omitempty"`
-	BaseSHA           string                      `json:"baseSha,omitempty"`
-	InputDeliveryID   string                      `json:"inputDeliveryId,omitempty"`
-	AnchorCapability  string                      `json:"anchorCapability,omitempty"`
+	MachineID         string                        `json:"machineId,omitempty"`
+	Adapter           protocol.Adapter              `json:"adapter,omitempty"`
+	PartID                 string                        `json:"partId,omitempty"`
+	LocationID             string                        `json:"locationId,omitempty"`
+	Isolation              protocol.LocationIsolation    `json:"isolation,omitempty"`
+	RouteExplicit          bool                          `json:"routeExplicit,omitempty"`
+	DesiredConfig          map[string]string             `json:"desiredConfig,omitempty"`
+	ExplicitFullPermission bool                          `json:"explicitFullPermission,omitempty"`
+	RequiredResources      []string                      `json:"requiredResources,omitempty"`
+	WorktreePath      string                        `json:"worktreePath,omitempty"`
+	BaseSHA           string                        `json:"baseSha,omitempty"`
+	InputDeliveryID   string                        `json:"inputDeliveryId,omitempty"`
+	AnchorCapability  string                        `json:"anchorCapability,omitempty"`
 	Anchor            *protocol.ProjectAnchorConfig `json:"anchor,omitempty"`
-	ForceNewSession   bool                        `json:"forceNewSession,omitempty"`
-	ActorKind         protocol.ActorKind          `json:"actorKind,omitempty"`
-	ActorID           string                      `json:"actorId,omitempty"`
+	ForceNewSession   bool                          `json:"forceNewSession,omitempty"`
+	ActorKind         protocol.ActorKind            `json:"actorKind,omitempty"`
+	ActorID           string                        `json:"actorId,omitempty"`
 }
 
 var reservedQueuePayloadKeys = map[string]bool{
 	"machineId":         true,
 	"adapter":           true,
-	"desiredConfig":     true,
-	"requiredResources": true,
+	"partId":                 true,
+	"locationId":             true,
+	"isolation":              true,
+	"routeExplicit":          true,
+	"desiredConfig":          true,
+	"explicitFullPermission": true,
+	"requiredResources":      true,
 	"worktreePath":      true,
 	"baseSha":           true,
 	"inputDeliveryId":   true,
@@ -604,11 +637,16 @@ type SubmitFollowupParams struct {
 	Source            protocol.PendingInputSource
 	MachineID         string
 	Adapter           protocol.Adapter
+	PartID            string
+	LocationID        string
+	Isolation         protocol.LocationIsolation
+	RouteExplicit     bool
 	WorktreePath      string
 	BaseSHA           string
-	InputDeliveryID   string
-	DesiredConfig     map[string]string
-	RequiredResources []string
+	InputDeliveryID        string
+	DesiredConfig          map[string]string
+	ExplicitFullPermission bool
+	RequiredResources      []string
 	Anchor            *protocol.ProjectAnchorConfig
 	AnchorCapability  string
 	VerifiedSite      bool
@@ -707,9 +745,14 @@ func (s *Store) SubmitFollowupAtomic(ctx context.Context, p SubmitFollowupParams
 		// leave route.InputDeliveryID empty so ConsumeNextPendingInput resolves the latest formal delivery
 		// AFTER the active attempt completes (avoiding stale D1 freeze when D2 is published!).
 		queuedRoute := &PendingInputRoute{
-			MachineID:         p.MachineID,
-			Adapter:           adapter,
-			DesiredConfig:     mergedCfg,
+			MachineID:              p.MachineID,
+			Adapter:                adapter,
+			PartID:                 p.PartID,
+			LocationID:             p.LocationID,
+			Isolation:              p.Isolation,
+			RouteExplicit:          p.RouteExplicit,
+			DesiredConfig:          mergedCfg,
+			ExplicitFullPermission: p.ExplicitFullPermission,
 			RequiredResources: reqResources,
 			WorktreePath:      p.WorktreePath,
 			BaseSHA:           p.BaseSHA,
@@ -927,11 +970,19 @@ func (s *Store) SubmitFollowupAtomic(ctx context.Context, p SubmitFollowupParams
 			}
 		}
 
+		if p.ExplicitFullPermission {
+			userPayload["explicitFullPermission"] = true
+		}
+
 		att, evAtt, err := createAttemptInTx(ctx, tx, createAttemptTxParams{
 			TaskID:            p.TaskID,
 			ProjectID:         projectID,
 			MachineID:         p.MachineID,
 			Adapter:           adapter,
+			PartID:            p.PartID,
+			LocationID:        p.LocationID,
+			Isolation:         p.Isolation,
+			RouteExplicit:     p.RouteExplicit,
 			TriggerKind:       protocol.TriggerFollowup,
 			TriggerPayload:    userPayload,
 			Prompt:            p.Body,
@@ -1121,9 +1172,10 @@ type DispatchAnnotationsParams struct {
 	Adapter           protocol.Adapter
 	WorktreePath      string
 	BaseSHA           string
-	InputDeliveryID   string
-	DesiredConfig     map[string]string
-	RequiredResources []string
+	InputDeliveryID        string
+	DesiredConfig          map[string]string
+	ExplicitFullPermission bool
+	RequiredResources      []string
 	Anchor            *protocol.ProjectAnchorConfig
 	AnchorCapability  string
 	ForceNewSession   bool
@@ -1445,11 +1497,16 @@ type ConsumeNextPendingInputParams struct {
 	PreferredInputID  string
 	MachineID         string
 	Adapter           protocol.Adapter
+	PartID            string
+	LocationID        string
+	Isolation         protocol.LocationIsolation
+	RouteExplicit     bool
 	WorktreePath      string
 	BaseSHA           string
-	InputDeliveryID   string
-	DesiredConfig     map[string]string
-	RequiredResources []string
+	InputDeliveryID        string
+	DesiredConfig          map[string]string
+	ExplicitFullPermission bool
+	RequiredResources      []string
 	Anchor            *protocol.ProjectAnchorConfig
 	AnchorCapability  string
 	LeaseTTLMs        int64
@@ -1546,6 +1603,10 @@ func (s *Store) ConsumeNextPendingInput(ctx context.Context, p ConsumeNextPendin
 		rt := parsePendingInputRoute(routeRaw)
 		machineID := p.MachineID
 		adapter := p.Adapter
+		partID := p.PartID
+		locationID := p.LocationID
+		isolation := p.Isolation
+		routeExplicit := p.RouteExplicit
 		desiredCfg := map[string]string{}
 		if desiredCfgJSON != "" {
 			_ = json.Unmarshal([]byte(desiredCfgJSON), &desiredCfg)
@@ -1577,6 +1638,20 @@ func (s *Store) ConsumeNextPendingInput(ctx context.Context, p ConsumeNextPendin
 			}
 			if rt.Adapter != "" {
 				adapter = rt.Adapter
+			}
+			if rt.PartID != "" {
+				partID = rt.PartID
+			}
+			if rt.LocationID != "" {
+				locationID = rt.LocationID
+			}
+			if rt.Isolation != "" {
+				isolation = rt.Isolation
+			}
+			if rt.RouteExplicit {
+				routeExplicit = true
+				partID = rt.PartID
+				locationID = rt.LocationID
 			}
 			for k, v := range rt.DesiredConfig {
 				desiredCfg[k] = v
@@ -1623,13 +1698,22 @@ func (s *Store) ConsumeNextPendingInput(ctx context.Context, p ConsumeNextPendin
 			return err
 		}
 
+		triggerPayload := sanitizeUserPendingPayload(pi.Payload)
+		if rt != nil && rt.ExplicitFullPermission {
+			triggerPayload["explicitFullPermission"] = true
+		}
+
 		att, evAtt, err := createAttemptInTx(ctx, tx, createAttemptTxParams{
 			TaskID:            p.TaskID,
 			ProjectID:         projectID,
 			MachineID:         machineID,
 			Adapter:           adapter,
+			PartID:            partID,
+			LocationID:        locationID,
+			Isolation:         isolation,
+			RouteExplicit:     routeExplicit,
 			TriggerKind:       triggerKind,
-			TriggerPayload:    pi.Payload,
+			TriggerPayload:    triggerPayload,
 			Prompt:            prompt,
 			WorktreePath:      worktreePath,
 			BaseSHA:           baseSHA,

@@ -21,6 +21,7 @@ import (
 
 	"github.com/Hebi8/hebi8-Orbit/internal/discovery"
 	"github.com/Hebi8/hebi8-Orbit/internal/protocol"
+	"gopkg.in/yaml.v3"
 )
 
 // parseFlagsPermuted reorders flag tokens ahead of positional arguments so CLI
@@ -295,25 +296,27 @@ func runPair(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	fs := flag.NewFlagSet("pair", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	var (
-		runnerOnly = fs.Bool("runner", false, "Only issue runner credentials")
-		clientOnly = fs.Bool("client", false, "Only issue client credentials")
-		machineID  = fs.String("machine", "", "Bind credentials to an existing machine ID (e.g. mini)")
-		ttlSec     = fs.Int("ttl", 600, "Pairing code expiry in seconds")
-		noWait     = fs.Bool("no-wait", false, "Return immediately without waiting for machine to connect")
-		hubURLFlag = fs.String("hub", "", "orbit-hub base URL")
-		tokenFlag  = fs.String("token", "", "optional auth token")
-		configDir  = fs.String("config-dir", "", "orbit config directory")
-		dataDirFlg = fs.String("data-dir", "", "orbit data directory")
-		jsonOut    = fs.Bool("json", false, "output JSON")
+		runnerOnly      = fs.Bool("runner", false, "Only issue runner credentials")
+		clientOnly      = fs.Bool("client", false, "Only issue client credentials")
+		clientOnlyAlias = fs.Bool("client-only", false, "Alias for --client")
+		machineID       = fs.String("machine", "", "Bind credentials to an existing machine ID (e.g. mini)")
+		ttlSec          = fs.Int("ttl", 600, "Pairing code expiry in seconds")
+		noWait          = fs.Bool("no-wait", false, "Return immediately without waiting for machine to connect")
+		hubURLFlag      = fs.String("hub", "", "orbit-hub base URL")
+		tokenFlag       = fs.String("token", "", "optional auth token")
+		configDir       = fs.String("config-dir", "", "orbit config directory")
+		dataDirFlg      = fs.String("data-dir", "", "orbit data directory")
+		jsonOut         = fs.Bool("json", false, "output JSON")
 	)
 	if err := parseFlagsPermuted(fs, args); err != nil {
 		return err
 	}
 
+	wantClientOnly := *clientOnly || *clientOnlyAlias
 	scope := protocol.PairingScopeBoth
-	if *runnerOnly && !*clientOnly {
+	if *runnerOnly && !wantClientOnly {
 		scope = protocol.PairingScopeRunner
-	} else if *clientOnly && !*runnerOnly {
+	} else if wantClientOnly && !*runnerOnly {
 		scope = protocol.PairingScopeClient
 	}
 
@@ -524,40 +527,59 @@ func runJoin(ctx context.Context, args []string, stdout, stderr io.Writer) error
 		return err
 	}
 
-	if !*runnerOnly && claimed.ClientToken != "" {
-		clientPath := filepath.Join(cfgDir, "client.yaml")
-		if err := writeClientConfigFull(clientPath, hubURL, "", claimed.ClientToken, claimed.MachineID, "remote"); err != nil {
+	netID := cliNetworkIDFor("remote", hubURL)
+	runRemoteRunner := !*noRunner && claimed.RunnerToken != ""
+	remoteRunnerDir := ""
+	remoteDataDir := ""
+	if runRemoteRunner {
+		// Isolate remote runner credentials/config so local workspace runner.token and other remote profiles are NEVER overwritten!
+		remoteRunnerDir = filepath.Join(cfgDir, "remotes", netID)
+		remoteDataDir = filepath.Join(dataDir, "remotes", netID)
+		if err := os.MkdirAll(remoteRunnerDir, 0o700); err != nil {
 			return err
 		}
-	}
-
-	if !*noRunner && claimed.RunnerToken != "" {
-		tokenPath := filepath.Join(cfgDir, "runner.token")
+		tokenPath := filepath.Join(remoteRunnerDir, "runner.token")
 		if err := os.WriteFile(tokenPath, []byte(claimed.RunnerToken+"\n"), 0o600); err != nil {
 			return err
 		}
 		wsURL := httpToWSURL(hubURL) + "/ws/runner"
-		if err := protocol.SaveRunnerLocalConfig(filepath.Join(cfgDir, "runner.yaml"), protocol.RunnerLocalConfig{
+		if err := protocol.SaveRunnerLocalConfig(filepath.Join(remoteRunnerDir, "runner.yaml"), protocol.RunnerLocalConfig{
 			SchemaVersion: 1,
 			MachineID:     claimed.MachineID,
 			HubURL:        hubURL,
 			HubWSURL:      wsURL,
-			DataDir:       dataDir,
+			DataDir:       remoteDataDir,
 		}); err != nil {
 			return err
 		}
+	}
 
-		if !*noStart {
-			if *useService {
-				if err := installAndStartService(ctx, "runner", cfgDir, dataDir, claimed.MachineID, io.Discard); err != nil {
-					fmt.Fprintf(stderr, "警告：安装后台服务失败（%v），改为直接启动 Runner\n", err)
-					_, _ = spawnDetachedBinary("orbit-runner", []string{"--config-dir", cfgDir}, filepath.Join(dataDir, "logs", "runner.log"))
-				}
-			} else {
-				if err := os.MkdirAll(filepath.Join(dataDir, "logs"), 0o755); err == nil {
-					if _, err := spawnDetachedBinary("orbit-runner", []string{"--config-dir", cfgDir}, filepath.Join(dataDir, "logs", "runner.log")); err != nil {
-						fmt.Fprintf(stderr, "警告：未能自动启动 orbit-runner（%v），可手动运行：orbit-runner --config-dir %s\n", err, cfgDir)
-					}
+	if !*runnerOnly && claimed.ClientToken != "" {
+		clientPath := filepath.Join(cfgDir, "client.yaml")
+		if err := upsertCLIClientNetwork(clientPath, cliNetworkProfile{
+			ID:              netID,
+			Name:            strings.TrimSpace(claimed.WorkspaceName),
+			Mode:            "remote",
+			HubURL:          hubURL,
+			ClientToken:     claimed.ClientToken,
+			MachineID:       claimed.MachineID,
+			RunLocalRunner:  runRemoteRunner,
+			RunnerConfigDir: remoteRunnerDir,
+		}); err != nil {
+			return err
+		}
+	}
+
+	if runRemoteRunner && !*noStart {
+		if *useService {
+			if err := installAndStartService(ctx, "runner", remoteRunnerDir, remoteDataDir, claimed.MachineID, io.Discard); err != nil {
+				fmt.Fprintf(stderr, "警告：安装后台服务失败（%v），改为直接启动 Runner\n", err)
+				_, _ = spawnDetachedBinary("orbit-runner", []string{"--config-dir", remoteRunnerDir}, filepath.Join(remoteDataDir, "logs", "runner.log"))
+			}
+		} else {
+			if err := os.MkdirAll(filepath.Join(remoteDataDir, "logs"), 0o755); err == nil {
+				if _, err := spawnDetachedBinary("orbit-runner", []string{"--config-dir", remoteRunnerDir}, filepath.Join(remoteDataDir, "logs", "runner.log")); err != nil {
+					fmt.Fprintf(stderr, "警告：未能自动启动 orbit-runner（%v），可手动运行：orbit-runner --config-dir %s\n", err, remoteRunnerDir)
 				}
 			}
 		}
@@ -1148,26 +1170,156 @@ func ensureLocalMachineFiles(cfgDir, machineID string) error {
 	return nil
 }
 
-func writeClientConfigFull(path, hubURL, devToken, clientToken, machineID, mode string) error {
+// cliNetworkProfile mirrors desktop/config.go NetworkProfile so CLI and Desktop share one multi-network client.yaml schema.
+type cliNetworkProfile struct {
+	ID              string `yaml:"id" json:"id"`
+	Name            string `yaml:"name,omitempty" json:"name,omitempty"`
+	Mode            string `yaml:"mode" json:"mode"` // local | remote
+	HubURL          string `yaml:"hubUrl" json:"hubUrl"`
+	DiscoveryID     string `yaml:"discoveryId,omitempty" json:"discoveryId,omitempty"`
+	ClientToken     string `yaml:"clientToken,omitempty" json:"-"`
+	DevToken        string `yaml:"devToken,omitempty" json:"-"`
+	MachineID       string `yaml:"machineId,omitempty" json:"machineId,omitempty"`
+	RunLocalRunner  bool   `yaml:"runLocalRunner,omitempty" json:"runLocalRunner,omitempty"`
+	RunnerConfigDir string `yaml:"runnerConfigDir,omitempty" json:"-"`
+	UpdatedAt       int64  `yaml:"updatedAt,omitempty" json:"updatedAt,omitempty"`
+}
+
+type cliClientConfig struct {
+	HubURL          string              `yaml:"hubUrl"`
+	DevToken        string              `yaml:"devToken,omitempty"`
+	ClientToken     string              `yaml:"clientToken,omitempty"`
+	MachineID       string              `yaml:"machineId,omitempty"`
+	Mode            string              `yaml:"mode,omitempty"`
+	RunLocalRunner  bool                `yaml:"runLocalRunner,omitempty"`
+	PAShortcut      string              `yaml:"paShortcut,omitempty"`
+	ActiveNetworkID string              `yaml:"activeNetworkId,omitempty"`
+	Networks        []cliNetworkProfile `yaml:"networks,omitempty"`
+}
+
+func cliNetworkIDFor(mode, hubURL string) string {
+	if strings.EqualFold(strings.TrimSpace(mode), "local") {
+		return "local"
+	}
+	norm, err := normalizeHubBaseURL(hubURL)
+	if err != nil {
+		norm = strings.ToLower(strings.TrimSpace(hubURL))
+	} else {
+		norm = strings.ToLower(norm)
+	}
+	sum := sha256.Sum256([]byte(norm))
+	return "net_" + hex.EncodeToString(sum[:4])
+}
+
+func cliDefaultNetworkName(mode, hubURL string) string {
+	if strings.EqualFold(strings.TrimSpace(mode), "local") {
+		return "本机工作区"
+	}
+	if u, err := url.Parse(hubURL); err == nil && u.Hostname() != "" {
+		return strings.Split(u.Hostname(), ".")[0]
+	}
+	return hubURL
+}
+
+func upsertCLIClientNetwork(path string, p cliNetworkProfile) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	doc := struct {
-		HubURL      string `yaml:"hubUrl"`
-		DevToken    string `yaml:"devToken,omitempty"`
-		ClientToken string `yaml:"clientToken,omitempty"`
-		MachineID   string `yaml:"machineId,omitempty"`
-		Mode        string `yaml:"mode,omitempty"`
-		PAShortcut  string `yaml:"paShortcut"`
-	}{
-		HubURL:      strings.TrimRight(hubURL, "/"),
-		DevToken:    strings.TrimSpace(devToken),
-		ClientToken: strings.TrimSpace(clientToken),
-		MachineID:   strings.TrimSpace(machineID),
-		Mode:        strings.TrimSpace(mode),
-		PAShortcut:  "CmdOrCtrl+Shift+O",
+	var cfg cliClientConfig
+	if raw, err := os.ReadFile(path); err == nil {
+		_ = yaml.Unmarshal(raw, &cfg)
 	}
-	return writeYAMLFile(path, doc, 0o600)
+	if strings.TrimSpace(cfg.PAShortcut) == "" {
+		cfg.PAShortcut = "CmdOrCtrl+Shift+O"
+	}
+	// Migrate legacy single-network top-level fields into Networks so existing profile is preserved.
+	if len(cfg.Networks) == 0 && strings.TrimSpace(cfg.HubURL) != "" {
+		legacyMode := strings.TrimSpace(cfg.Mode)
+		if legacyMode == "" {
+			legacyMode = "remote"
+		}
+		legacyURL := strings.TrimRight(strings.TrimSpace(cfg.HubURL), "/")
+		if norm, err := normalizeHubBaseURL(legacyURL); err == nil {
+			legacyURL = norm
+		}
+		legacyID := cliNetworkIDFor(legacyMode, legacyURL)
+		cfg.Networks = append(cfg.Networks, cliNetworkProfile{
+			ID:             legacyID,
+			Name:           cliDefaultNetworkName(legacyMode, legacyURL),
+			Mode:           legacyMode,
+			HubURL:         legacyURL,
+			ClientToken:    strings.TrimSpace(cfg.ClientToken),
+			DevToken:       strings.TrimSpace(cfg.DevToken),
+			MachineID:      strings.TrimSpace(cfg.MachineID),
+			RunLocalRunner: cfg.RunLocalRunner,
+		})
+		if cfg.ActiveNetworkID == "" {
+			cfg.ActiveNetworkID = legacyID
+		}
+	}
+
+	p.Mode = strings.TrimSpace(p.Mode)
+	if p.Mode == "" {
+		p.Mode = "remote"
+	}
+	p.HubURL = strings.TrimRight(strings.TrimSpace(p.HubURL), "/")
+	if norm, err := normalizeHubBaseURL(p.HubURL); err == nil {
+		p.HubURL = norm
+	}
+	if strings.TrimSpace(p.ID) == "" {
+		p.ID = cliNetworkIDFor(p.Mode, p.HubURL)
+	}
+	if strings.TrimSpace(p.Name) == "" {
+		p.Name = cliDefaultNetworkName(p.Mode, p.HubURL)
+	}
+	p.ClientToken = strings.TrimSpace(p.ClientToken)
+	p.DevToken = strings.TrimSpace(p.DevToken)
+	p.MachineID = strings.TrimSpace(p.MachineID)
+	p.UpdatedAt = time.Now().UnixMilli()
+
+	replaced := false
+	for i, existing := range cfg.Networks {
+		if existing.ID == p.ID || (p.HubURL != "" && existing.HubURL != "" && sameOriginURL(existing.HubURL, p.HubURL)) {
+			if p.DiscoveryID == "" {
+				p.DiscoveryID = existing.DiscoveryID
+			}
+			if p.RunnerConfigDir == "" {
+				p.RunnerConfigDir = existing.RunnerConfigDir
+			}
+			if p.ClientToken == "" && existing.ClientToken != "" && p.Mode == existing.Mode {
+				p.ClientToken = existing.ClientToken
+			}
+			if p.DevToken == "" && existing.DevToken != "" && p.Mode == existing.Mode {
+				p.DevToken = existing.DevToken
+			}
+			cfg.Networks[i] = p
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		cfg.Networks = append(cfg.Networks, p)
+	}
+
+	cfg.ActiveNetworkID = p.ID
+	cfg.HubURL = p.HubURL
+	cfg.DevToken = p.DevToken
+	cfg.ClientToken = p.ClientToken
+	cfg.MachineID = p.MachineID
+	cfg.Mode = p.Mode
+	cfg.RunLocalRunner = p.RunLocalRunner
+	return writeYAMLFile(path, cfg, 0o600)
+}
+
+func writeClientConfigFull(path, hubURL, devToken, clientToken, machineID, mode string) error {
+	return upsertCLIClientNetwork(path, cliNetworkProfile{
+		Mode:           strings.TrimSpace(mode),
+		HubURL:         strings.TrimRight(strings.TrimSpace(hubURL), "/"),
+		DevToken:       strings.TrimSpace(devToken),
+		ClientToken:    strings.TrimSpace(clientToken),
+		MachineID:      strings.TrimSpace(machineID),
+		RunLocalRunner: strings.EqualFold(strings.TrimSpace(mode), "local"),
+	})
 }
 
 func isLocalRunnerRunning(dataDir, machineID string) bool {

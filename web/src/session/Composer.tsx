@@ -7,41 +7,32 @@ import type {
   FollowupMode,
   MachineView,
   PendingInput,
+  ProjectView,
   SessionAdapter,
   TaskSummary,
 } from '../generated/protocol';
 import { SessionAdapterValues } from '../generated/protocol';
 import { QueueSendIcon, SendUpIcon, StopSquareIcon, SwarmIcon } from '../components/Icons';
+import { TaskRefButton, TaskRefChips } from '../components/TaskRefPicker';
+import {
+  ADAPTER_LABELS,
+  defaultModeDisplayLabel,
+  defaultModeFor,
+  effortLabel,
+  findAgentProbe,
+  isFullBypassMode,
+  modeLabel,
+  nextModeOverrideAfterSend,
+  probeEfforts,
+  probeModels,
+  probeModes,
+} from '../lib/agentCaps';
 import { api, errMsg } from '../lib/api';
-import { isTaskBusy } from '../lib/format';
+import { PA_PROJECT_ID, isTaskBusy } from '../lib/format';
 import { toast, useWorkbenchStore } from '../store/useWorkbenchStore';
 
 /** Drafts survive session switches (per-task, in-memory). */
 const drafts = new Map<string, string>();
-
-const ADAPTER_LABELS: Record<string, string> = {
-  claude: 'Claude Code',
-  codex: 'Codex',
-  agy: 'Antigravity',
-};
-
-const MODEL_PRESETS: Record<string, string[]> = {
-  claude: ['opus', 'sonnet', 'haiku'],
-  codex: ['gpt-6.2-sol', 'gpt-6.2-astra', 'gpt-6.1-sol'],
-  agy: ['gemini-4-neon', 'gemini-4-carbon', 'gemini-4-argon'],
-};
-
-const EFFORT_OPTIONS = [
-  { value: 'low', label: 'Low' },
-  { value: 'medium', label: 'Medium' },
-  { value: 'high', label: 'High' },
-];
-
-const MODE_OPTIONS = [
-  { value: 'ask', label: 'Ask' },
-  { value: 'auto', label: 'Auto' },
-  { value: 'full', label: 'Full' },
-];
 
 function parseMention(text: string, members: BoardMemberCursor[]): { target: string; body: string } | null {
   const m = /^@([\w.-]+)\s+([\s\S]+)$/.exec(text.trim());
@@ -60,6 +51,8 @@ export function Composer({
   openAnnotations = [],
   runtimeConfig,
   machines = [],
+  projects = [],
+  machineId,
   compact = false,
   onOpenReview,
 }: {
@@ -72,6 +65,8 @@ export function Composer({
   openAnnotations?: AnnotationView[];
   runtimeConfig?: Record<string, string>;
   machines?: MachineView[];
+  projects?: ProjectView[];
+  machineId?: string;
   compact?: boolean;
   onOpenReview?: () => void;
 }) {
@@ -84,15 +79,24 @@ export function Composer({
   const [modelOverride, setModelOverride] = useState<string>('');
   const [effortOverride, setEffortOverride] = useState<string>('');
   const [modeOverride, setModeOverride] = useState<string>('');
+  const [refIds, setRefIds] = useState<string[]>([]);
   const stash = useRef<string | null>(null);
   const taRef = useRef<HTMLTextAreaElement | null>(null);
   const busy = isTaskBusy(task);
+  const isPA = task.projectId === PA_PROJECT_ID;
 
   const taskAdapter = (task.preferredAdapter || 'agy') as SessionAdapter;
   const availableAdapters = useMemo(() => {
     const list: SessionAdapter[] = [];
     const seen = new Set<string>();
     for (const mach of machines) {
+      if (mach.transportMode === 'ssh_outbound') continue;
+      for (const ag of mach.agents ?? []) {
+        if (ag.state === 'ready' && ag.enabled && (SessionAdapterValues as readonly string[]).includes(ag.adapter) && !seen.has(ag.adapter)) {
+          seen.add(ag.adapter);
+          list.push(ag.adapter as SessionAdapter);
+        }
+      }
       for (const adp of mach.adapters ?? []) {
         if ((SessionAdapterValues as readonly string[]).includes(adp) && !seen.has(adp)) {
           seen.add(adp);
@@ -108,15 +112,36 @@ export function Composer({
   }, [machines, taskAdapter]);
 
   const effectiveAdapter = (adapterOverride || taskAdapter) as SessionAdapter;
-  const effectiveModel = modelOverride || runtimeConfig?.model || '';
-  const effectiveEffort = effortOverride || runtimeConfig?.thought_level || runtimeConfig?.effort || 'high';
-  const effectiveMode = modeOverride || runtimeConfig?.mode || 'auto';
+  const activeProbe = useMemo(
+    () => findAgentProbe(machines, machineId, effectiveAdapter),
+    [machines, machineId, effectiveAdapter],
+  );
 
-  const modelChoices = useMemo(() => {
-    const base = MODEL_PRESETS[effectiveAdapter] ?? [];
-    if (effectiveModel && !base.includes(effectiveModel)) return [effectiveModel, ...base];
-    return base;
-  }, [effectiveAdapter, effectiveModel]);
+  const effectiveModel = modelOverride || runtimeConfig?.model || activeProbe?.defaultModel || '';
+  const effectiveEffort =
+    effortOverride ||
+    runtimeConfig?.thought_level ||
+    runtimeConfig?.effort ||
+    runtimeConfig?.reasoning_effort ||
+    activeProbe?.defaultEffort ||
+    '';
+  const effectiveMode =
+    modeOverride ||
+    runtimeConfig?.mode ||
+    defaultModeFor(activeProbe, effectiveAdapter, isPA);
+
+  const modelChoices = useMemo(
+    () => probeModels(activeProbe, effectiveAdapter, effectiveModel),
+    [activeProbe, effectiveAdapter, effectiveModel],
+  );
+  const effortChoices = useMemo(
+    () => probeEfforts(activeProbe, effectiveEffort),
+    [activeProbe, effectiveEffort],
+  );
+  const modeChoices = useMemo(
+    () => probeModes(activeProbe, effectiveAdapter, effectiveMode),
+    [activeProbe, effectiveAdapter, effectiveMode],
+  );
 
   useEffect(() => {
     setText(drafts.get(task.taskId) ?? '');
@@ -125,6 +150,7 @@ export function Composer({
     setModelOverride('');
     setEffortOverride('');
     setModeOverride('');
+    setRefIds([]);
   }, [task.taskId, needsVerifyAttemptId]);
 
   useEffect(() => {
@@ -152,6 +178,7 @@ export function Composer({
   const refresh = () => {
     void qc.invalidateQueries({ queryKey: ['task-timeline', task.taskId] });
     void qc.invalidateQueries({ queryKey: ['project-tasks', task.projectId] });
+    void qc.invalidateQueries({ queryKey: ['all-tasks'] });
     void qc.invalidateQueries({ queryKey: ['delivery'] });
     void qc.invalidateQueries({ queryKey: ['global-artifacts'] });
     void qc.invalidateQueries({ queryKey: ['bootstrap'] });
@@ -170,9 +197,11 @@ export function Composer({
     if (modelOverride) cfg.model = modelOverride;
     if (effortOverride) cfg.thought_level = effortOverride;
     if (modeOverride) cfg.mode = modeOverride;
+    const explicitFullPermission = modeOverride !== '' && isFullBypassMode(modeOverride) ? true : undefined;
     return {
       adapter: adapterOverride ? (adapterOverride as SessionAdapter) : undefined,
       config: Object.keys(cfg).length > 0 ? cfg : undefined,
+      explicitFullPermission,
     };
   };
 
@@ -188,13 +217,21 @@ export function Composer({
   });
 
   const followup = useMutation({
-    mutationFn: (v: { message: string; mode: FollowupMode; verifiedSite?: boolean; verifiedAttemptId?: string }) => {
+    mutationFn: (v: {
+      message: string;
+      mode: FollowupMode;
+      referencedTaskIds?: string[];
+      verifiedSite?: boolean;
+      verifiedAttemptId?: string;
+    }) => {
       const rt = buildRuntimePayload();
       return api.followup(task.taskId, {
         message: v.message,
         mode: v.mode,
         adapter: rt.adapter,
         config: rt.config,
+        explicitFullPermission: rt.explicitFullPermission,
+        referencedTaskIds: v.referencedTaskIds && v.referencedTaskIds.length > 0 ? v.referencedTaskIds : undefined,
         verifiedSite: v.verifiedSite,
         verifiedAttemptId: v.verifiedAttemptId,
       });
@@ -205,7 +242,9 @@ export function Composer({
       if (res.pendingInput && v.mode === 'queue') toast('将在下一轮发出');
       if (v.mode === 'steer') toast('已打断当前轮，优先执行');
       setDraft('');
+      setRefIds([]);
       setSiteVerified(false);
+      setModeOverride((cur) => nextModeOverrideAfterSend(cur));
       refresh();
     },
     onError: (e) => toast(errMsg(e), 'err'),
@@ -291,18 +330,17 @@ export function Composer({
     followup.mutate({
       message: msg,
       mode,
+      referencedTaskIds: refIds.length > 0 ? refIds : undefined,
       verifiedSite: needsVerifyGate ? true : undefined,
       verifiedAttemptId: needsVerifyGate ? needsVerifyAttemptId : undefined,
     });
   };
 
-  // Locked v2 rule: completely blank placeholder when idle; only show concise shortcut when busy.
   let placeholder = '';
   if (editing) placeholder = '编辑这条…';
   else if (worker) placeholder = `发给 @${worker}`;
   else if (busy) placeholder = 'Enter 入队 · ⌘↵ 立刻插入';
 
-  // Pure icon-only state action button
   const renderActionButton = () => {
     if (editing) {
       return (
@@ -393,7 +431,6 @@ export function Composer({
           </div>
         )}
 
-        {/* Pending Review comments attachment pill at top of composer */}
         {hasAttachments && (
           <div className="composer-attach-row">
             <button
@@ -406,6 +443,14 @@ export function Composer({
               <span>{openAnnotations.length} 条 Review 批注</span>
             </button>
           </div>
+        )}
+
+        {!editing && !worker && refIds.length > 0 && (
+          <TaskRefChips
+            selectedIds={refIds}
+            onRemove={(id) => setRefIds((prev) => prev.filter((x) => x !== id))}
+            projects={projects}
+          />
         )}
 
         <textarea
@@ -438,12 +483,23 @@ export function Composer({
         <div className="composer-meta-bar">
           {!worker ? (
             <div className="runtime-controls" aria-label="会话运行配置">
+              {!compact && !editing && (
+                <TaskRefButton
+                  selectedIds={refIds}
+                  onChange={setRefIds}
+                  projects={projects}
+                  currentTaskId={task.taskId}
+                  prominent={isPA}
+                />
+              )}
               <label className="rt-pill" title="Agent">
                 <select
                   value={effectiveAdapter}
                   onChange={(e) => {
                     setAdapterOverride(e.target.value);
                     setModelOverride('');
+                    setEffortOverride('');
+                    setModeOverride('');
                   }}
                   aria-label="Agent"
                 >
@@ -461,7 +517,9 @@ export function Composer({
                   onChange={(e) => setModelOverride(e.target.value)}
                   aria-label="模型"
                 >
-                  <option value="">默认模型</option>
+                  <option value="">
+                    {activeProbe?.defaultModel ? `默认 (${activeProbe.defaultModel})` : '跟随 Agent 默认值'}
+                  </option>
                   {modelChoices.map((mc) => (
                     <option key={mc} value={mc}>
                       {mc}
@@ -471,30 +529,36 @@ export function Composer({
               </label>
               {!compact && (
                 <>
+                  {effortChoices.length > 0 && (
+                    <>
+                      <span className="rt-sep">·</span>
+                      <label className="rt-pill" title="思考强度">
+                        <select
+                          value={effectiveEffort}
+                          onChange={(e) => setEffortOverride(e.target.value)}
+                          aria-label="思考强度"
+                        >
+                          <option value="">跟随 Agent 默认值</option>
+                          {effortChoices.map((eff) => (
+                            <option key={eff} value={eff}>
+                              {effortLabel(eff)}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                    </>
+                  )}
                   <span className="rt-sep">·</span>
-                  <label className="rt-pill" title="思考强度">
-                    <select
-                      value={effectiveEffort}
-                      onChange={(e) => setEffortOverride(e.target.value)}
-                      aria-label="Effort"
-                    >
-                      {EFFORT_OPTIONS.map((opt) => (
-                        <option key={opt.value} value={opt.value}>
-                          {opt.label}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                  <span className="rt-sep">·</span>
-                  <label className="rt-pill" title="权限模式">
+                  <label className="rt-pill" title="Agent 权限模式">
                     <select
                       value={effectiveMode}
                       onChange={(e) => setModeOverride(e.target.value)}
-                      aria-label="权限"
+                      aria-label="权限模式"
                     >
-                      {MODE_OPTIONS.map((opt) => (
-                        <option key={opt.value} value={opt.value}>
-                          {opt.label}
+                      <option value="">{defaultModeDisplayLabel(activeProbe, modeChoices)}</option>
+                      {modeChoices.map((opt) => (
+                        <option key={opt.id} value={opt.id} title={opt.description || undefined}>
+                          {modeLabel(opt)}
                         </option>
                       ))}
                     </select>

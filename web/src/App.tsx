@@ -6,7 +6,16 @@ import { MobileTabs } from './components/MobileTabs';
 import { Sidebar } from './components/Sidebar';
 import { useBootstrap } from './hooks/queries';
 import { useRealtimeSync } from './hooks/useRealtimeSync';
-import { api, errMsg, setStoredClientToken, setStoredDevToken } from './lib/api';
+import {
+  ApiError,
+  api,
+  detectAndRememberDesktopShell,
+  errMsg,
+  isDesktopShell,
+  openDesktopSetup,
+  setStoredClientToken,
+  setStoredDevToken,
+} from './lib/api';
 import { hasUrgentSession } from './lib/format';
 import { navigate, parseHash, paths, replaceHash, useRoute } from './lib/router';
 import { ArtifactsPage } from './pages/ArtifactsPage';
@@ -78,42 +87,156 @@ function useGlobalKeys() {
   }, []);
 }
 
-function BootError({ message, onRetry }: { message: string; onRetry: () => void }) {
+function BootError({ error, onRetry }: { error: unknown; onRetry: () => void }) {
+  const isUnauth = error instanceof ApiError && error.status === 401;
+  const [pairCode, setPairCode] = useState('');
+  const [deviceName, setDeviceName] = useState('');
+  const [pairing, setPairing] = useState(false);
+  const [pairErr, setPairErr] = useState('');
+  const [showManual, setShowManual] = useState(!isUnauth);
   const [token, setToken] = useState('');
+  const inDesktop = isDesktopShell();
+
+  const submitPair = async () => {
+    const trimmed = pairCode.trim();
+    if (!trimmed || pairing) return;
+    setPairing(true);
+    setPairErr('');
+    try {
+      const res = await api.pairClient(trimmed, deviceName);
+      setStoredClientToken(res.clientToken);
+      setStoredDevToken('');
+      toast(`已配对并登录到 ${res.workspaceName || 'Orbit'}`);
+      onRetry();
+    } catch (e) {
+      setPairErr(errMsg(e));
+    } finally {
+      setPairing(false);
+    }
+  };
+
   return (
-    <div className="empty" style={{ maxWidth: 440, margin: '18vh auto 0' }}>
-      <div className="brand" style={{ justifyContent: 'center' }}>
-        <span className="brand-mark" />
-        <b>hebi8-Orbit</b>
-      </div>
-      <p>连接失败：{message}</p>
-      <p className="faint">若需要手动认证，请填入访问令牌（仅保存在当前浏览器）。</p>
-      <div style={{ display: 'flex', gap: 6 }}>
-        <input
-          type="password"
-          className="field"
-          value={token}
-          onChange={(e) => setToken(e.target.value)}
-          placeholder="输入访问令牌"
-          autoComplete="off"
-        />
-        <button
-          type="button"
-          className="btn pri"
-          onClick={() => {
-            const trimmed = token.trim();
-            if (trimmed.startsWith('ock_')) {
-              setStoredClientToken(trimmed);
-              setStoredDevToken('');
-            } else if (trimmed) {
-              setStoredClientToken('');
-              setStoredDevToken(trimmed);
-            }
-            onRetry();
-          }}
-        >
-          重试
-        </button>
+    <div className="auth-gate">
+      <div className="auth-gate-card">
+        <div className="brand" style={{ padding: 0, marginBottom: 14 }}>
+          <span className="brand-mark" />
+          <b>hebi8-Orbit</b>
+        </div>
+
+        {isUnauth ? (
+          <>
+            <h1 className="auth-gate-title">配对访问此网络</h1>
+            <p className="muted" style={{ fontSize: 12.5, margin: '0 0 14px', lineHeight: 1.55 }}>
+              输入目标网络的 8 位配对码即可保留登录态访问。配对后本浏览器仅作为已登录客户端设备，不会注册为执行主机。
+            </p>
+            <div className="auth-gate-form">
+              <input
+                type="text"
+                className="field mono auth-code-in"
+                value={pairCode}
+                onChange={(e) => setPairCode(e.target.value.toUpperCase())}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') void submitPair();
+                }}
+                placeholder="输入配对码（如 XXXX-XXXX）"
+                autoComplete="off"
+                spellCheck={false}
+                autoFocus
+              />
+              <input
+                type="text"
+                className="field"
+                value={deviceName}
+                onChange={(e) => setDeviceName(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') void submitPair();
+                }}
+                placeholder="设备名称（可选，如 MacBook Chrome）"
+                autoComplete="off"
+              />
+              {pairErr && <div className="bad-t" style={{ fontSize: 12 }}>{pairErr}</div>}
+              <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 4 }}>
+                <button
+                  type="button"
+                  className="btn pri"
+                  style={{ flex: 1 }}
+                  disabled={!pairCode.trim() || pairing}
+                  onClick={() => void submitPair()}
+                >
+                  {pairing ? '验证配对码…' : '配对并进入'}
+                </button>
+                {inDesktop && (
+                  <button type="button" className="btn ghost" onClick={() => openDesktopSetup()}>
+                    切换网络
+                  </button>
+                )}
+              </div>
+            </div>
+            <div className="auth-gate-tip">
+              在目标主机运行 <code className="mono">orbit pair --client</code> 或在「设置 → 机器与 Agent → 添加机器」获取配对码。
+            </div>
+            <div style={{ marginTop: 12 }}>
+              <button type="button" className="lk faint" style={{ fontSize: 11.5 }} onClick={() => setShowManual((v) => !v)}>
+                {showManual ? '收起手动令牌' : '已有访问令牌？手动输入'}
+              </button>
+            </div>
+          </>
+        ) : (
+          <>
+            <p style={{ margin: '0 0 8px' }}>连接失败：{errMsg(error)}</p>
+            <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
+              <button type="button" className="btn pri sm" onClick={onRetry}>重试</button>
+              {inDesktop && (
+                <button type="button" className="btn ghost sm" onClick={() => openDesktopSetup()}>
+                  切换网络
+                </button>
+              )}
+            </div>
+          </>
+        )}
+
+        {showManual && (
+          <div style={{ display: 'flex', gap: 6, marginTop: 10 }}>
+            <input
+              type="password"
+              className="field"
+              value={token}
+              onChange={(e) => setToken(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && token.trim()) {
+                  const trimmed = token.trim();
+                  if (trimmed.startsWith('ock_')) {
+                    setStoredClientToken(trimmed);
+                    setStoredDevToken('');
+                  } else {
+                    setStoredClientToken('');
+                    setStoredDevToken(trimmed);
+                  }
+                  onRetry();
+                }
+              }}
+              placeholder="输入 ock_ 或 devToken"
+              autoComplete="off"
+            />
+            <button
+              type="button"
+              className="btn ghost"
+              onClick={() => {
+                const trimmed = token.trim();
+                if (trimmed.startsWith('ock_')) {
+                  setStoredClientToken(trimmed);
+                  setStoredDevToken('');
+                } else if (trimmed) {
+                  setStoredClientToken('');
+                  setStoredDevToken(trimmed);
+                }
+                onRetry();
+              }}
+            >
+              登录
+            </button>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -202,6 +325,10 @@ export function App() {
   useRealtimeSync(isPublicRoute ? undefined : bootQ.data?.snapshotSeq);
   useGlobalKeys();
 
+  useEffect(() => {
+    detectAndRememberDesktopShell();
+  }, []);
+
   useEffect(() => applyThemeToDocument(theme), [theme]);
 
   const boot = bootQ.data;
@@ -217,6 +344,13 @@ export function App() {
     }
   }, [boot?.setup?.currentMachineId, storedLocalMachineId, setLocalMachineId]);
 
+  // Auto-guide first-time workspaces through local agent discovery & setup onboarding.
+  useEffect(() => {
+    if (boot?.setup?.needsOnboarding && route.name === 'home') {
+      replaceHash(paths.onboarding());
+    }
+  }, [boot?.setup?.needsOnboarding, route.name]);
+
   if (route.name === 'auth') {
     return <AuthHandoffScreen code={route.code} />;
   }
@@ -225,7 +359,7 @@ export function App() {
   }
 
   if (!boot) {
-    if (bootQ.isError) return <BootError message={errMsg(bootQ.error)} onRetry={() => void bootQ.refetch()} />;
+    if (bootQ.isError) return <BootError error={bootQ.error} onRetry={() => void bootQ.refetch()} />;
     return <div className="empty" style={{ marginTop: '30vh' }}>连接中…</div>;
   }
 

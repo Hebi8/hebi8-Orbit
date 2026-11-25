@@ -17,22 +17,23 @@ import (
 )
 
 type wsTicketEntry struct {
-	actor     string
-	kind      authKind
-	machineID string
-	expiresAt time.Time
+	actor         string
+	kind          authKind
+	machineID     string
+	clientTokenID string
+	expiresAt     time.Time
 }
 
 type actorContextKey struct{}
 type actorKindContextKey struct{}
 type clientMachineIDContextKey struct{}
+type clientTokenIDContextKey struct{}
 
 type authKind int
 
 const (
 	authNone authKind = iota
 	authClientToken
-	authTailscale
 	authDevToken
 	authDevOpen
 )
@@ -51,6 +52,20 @@ func withClientMachineID(ctx context.Context, machineID string) context.Context 
 
 func clientMachineIDFromContext(ctx context.Context) string {
 	if v, ok := ctx.Value(clientMachineIDContextKey{}).(string); ok {
+		return v
+	}
+	return ""
+}
+
+func withClientTokenID(ctx context.Context, tokenID string) context.Context {
+	if strings.TrimSpace(tokenID) == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, clientTokenIDContextKey{}, strings.TrimSpace(tokenID))
+}
+
+func clientTokenIDFromContext(ctx context.Context) string {
+	if v, ok := ctx.Value(clientTokenIDContextKey{}).(string); ok {
 		return v
 	}
 	return ""
@@ -114,10 +129,10 @@ func (s *Server) securityHeadersMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// authMiddleware enforces cookie-less client/Tailscale auth + exact Origin + X-Orbit-Request write protection.
+// authMiddleware enforces cookie-less paired client token / local loopback auth + exact Origin + X-Orbit-Request write protection.
 func (s *Server) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		actor, kind, clientMachineID, ok := s.authenticate(r)
+		actor, _, clientMachineID, clientTokenID, ok := s.authenticate(r)
 		if !ok {
 			writeAPIError(w, http.StatusUnauthorized, "ERR_UNAUTHORIZED", "authentication required")
 			return
@@ -130,14 +145,7 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 				return
 			}
 			origin := strings.TrimSpace(r.Header.Get("Origin"))
-			if kind == authTailscale {
-				// Tailscale-authenticated writes MUST carry an exact matching Origin header
-				// (mirroring WS handshake rules). Local/remote CLI uses Bearer client token or X-Orbit-Dev-Token instead.
-				if origin == "" || !s.isAllowedOrigin(origin, r) {
-					writeAPIError(w, http.StatusForbidden, "ERR_ORIGIN_FORBIDDEN", "write requests authenticated via Tailscale require exact matching Origin header")
-					return
-				}
-			} else if origin != "" && !s.isAllowedOrigin(origin, r) {
+			if origin != "" && !s.isAllowedOrigin(origin, r) {
 				writeAPIError(w, http.StatusForbidden, "ERR_ORIGIN_FORBIDDEN", "origin does not match configured hub origin")
 				return
 			}
@@ -155,49 +163,74 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 
 		ctx := withActor(r.Context(), actor, actorKind)
 		ctx = withClientMachineID(ctx, clientMachineID)
+		ctx = withClientTokenID(ctx, clientTokenID)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
-func (s *Server) authenticate(r *http.Request) (string, authKind, string, bool) {
+func (s *Server) maybeTouchClientToken(tokenID string) {
+	if tokenID == "" {
+		return
+	}
+	now := time.Now()
+	s.clientTouchMu.Lock()
+	if s.clientLastTouch == nil {
+		s.clientLastTouch = map[string]time.Time{}
+	}
+	if last, ok := s.clientLastTouch[tokenID]; ok && now.Sub(last) < time.Minute {
+		s.clientTouchMu.Unlock()
+		return
+	}
+	s.clientLastTouch[tokenID] = now
+	s.clientTouchMu.Unlock()
+
+	s.bgWG.Add(1)
+	go func() {
+		defer s.bgWG.Done()
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = s.store.TouchClientTokenLastUsed(ctx, tokenID)
+	}()
+}
+
+func (s *Server) authenticate(r *http.Request) (string, authKind, string, string, bool) {
 	cfg := s.hubConfigSnapshot()
 
-	// 1. Explicit Authorization: Bearer ock_... client token.
+	// 1. Explicit Authorization: Bearer ock_... paired client token.
 	// If an Authorization header is presented and invalid, reject immediately (NEVER fall through!).
+	// Tailscale-User-Login alone NEVER grants access; if an allowlist is configured it acts as an extra restriction.
 	if rawAuth := strings.TrimSpace(r.Header.Get("Authorization")); rawAuth != "" {
 		bearer := extractBearerToken(rawAuth)
 		if bearer == "" || !strings.HasPrefix(bearer, "ock_") {
-			return "", authNone, "", false
+			return "", authNone, "", "", false
+		}
+		if tsLogin := strings.TrimSpace(r.Header.Get("Tailscale-User-Login")); tsLogin != "" && s.hasConfiguredTailscaleLogins() {
+			if !s.isAllowedTailscaleLogin(tsLogin) {
+				return "", authNone, "", "", false
+			}
 		}
 		info, valid, err := s.store.VerifyClientToken(r.Context(), bearer)
 		if err != nil || !valid {
-			return "", authNone, "", false
+			return "", authNone, "", "", false
 		}
-		return "client:" + info.ID, authClientToken, info.MachineID, true
+		s.maybeTouchClientToken(info.ID)
+		return "client:" + info.ID, authClientToken, info.MachineID, info.ID, true
 	}
 
-	// 2. Tailscale Serve injected identity header (no cookies ever trusted for auth)
-	if tsLogin := strings.TrimSpace(r.Header.Get("Tailscale-User-Login")); tsLogin != "" {
-		if s.isAllowedTailscaleLogin(tsLogin) {
-			return tsLogin, authTailscale, "", true
-		}
-		return "", authNone, "", false
-	}
-
-	// 3. Local loopback development token or --dev-open (direct loopback ONLY; never proxied requests)
-	if isLoopbackAddr(r.RemoteAddr) {
+	// 2. Direct loopback development token or --dev-open (direct loopback ONLY; NEVER proxied/Tailscale requests).
+	if isLoopbackAddr(r.RemoteAddr) && !hasReverseProxyHeaders(r) {
 		if cfg.DevToken != "" {
 			provided := r.Header.Get("X-Orbit-Dev-Token")
 			if provided != "" && subtle.ConstantTimeCompare([]byte(provided), []byte(cfg.DevToken)) == 1 {
-				return "dev-token", authDevToken, "", true
+				return "dev-token", authDevToken, "", "", true
 			}
 		}
-		if cfg.DevOpen && isLoopbackHost(r.Host) && !hasReverseProxyHeaders(r) && !s.isTailscaleSharingActive() {
-			return "dev-local", authDevOpen, "", true
+		if cfg.DevOpen && isLoopbackHost(r.Host) {
+			return "dev-local", authDevOpen, "", "", true
 		}
 	}
 
-	return "", authNone, "", false
+	return "", authNone, "", "", false
 }
 
 func isLoopbackHost(hostport string) bool {
@@ -308,7 +341,7 @@ func (s *Server) runnerAuthMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-func (s *Server) issueWSTicket(actor string, kind authKind, machineID string) (string, int64) {
+func (s *Server) issueWSTicket(actor string, kind authKind, machineID, clientTokenID string) (string, int64) {
 	var raw [24]byte
 	_, _ = rand.Read(raw[:])
 	ticket := "wst_" + hex.EncodeToString(raw[:])
@@ -324,67 +357,92 @@ func (s *Server) issueWSTicket(actor string, kind authKind, machineID string) (s
 			delete(s.wsTickets, k)
 		}
 	}
-	s.wsTickets[ticket] = wsTicketEntry{actor: actor, kind: kind, machineID: machineID, expiresAt: exp}
+	s.wsTickets[ticket] = wsTicketEntry{
+		actor:         actor,
+		kind:          kind,
+		machineID:     machineID,
+		clientTokenID: clientTokenID,
+		expiresAt:     exp,
+	}
 	s.wsTicketsMu.Unlock()
 	return ticket, exp.UnixMilli()
 }
 
-func (s *Server) consumeWSTicket(ticket string) (string, authKind, bool) {
+func (s *Server) consumeWSTicket(ctx context.Context, ticket string) (string, authKind, string, bool) {
 	ticket = strings.TrimSpace(ticket)
 	if ticket == "" {
-		return "", authNone, false
+		return "", authNone, "", false
 	}
 	now := time.Now()
 	s.wsTicketsMu.Lock()
-	defer s.wsTicketsMu.Unlock()
 	entry, ok := s.wsTickets[ticket]
-	if !ok {
-		return "", authNone, false
+	if ok {
+		delete(s.wsTickets, ticket)
 	}
-	delete(s.wsTickets, ticket)
-	if now.After(entry.expiresAt) {
-		return "", authNone, false
+	s.wsTicketsMu.Unlock()
+	if !ok || now.After(entry.expiresAt) {
+		return "", authNone, "", false
 	}
-	return entry.actor, entry.kind, true
+	if entry.kind == authClientToken || entry.clientTokenID != "" {
+		active, err := s.store.IsClientTokenActive(ctx, entry.clientTokenID)
+		if err != nil || !active {
+			return "", authNone, "", false
+		}
+	}
+	return entry.actor, entry.kind, entry.clientTokenID, true
+}
+
+func (s *Server) revokeWSTicketsForClientToken(clientTokenID string) {
+	clientTokenID = strings.TrimSpace(clientTokenID)
+	if clientTokenID == "" {
+		return
+	}
+	s.wsTicketsMu.Lock()
+	for k, v := range s.wsTickets {
+		if v.clientTokenID == clientTokenID {
+			delete(s.wsTickets, k)
+		}
+	}
+	s.wsTicketsMu.Unlock()
 }
 
 func (s *Server) handleCreateWSTicket(w http.ResponseWriter, r *http.Request) {
-	actor, kind, machineID, ok := s.authenticate(r)
+	actor, kind, machineID, clientTokenID, ok := s.authenticate(r)
 	if !ok {
 		writeAPIError(w, http.StatusUnauthorized, "ERR_UNAUTHORIZED", "authentication required")
 		return
 	}
-	ticket, expiresAt := s.issueWSTicket(actor, kind, machineID)
+	ticket, expiresAt := s.issueWSTicket(actor, kind, machineID, clientTokenID)
 	writeJSON(w, http.StatusOK, protocol.WSTicketResponse{
 		Ticket:    ticket,
 		ExpiresAt: expiresAt,
 	})
 }
 
-func (s *Server) validateWSRequest(r *http.Request) (string, int, string) {
-	actor, kind, _, ok := s.authenticate(r)
+func (s *Server) validateWSRequest(r *http.Request) (string, string, int, string) {
+	actor, kind, _, clientTokenID, ok := s.authenticate(r)
 	if !ok {
 		if ticket := strings.TrimSpace(r.URL.Query().Get("ticket")); ticket != "" {
-			actor, kind, ok = s.consumeWSTicket(ticket)
+			actor, kind, clientTokenID, ok = s.consumeWSTicket(r.Context(), ticket)
 		}
 	}
 	if !ok {
-		return "", http.StatusUnauthorized, "authentication required"
+		return "", "", http.StatusUnauthorized, "authentication required"
 	}
 
 	origin := strings.TrimSpace(r.Header.Get("Origin"))
 	if origin != "" {
 		if !s.isAllowedOrigin(origin, r) {
-			return "", http.StatusForbidden, "websocket origin does not match configured hub origin"
+			return "", "", http.StatusForbidden, "websocket origin does not match configured hub origin"
 		}
-		return actor, http.StatusOK, ""
+		return actor, clientTokenID, http.StatusOK, ""
 	}
 
 	// Non-browser clients without Origin allowed under clientToken / devToken / devOpen
 	if kind == authClientToken || ((kind == authDevToken || kind == authDevOpen) && isLoopbackAddr(r.RemoteAddr)) {
-		return actor, http.StatusOK, ""
+		return actor, clientTokenID, http.StatusOK, ""
 	}
-	return "", http.StatusForbidden, "missing Origin header on websocket handshake"
+	return "", "", http.StatusForbidden, "missing Origin header on websocket handshake"
 }
 
 func (s *Server) isAllowedOrigin(origin string, r *http.Request) bool {

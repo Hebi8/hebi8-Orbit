@@ -1,9 +1,9 @@
 import { useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import { SlidersHorizontal } from 'lucide-react';
+import { ArrowLeftRight, SlidersHorizontal } from 'lucide-react';
 import type { MachineView } from '../generated/protocol';
 import { useHubLatency } from '../hooks/useHubLatency';
-import { api, errMsg } from '../lib/api';
+import { api, errMsg, isDesktopShell, openDesktopSetup } from '../lib/api';
 import { cleanMachineName, humanResourceLabel, relTime } from '../lib/format';
 import { resolveEffectiveLocalMachineId } from '../lib/ide';
 import { navigate, paths } from '../lib/router';
@@ -181,6 +181,19 @@ export function MachinesPopover({
           </div>
 
           <div className="ws-pop-foot">
+            {isDesktopShell() && (
+              <button
+                type="button"
+                className="ws-settings-btn"
+                onClick={() => {
+                  setOpen(false);
+                  openDesktopSetup();
+                }}
+              >
+                <ArrowLeftRight size={12} strokeWidth={1.6} />
+                <span>切换网络</span>
+              </button>
+            )}
             <button
               type="button"
               className="ws-settings-btn"

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { FileSpreadsheet, FileText, Layers, Presentation, Table } from 'lucide-react';
+import { FileSpreadsheet, FileText, Layers, Link2, Presentation, Table } from 'lucide-react';
 import type { AttemptView, TaskTimelineResponse } from '../generated/protocol';
 import { ApprovalNotice } from '../components/ApprovalNotice';
 import { FolderChangesCard } from '../components/FolderChangesCard';
@@ -8,7 +8,18 @@ import { CaretIcon } from '../components/Icons';
 import { useAttemptRaw } from '../hooks/queries';
 import { api, errMsg } from '../lib/api';
 import { deliveryInlineImages, deliveryReusableArtifacts } from '../lib/artifacts';
-import { artifactShortLabel, attemptStateLabel, basename, hhmm, isAttemptLive, shortSha, triggerLabel } from '../lib/format';
+import {
+  PA_PROJECT_ID,
+  SCRATCH_PROJECT_ID,
+  artifactShortLabel,
+  attemptStateLabel,
+  basename,
+  hhmm,
+  isAttemptLive,
+  shortSha,
+  triggerLabel,
+} from '../lib/format';
+import { navigate, paths } from '../lib/router';
 import { buildSegments, lastLiveStep } from '../lib/segments';
 import { toast, useWorkbenchStore } from '../store/useWorkbenchStore';
 import { Segments } from './Segments';
@@ -212,6 +223,25 @@ export function Turn({
   return (
     <div className="turn" id={`turn-${attempt.attemptId}`} data-turn={index}>
       <div className="it u">
+        {attempt.refTasks && attempt.refTasks.length > 0 && (
+          <div className="turn-refs" aria-label="引用的对话">
+            {attempt.refTasks.map((ref) => (
+              <button
+                key={ref.taskId}
+                type="button"
+                className="turn-ref-pill"
+                title={ref.projectName ? `${ref.projectName} · ${ref.title}` : ref.title}
+                onClick={() => navigate(ref.projectId === PA_PROJECT_ID ? paths.pa(ref.taskId) : paths.session(ref.taskId))}
+              >
+                <Link2 size={11} strokeWidth={1.7} />
+                <span className="turn-ref-proj">
+                  {ref.projectName || (ref.projectId === SCRATCH_PROJECT_ID ? '对话' : ref.projectId === PA_PROJECT_ID ? 'PA' : ref.projectId)}
+                </span>
+                <span className="ell">{ref.title || ref.taskId}</span>
+              </button>
+            ))}
+          </div>
+        )}
         <div className={`ub ${prompt.placeholder ? 'phd' : ''}`}>{prompt.text}</div>
         {prompt.detail.length > 0 && (
           <div className="udetail">

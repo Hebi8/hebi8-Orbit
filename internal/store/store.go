@@ -453,32 +453,55 @@ func ensureColumnTx(ctx context.Context, tx *sql.Tx, table, column, colDef strin
 }
 
 func ensureScratchProjectTx(ctx context.Context, tx *sql.Tx, now int64) error {
-	cfg := protocol.ProjectConfig{
-		DisplayName:       protocol.ScratchProjectDisplayName,
-		RepoIdentity:      protocol.ScratchProjectRepoIdentity,
-		DefaultBranch:     "main",
-		DefaultCapability: "primary-dev",
-		DefaultAdapter:    protocol.AdapterAgy,
-		IDEScheme:         protocol.IDECursor,
-		Anchors:           map[string]protocol.ProjectAnchorConfig{},
+	virtuals := []struct {
+		id      string
+		name    string
+		repoID  string
+		defMode string
+	}{
+		{
+			id:     protocol.ScratchProjectID,
+			name:   protocol.ScratchProjectDisplayName,
+			repoID: protocol.ScratchProjectRepoIdentity,
+		},
+		{
+			id:      protocol.PAProjectID,
+			name:    protocol.PAProjectDisplayName,
+			repoID:  protocol.PAProjectRepoIdentity,
+			defMode: "auto",
+		},
 	}
-	cfgJSON, err := json.Marshal(cfg)
-	if err != nil {
-		return err
-	}
-	_, err = tx.ExecContext(ctx, `
-		INSERT INTO projects (
-			project_id, display_name, repo_identity, default_branch,
-			mirror_bare_path, config_json, archived, updated_at
-		) VALUES (?, ?, ?, 'main', '', ?, 0, ?)
-		ON CONFLICT(project_id) DO UPDATE SET
-			display_name = excluded.display_name,
-			repo_identity = excluded.repo_identity,
-			archived = 0,
-			updated_at = excluded.updated_at
-	`, protocol.ScratchProjectID, protocol.ScratchProjectDisplayName, protocol.ScratchProjectRepoIdentity, string(cfgJSON), now)
-	if err != nil {
-		return fmt.Errorf("ensure _scratch project: %w", err)
+	for _, vp := range virtuals {
+		cfg := protocol.ProjectConfig{
+			DisplayName:       vp.name,
+			RepoIdentity:      vp.repoID,
+			DefaultBranch:     "main",
+			DefaultCapability: "primary-dev",
+			DefaultAdapter:    protocol.AdapterAgy,
+			IDEScheme:         protocol.IDECursor,
+			Anchors:           map[string]protocol.ProjectAnchorConfig{},
+		}
+		if vp.defMode != "" {
+			cfg.DefaultModelConfig.Mode = vp.defMode
+		}
+		cfgJSON, err := json.Marshal(cfg)
+		if err != nil {
+			return err
+		}
+		_, err = tx.ExecContext(ctx, `
+			INSERT INTO projects (
+				project_id, display_name, repo_identity, default_branch,
+				mirror_bare_path, config_json, archived, updated_at
+			) VALUES (?, ?, ?, 'main', '', ?, 0, ?)
+			ON CONFLICT(project_id) DO UPDATE SET
+				display_name = excluded.display_name,
+				repo_identity = excluded.repo_identity,
+				archived = 0,
+				updated_at = excluded.updated_at
+		`, vp.id, vp.name, vp.repoID, string(cfgJSON), now)
+		if err != nil {
+			return fmt.Errorf("ensure virtual project %s: %w", vp.id, err)
+		}
 	}
 	return nil
 }

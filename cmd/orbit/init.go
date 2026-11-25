@@ -318,7 +318,8 @@ func initHubMode(cfgDirAbs, dataDir, machineFlag, workspaceName, listenAddr, ori
 	if err := os.WriteFile(tokenPath, []byte(runnerToken+"\n"), 0o600); err != nil {
 		return fmt.Errorf("write runner.token: %w", err)
 	}
-	if err := writeClientYAML(clientPath, "http://"+strings.TrimPrefix(strings.TrimPrefix(listenAddr, "http://"), "https://"), devToken); err != nil {
+	localHubURL := "http://" + strings.TrimPrefix(strings.TrimPrefix(listenAddr, "http://"), "https://")
+	if err := writeClientConfigFull(clientPath, localHubURL, devToken, "", machineID, "local"); err != nil {
 		return err
 	}
 
@@ -557,19 +558,7 @@ func existingClientHubURL(cfgDirAbs string) string {
 }
 
 func writeClientYAML(path, hubURL, devToken string) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
-	}
-	doc := struct {
-		HubURL     string `yaml:"hubUrl"`
-		DevToken   string `yaml:"devToken,omitempty"`
-		PAShortcut string `yaml:"paShortcut"`
-	}{
-		HubURL:     strings.TrimRight(hubURL, "/"),
-		DevToken:   strings.TrimSpace(devToken),
-		PAShortcut: "CmdOrCtrl+Shift+O",
-	}
-	return writeYAMLFile(path, doc, 0o600)
+	return writeClientConfigFull(path, hubURL, devToken, "", "", "remote")
 }
 
 func writeYAMLFile(path string, v any, perm os.FileMode) error {

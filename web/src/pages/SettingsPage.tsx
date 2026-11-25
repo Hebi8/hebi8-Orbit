@@ -1,17 +1,20 @@
 import { useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import {
+  ArrowLeftRight,
   ArrowUp,
   Check,
   ChevronDown,
   ChevronRight,
   Copy,
-  ExternalLink,
   Folder,
   Globe,
   Laptop,
+  LogOut,
+  MonitorSmartphone,
   Plus,
   Radar,
+  Sparkles,
   Trash2,
 } from 'lucide-react';
 import type {
@@ -25,17 +28,20 @@ import { AgentList, agentDisplayName } from '../components/AgentList';
 import { DeviceRoleIcon } from '../components/DeviceRoleIcon';
 import { PageHeader } from '../components/PageHeader';
 import { PairDialog } from '../components/PairDialog';
-import { useNetworkSettings } from '../hooks/queries';
-import { api, errMsg } from '../lib/api';
+import { useClientDevices, useNetworkSettings } from '../hooks/queries';
+import { api, errMsg, isDesktopShell, openDesktopSetup, setStoredClientToken } from '../lib/api';
 import { cleanMachineName, relTime } from '../lib/format';
 import { resolveEffectiveLocalMachineId } from '../lib/ide';
+import { navigate, paths } from '../lib/router';
 import { toast, useWorkbenchStore } from '../store/useWorkbenchStore';
 
 export function SettingsPage({ boot }: { boot: BootstrapResponse }) {
   const qc = useQueryClient();
   const netQ = useNetworkSettings(true);
+  const clientsQ = useClientDevices(true);
   const storedLocalId = useWorkbenchStore((s) => s.localMachineId);
   const setWorkspaceNameOverride = useWorkbenchStore((s) => s.setWorkspaceNameOverride);
+  const inDesktop = isDesktopShell();
 
   const net = netQ.data;
   const workspaceName = net?.workspaceName || boot.workspaceName || 'Home LAN';
@@ -70,6 +76,33 @@ export function SettingsPage({ boot }: { boot: BootstrapResponse }) {
   const refreshAll = () => {
     void qc.invalidateQueries({ queryKey: ['bootstrap'] });
     void qc.invalidateQueries({ queryKey: ['network-settings'] });
+    void qc.invalidateQueries({ queryKey: ['client-devices'] });
+  };
+
+  const revokeClientDevice = async (clientId: string, name: string, isCurrent?: boolean) => {
+    try {
+      await api.revokeClient(clientId);
+      if (isCurrent) {
+        setStoredClientToken('');
+        window.location.reload();
+        return;
+      }
+      refreshAll();
+      toast(`已移除客户端设备：${name}`);
+    } catch (e) {
+      toast(errMsg(e), 'err');
+    }
+  };
+
+  const logoutCurrentDevice = async () => {
+    try {
+      await api.logoutClient();
+    } catch {
+      // ignore if already revoked
+    } finally {
+      setStoredClientToken('');
+      window.location.reload();
+    }
   };
 
   const saveWorkspaceName = async () => {
@@ -227,6 +260,18 @@ export function SettingsPage({ boot }: { boot: BootstrapResponse }) {
           <section className="set-sec">
             <div className="set-hd">
               <h2>网络</h2>
+              <div style={{ display: 'flex', gap: 6 }}>
+                {inDesktop && (
+                  <button type="button" className="btn ghost sm" onClick={() => openDesktopSetup()}>
+                    <ArrowLeftRight size={12} strokeWidth={1.7} /> 切换网络
+                  </button>
+                )}
+                {boot.setup?.currentClientId && (
+                  <button type="button" className="btn ghost sm" onClick={() => void logoutCurrentDevice()}>
+                    <LogOut size={12} strokeWidth={1.7} /> 退出登录
+                  </button>
+                )}
+              </div>
             </div>
 
             <div className="set-row">
@@ -437,14 +482,31 @@ export function SettingsPage({ boot }: { boot: BootstrapResponse }) {
                                 <Copy size={11.5} strokeWidth={1.7} /> 复制
                               </button>
                               {!h.isSelf && (
-                                <a
-                                  href={h.origin}
-                                  target="_blank"
-                                  rel="noreferrer"
-                                  className="btn ghost sm"
-                                >
-                                  <ExternalLink size={11.5} strokeWidth={1.7} /> 打开
-                                </a>
+                                inDesktop ? (
+                                  <button
+                                    type="button"
+                                    className="btn pri sm"
+                                    onClick={() =>
+                                      openDesktopSetup({
+                                        origin: h.origin,
+                                        hostName: h.hostName || h.dnsName,
+                                        discoveryId: h.discoveryId,
+                                      })
+                                    }
+                                  >
+                                    <ArrowLeftRight size={11.5} strokeWidth={1.7} /> 切换 / 配对
+                                  </button>
+                                ) : (
+                                  <button
+                                    type="button"
+                                    className="btn pri sm"
+                                    onClick={() => {
+                                      window.open(h.origin, '_blank', 'noopener,noreferrer');
+                                    }}
+                                  >
+                                    <ArrowLeftRight size={11.5} strokeWidth={1.7} /> 配对访问
+                                  </button>
+                                )
                               )}
                             </div>
                           </div>
@@ -457,20 +519,69 @@ export function SettingsPage({ boot }: { boot: BootstrapResponse }) {
             </div>
           </section>
 
+          {/* Section 1.5: 已登录客户端设备 */}
+          <section className="set-sec">
+            <div className="set-hd">
+              <h2>已登录客户端设备</h2>
+              <span className="faint" style={{ fontSize: 11.5 }}>
+                通过配对码登录的浏览器/桌面端（仅访问，不作为执行主机）
+              </span>
+            </div>
+            <div className="client-dev-list">
+              {(clientsQ.data ?? []).length === 0 ? (
+                <div className="faint" style={{ fontSize: 12, padding: '6px 0' }}>
+                  暂无已配对的远程客户端设备
+                </div>
+              ) : (
+                (clientsQ.data ?? []).map((c) => (
+                  <div className="client-dev-row" key={c.id}>
+                    <MonitorSmartphone size={14} strokeWidth={1.7} className="muted" />
+                    <div className="client-dev-main">
+                      <div className="client-dev-hd">
+                        <span className="ell">{c.name}</span>
+                        {c.isCurrent && <span className="duty-cur">当前设备</span>}
+                        <span className="faint mono" style={{ fontSize: 11 }}>{c.scope}</span>
+                      </div>
+                      <div className="faint" style={{ fontSize: 11.5 }}>
+                        {c.lastUsedAt ? `最近活跃 · ${relTime(c.lastUsedAt)}` : `登录于 ${relTime(c.createdAt)}`}
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      className="btn ghost sm bad-t"
+                      onClick={() => void revokeClientDevice(c.id, c.name, c.isCurrent)}
+                    >
+                      <LogOut size={11.5} strokeWidth={1.7} /> {c.isCurrent ? '登出' : '移除'}
+                    </button>
+                  </div>
+                ))
+              )}
+            </div>
+          </section>
+
           {/* Section 2: 机器与 Agent */}
           <section className="set-sec">
             <div className="set-hd">
               <h2>机器与 Agent</h2>
-              <button
-                type="button"
-                className="btn pri sm"
-                onClick={() => {
-                  setPairBindMachine(undefined);
-                  setPairOpen(true);
-                }}
-              >
-                <Plus size={12.5} strokeWidth={1.8} /> 添加机器
-              </button>
+              <div style={{ display: 'flex', gap: 6 }}>
+                <button
+                  type="button"
+                  className="btn ghost sm"
+                  onClick={() => navigate(paths.onboarding())}
+                >
+                  <Sparkles size={12} strokeWidth={1.7} /> Agent 接入引导
+                </button>
+                <button
+                  type="button"
+                  className="btn pri sm"
+                  onClick={() => {
+                    setPairBindMachine(undefined);
+                    setPairOpen(true);
+                  }}
+                >
+                  <Plus size={12.5} strokeWidth={1.8} /> 添加机器 / 配对码
+                </button>
+              </div>
             </div>
 
             <div className="set-mach-list">

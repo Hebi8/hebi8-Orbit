@@ -120,6 +120,8 @@ export function SessionConversation({
         openAnnotations={openAnnotations}
         runtimeConfig={tl.runtimeConfig}
         machines={boot?.machines}
+        projects={boot?.projects}
+        machineId={lastAttempt?.machineId}
         compact={compact}
         onOpenReview={onOpenReview}
       />

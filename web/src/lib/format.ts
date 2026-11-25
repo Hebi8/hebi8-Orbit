@@ -9,6 +9,11 @@ import type {
 } from '../generated/protocol';
 
 export const SCRATCH_PROJECT_ID = '_scratch';
+export const PA_PROJECT_ID = '_pa';
+
+export function isVirtualProject(projectId?: string | null): boolean {
+  return projectId === SCRATCH_PROJECT_ID || projectId === PA_PROJECT_ID;
+}
 
 export function shortSha(sha?: string | null): string {
   return sha ? sha.slice(0, 7) : '';
@@ -334,7 +339,7 @@ export function toolVerb(name: string, title: string): string {
 
 /**
  * Strips any parenthetical role/tag description from machine display names
- * (e.g. "devNuc (Primary Hub & Dev)" -> "devNuc") so machine names stand cleanly on their own.
+ * (e.g. "dev-node (Primary Hub & Dev)" -> "dev-node") so machine names stand cleanly on their own.
  */
 export function cleanMachineName(m?: { displayName?: string; machineId: string } | null): string {
   if (!m) return '';

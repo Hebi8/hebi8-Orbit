@@ -590,6 +590,31 @@ func runApprovalDecide(ctx context.Context, allow bool, args []string, stdout, s
 	return nil
 }
 
+type repeatedStringFlag []string
+
+func (f *repeatedStringFlag) String() string { return strings.Join(*f, ",") }
+func (f *repeatedStringFlag) Set(v string) error {
+	for _, part := range strings.Split(v, ",") {
+		if trimmed := strings.TrimSpace(part); trimmed != "" {
+			*f = append(*f, trimmed)
+		}
+	}
+	return nil
+}
+
+func isTerminalAttemptState(st protocol.AttemptState) bool {
+	switch st {
+	case protocol.AttemptSucceeded,
+		protocol.AttemptNeedsVerification,
+		protocol.AttemptFailed,
+		protocol.AttemptExpired,
+		protocol.AttemptCancelled:
+		return true
+	default:
+		return false
+	}
+}
+
 func runPA(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if len(args) > 0 && args[0] == "chat" {
 		args = args[1:]
@@ -597,53 +622,289 @@ func runPA(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("pa", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	var (
-		threadID   = fs.String("thread", "", "existing PA thread ID")
-		newThread  = fs.Bool("new", false, "start a fresh PA thread")
-		hubURLFlag = fs.String("hub", "", "orbit-hub base URL")
-		tokenFlag  = fs.String("token", "", "optional X-Orbit-Dev-Token")
-		configDir  = fs.String("config-dir", "", "orbit config directory")
-		dataDirFlg = fs.String("data-dir", "", "orbit data directory")
-		jsonOut    = fs.Bool("json", false, "output JSON")
+		taskIDFlag  = fs.String("task", "", "existing _pa task ID to continue")
+		threadID    = fs.String("thread", "", "legacy PA thread ID (uses /api/pa/chat)")
+		newThread   = fs.Bool("new", false, "start a fresh PA conversation")
+		briefFlag   = fs.Bool("brief", false, "fetch structured workspace brief (/api/pa/brief)")
+		adapterFlag = fs.String("adapter", "", "optional agent adapter override (agy|claude|codex)")
+		machineFlag = fs.String("machine", "", "optional target machine ID")
+		modelFlag   = fs.String("model", "", "optional model override")
+		effortFlag  = fs.String("effort", "", "optional effort/thought_level override")
+		modeFlag    = fs.String("mode", "", "optional permission mode override")
+		noWait      = fs.Bool("no-wait", false, "dispatch without waiting for assistant reply")
+		timeoutSec  = fs.Int("timeout", 180, "max seconds to wait for assistant reply")
+		hubURLFlag  = fs.String("hub", "", "orbit-hub base URL")
+		tokenFlag   = fs.String("token", "", "optional auth token")
+		configDir   = fs.String("config-dir", "", "orbit config directory")
+		dataDirFlg  = fs.String("data-dir", "", "orbit data directory")
+		jsonOut     = fs.Bool("json", false, "output JSON")
+		refFlags    repeatedStringFlag
 	)
-	if err := fs.Parse(args); err != nil {
+	fs.Var(&refFlags, "ref", "referenced conversation taskId (repeatable or comma-separated)")
+	if err := parseFlagsPermuted(fs, args); err != nil {
 		return err
 	}
-	msg := strings.TrimSpace(strings.Join(fs.Args(), " "))
-	if msg == "" {
-		return fmt.Errorf("usage: orbit pa [--thread <id>] [--new] \"<message>\"")
-	}
+
 	c := newHubClient(*configDir, *dataDirFlg, *hubURLFlag, *tokenFlag)
 
-	tid := strings.TrimSpace(*threadID)
-	if *newThread {
-		rawTh, err := c.doJSON(ctx, http.MethodPost, "/api/pa/threads", protocol.CreatePAThreadRequest{})
+	// Legacy structured brief shortcut preserved for compatibility
+	if *briefFlag {
+		raw, err := c.doJSON(ctx, http.MethodPost, "/api/pa/brief", map[string]any{})
 		if err != nil {
 			return err
 		}
-		var th struct {
-			Thread protocol.PAThread `json:"thread"`
+		if *jsonOut {
+			return writeRawJSON(stdout, raw)
 		}
-		if err := json.Unmarshal(rawTh, &th); err != nil {
+		var brief protocol.PABriefResponse
+		if err := json.Unmarshal(raw, &brief); err != nil {
 			return err
 		}
-		tid = th.Thread.PAThreadID
+		if strings.TrimSpace(brief.Summary) != "" {
+			fmt.Fprintln(stdout, brief.Summary)
+		} else {
+			return writeRawJSON(stdout, raw)
+		}
+		return nil
 	}
 
-	raw, err := c.doJSON(ctx, http.MethodPost, "/api/pa/chat", protocol.PAChatRequest{
-		ThreadID: tid,
-		Message:  msg,
-	})
-	if err != nil {
-		return err
+	msg := strings.TrimSpace(strings.Join(fs.Args(), " "))
+	if msg == "" {
+		return fmt.Errorf("usage: orbit pa [--task <taskId>] [--ref <taskId>] [--adapter <adp>] [--brief] \"<message>\"")
 	}
+
+	// Legacy /api/pa/chat path ONLY if caller explicitly passed --thread
+	if tid := strings.TrimSpace(*threadID); tid != "" && strings.TrimSpace(*taskIDFlag) == "" {
+		raw, err := c.doJSON(ctx, http.MethodPost, "/api/pa/chat", protocol.PAChatRequest{
+			ThreadID: tid,
+			Message:  msg,
+		})
+		if err != nil {
+			return err
+		}
+		if *jsonOut {
+			return writeRawJSON(stdout, raw)
+		}
+		var resp protocol.PAChatResponse
+		if err := json.Unmarshal(raw, &resp); err != nil {
+			return err
+		}
+		fmt.Fprintln(stdout, resp.AssistantMessage.Content)
+		return nil
+	}
+	_ = newThread // new _pa task is created by default when --task is empty
+
+	cfg := map[string]string{}
+	if v := strings.TrimSpace(*modelFlag); v != "" {
+		cfg["model"] = v
+	}
+	if v := strings.TrimSpace(*effortFlag); v != "" {
+		cfg["thought_level"] = v
+	}
+	if v := strings.TrimSpace(*modeFlag); v != "" {
+		cfg["mode"] = v
+	}
+
+	taskID := strings.TrimSpace(*taskIDFlag)
+	var attemptID string
+	var pendingInputID string
+
+	if taskID == "" {
+		createReq := protocol.CreateTaskRequest{
+			Goal:              msg,
+			MachineID:         strings.TrimSpace(*machineFlag),
+			ReferencedTaskIDs: []string(refFlags),
+		}
+		if adp := strings.TrimSpace(*adapterFlag); adp != "" {
+			createReq.Adapter = protocol.Adapter(adp)
+		}
+		if len(cfg) > 0 {
+			createReq.Config = cfg
+		}
+		raw, err := c.doJSON(ctx, http.MethodPost, "/api/projects/"+url.PathEscape(protocol.PAProjectID)+"/tasks", createReq)
+		if err != nil {
+			return err
+		}
+		var resp protocol.CreateTaskResponse
+		if err := json.Unmarshal(raw, &resp); err != nil {
+			return err
+		}
+		taskID = resp.Task.TaskID
+		if resp.Attempt != nil {
+			attemptID = resp.Attempt.AttemptID
+		}
+		if *noWait {
+			if *jsonOut {
+				return writeRawJSON(stdout, raw)
+			}
+			fmt.Fprintf(stdout, "PA task %s dispatched (attempt=%s)\n", taskID, attemptID)
+			return nil
+		}
+	} else {
+		fReq := protocol.FollowupTaskRequest{
+			Message:           msg,
+			Mode:              protocol.FollowupModeQueue,
+			ReferencedTaskIDs: []string(refFlags),
+		}
+		if adp := strings.TrimSpace(*adapterFlag); adp != "" {
+			fReq.Adapter = protocol.Adapter(adp)
+		}
+		if len(cfg) > 0 {
+			fReq.Config = cfg
+		}
+		raw, err := c.doJSON(ctx, http.MethodPost, "/api/tasks/"+url.PathEscape(taskID)+"/followup", fReq)
+		if err != nil {
+			return err
+		}
+		var resp protocol.FollowupTaskResponse
+		if err := json.Unmarshal(raw, &resp); err != nil {
+			return err
+		}
+		if resp.Attempt != nil {
+			attemptID = resp.Attempt.AttemptID
+		}
+		if resp.PendingInput != nil {
+			pendingInputID = resp.PendingInput.InputID
+		}
+		if *noWait {
+			if *jsonOut {
+				return writeRawJSON(stdout, raw)
+			}
+			if attemptID != "" {
+				fmt.Fprintf(stdout, "PA follow-up dispatched on %s (attempt=%s)\n", taskID, attemptID)
+			} else {
+				fmt.Fprintf(stdout, "PA follow-up queued on %s (input=%s)\n", taskID, pendingInputID)
+			}
+			return nil
+		}
+	}
+
+	waitDur := time.Duration(*timeoutSec) * time.Second
+	if waitDur <= 0 {
+		waitDur = 180 * time.Second
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, waitDur)
+	defer cancel()
+
+	// Poll queue input directly by inputId until dispatched, then poll timeline until attempt finishes.
+	var finalAtt *protocol.AttemptView
+	ticker := time.NewTicker(600 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if attemptID == "" && pendingInputID != "" {
+			qPath := "/api/tasks/" + url.PathEscape(taskID) + "/queue/" + url.PathEscape(pendingInputID)
+			qRaw, qErr := c.doJSON(waitCtx, http.MethodGet, qPath, nil)
+			if qErr != nil {
+				if waitCtx.Err() != nil {
+					return fmt.Errorf("timed out waiting for queued PA input %s: %w", pendingInputID, qErr)
+				}
+				return fmt.Errorf("queued PA input %s unavailable before dispatch: %w", pendingInputID, qErr)
+			}
+			var pi protocol.PendingInput
+			if err := json.Unmarshal(qRaw, &pi); err != nil {
+				return err
+			}
+			if pi.DispatchedAttemptID != "" {
+				attemptID = pi.DispatchedAttemptID
+			} else if pi.State != protocol.PendingInputQueued {
+				return fmt.Errorf("queued PA input %s ended in state %s before dispatch", pendingInputID, pi.State)
+			} else {
+				select {
+				case <-waitCtx.Done():
+					return fmt.Errorf("timed out waiting for queued PA input %s on task %s", pendingInputID, taskID)
+				case <-ticker.C:
+				}
+				continue
+			}
+		}
+
+		tlRaw, err := c.doJSON(waitCtx, http.MethodGet, "/api/tasks/"+url.PathEscape(taskID)+"/timeline?includeRaw=0", nil)
+		if err != nil {
+			if waitCtx.Err() != nil {
+				return fmt.Errorf("timed out waiting for PA task %s: %w", taskID, err)
+			}
+			return err
+		}
+		var tl protocol.TaskTimelineResponse
+		if err := json.Unmarshal(tlRaw, &tl); err != nil {
+			return err
+		}
+		if attemptID != "" {
+			for i := range tl.Attempts {
+				if tl.Attempts[i].AttemptID == attemptID {
+					att := tl.Attempts[i]
+					if isTerminalAttemptState(att.State) {
+						finalAtt = &att
+					}
+					break
+				}
+			}
+		}
+		if finalAtt != nil {
+			break
+		}
+		select {
+		case <-waitCtx.Done():
+			return fmt.Errorf("timed out waiting for PA task %s (attempt=%s)", taskID, attemptID)
+		case <-ticker.C:
+		}
+	}
+
+	// Collect full assistant reply from paginated raw ACP events for finalAtt.AttemptID
+	var replySB strings.Builder
+	var afterSeq int64
+	for page := 0; page < 40; page++ {
+		rawURL := fmt.Sprintf("/api/attempts/%s/raw?afterSeq=%d&limit=500", url.PathEscape(finalAtt.AttemptID), afterSeq)
+		rawBytes, err := c.doJSON(ctx, http.MethodGet, rawURL, nil)
+		if err != nil {
+			return err
+		}
+		var rawResp protocol.AttemptRawEventsResponse
+		if err := json.Unmarshal(rawBytes, &rawResp); err != nil {
+			return err
+		}
+		for _, ev := range rawResp.Events {
+			if ev.Seq > afterSeq {
+				afterSeq = ev.Seq
+			}
+			if ev.Kind == protocol.EventACPMessageBatch {
+				if txt, ok := ev.Payload["text"].(string); ok && txt != "" {
+					replySB.WriteString(txt)
+				}
+			}
+		}
+		if len(rawResp.Events) < 500 {
+			break
+		}
+	}
+	replyText := strings.TrimSpace(replySB.String())
+
 	if *jsonOut {
-		return writeRawJSON(stdout, raw)
+		enc, _ := json.MarshalIndent(map[string]any{
+			"taskId":      taskID,
+			"attemptId":   finalAtt.AttemptID,
+			"state":       finalAtt.State,
+			"reply":       replyText,
+			"errorCode":   finalAtt.ErrorCode,
+			"errorDetail": finalAtt.ErrorDetail,
+		}, "", "  ")
+		return writeRawJSON(stdout, enc)
 	}
-	var resp protocol.PAChatResponse
-	if err := json.Unmarshal(raw, &resp); err != nil {
-		return err
+
+	if replyText != "" {
+		fmt.Fprintln(stdout, replyText)
 	}
-	fmt.Fprintln(stdout, resp.AssistantMessage.Content)
+	if finalAtt.State != protocol.AttemptSucceeded {
+		detail := strings.TrimSpace(finalAtt.ErrorDetail)
+		if detail == "" {
+			detail = string(finalAtt.State)
+		}
+		return fmt.Errorf("PA attempt %s ended with %s: %s", finalAtt.AttemptID, finalAtt.State, detail)
+	}
+	if replyText == "" {
+		fmt.Fprintf(stdout, "(PA completed task %s with empty text reply)\n", taskID)
+	}
+	fmt.Fprintf(stderr, "task=%s\n", taskID)
 	return nil
 }
 

@@ -312,7 +312,7 @@ func (s *Server) handleDeleteMachine(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusConflict, "ERR_FILE_MANAGED", "machine is configured in machines.yaml and cannot be removed from UI")
 		return
 	}
-	ev, err := s.store.RemovePairedMachine(r.Context(), machineID, actorFromContext(r.Context()))
+	ev, revokedClientIDs, err := s.store.RemovePairedMachine(r.Context(), machineID, actorFromContext(r.Context()))
 	if errors.Is(err, store.ErrNotFound) {
 		writeAPIError(w, http.StatusNotFound, "ERR_MACHINE_NOT_FOUND", err.Error())
 		return
@@ -320,6 +320,9 @@ func (s *Server) handleDeleteMachine(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeAPIError(w, http.StatusInternalServerError, "ERR_REMOVE_MACHINE", err.Error())
 		return
+	}
+	for _, cid := range revokedClientIDs {
+		s.revokeClientTokenSessions(cid)
 	}
 	s.runners.DisconnectMachine(machineID, "machine removed")
 	if err := s.refreshEffectiveRegistry(context.WithoutCancel(r.Context())); err != nil {
@@ -988,11 +991,6 @@ func (s *Server) recordTailscaleSharing(ctx context.Context, origin, actorID str
 	if !slices.Contains(cur.ExtraOrigins, cur.TailscaleOrigin) {
 		cur.ExtraOrigins = append(cur.ExtraOrigins, cur.TailscaleOrigin)
 	}
-	if tsBin := findTailscaleBin(); tsBin != "" {
-		if login := queryTailscaleSelfLogin(ctx, tsBin); login != "" && !slices.Contains(cur.ExtraLogins, login) {
-			cur.ExtraLogins = append(cur.ExtraLogins, login)
-		}
-	}
 	if ev, err := s.store.SaveDynamicNetworkSettings(ctx, cur, actorID); err == nil {
 		_ = s.refreshEffectiveRegistry(context.WithoutCancel(ctx))
 		s.broker.Broadcast(ev)
@@ -1059,6 +1057,7 @@ func (s *Server) handleCompleteOnboarding(w http.ResponseWriter, r *http.Request
 	boot, _ := s.store.Bootstrap(r.Context(), yamlMachines)
 	enriched := s.enrichMachineViews(r.Context(), boot.Machines)
 	setup := s.buildSetupStatus(r.Context(), enriched, clientMachineIDFromContext(r.Context()))
+	setup.CurrentClientID = clientTokenIDFromContext(r.Context())
 	writeJSON(w, http.StatusOK, protocol.CompleteOnboardingResponse{
 		Completed: true,
 		Setup:     setup,

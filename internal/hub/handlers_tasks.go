@@ -66,8 +66,19 @@ func (s *Server) createTaskInternalWithPA(
 	if st, code, err := s.validateAdapterSupport(route); err != nil {
 		return resp, nil, st, code, err
 	}
-	// If dispatching a dynamic UI remote Git project to an already-connected legacy Runner lacking bundle.v1, surface upgrade guidance early.
-	if !route.IsPlainFolder && proj.Source == protocol.ProjectSourceUI &&
+	// Resolve requested per-project worktree toggle in-memory first; persisted atomically inside
+	// store.CreateTask AFTER idempotency checks confirm a genuinely new task.
+	var desiredProjectIso protocol.LocationIsolation
+	if req.UseWorktree != nil && !protocol.IsVirtualProjectID(projectID) && !route.IsPlainFolder {
+		desiredProjectIso = protocol.IsolationInPlace
+		if *req.UseWorktree {
+			desiredProjectIso = protocol.IsolationWorktree
+		}
+		route.Isolation = desiredProjectIso
+	}
+
+	// If dispatching a dynamic UI remote Git project (in worktree mode) to an already-connected legacy Runner lacking bundle.v1, surface upgrade guidance early.
+	if !route.IsPlainFolder && route.Isolation != protocol.IsolationInPlace && proj.Source == protocol.ProjectSourceUI &&
 		route.MachineCfg.Transport != "" && route.MachineCfg.Transport != protocol.TransportLocalWS &&
 		s.runners.IsConnected(route.MachineID) && !s.runners.HasCapability(route.MachineID, protocol.RunnerCapBundleV1) {
 		return resp, nil, http.StatusUpgradeRequired, "ERR_RUNNER_UPGRADE_REQUIRED", fmt.Errorf(
@@ -76,14 +87,16 @@ func (s *Server) createTaskInternalWithPA(
 		)
 	}
 
-	// Merge project defaults -> machine agent defaultModel -> explicit request overrides
+	// Merge project defaults -> machine agent defaultModel -> explicit request overrides.
+	// Never apply a project's DefaultModelConfig.Model across a different adapter (e.g. agy model on claude/codex).
 	desiredCfg := map[string]string{}
 	s.mu.RLock()
 	if pCfg, ok := s.projects.Projects[projectID]; ok {
-		if pCfg.DefaultModelConfig.Model != "" {
+		sameAdapter := pCfg.DefaultAdapter == "" || pCfg.DefaultAdapter == route.Adapter
+		if sameAdapter && pCfg.DefaultModelConfig.Model != "" {
 			desiredCfg["model"] = pCfg.DefaultModelConfig.Model
 		}
-		if pCfg.DefaultModelConfig.ThoughtLevel != "" {
+		if sameAdapter && pCfg.DefaultModelConfig.ThoughtLevel != "" {
 			desiredCfg["thought_level"] = pCfg.DefaultModelConfig.ThoughtLevel
 		}
 		if pCfg.DefaultModelConfig.Mode != "" {
@@ -91,6 +104,9 @@ func (s *Server) createTaskInternalWithPA(
 		}
 	}
 	s.mu.RUnlock()
+	if projectID == protocol.PAProjectID && desiredCfg["mode"] == "" {
+		desiredCfg["mode"] = "auto"
+	}
 	if agentSettings, _, err := s.store.GetMachineAgentSettings(ctx, route.MachineID); err == nil {
 		if ac, ok := agentSettings[string(route.Adapter)]; ok && strings.TrimSpace(ac.DefaultModel) != "" {
 			desiredCfg["model"] = strings.TrimSpace(ac.DefaultModel)
@@ -104,7 +120,7 @@ func (s *Server) createTaskInternalWithPA(
 
 	triggerKind := protocol.TriggerInitial
 	baseSHA := ""
-	if req.ImportDirtyWorkspace && projectID != protocol.ScratchProjectID && strings.TrimSpace(route.Anchor.RepoPath) != "" {
+	if req.ImportDirtyWorkspace && !protocol.IsVirtualProjectID(projectID) && strings.TrimSpace(route.Anchor.RepoPath) != "" {
 		if route.MachineCfg.Transport != "" && route.MachineCfg.Transport != protocol.TransportLocalWS {
 			return resp, nil, http.StatusBadRequest, "ERR_REMOTE_DIRTY_IMPORT_UNSUPPORTED", errors.New("远程机器项目暂不支持直接带入未提交改动，请先在该机器提交后再发起任务")
 		}
@@ -133,8 +149,15 @@ func (s *Server) createTaskInternalWithPA(
 		createdBy = protocol.TaskCreatedByPA
 	}
 
+	refMetas := s.resolveReferencedTaskMetas(ctx, req.ReferencedTaskIDs, "")
 	triggerPayload := map[string]any{
 		"prompt": req.Goal,
+	}
+	if req.ExplicitFullPermission {
+		triggerPayload["explicitFullPermission"] = true
+	}
+	if len(refMetas) > 0 {
+		triggerPayload["refTasks"] = refMetas
 	}
 	if req.SwarmIdleTimeoutMs > 0 {
 		triggerPayload["swarmIdleTimeoutMs"] = req.SwarmIdleTimeoutMs
@@ -149,32 +172,34 @@ func (s *Server) createTaskInternalWithPA(
 	}
 
 	res, err := s.store.CreateTask(ctx, store.CreateTaskParams{
-		ProjectID:          projectID,
-		ParentTaskID:       strings.TrimSpace(req.ParentTaskID),
-		Title:              req.Title,
-		Goal:               req.Goal,
-		RequiredCapability: route.Capability,
-		RequiredResources:  req.RequiredResources,
-		Adapter:            route.Adapter,
-		DesiredConfig:      desiredCfg,
-		CreatedBy:          createdBy,
-		IdempotencyKey:     idempKey,
-		Sources:            req.Sources,
-		MachineID:          route.MachineID,
-		PartID:             route.PartID,
-		LocationID:         route.LocationID,
-		Isolation:          route.Isolation,
-		Anchor:             anchorPtr,
-		AnchorCapability:   route.Capability,
-		BaseSHA:            baseSHA,
-		Prompt:             req.Goal,
-		TriggerKind:        triggerKind,
-		TriggerPayload:     triggerPayload,
-		CreateAttempt:      createAttempt,
-		LeaseTTLMs:         s.leaseTTL.Milliseconds(),
-		ActorID:            actorID,
-		ActorKind:          actorKind,
-		PAIdempotency:      paIdemp,
+		ProjectID:           projectID,
+		ParentTaskID:        strings.TrimSpace(req.ParentTaskID),
+		Title:               req.Title,
+		Goal:                req.Goal,
+		RequiredCapability:  route.Capability,
+		RequiredResources:   req.RequiredResources,
+		Adapter:             route.Adapter,
+		DesiredConfig:       desiredCfg,
+		CreatedBy:           createdBy,
+		IdempotencyKey:      idempKey,
+		Sources:             req.Sources,
+		MachineID:           route.MachineID,
+		PartID:              route.PartID,
+		LocationID:          route.LocationID,
+		Isolation:           route.Isolation,
+		RouteExplicit:       true,
+		ProjectGitIsolation: desiredProjectIso,
+		Anchor:              anchorPtr,
+		AnchorCapability:    route.Capability,
+		BaseSHA:             baseSHA,
+		Prompt:              req.Goal,
+		TriggerKind:         triggerKind,
+		TriggerPayload:      triggerPayload,
+		CreateAttempt:       createAttempt,
+		LeaseTTLMs:          s.leaseTTL.Milliseconds(),
+		ActorID:             actorID,
+		ActorKind:           actorKind,
+		PAIdempotency:       paIdemp,
 	})
 	if errors.Is(err, store.ErrNotFound) {
 		return resp, nil, http.StatusNotFound, "ERR_NOT_FOUND", err
@@ -198,7 +223,8 @@ func (s *Server) createTaskInternalWithPA(
 
 	dispatched := false
 	if res.Created && res.Attempt != nil {
-		dispatched = s.dispatchAttemptRecord(ctx, *res.Attempt, req.Goal, req.SwarmIdleTimeoutMs)
+		effectivePrompt := s.decorateAttemptPrompt(ctx, projectID, req.Goal, refMetas, projectID == protocol.PAProjectID)
+		dispatched = s.dispatchAttemptRecord(ctx, *res.Attempt, effectivePrompt, req.SwarmIdleTimeoutMs)
 	}
 
 	var attView *protocol.AttemptView
@@ -369,6 +395,32 @@ func (s *Server) followupTaskInternalWithPA(
 		return resp, nil, http.StatusInternalServerError, "ERR_PROJECT_LOOKUP", err
 	}
 
+	refMetas := s.resolveReferencedTaskMetas(ctx, req.ReferencedTaskIDs, taskID)
+	effPayloadExtra := payloadExtra
+	if len(refMetas) > 0 {
+		cloned := map[string]any{}
+		for k, v := range payloadExtra {
+			cloned[k] = v
+		}
+		cloned["refTasks"] = refMetas
+		effPayloadExtra = cloned
+	}
+
+	// Preserve existing task machine/location/isolation pinning across follow-ups when caller didn't switch capability.
+	prevMachineID := ""
+	prevPartID := ""
+	prevLocID := ""
+	var prevIsolation protocol.LocationIsolation
+	if strings.TrimSpace(req.RequiredCapability) == "" {
+		if tl, tlErr := s.store.GetTaskTimeline(ctx, taskID, 0, false); tlErr == nil && len(tl.Attempts) > 0 {
+			last := tl.Attempts[len(tl.Attempts)-1]
+			prevMachineID = last.MachineID
+			prevPartID = last.PartID
+			prevLocID = last.LocationID
+			prevIsolation = last.Isolation
+		}
+	}
+
 	reqCap := strings.TrimSpace(req.RequiredCapability)
 	if reqCap == "" {
 		reqCap = task.RequiredCapability
@@ -377,9 +429,12 @@ func (s *Server) followupTaskInternalWithPA(
 	if reqAdapter == "" {
 		reqAdapter = task.PreferredAdapter
 	}
-	route, err := s.resolveExecutionRoute(proj, reqCap, reqAdapter)
+	route, err := s.resolveExecutionRouteWithLocation(proj, reqCap, reqAdapter, prevMachineID, prevPartID, prevLocID)
 	if err != nil {
-		return resp, nil, http.StatusBadRequest, "ERR_ROUTE_FAILED", err
+		route, err = s.resolveExecutionRoute(proj, reqCap, reqAdapter)
+		if err != nil {
+			return resp, nil, http.StatusBadRequest, "ERR_ROUTE_FAILED", err
+		}
 	}
 	if err := enforcePostRouteGuard(actorKind, route); err != nil {
 		return resp, nil, http.StatusForbidden, "ERR_DEPLOY_FORBIDDEN", err
@@ -387,8 +442,14 @@ func (s *Server) followupTaskInternalWithPA(
 	if st, code, err := s.validateAdapterSupport(route); err != nil {
 		return resp, nil, st, code, err
 	}
-	// If dispatching a dynamic UI remote project to an already-connected legacy Runner lacking bundle.v1, surface upgrade guidance early.
-	if proj.Source == protocol.ProjectSourceUI &&
+	effectiveIsolation := route.Isolation
+	if prevIsolation != "" && !route.IsPlainFolder {
+		effectiveIsolation = prevIsolation
+	}
+	// If dispatching a dynamic UI remote Git project (in worktree mode) to an already-connected legacy Runner lacking bundle.v1, surface upgrade guidance early.
+	if !protocol.IsVirtualProjectID(task.ProjectID) && !route.IsPlainFolder &&
+		effectiveIsolation != protocol.IsolationInPlace &&
+		proj.Source == protocol.ProjectSourceUI &&
 		route.MachineCfg.Transport != "" && route.MachineCfg.Transport != protocol.TransportLocalWS &&
 		s.runners.IsConnected(route.MachineID) && !s.runners.HasCapability(route.MachineID, protocol.RunnerCapBundleV1) {
 		return resp, nil, http.StatusUpgradeRequired, "ERR_RUNNER_UPGRADE_REQUIRED", fmt.Errorf(
@@ -397,6 +458,7 @@ func (s *Server) followupTaskInternalWithPA(
 		)
 	}
 
+	routeExplicit := strings.TrimSpace(req.RequiredCapability) != ""
 	var anchorPtr *protocol.ProjectAnchorConfig
 	if route.HasAnchor {
 		a := route.Anchor
@@ -405,7 +467,7 @@ func (s *Server) followupTaskInternalWithPA(
 
 	// fork_new_session while task has an active attempt creates a linked child task immediately
 	// seeded from task.LatestDeliveryID so the active session remains undisturbed.
-	// S2: Inherit parent task's effective DesiredConfig and RequiredResources when not overridden.
+	// S2: Inherit parent task's effective DesiredConfig, RequiredResources, location, isolation, and refs.
 	if mode == protocol.FollowupModeForkNewSession && task.ActiveAttemptID != "" {
 		createdBy := protocol.TaskCreatedByHuman
 		if actorKind == protocol.ActorPA {
@@ -425,6 +487,24 @@ func (s *Server) followupTaskInternalWithPA(
 		if forkResources == nil {
 			forkResources = append([]string(nil), parentRes...)
 		}
+		forkPartID := route.PartID
+		if forkPartID == "" {
+			forkPartID = prevPartID
+		}
+		forkLocID := route.LocationID
+		if forkLocID == "" {
+			forkLocID = prevLocID
+		}
+		forkTriggerPayload := map[string]any{
+			"prompt":           req.Message,
+			"forkedFromTaskId": task.TaskID,
+		}
+		if req.ExplicitFullPermission {
+			forkTriggerPayload["explicitFullPermission"] = true
+		}
+		if len(refMetas) > 0 {
+			forkTriggerPayload["refTasks"] = refMetas
+		}
 		forkRes, err := s.store.CreateTask(ctx, store.CreateTaskParams{
 			ProjectID:          task.ProjectID,
 			ParentTaskID:       task.TaskID,
@@ -436,12 +516,16 @@ func (s *Server) followupTaskInternalWithPA(
 			DesiredConfig:      forkCfg,
 			CreatedBy:          createdBy,
 			MachineID:          route.MachineID,
+			PartID:             forkPartID,
+			LocationID:         forkLocID,
+			Isolation:          effectiveIsolation,
+			RouteExplicit:      routeExplicit,
 			Anchor:             anchorPtr,
 			AnchorCapability:   route.Capability,
 			InputDeliveryID:    task.LatestDeliveryID,
 			Prompt:             req.Message,
 			TriggerKind:        protocol.TriggerFollowup,
-			TriggerPayload:     map[string]any{"prompt": req.Message, "forkedFromTaskId": task.TaskID},
+			TriggerPayload:     forkTriggerPayload,
 			CreateAttempt:      true,
 			LeaseTTLMs:         s.leaseTTL.Milliseconds(),
 			ActorID:            actorID,
@@ -463,7 +547,8 @@ func (s *Server) followupTaskInternalWithPA(
 		dispatched := false
 		var attView *protocol.AttemptView
 		if forkRes.Attempt != nil {
-			dispatched = s.dispatchAttemptRecord(ctx, *forkRes.Attempt, req.Message, 0)
+			effectivePrompt := s.decorateAttemptPrompt(ctx, task.ProjectID, req.Message, refMetas, task.ProjectID == protocol.PAProjectID)
+			dispatched = s.dispatchAttemptRecord(ctx, *forkRes.Attempt, effectivePrompt, 0)
 			v := forkRes.Attempt.AttemptView
 			attView = &v
 		}
@@ -490,8 +575,13 @@ func (s *Server) followupTaskInternalWithPA(
 		Source:            src,
 		MachineID:         route.MachineID,
 		Adapter:           route.Adapter,
-		DesiredConfig:     req.Config,
-		RequiredResources: req.RequiredResources,
+		PartID:                 route.PartID,
+		LocationID:             route.LocationID,
+		Isolation:              effectiveIsolation,
+		RouteExplicit:          routeExplicit,
+		DesiredConfig:          req.Config,
+		ExplicitFullPermission: req.ExplicitFullPermission,
+		RequiredResources:      req.RequiredResources,
 		Anchor:            anchorPtr,
 		AnchorCapability:  route.Capability,
 		VerifiedSite:      req.VerifiedSite,
@@ -499,7 +589,7 @@ func (s *Server) followupTaskInternalWithPA(
 		LeaseTTLMs:        s.leaseTTL.Milliseconds(),
 		ActorKind:         actorKind,
 		ActorID:           actorID,
-		PayloadExtra:      payloadExtra,
+		PayloadExtra:      effPayloadExtra,
 		PAIdempotency:     paIdemp,
 	})
 	if errors.Is(err, store.ErrNotFound) {
@@ -552,7 +642,8 @@ func (s *Server) followupTaskInternalWithPA(
 	dispatched := false
 	var attView *protocol.AttemptView
 	if subRes.Attempt != nil {
-		dispatched = s.dispatchAttemptRecord(ctx, *subRes.Attempt, req.Message, 0)
+		effectivePrompt := s.decorateAttemptPrompt(ctx, task.ProjectID, req.Message, refMetas, false)
+		dispatched = s.dispatchAttemptRecord(ctx, *subRes.Attempt, effectivePrompt, 0)
 		v := subRes.Attempt.AttemptView
 		attView = &v
 	}
@@ -736,6 +827,21 @@ func (s *Server) handleListQueue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+func (s *Server) handleGetQueueInput(w http.ResponseWriter, r *http.Request) {
+	taskID := chi.URLParam(r, "taskId")
+	inputID := chi.URLParam(r, "inputId")
+	pi, err := s.store.GetPendingInput(r.Context(), taskID, inputID)
+	if errors.Is(err, store.ErrNotFound) {
+		writeAPIError(w, http.StatusNotFound, "ERR_NOT_FOUND", err.Error())
+		return
+	}
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, "ERR_QUEUE_GET", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, pi)
 }
 
 func (s *Server) handleEnqueueInput(w http.ResponseWriter, r *http.Request) {

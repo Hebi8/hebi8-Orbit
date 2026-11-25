@@ -18,8 +18,8 @@ func backfillV6ProjectsTx(ctx context.Context, tx *sql.Tx, now int64) error {
 	rows, err := tx.QueryContext(ctx, `
 		SELECT project_id, display_name, repo_identity, config_json
 		FROM projects
-		WHERE project_id != ?
-	`, protocol.ScratchProjectID)
+		WHERE project_id NOT IN (?, ?)
+	`, protocol.ScratchProjectID, protocol.PAProjectID)
 	if err != nil {
 		return err
 	}
@@ -64,7 +64,7 @@ func defaultIsolationForKind(kind protocol.ProjectPartKind) protocol.LocationIso
 }
 
 func ensureDefaultPartAndLocationsTx(ctx context.Context, tx *sql.Tx, projectID, displayName, repoIdentity, cfgJSON string, now int64) error {
-	if projectID == "" || projectID == protocol.ScratchProjectID {
+	if projectID == "" || protocol.IsVirtualProjectID(projectID) {
 		return nil
 	}
 	var cfg protocol.ProjectConfig
@@ -139,6 +139,19 @@ func ensureDefaultPartAndLocationsTx(ctx context.Context, tx *sql.Tx, projectID,
 	})
 
 	iso := defaultIsolationForKind(protocol.ProjectPartKind(firstPartKind))
+	if protocol.ProjectPartKind(firstPartKind) != protocol.ProjectPartFolder {
+		var inherited string
+		if err := tx.QueryRowContext(ctx, `
+			SELECT l.isolation
+			FROM project_locations l
+			JOIN project_parts p ON p.part_id = l.part_id
+			WHERE l.project_id = ? AND p.kind != 'folder'
+			ORDER BY l.updated_at DESC
+			LIMIT 1
+		`, projectID).Scan(&inherited); err == nil && protocol.LocationIsolation(inherited).IsValid() {
+			iso = protocol.LocationIsolation(inherited)
+		}
+	}
 	for _, k := range keys {
 		a := cfg.Anchors[k]
 		m := strings.TrimSpace(a.Machine)
@@ -413,7 +426,7 @@ func (s *Store) UpdateProjectSettings(ctx context.Context, projectID string, req
 	var pv protocol.ProjectView
 	var ev protocol.EventRecord
 	now := time.Now().UnixMilli()
-	if strings.TrimSpace(projectID) == "" || projectID == protocol.ScratchProjectID {
+	if strings.TrimSpace(projectID) == "" || protocol.IsVirtualProjectID(projectID) {
 		return pv, ev, fmt.Errorf("%w: invalid projectId", ErrInvalidInput)
 	}
 	err := s.WithWriteTx(ctx, func(tx *sql.Tx) error {
@@ -563,6 +576,19 @@ func (s *Store) CreateProjectPart(
 			cleanPath := filepath.Clean(strings.TrimSpace(absPath))
 			locID := newID("loc")
 			iso := defaultIsolationForKind(kind)
+			if kind != protocol.ProjectPartFolder {
+				var inherited string
+				if err := tx.QueryRowContext(ctx, `
+					SELECT l.isolation
+					FROM project_locations l
+					JOIN project_parts p ON p.part_id = l.part_id
+					WHERE l.project_id = ? AND p.kind != 'folder'
+					ORDER BY l.updated_at DESC
+					LIMIT 1
+				`, projectID).Scan(&inherited); err == nil && protocol.LocationIsolation(inherited).IsValid() {
+					iso = protocol.LocationIsolation(inherited)
+				}
+			}
 			if _, err := tx.ExecContext(ctx, `
 				INSERT INTO project_locations (location_id, part_id, project_id, machine_id, abs_path, is_default, isolation, created_at, updated_at)
 				VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)
@@ -686,7 +712,23 @@ func (s *Store) CreateProjectLocation(
 		kind := protocol.ProjectPartKind(kindStr)
 		iso := req.Isolation
 		if iso == "" {
-			iso = defaultIsolationForKind(kind)
+			if kind != protocol.ProjectPartFolder {
+				var inherited string
+				err := tx.QueryRowContext(ctx, `
+					SELECT l.isolation
+					FROM project_locations l
+					JOIN project_parts p ON p.part_id = l.part_id
+					WHERE l.project_id = ? AND p.kind != 'folder'
+					ORDER BY l.updated_at DESC
+					LIMIT 1
+				`, projectID).Scan(&inherited)
+				if err == nil && protocol.LocationIsolation(inherited).IsValid() {
+					iso = protocol.LocationIsolation(inherited)
+				}
+			}
+			if iso == "" {
+				iso = defaultIsolationForKind(kind)
+			}
 		}
 		if !iso.IsValid() {
 			return fmt.Errorf("%w: invalid isolation %q", ErrInvalidInput, iso)
@@ -845,6 +887,79 @@ func (s *Store) UpdateProjectLocation(
 	}
 	pv, err = s.GetProject(ctx, projectID)
 	return pv, ev, err
+}
+
+func setProjectGitIsolationTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	projectID string,
+	isolation protocol.LocationIsolation,
+	actorID string,
+	now int64,
+) (protocol.EventRecord, bool, error) {
+	var ev protocol.EventRecord
+	if strings.TrimSpace(projectID) == "" || protocol.IsVirtualProjectID(projectID) || !isolation.IsValid() {
+		return ev, false, nil
+	}
+	res, err := tx.ExecContext(ctx, `
+		UPDATE project_locations
+		SET isolation = ?, updated_at = ?
+		WHERE project_id = ?
+		  AND part_id IN (SELECT part_id FROM project_parts WHERE project_id = ? AND kind != 'folder')
+		  AND isolation != ?
+	`, string(isolation), now, projectID, projectID, string(isolation))
+	if err != nil {
+		return ev, false, err
+	}
+	if aff, _ := res.RowsAffected(); aff == 0 {
+		return ev, false, nil
+	}
+	if err := syncProjectAnchorsMirrorTx(ctx, tx, projectID, now); err != nil {
+		return ev, false, err
+	}
+	ev, err = insertEventTx(ctx, tx, eventInsert{
+		StreamID:   "global",
+		ProjectID:  projectID,
+		ActorKind:  protocol.ActorHuman,
+		ActorID:    actorID,
+		Kind:       protocol.EventProjectChanged,
+		Visibility: protocol.VisibilityTimeline,
+		Payload: map[string]any{
+			"projectId": projectID,
+			"isolation": isolation,
+			"action":    "project_isolation_updated",
+		},
+		CreatedAt: now,
+	})
+	return ev, err == nil, err
+}
+
+// SetProjectGitIsolation updates isolation uniformly across all non-folder (Git) locations of a project
+// so the Worktree toggle is remembered consistently at project granularity across machines/locations.
+func (s *Store) SetProjectGitIsolation(
+	ctx context.Context,
+	projectID string,
+	isolation protocol.LocationIsolation,
+	actorID string,
+) (protocol.EventRecord, error) {
+	var ev protocol.EventRecord
+	if strings.TrimSpace(projectID) == "" || protocol.IsVirtualProjectID(projectID) {
+		return ev, fmt.Errorf("%w: invalid projectId", ErrInvalidInput)
+	}
+	if !isolation.IsValid() {
+		return ev, fmt.Errorf("%w: invalid isolation %q", ErrInvalidInput, isolation)
+	}
+	now := time.Now().UnixMilli()
+	err := s.WithWriteTx(ctx, func(tx *sql.Tx) error {
+		var changed bool
+		var err error
+		ev, changed, err = setProjectGitIsolationTx(ctx, tx, projectID, isolation, actorID, now)
+		if !changed {
+			ev = protocol.EventRecord{}
+		}
+		return err
+	})
+	return ev, err
 }
 
 // DeleteProjectLocation removes a bound location from a part, promoting another to default if needed.

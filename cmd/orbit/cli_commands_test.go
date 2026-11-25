@@ -73,9 +73,47 @@ func TestCLICommands_VersionTasksApprovalsPAArtifactsDoctor(t *testing.T) {
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
 	})
+	mux.HandleFunc("POST /api/projects/_pa/tasks", func(w http.ResponseWriter, r *http.Request) {
+		var req protocol.CreateTaskRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if req.Goal != "status?" || len(req.ReferencedTaskIDs) != 1 || req.ReferencedTaskIDs[0] != "tsk_1" {
+			t.Errorf("unexpected _pa create task payload: %+v", req)
+		}
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(protocol.CreateTaskResponse{
+			Task: protocol.TaskSummary{
+				TaskID:    "tsk_pa_1",
+				ProjectID: protocol.PAProjectID,
+				Goal:      req.Goal,
+				State:     protocol.TaskStateRunning,
+			},
+			Attempt: &protocol.AttemptView{AttemptID: "att_pa_1", State: protocol.AttemptRunning},
+		})
+	})
+	mux.HandleFunc("GET /api/tasks/tsk_pa_1/timeline", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(protocol.TaskTimelineResponse{
+			Task: protocol.TaskSummary{TaskID: "tsk_pa_1", ProjectID: protocol.PAProjectID, State: protocol.TaskStateDone},
+			Attempts: []protocol.AttemptView{
+				{AttemptID: "att_pa_1", State: protocol.AttemptSucceeded},
+			},
+		})
+	})
+	mux.HandleFunc("GET /api/attempts/att_pa_1/raw", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(protocol.AttemptRawEventsResponse{
+			AttemptID: "att_pa_1",
+			Events: []protocol.EventRecord{
+				{Seq: 1, Kind: protocol.EventACPMessageBatch, Payload: map[string]any{"text": "一切正常，1 个任务在跑。"}},
+			},
+		})
+	})
+	mux.HandleFunc("POST /api/pa/brief", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(protocol.PABriefResponse{
+			Summary: "工作区简报：1 个进行中任务",
+		})
+	})
 	mux.HandleFunc("POST /api/pa/chat", func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(protocol.PAChatResponse{
-			AssistantMessage: protocol.PAMessage{Content: "一切正常，1 个任务在跑。"},
+			AssistantMessage: protocol.PAMessage{Content: "legacy reply"},
 		})
 	})
 	mux.HandleFunc("GET /api/artifacts", func(w http.ResponseWriter, r *http.Request) {
@@ -110,8 +148,11 @@ func TestCLICommands_VersionTasksApprovalsPAArtifactsDoctor(t *testing.T) {
 	if out := runCmd("approvals", "allow", "--hub", ts.URL, "apr_1"); !strings.Contains(out, "allow_once_opt") {
 		t.Fatalf("expected allow_once_opt in approvals allow: %q", out)
 	}
-	if out := runCmd("pa", "--hub", ts.URL, "status?"); !strings.Contains(out, "一切正常") {
+	if out := runCmd("pa", "--hub", ts.URL, "--ref", "tsk_1", "status?"); !strings.Contains(out, "一切正常") {
 		t.Fatalf("unexpected pa output: %q", out)
+	}
+	if out := runCmd("pa", "--hub", ts.URL, "--brief"); !strings.Contains(out, "工作区简报") {
+		t.Fatalf("unexpected pa --brief output: %q", out)
 	}
 	if out := runCmd("artifacts", "--hub", ts.URL); !strings.Contains(out, "plan.md") {
 		t.Fatalf("expected plan.md in artifacts: %q", out)

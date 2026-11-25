@@ -249,6 +249,7 @@ type AcpAdapterDriver interface {
 	LoadSession(ctx context.Context, sid acp.SessionId, cwd string) (acp.LoadSessionResponse, error)
 	CloseSession(ctx context.Context, sid acp.SessionId) error
 	SetConfigOption(ctx context.Context, sid acp.SessionId, configID, value string) (acp.SetSessionConfigOptionResponse, error)
+	SetSessionMode(ctx context.Context, sid acp.SessionId, modeID string) (acp.SetSessionModeResponse, error)
 	Prompt(ctx context.Context, sid acp.SessionId, promptText string) (acp.PromptResponse, error)
 	Cancel(ctx context.Context, sid acp.SessionId) error
 }
@@ -451,7 +452,11 @@ func (d *AgyAcpDriver) buildEnv() []string {
 			env = setEnvVar(env, "PATH", d.cfg.OrbitBinDir+string(os.PathListSeparator)+curPath)
 		}
 	}
-	env = append(env, d.cfg.ExtraEnv...)
+	for _, kv := range d.cfg.ExtraEnv {
+		if idx := strings.IndexByte(kv, '='); idx > 0 {
+			env = setEnvVar(env, kv[:idx], kv[idx+1:])
+		}
+	}
 	return env
 }
 
@@ -648,6 +653,17 @@ func (d *AgyAcpDriver) SetConfigOption(ctx context.Context, sid acp.SessionId, c
 			ConfigId:  acp.SessionConfigId(configID),
 			Value:     acp.SessionConfigValueId(value),
 		},
+	})
+}
+
+func (d *AgyAcpDriver) SetSessionMode(ctx context.Context, sid acp.SessionId, modeID string) (acp.SetSessionModeResponse, error) {
+	conn, err := d.getConn()
+	if err != nil {
+		return acp.SetSessionModeResponse{}, err
+	}
+	return conn.SetSessionMode(ctx, acp.SetSessionModeRequest{
+		SessionId: sid,
+		ModeId:    acp.SessionModeId(modeID),
 	})
 }
 

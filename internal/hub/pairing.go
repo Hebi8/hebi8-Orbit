@@ -477,7 +477,7 @@ func (s *Server) emitPairingLockedEvent(ctx context.Context) {
 
 // handleCreateAuthHandoff issues a 30-second single-use handoff code for Desktop / CLI browser handoff.
 func (s *Server) handleCreateAuthHandoff(w http.ResponseWriter, r *http.Request) {
-	actor, kind, machineID, ok := s.authenticate(r)
+	actor, kind, machineID, _, ok := s.authenticate(r)
 	if !ok {
 		writeAPIError(w, http.StatusUnauthorized, "ERR_UNAUTHORIZED", "authentication required")
 		return
@@ -584,4 +584,179 @@ func (s *Server) handleClaimAuthHandoff(w http.ResponseWriter, r *http.Request) 
 		ClientToken: rawToken,
 		MachineID:   entry.machineID,
 	})
+}
+
+// handlePairClient redeems a one-time pairing code from a same-origin browser/client into a persistent
+// client-only device login session (ock_ token). It NEVER registers a runner/host machine.
+func (s *Server) handlePairClient(w http.ResponseWriter, r *http.Request) {
+	if strings.EqualFold(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")), "cross-site") {
+		writeAPIError(w, http.StatusForbidden, "ERR_ORIGIN_FORBIDDEN", "cross-site request rejected")
+		return
+	}
+	if origin := strings.TrimSpace(r.Header.Get("Origin")); origin != "" {
+		if !s.isAllowedOrigin(origin, r) {
+			// Refresh live Tailscale Serve origin once if a fresh hub hasn't cached it yet.
+			_, tsShared, tsOrigin, _, _ := s.probeTailscaleState(r.Context())
+			if tsShared && tsOrigin != "" {
+				s.recordTailscaleSharing(context.WithoutCancel(r.Context()), tsOrigin, "system")
+			}
+			if !s.isAllowedOrigin(origin, r) {
+				writeAPIError(w, http.StatusForbidden, "ERR_ORIGIN_FORBIDDEN", "origin not allowed")
+				return
+			}
+		}
+	}
+	if r.Header.Get("X-Orbit-Request") != "1" {
+		writeAPIError(w, http.StatusForbidden, "ERR_MISSING_REQUEST_HEADER", "client pairing requires X-Orbit-Request: 1 header")
+		return
+	}
+	if tsLogin := strings.TrimSpace(r.Header.Get("Tailscale-User-Login")); tsLogin != "" && s.hasConfiguredTailscaleLogins() {
+		if !s.isAllowedTailscaleLogin(tsLogin) {
+			writeAPIError(w, http.StatusForbidden, "ERR_FORBIDDEN", "tailscale login is not allowed")
+			return
+		}
+	}
+
+	now := time.Now()
+	if blocked, circuitOpen := s.pairLimiter.checkAndReserve(now); blocked {
+		if circuitOpen {
+			writeAPIError(w, http.StatusTooManyRequests, "ERR_PAIRING_LOCKED", "pairing temporarily locked due to repeated invalid attempts")
+		} else {
+			writeAPIError(w, http.StatusTooManyRequests, "ERR_RATE_LIMITED", "too many pairing attempts; try again shortly")
+		}
+		return
+	}
+
+	var req protocol.PairClientRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<14)).Decode(&req); err != nil {
+		writeAPIError(w, http.StatusBadRequest, "ERR_INVALID_JSON", "invalid request body")
+		return
+	}
+
+	normalized := normalizePairingCode(req.Code)
+	if normalized == "" {
+		if s.pairLimiter.recordFailure(now) {
+			s.emitPairingLockedEvent(r.Context())
+		}
+		writeAPIError(w, http.StatusUnauthorized, "ERR_PAIRING_INVALID", "配对码无效或已过期")
+		return
+	}
+
+	deviceName := strings.TrimSpace(req.DeviceName)
+	if deviceName == "" {
+		deviceName = inferClientDeviceName(r.UserAgent())
+	}
+	if len(deviceName) > 64 {
+		deviceName = deviceName[:64]
+	}
+
+	res, err := s.store.ClaimPairingCode(r.Context(), store.ClaimPairingCodeParams{
+		CodeHash:    store.HashSecret(normalized),
+		WantRunner:  false,
+		WantClient:  true,
+		ClientName:  deviceName,
+		ClientScope: "browser",
+		NowMs:       now.UnixMilli(),
+	})
+	if errors.Is(err, store.ErrPairingInvalid) {
+		if s.pairLimiter.recordFailure(now) {
+			s.emitPairingLockedEvent(r.Context())
+		}
+		writeAPIError(w, http.StatusUnauthorized, "ERR_PAIRING_INVALID", "配对码无效或已过期")
+		return
+	}
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, "ERR_PAIRING_CLAIM", err.Error())
+		return
+	}
+	if len(res.Events) > 0 {
+		s.broker.Broadcast(res.Events...)
+	}
+
+	writeJSON(w, http.StatusOK, protocol.PairClientResponse{
+		ClientToken:   res.ClientToken,
+		TokenID:       res.ClientTokenID,
+		DeviceName:    res.ClientName,
+		WorkspaceName: s.effectiveWorkspaceName(),
+	})
+}
+
+func inferClientDeviceName(ua string) string {
+	low := strings.ToLower(ua)
+	browser := "浏览器"
+	switch {
+	case strings.Contains(low, "edg/"):
+		browser = "Edge"
+	case strings.Contains(low, "chrome/") && !strings.Contains(low, "chromium"):
+		browser = "Chrome"
+	case strings.Contains(low, "firefox/"):
+		browser = "Firefox"
+	case strings.Contains(low, "safari/") && !strings.Contains(low, "chrome/"):
+		browser = "Safari"
+	}
+	osName := ""
+	switch {
+	case strings.Contains(low, "iphone"):
+		osName = "iPhone"
+	case strings.Contains(low, "ipad"):
+		osName = "iPad"
+	case strings.Contains(low, "android"):
+		osName = "Android"
+	case strings.Contains(low, "mac os x") || strings.Contains(low, "macintosh"):
+		osName = "macOS"
+	case strings.Contains(low, "windows"):
+		osName = "Windows"
+	case strings.Contains(low, "linux"):
+		osName = "Linux"
+	}
+	if osName != "" {
+		return browser + " · " + osName
+	}
+	return browser + "客户端"
+}
+
+func (s *Server) handleListClients(w http.ResponseWriter, r *http.Request) {
+	clients, err := s.store.ListActiveClientTokens(r.Context())
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, "ERR_LIST_CLIENTS", err.Error())
+		return
+	}
+	curID := clientTokenIDFromContext(r.Context())
+	for i := range clients {
+		if curID != "" && clients[i].ID == curID {
+			clients[i].IsCurrent = true
+		}
+	}
+	writeJSON(w, http.StatusOK, protocol.ListClientsResponse{Clients: clients})
+}
+
+func (s *Server) handleRevokeClient(w http.ResponseWriter, r *http.Request) {
+	if actorKindFromContext(r.Context()) != protocol.ActorHuman {
+		writeAPIError(w, http.StatusForbidden, "ERR_FORBIDDEN", "only a human operator can revoke client devices")
+		return
+	}
+	clientID := chi.URLParam(r, "clientId")
+	revoked, err := s.store.RevokeClientToken(r.Context(), clientID)
+	if errors.Is(err, store.ErrNotFound) {
+		writeAPIError(w, http.StatusNotFound, "ERR_CLIENT_NOT_FOUND", "client device not found")
+		return
+	}
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, "ERR_REVOKE_CLIENT", err.Error())
+		return
+	}
+	s.revokeClientTokenSessions(clientID)
+	writeJSON(w, http.StatusOK, protocol.RevokeClientResponse{
+		ClientID: clientID,
+		Revoked:  revoked,
+	})
+}
+
+func (s *Server) handleLogoutClient(w http.ResponseWriter, r *http.Request) {
+	tokenID := clientTokenIDFromContext(r.Context())
+	if tokenID != "" {
+		_, _ = s.store.RevokeClientToken(r.Context(), tokenID)
+		s.revokeClientTokenSessions(tokenID)
+	}
+	writeJSON(w, http.StatusOK, protocol.LogoutClientResponse{LoggedOut: true})
 }

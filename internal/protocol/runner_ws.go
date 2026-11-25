@@ -26,23 +26,36 @@ type AgentTestResult struct {
 	Error     string `json:"error,omitempty"`
 }
 
+// AgentModeOption describes one real ACP permission/operating mode advertised by an adapter.
+type AgentModeOption struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+}
+
 // AgentProbe captures the probed runtime status and metadata of one ACP adapter on a machine.
 type AgentProbe struct {
-	Adapter        Adapter          `json:"adapter"`
-	State          AgentState       `json:"state"`
-	Enabled        bool             `json:"enabled"`
-	BridgeBin      string           `json:"bridgeBin,omitempty"`
-	BridgeVersion  string           `json:"bridgeVersion,omitempty"`
-	MainCLI        string           `json:"mainCli,omitempty"`
-	Source         string           `json:"source,omitempty"` // flag | file | settings | managed | path | none
-	HintCode       string           `json:"hintCode,omitempty"`
-	Detail         string           `json:"detail,omitempty"`
-	DefaultModel   string           `json:"defaultModel,omitempty"`
-	Models         []string         `json:"models,omitempty"`
-	MaxLiveWorkers int              `json:"maxLiveWorkers,omitempty"`
-	LockedFields   []string         `json:"lockedFields,omitempty"`
-	LastTest       *AgentTestResult `json:"lastTest,omitempty"`
-	ProbedAt       int64            `json:"probedAt,omitempty"`
+	Adapter        Adapter           `json:"adapter"`
+	State          AgentState        `json:"state"`
+	Enabled        bool              `json:"enabled"`
+	BridgeBin      string            `json:"bridgeBin,omitempty"`
+	BridgeVersion  string            `json:"bridgeVersion,omitempty"`
+	MainCLI        string            `json:"mainCli,omitempty"`
+	Source         string            `json:"source,omitempty"` // flag | file | settings | managed | path | none
+	HintCode       string            `json:"hintCode,omitempty"`
+	Detail         string            `json:"detail,omitempty"`
+	DefaultModel   string            `json:"defaultModel,omitempty"`
+	Models         []string          `json:"models,omitempty"`
+	DefaultMode    string            `json:"defaultMode,omitempty"`
+	Modes          []AgentModeOption `json:"modes,omitempty"`
+	ModeViaLegacy  bool              `json:"modeViaLegacy,omitempty"`
+	DefaultEffort  string            `json:"defaultEffort,omitempty"`
+	Efforts        []string          `json:"efforts,omitempty"`
+	AuthChecked    bool              `json:"authChecked,omitempty"`
+	MaxLiveWorkers int               `json:"maxLiveWorkers,omitempty"`
+	LockedFields   []string          `json:"lockedFields,omitempty"`
+	LastTest       *AgentTestResult  `json:"lastTest,omitempty"`
+	ProbedAt       int64             `json:"probedAt,omitempty"`
 }
 
 // RunnerAgentConfig carries Hub-managed dynamic overrides for one adapter on a machine.
@@ -172,8 +185,9 @@ type AttemptDispatchFrame struct {
 	RepoIdentity       string              `json:"repoIdentity,omitempty"`
 	BaseSHA            string              `json:"baseSha,omitempty"`
 	DefaultBranch      string              `json:"defaultBranch,omitempty"`
-	DesiredConfig      map[string]string   `json:"desiredConfig,omitempty"`
-	ProjectEnv         map[string]string   `json:"projectEnv,omitempty"`
+	DesiredConfig          map[string]string   `json:"desiredConfig,omitempty"`
+	ExplicitFullPermission bool                `json:"explicitFullPermission,omitempty"`
+	ProjectEnv             map[string]string   `json:"projectEnv,omitempty"`
 	SystemPromptAppend string              `json:"systemPromptAppend,omitempty"`
 	InputDelivery      *InputDeliveryRef   `json:"inputDelivery,omitempty"`
 	Prompt             string              `json:"prompt"`
