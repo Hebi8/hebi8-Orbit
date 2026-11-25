@@ -56,7 +56,7 @@ func (s *Server) createTaskInternalWithPA(
 		return resp, nil, http.StatusInternalServerError, "ERR_PROJECT_LOOKUP", err
 	}
 
-	route, err := s.resolveExecutionRoute(proj, req.RequiredCapability, req.Adapter, req.MachineID)
+	route, err := s.resolveExecutionRouteWithLocation(proj, req.RequiredCapability, req.Adapter, req.MachineID, req.PartID, req.LocationID)
 	if err != nil {
 		return resp, nil, http.StatusBadRequest, "ERR_ROUTE_FAILED", err
 	}
@@ -66,8 +66,8 @@ func (s *Server) createTaskInternalWithPA(
 	if st, code, err := s.validateAdapterSupport(route); err != nil {
 		return resp, nil, st, code, err
 	}
-	// If dispatching a dynamic UI remote project to an already-connected legacy Runner lacking bundle.v1, surface upgrade guidance early.
-	if proj.Source == protocol.ProjectSourceUI &&
+	// If dispatching a dynamic UI remote Git project to an already-connected legacy Runner lacking bundle.v1, surface upgrade guidance early.
+	if !route.IsPlainFolder && proj.Source == protocol.ProjectSourceUI &&
 		route.MachineCfg.Transport != "" && route.MachineCfg.Transport != protocol.TransportLocalWS &&
 		s.runners.IsConnected(route.MachineID) && !s.runners.HasCapability(route.MachineID, protocol.RunnerCapBundleV1) {
 		return resp, nil, http.StatusUpgradeRequired, "ERR_RUNNER_UPGRADE_REQUIRED", fmt.Errorf(
@@ -161,6 +161,9 @@ func (s *Server) createTaskInternalWithPA(
 		IdempotencyKey:     idempKey,
 		Sources:            req.Sources,
 		MachineID:          route.MachineID,
+		PartID:             route.PartID,
+		LocationID:         route.LocationID,
+		Isolation:          route.Isolation,
 		Anchor:             anchorPtr,
 		AnchorCapability:   route.Capability,
 		BaseSHA:            baseSHA,

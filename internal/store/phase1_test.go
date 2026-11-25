@@ -126,8 +126,8 @@ func TestPhase0ToPhase1SmoothMigration(t *testing.T) {
 	if err := s.ReadDB().QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&maxVer); err != nil {
 		t.Fatal(err)
 	}
-	if maxVer != 5 {
-		t.Fatalf("expected schema version 5, got %d", maxVer)
+	if maxVer != 6 {
+		t.Fatalf("expected schema version 6, got %d", maxVer)
 	}
 
 	// Verify _scratch exists

@@ -519,7 +519,7 @@ func applyStateFrameTx(
 				WHERE triggered_attempt_id = ? AND status = 'queued'
 			`, att.AttemptID).Scan(&queuedAnnCount)
 
-			requiresDelivery := att.ProjectID != protocol.ScratchProjectID ||
+			requiresDelivery := (att.ProjectID != protocol.ScratchProjectID && att.Isolation != protocol.IsolationInPlace) ||
 				queuedAnnCount > 0 ||
 				att.TriggerKind == protocol.TriggerAnnotationBatch
 			if requiresDelivery && att.OutputDeliveryID == "" {
@@ -547,6 +547,12 @@ func applyStateFrameTx(
 	if tu, ok := item.Payload["tokenUsage"]; ok && tu != nil {
 		if b, err := json.Marshal(tu); err == nil {
 			tokenUsageVal = string(b)
+		}
+	}
+	var folderChangesVal any
+	if fc, ok := item.Payload["folderChanges"]; ok && fc != nil {
+		if b, err := json.Marshal(fc); err == nil {
+			folderChangesVal = string(b)
 		}
 	}
 
@@ -603,9 +609,10 @@ func applyStateFrameTx(
 		    error_detail = COALESCE(?, error_detail),
 		    resume_state = COALESCE(?, resume_state),
 		    token_usage_json = COALESCE(?, token_usage_json),
+		    folder_changes_json = COALESCE(?, folder_changes_json),
 		    finished_at = COALESCE(?, finished_at)
 		WHERE attempt_id = ?
-	`, string(newState), worktree, baseSHA, compSrcVal, errCodeVal, errDetailVal, resumeStateVal, tokenUsageVal, finishedAtVal, att.AttemptID); err != nil {
+	`, string(newState), worktree, baseSHA, compSrcVal, errCodeVal, errDetailVal, resumeStateVal, tokenUsageVal, folderChangesVal, finishedAtVal, att.AttemptID); err != nil {
 		return fmt.Errorf("update attempt state: %w", err)
 	}
 	att.State = newState

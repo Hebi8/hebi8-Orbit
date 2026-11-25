@@ -1,42 +1,66 @@
 import { useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import { Check, ChevronDown, ChevronRight, Copy, Globe, Laptop, Plus, Trash2 } from 'lucide-react';
-import type { BootstrapResponse, MachineView, TailscaleEnableResponse } from '../generated/protocol';
-import { AddProjectModal } from '../components/AddProjectModal';
+import {
+  ArrowUp,
+  Check,
+  ChevronDown,
+  ChevronRight,
+  Copy,
+  Folder,
+  Globe,
+  Laptop,
+  Plus,
+  Trash2,
+} from 'lucide-react';
+import type {
+  BootstrapResponse,
+  MachineRole,
+  MachineView,
+  TailscaleEnableResponse,
+} from '../generated/protocol';
 import { AgentList, agentDisplayName } from '../components/AgentList';
+import { DeviceRoleIcon } from '../components/DeviceRoleIcon';
 import { PageHeader } from '../components/PageHeader';
 import { PairDialog } from '../components/PairDialog';
 import { useNetworkSettings } from '../hooks/queries';
 import { api, errMsg } from '../lib/api';
-import { SCRATCH_PROJECT_ID, cleanMachineName, relTime } from '../lib/format';
+import { cleanMachineName, relTime } from '../lib/format';
+import { resolveEffectiveLocalMachineId } from '../lib/ide';
 import { toast, useWorkbenchStore } from '../store/useWorkbenchStore';
 
 export function SettingsPage({ boot }: { boot: BootstrapResponse }) {
   const qc = useQueryClient();
   const netQ = useNetworkSettings(true);
+  const storedLocalId = useWorkbenchStore((s) => s.localMachineId);
   const setWorkspaceNameOverride = useWorkbenchStore((s) => s.setWorkspaceNameOverride);
 
   const net = netQ.data;
   const workspaceName = net?.workspaceName || boot.workspaceName || 'Home LAN';
+  const discoveryId = net?.discoveryId || boot.setup?.discoveryId || '';
+  const dutyPriority = net?.dutyPriority ?? boot.setup?.dutyPriority ?? [];
+  const activeDutyId = net?.activeDutyMachineId || boot.setup?.activeDutyMachineId || '';
+  const effectiveLocalId = resolveEffectiveLocalMachineId(
+    boot.machines,
+    boot.setup?.currentMachineId || storedLocalId,
+  );
 
   const [editingName, setEditingName] = useState(false);
   const [nameDraft, setNameDraft] = useState(workspaceName);
   const [savingName, setSavingName] = useState(false);
+  const [savingDuty, setSavingDuty] = useState(false);
 
   const [expandedMachine, setExpandedMachine] = useState<string>(() => {
     const first = boot.machines.find((m) => m.status === 'online' && m.transportMode !== 'ssh_outbound');
     return first?.machineId ?? '';
   });
   const [aliasEdits, setAliasEdits] = useState<Record<string, string>>({});
+  const [rootDrafts, setRootDrafts] = useState<Record<string, string>>({});
 
   const [pairOpen, setPairOpen] = useState(false);
   const [pairBindMachine, setPairBindMachine] = useState<string | undefined>(undefined);
-  const [projModalOpen, setProjModalOpen] = useState(false);
 
   const [tsLoading, setTsLoading] = useState(false);
   const [tsConfirm, setTsConfirm] = useState<TailscaleEnableResponse | null>(null);
-
-  const realProjects = boot.projects.filter((p) => p.projectId !== SCRATCH_PROJECT_ID && !p.archived);
 
   const refreshAll = () => {
     void qc.invalidateQueries({ queryKey: ['bootstrap'] });
@@ -52,11 +76,25 @@ export function SettingsPage({ boot }: { boot: BootstrapResponse }) {
       setWorkspaceNameOverride('');
       setEditingName(false);
       refreshAll();
-      toast(`已更新名称：${trimmed}`);
+      toast(`已更新工作区名称：${trimmed}`);
     } catch (e) {
       toast(errMsg(e), 'err');
     } finally {
       setSavingName(false);
+    }
+  };
+
+  const pinDutyMachine = async (machineId: string) => {
+    const next = [machineId, ...dutyPriority.filter((id) => id !== machineId)];
+    setSavingDuty(true);
+    try {
+      await api.updateNetworkSettings({ dutyPriority: next });
+      refreshAll();
+      toast('已调整主控顺位');
+    } catch (e) {
+      toast(errMsg(e), 'err');
+    } finally {
+      setSavingDuty(false);
     }
   };
 
@@ -69,7 +107,7 @@ export function SettingsPage({ boot }: { boot: BootstrapResponse }) {
       } else {
         setTsConfirm(null);
         refreshAll();
-        toast(res.origin ? `已开启多机共享：${res.origin}` : '已开启多机共享');
+        toast(res.origin ? `已开启外部接入：${res.origin}` : '已开启外部接入');
       }
     } catch (e) {
       toast(errMsg(e), 'err');
@@ -83,7 +121,41 @@ export function SettingsPage({ boot }: { boot: BootstrapResponse }) {
     try {
       await api.updateMachine(m.machineId, { displayAlias: alias });
       refreshAll();
-      toast('已更新机器名称');
+      toast('已更新设备名称');
+    } catch (e) {
+      toast(errMsg(e), 'err');
+    }
+  };
+
+  const updateMachineRole = async (m: MachineView, nextRole: MachineRole) => {
+    try {
+      await api.updateMachine(m.machineId, { role: nextRole });
+      refreshAll();
+      toast(nextRole === 'full' ? '已设为完整设备' : '已设为受限节点');
+    } catch (e) {
+      toast(errMsg(e), 'err');
+    }
+  };
+
+  const addAllowedRoot = async (m: MachineView) => {
+    const raw = (rootDrafts[m.machineId] ?? '').trim();
+    if (!raw) return;
+    const next = [...(m.allowedRoots ?? []), raw];
+    try {
+      await api.updateMachine(m.machineId, { allowedRoots: next });
+      setRootDrafts((d) => ({ ...d, [m.machineId]: '' }));
+      refreshAll();
+      toast('已添加工作目录');
+    } catch (e) {
+      toast(errMsg(e), 'err');
+    }
+  };
+
+  const removeAllowedRoot = async (m: MachineView, target: string) => {
+    const next = (m.allowedRoots ?? []).filter((r) => r !== target);
+    try {
+      await api.updateMachine(m.machineId, { allowedRoots: next });
+      refreshAll();
     } catch (e) {
       toast(errMsg(e), 'err');
     }
@@ -99,24 +171,19 @@ export function SettingsPage({ boot }: { boot: BootstrapResponse }) {
     }
   };
 
-  const removeProject = async (projectId: string, displayName: string) => {
+  const copyValue = async (val: string, label: string) => {
     try {
-      await api.deleteProject(projectId);
-      refreshAll();
-      toast(`已移除项目 ${displayName}`);
-    } catch (e) {
-      toast(errMsg(e), 'err');
+      await navigator.clipboard.writeText(val);
+      toast(`已复制${label}`);
+    } catch {
+      toast(val);
     }
   };
 
-  const copyOrigin = async (u: string) => {
-    try {
-      await navigator.clipboard.writeText(u);
-      toast('已复制地址');
-    } catch {
-      toast(u);
-    }
-  };
+  const machineMap = new Map(boot.machines.map((m) => [m.machineId, m]));
+  const dutyMachines = dutyPriority
+    .map((id) => machineMap.get(id))
+    .filter((m): m is MachineView => !!m);
 
   return (
     <main className="main">
@@ -125,14 +192,14 @@ export function SettingsPage({ boot }: { boot: BootstrapResponse }) {
       </PageHeader>
       <div className="page-scroll">
         <div className="set-wrap">
-          {/* Section 1: Network */}
+          {/* Section 1: 网络 */}
           <section className="set-sec">
             <div className="set-hd">
               <h2>网络</h2>
             </div>
 
             <div className="set-row">
-              <div className="set-k">空间名称</div>
+              <div className="set-k">工作区名称</div>
               <div className="set-v">
                 {editingName ? (
                   <div className="set-inline">
@@ -146,7 +213,12 @@ export function SettingsPage({ boot }: { boot: BootstrapResponse }) {
                       }}
                       autoFocus
                     />
-                    <button type="button" className="btn pri sm" disabled={savingName} onClick={() => void saveWorkspaceName()}>
+                    <button
+                      type="button"
+                      className="btn pri sm"
+                      disabled={savingName}
+                      onClick={() => void saveWorkspaceName()}
+                    >
                       保存
                     </button>
                     <button type="button" className="btn ghost sm" onClick={() => setEditingName(false)}>
@@ -166,30 +238,84 @@ export function SettingsPage({ boot }: { boot: BootstrapResponse }) {
                     >
                       改名
                     </button>
+                    {discoveryId && (
+                      <button
+                        type="button"
+                        className="btn ghost sm"
+                        title="复制工作区网络发现 ID"
+                        onClick={() => void copyValue(discoveryId, '网络 ID')}
+                      >
+                        <Copy size={11.5} strokeWidth={1.7} /> 复制网络 ID
+                      </button>
+                    )}
                   </div>
                 )}
               </div>
             </div>
 
+            {dutyMachines.length > 0 && (
+              <div className="set-row">
+                <div className="set-k">主控顺位</div>
+                <div className="set-v">
+                  <div className="duty-list">
+                    {dutyMachines.map((m, idx) => {
+                      const isDuty = m.machineId === activeDutyId;
+                      const label = m.displayAlias || cleanMachineName(m);
+                      return (
+                        <div className="duty-row" key={m.machineId}>
+                          <span className="duty-rank mono">#{idx + 1}</span>
+                          <DeviceRoleIcon
+                            machine={m}
+                            isActiveDuty={isDuty}
+                            isCurrentDevice={m.machineId === effectiveLocalId}
+                            size={13.5}
+                          />
+                          <span className="duty-name ell">{label}</span>
+                          {isDuty && <span className="duty-cur">当前主控</span>}
+                          <span className="duty-right">
+                            {idx > 0 && (
+                              <button
+                                type="button"
+                                className="btn ghost sm"
+                                disabled={savingDuty}
+                                onClick={() => void pinDutyMachine(m.machineId)}
+                              >
+                                <ArrowUp size={11.5} strokeWidth={1.8} /> 置顶
+                              </button>
+                            )}
+                          </span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              </div>
+            )}
+
             <div className="set-row">
-              <div className="set-k">多机接入</div>
+              <div className="set-k">外部接入</div>
               <div className="set-v">
                 {net?.tailscaleShared ? (
-                  <div className="set-inline">
-                    <span className="ok-t">已开启</span>
-                    <span className="mono muted ell">{net.tailscaleOrigin || net.hubOrigin}</span>
-                    <button
-                      type="button"
-                      className="btn ghost sm"
-                      onClick={() => void copyOrigin(net.tailscaleOrigin || net.hubOrigin)}
-                    >
-                      <Copy size={11.5} strokeWidth={1.7} /> 复制
-                    </button>
+                  <div className="set-col">
+                    <div className="set-inline">
+                      <span className="ok-t">已开启</span>
+                      <span className="mono muted ell">{net.tailscaleOrigin || net.hubOrigin}</span>
+                      <button
+                        type="button"
+                        className="btn ghost sm"
+                        onClick={() => void copyValue(net.tailscaleOrigin || net.hubOrigin, '接入地址')}
+                      >
+                        <Copy size={11.5} strokeWidth={1.7} /> 复制
+                      </button>
+                    </div>
+                    <div className="faint" style={{ fontSize: 11.5 }}>
+                      手机与浏览器薄客户端可通过此入口访问当前主控。
+                    </div>
                   </div>
                 ) : net?.tailscaleAvailable ? (
                   <div className="set-col">
                     <div className="set-inline">
-                      <span className="muted">仅本机使用</span>
+                      <span className="muted">仅局域网与本机直连</span>
                       <button
                         type="button"
                         className="btn ghost sm"
@@ -197,14 +323,14 @@ export function SettingsPage({ boot }: { boot: BootstrapResponse }) {
                         onClick={() => void triggerTailscaleShare(false)}
                       >
                         <Globe size={12} strokeWidth={1.7} />
-                        {tsLoading ? '检查中…' : '让其他机器连进来'}
+                        {tsLoading ? '检查中…' : '开启外部接入'}
                       </button>
                     </div>
                     {tsConfirm && (
                       <div className="set-confirm">
                         <div className="muted">
                           {tsConfirm.conflictDetail ||
-                            `将通过 Tailscale 开启端口 ${tsConfirm.suggestedPort} 供你的其他设备接入。`}
+                            `将通过 Tailscale 开启端口 ${tsConfirm.suggestedPort} 供薄客户端与外网设备接入。`}
                         </div>
                         <div className="mono muted" style={{ fontSize: 11 }}>
                           {tsConfirm.command}
@@ -227,14 +353,14 @@ export function SettingsPage({ boot }: { boot: BootstrapResponse }) {
                   </div>
                 ) : (
                   <span className="muted">
-                    {net?.tailscaleHint || '安装并登录 Tailscale 后即可让其他机器接入'}
+                    {net?.tailscaleHint || '安装并登录 Tailscale 后即可为手机与远程设备开启外部接入'}
                   </span>
                 )}
               </div>
             </div>
           </section>
 
-          {/* Section 2: Machines & Agents */}
+          {/* Section 2: 机器与 Agent */}
           <section className="set-sec">
             <div className="set-hd">
               <h2>机器与 Agent</h2>
@@ -258,6 +384,10 @@ export function SettingsPage({ boot }: { boot: BootstrapResponse }) {
                 const readyAgents = (m.agents ?? []).filter((a) => a.state === 'ready' && a.enabled);
                 const needsPair = isExec && !m.hasCredentials;
                 const label = m.displayAlias || cleanMachineName(m);
+                const isDuty = m.machineId === activeDutyId;
+                const isCurrent = !!effectiveLocalId && m.machineId === effectiveLocalId;
+                const curRole: MachineRole =
+                  m.role === 'worker' || !isExec ? 'worker' : 'full';
 
                 return (
                   <div className={`set-mach-card ${expanded ? 'open' : ''}`} key={m.machineId}>
@@ -265,10 +395,13 @@ export function SettingsPage({ boot }: { boot: BootstrapResponse }) {
                       className="set-mach-hd"
                       onClick={() => isExec && setExpandedMachine(expanded ? '' : m.machineId)}
                     >
-                      <span className={`node-dot ${online ? 'good' : 'off'}`} />
+                      <DeviceRoleIcon
+                        machine={m}
+                        isActiveDuty={isDuty}
+                        isCurrentDevice={isCurrent}
+                        size={14}
+                      />
                       <span className="set-mach-name ell">{label}</span>
-                      {m.transportMode === 'local_ws' && <span className="node-local-pill">本机</span>}
-                      {!isExec && <span className="node-local-pill">部署目标</span>}
 
                       <div className="set-mach-summary">
                         {isExec && readyAgents.length > 0 && !expanded && (
@@ -314,7 +447,7 @@ export function SettingsPage({ boot }: { boot: BootstrapResponse }) {
                           <span className="muted">显示名称</span>
                           <input
                             className="field"
-                            style={{ maxWidth: 220 }}
+                            style={{ maxWidth: 200 }}
                             value={aliasEdits[m.machineId] ?? m.displayAlias ?? ''}
                             placeholder={cleanMachineName(m)}
                             onChange={(e) =>
@@ -327,68 +460,93 @@ export function SettingsPage({ boot }: { boot: BootstrapResponse }) {
                           <button type="button" className="btn ghost sm" onClick={() => void saveMachineAlias(m)}>
                             保存
                           </button>
-                          {m.source === 'paired' && (
+
+                          <div className="role-seg" style={{ marginLeft: 'auto' }}>
                             <button
                               type="button"
-                              className="btn ghost sm bad-t"
-                              style={{ marginLeft: 'auto' }}
-                              onClick={() => void removeMachine(m)}
+                              className={curRole === 'full' ? 'on' : ''}
+                              onClick={() => curRole !== 'full' && void updateMachineRole(m, 'full')}
                             >
-                              <Trash2 size={12} strokeWidth={1.7} /> 移除
+                              完整设备
                             </button>
-                          )}
+                            <button
+                              type="button"
+                              className={curRole === 'worker' ? 'on' : ''}
+                              onClick={() => curRole !== 'worker' && void updateMachineRole(m, 'worker')}
+                            >
+                              受限节点
+                            </button>
+                          </div>
                         </div>
 
                         <AgentList machine={m} showAdvanced />
+
+                        {/* Allowed working directories */}
+                        <div className="roots-block">
+                          <div className="ag-block-lbl">工作目录范围</div>
+                          <div className="roots-list">
+                            {(m.allowedRoots ?? []).length === 0 ? (
+                              <span className="faint" style={{ fontSize: 12 }}>
+                                默认使用用户主目录（~）
+                              </span>
+                            ) : (
+                              (m.allowedRoots ?? []).map((rt) => (
+                                <span className="root-chip mono" key={rt}>
+                                  <Folder size={11} strokeWidth={1.6} />
+                                  <span>{rt}</span>
+                                  <button
+                                    type="button"
+                                    aria-label={`移除 ${rt}`}
+                                    onClick={() => void removeAllowedRoot(m, rt)}
+                                  >
+                                    ×
+                                  </button>
+                                </span>
+                              ))
+                            )}
+                          </div>
+                          <div className="set-inline" style={{ marginTop: 6 }}>
+                            <input
+                              className="field mono"
+                              style={{ maxWidth: 260 }}
+                              placeholder="添加允许浏览/扫描的路径（如 ~/dev）"
+                              value={rootDrafts[m.machineId] ?? ''}
+                              onChange={(e) =>
+                                setRootDrafts((d) => ({ ...d, [m.machineId]: e.target.value }))
+                              }
+                              onKeyDown={(e) => {
+                                if (e.key === 'Enter') {
+                                  e.preventDefault();
+                                  void addAllowedRoot(m);
+                                }
+                              }}
+                            />
+                            <button
+                              type="button"
+                              className="btn ghost sm"
+                              disabled={!(rootDrafts[m.machineId] ?? '').trim()}
+                              onClick={() => void addAllowedRoot(m)}
+                            >
+                              <Plus size={12} strokeWidth={1.8} /> 添加
+                            </button>
+                            {m.source === 'paired' && (
+                              <button
+                                type="button"
+                                className="btn ghost sm bad-t"
+                                style={{ marginLeft: 'auto' }}
+                                onClick={() => void removeMachine(m)}
+                              >
+                                <Trash2 size={12} strokeWidth={1.7} /> 移除设备
+                              </button>
+                            )}
+                          </div>
+                        </div>
                       </div>
                     )}
                   </div>
                 );
               })}
             </div>
-          </section>
-
-          {/* Section 3: Projects */}
-          <section className="set-sec">
-            <div className="set-hd">
-              <h2>项目</h2>
-              <button type="button" className="btn ghost sm" onClick={() => setProjModalOpen(true)}>
-                <Plus size={12.5} strokeWidth={1.8} /> 添加项目
-              </button>
-            </div>
-            {realProjects.length === 0 ? (
-              <div className="muted" style={{ padding: '6px 0' }}>
-                还没有添加本地项目。
-              </div>
-            ) : (
-              <div className="set-proj-list">
-                {realProjects.map((p) => {
-                  const anchor = p.anchors[p.defaultCapability] ?? Object.values(p.anchors)[0];
-                  return (
-                    <div className="set-proj-row" key={p.projectId}>
-                      <div className="ell grow">
-                        <b>{p.displayName}</b>
-                        <span className="muted mono" style={{ marginLeft: 10 }}>
-                          {anchor?.machine || ''}
-                          {anchor?.repoPath ? ` · ${anchor.repoPath}` : ''}
-                        </span>
-                      </div>
-                      {p.source === 'ui' && (
-                        <button
-                          type="button"
-                          className="ib"
-                          title="移除项目"
-                          aria-label={`移除 ${p.displayName}`}
-                          onClick={() => void removeProject(p.projectId, p.displayName)}
-                        >
-                          <Trash2 size={13} strokeWidth={1.6} />
-                        </button>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-            )}
           </section>
         </div>
       </div>
@@ -401,12 +559,6 @@ export function SettingsPage({ boot }: { boot: BootstrapResponse }) {
           setPairOpen(false);
           setPairBindMachine(undefined);
         }}
-      />
-      <AddProjectModal
-        open={projModalOpen}
-        machines={boot.machines}
-        defaultMachineId={boot.setup?.currentMachineId}
-        onClose={() => setProjModalOpen(false)}
       />
     </main>
   );

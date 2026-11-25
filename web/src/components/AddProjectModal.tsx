@@ -1,18 +1,23 @@
 import { useEffect, useRef, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import { Folder, GitBranch, ArrowUp, X } from 'lucide-react';
+import { ArrowUp, Folder, GitBranch, X } from 'lucide-react';
 import type { DirEntryView, MachineView, ProjectView } from '../generated/protocol';
 import { api, errMsg } from '../lib/api';
 import { cleanMachineName } from '../lib/format';
 import { toast } from '../store/useWorkbenchStore';
+import { DeviceRoleIcon } from './DeviceRoleIcon';
 
 export function ProjectDirPicker({
   machines,
   defaultMachineId,
+  activeDutyMachineId,
+  currentMachineId,
   onAdded,
 }: {
   machines: MachineView[];
   defaultMachineId?: string;
+  activeDutyMachineId?: string;
+  currentMachineId?: string;
   onAdded?: (project: ProjectView) => void;
 }) {
   const qc = useQueryClient();
@@ -25,8 +30,9 @@ export function ProjectDirPicker({
   const [curPath, setCurPath] = useState('');
   const [parentPath, setParentPath] = useState('');
   const [pathInput, setPathInput] = useState('');
+  const [displayName, setDisplayName] = useState('');
   const [entries, setEntries] = useState<DirEntryView[]>([]);
-  const [selectedRepo, setSelectedRepo] = useState('');
+  const [selectedDir, setSelectedDir] = useState('');
   const [loadedMachineId, setLoadedMachineId] = useState('');
   const [loading, setLoading] = useState(false);
   const [adding, setAdding] = useState(false);
@@ -53,7 +59,7 @@ export function ProjectDirPicker({
       setParentPath(res.parentPath ?? '');
       setPathInput(res.path);
       setEntries(res.entries ?? []);
-      setSelectedRepo('');
+      setSelectedDir('');
       setLoadedMachineId(mid);
     } catch (e) {
       if (seq !== reqSeqRef.current || activeMachineRef.current !== mid) return;
@@ -70,7 +76,7 @@ export function ProjectDirPicker({
     setParentPath('');
     setPathInput('');
     setEntries([]);
-    setSelectedRepo('');
+    setSelectedDir('');
     setLoadedMachineId('');
     setError('');
     if (machineId) {
@@ -78,14 +84,16 @@ export function ProjectDirPicker({
     }
   }, [machineId]);
 
-  const submitAdd = async (repoPath: string) => {
-    if (!machineId || loadedMachineId !== machineId || !repoPath.trim()) return;
+  const submitAdd = async (targetPath: string) => {
+    if (!machineId || loadedMachineId !== machineId || !targetPath.trim()) return;
     setAdding(true);
     setError('');
     try {
       const res = await api.createProject({
         machineId,
-        repoPath: repoPath.trim(),
+        repoPath: targetPath.trim(),
+        displayName: displayName.trim() || undefined,
+        allowFolder: true,
       });
       toast(`已添加项目 ${res.project.displayName}`);
       void qc.invalidateQueries({ queryKey: ['bootstrap'] });
@@ -98,59 +106,81 @@ export function ProjectDirPicker({
   };
 
   if (eligible.length === 0) {
-    return <div className="muted">当前没有在线的机器，请先启动或连接一台机器。</div>;
+    return <div className="muted">当前没有在线的设备，请先启动或连接一台设备。</div>;
   }
 
   return (
     <div className="dir-picker">
-      <div className="dir-bar">
-        {eligible.length > 1 && (
-          <select
-            className="field dir-mach"
-            value={machineId}
-            onChange={(e) => setMachineId(e.target.value)}
-            aria-label="选择机器"
-          >
-            {eligible.map((m) => (
-              <option key={m.machineId} value={m.machineId}>
-                {m.displayAlias || cleanMachineName(m)}
-              </option>
-            ))}
-          </select>
-        )}
-        <div className="dir-path-wrap">
-          {parentPath && (
+      {eligible.length > 1 && (
+        <div className="dir-mach-tabs" role="tablist" aria-label="选择设备">
+          {eligible.map((m) => (
             <button
+              key={m.machineId}
               type="button"
-              className="ib"
-              title="上一级目录"
-              aria-label="上一级目录"
-              onClick={() => void loadDir(machineId, parentPath)}
+              role="tab"
+              aria-selected={machineId === m.machineId}
+              className={`dir-mach-tab ${machineId === m.machineId ? 'on' : ''}`}
+              onClick={() => setMachineId(m.machineId)}
             >
-              <ArrowUp size={13} strokeWidth={1.7} />
+              <DeviceRoleIcon
+                machine={m}
+                isActiveDuty={m.machineId === activeDutyMachineId}
+                isCurrentDevice={m.machineId === currentMachineId}
+                size={13}
+              />
+              <span className="ell">{m.displayAlias || cleanMachineName(m)}</span>
             </button>
-          )}
-          <input
-            className="field mono grow"
-            value={pathInput}
-            placeholder="输入或粘贴 Git 仓库路径"
-            onChange={(e) => setPathInput(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') {
-                e.preventDefault();
-                void loadDir(machineId, pathInput);
-              }
-            }}
-          />
+          ))}
+        </div>
+      )}
+
+      <div className="dir-extra-row">
+        <span className="muted" style={{ fontSize: 12, flexShrink: 0 }}>
+          项目名称
+        </span>
+        <input
+          className="field grow"
+          value={displayName}
+          placeholder="留空则默认使用目录名"
+          onChange={(e) => setDisplayName(e.target.value)}
+        />
+      </div>
+
+      <div className="dir-path-wrap">
+        {parentPath && (
           <button
             type="button"
-            className="btn ghost sm"
-            disabled={loading}
-            onClick={() => void loadDir(machineId, pathInput)}
+            className="ib"
+            title="上一级目录"
+            aria-label="上一级目录"
+            onClick={() => void loadDir(machineId, parentPath)}
           >
-            打开
+            <ArrowUp size={13} strokeWidth={1.7} />
           </button>
-        </div>
+        )}
+        <input
+          className="field mono grow"
+          value={pathInput}
+          placeholder="输入或粘贴仓库 / 目录路径"
+          onChange={(e) => {
+            setPathInput(e.target.value);
+            setSelectedDir('');
+          }}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') {
+              e.preventDefault();
+              void loadDir(machineId, pathInput);
+            }
+          }}
+        />
+        <button
+          type="button"
+          className="btn ghost sm"
+          disabled={loading}
+          onClick={() => void loadDir(machineId, pathInput)}
+        >
+          打开
+        </button>
       </div>
 
       {error && <div className="bad-t dir-err">{error}</div>}
@@ -159,28 +189,20 @@ export function ProjectDirPicker({
         {loading ? (
           <div className="dir-empty muted">正在读取目录…</div>
         ) : entries.length === 0 ? (
-          <div className="dir-empty muted">该目录下没有子文件夹</div>
+          <div className="dir-empty muted">该目录下没有子文件夹，可直接添加当前目录</div>
         ) : (
           entries.map((entry) => {
-            const selected = selectedRepo === entry.path;
+            const selected = selectedDir === entry.path;
             return (
               <div
                 key={entry.path}
                 className={`dir-row ${selected ? 'on' : ''}`}
                 onClick={() => {
-                  if (entry.isGitRepo) {
-                    setSelectedRepo(entry.path);
-                    setPathInput(entry.path);
-                  } else {
-                    void loadDir(machineId, entry.path);
-                  }
+                  setSelectedDir(entry.path);
+                  setPathInput(entry.path);
                 }}
                 onDoubleClick={() => {
-                  if (!entry.isGitRepo) {
-                    void loadDir(machineId, entry.path);
-                  } else {
-                    void submitAdd(entry.path);
-                  }
+                  void loadDir(machineId, entry.path);
                 }}
               >
                 {entry.isGitRepo ? (
@@ -189,19 +211,20 @@ export function ProjectDirPicker({
                   <Folder size={13.5} strokeWidth={1.6} className="muted" />
                 )}
                 <span className="ell grow">{entry.name}</span>
-                {entry.isGitRepo && (
-                  <button
-                    type="button"
-                    className="btn ghost sm"
-                    disabled={adding}
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      void submitAdd(entry.path);
-                    }}
-                  >
-                    添加
-                  </button>
+                {entry.isGitRepo && entry.branch && (
+                  <span className="git-zsh mono">{entry.branch}</span>
                 )}
+                <button
+                  type="button"
+                  className="btn ghost sm"
+                  disabled={adding}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    void submitAdd(entry.path);
+                  }}
+                >
+                  添加
+                </button>
               </div>
             );
           })
@@ -209,14 +232,14 @@ export function ProjectDirPicker({
       </div>
 
       <div className="dir-foot">
-        <span className="muted ell mono">{selectedRepo || curPath}</span>
+        <span className="muted ell mono">{selectedDir || curPath}</span>
         <button
           type="button"
-          className={`btn ${selectedRepo ? 'pri' : 'ghost'} sm`}
-          disabled={adding || loading || loadedMachineId !== machineId || !(selectedRepo || pathInput.trim())}
-          onClick={() => void submitAdd(selectedRepo || pathInput.trim())}
+          className="btn pri sm"
+          disabled={adding || loading || loadedMachineId !== machineId || !(selectedDir || pathInput.trim())}
+          onClick={() => void submitAdd(selectedDir || pathInput.trim())}
         >
-          {adding ? '添加中…' : '添加当前路径'}
+          {adding ? '添加中…' : '添加此目录'}
         </button>
       </div>
     </div>
@@ -227,12 +250,16 @@ export function AddProjectModal({
   open,
   machines,
   defaultMachineId,
+  activeDutyMachineId,
+  currentMachineId,
   onClose,
   onAdded,
 }: {
   open: boolean;
   machines: MachineView[];
   defaultMachineId?: string;
+  activeDutyMachineId?: string;
+  currentMachineId?: string;
   onClose: () => void;
   onAdded?: (project: ProjectView) => void;
 }) {
@@ -241,7 +268,7 @@ export function AddProjectModal({
     <div className="modal-scrim" onClick={onClose}>
       <section className="modal-card proj-modal" role="dialog" aria-label="添加项目" onClick={(e) => e.stopPropagation()}>
         <div className="modal-hd">
-          <h3>添加本地项目</h3>
+          <h3>添加项目</h3>
           <button type="button" className="ib" onClick={onClose} aria-label="关闭">
             <X size={15} strokeWidth={1.7} />
           </button>
@@ -250,6 +277,8 @@ export function AddProjectModal({
           <ProjectDirPicker
             machines={machines}
             defaultMachineId={defaultMachineId}
+            activeDutyMachineId={activeDutyMachineId}
+            currentMachineId={currentMachineId}
             onAdded={(p) => {
               onAdded?.(p);
               onClose();

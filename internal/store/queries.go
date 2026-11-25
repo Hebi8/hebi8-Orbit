@@ -90,6 +90,9 @@ func (s *Store) SyncRegistry(ctx context.Context, dataDir string, projects proto
 			if err != nil {
 				return fmt.Errorf("upsert project %s: %w", projectID, err)
 			}
+			if err := ensureDefaultPartAndLocationsTx(ctx, tx, projectID, p.DisplayName, p.RepoIdentity, string(cfgJSON), now); err != nil {
+				return fmt.Errorf("sync project parts %s: %w", projectID, err)
+			}
 		}
 		if err := ensureScratchProjectTx(ctx, tx, now); err != nil {
 			return err
@@ -121,7 +124,8 @@ func (s *Store) Bootstrap(ctx context.Context, machineMeta map[string]protocol.M
 		// Projects with live active & blocked counts (real projects first, _scratch last)
 		rows, err := tx.QueryContext(ctx, `
 			SELECT p.project_id, p.display_name, p.repo_identity, p.default_branch,
-			       p.mirror_bare_path, p.config_json, p.archived, p.source, p.updated_at,
+			       p.mirror_bare_path, p.config_json, p.system_prompt, p.shared_env_json,
+			       p.archived, p.source, p.updated_at,
 			       COALESCE(SUM(CASE WHEN t.state IN ('queued','running','waiting_approval','in_review') THEN 1 ELSE 0 END), 0) AS active_count,
 			       COALESCE(SUM(CASE WHEN t.state IN ('waiting_resource','failed') THEN 1 ELSE 0 END), 0) AS blocked_count
 			FROM projects p
@@ -137,15 +141,18 @@ func (s *Store) Bootstrap(ctx context.Context, machineMeta map[string]protocol.M
 
 		for rows.Next() {
 			var pv protocol.ProjectView
-			var cfgJSON, srcStr string
+			var cfgJSON, sysPrompt, sharedEnvJSON, srcStr string
 			var archived int
 			if err := rows.Scan(
 				&pv.ProjectID, &pv.DisplayName, &pv.RepoIdentity, &pv.DefaultBranch,
-				&pv.MirrorBarePath, &cfgJSON, &archived, &srcStr, &pv.UpdatedAt,
+				&pv.MirrorBarePath, &cfgJSON, &sysPrompt, &sharedEnvJSON,
+				&archived, &srcStr, &pv.UpdatedAt,
 				&pv.ActiveTaskCount, &pv.BlockedTaskCount,
 			); err != nil {
 				return err
 			}
+			pv.SystemPrompt = sysPrompt
+			_ = json.Unmarshal([]byte(sharedEnvJSON), &pv.SharedEnv)
 			pv.Archived = archived != 0
 			if srcStr != "" {
 				pv.Source = protocol.ProjectSource(srcStr)
@@ -169,6 +176,15 @@ func (s *Store) Bootstrap(ctx context.Context, machineMeta map[string]protocol.M
 		}
 		if err := rows.Err(); err != nil {
 			return err
+		}
+		if partsByProject, err := loadProjectPartsTx(ctx, tx, ""); err == nil {
+			for i := range resp.Projects {
+				if parts, ok := partsByProject[resp.Projects[i].ProjectID]; ok {
+					resp.Projects[i].Parts = parts
+				}
+			}
+		} else {
+			return fmt.Errorf("query project parts: %w", err)
 		}
 
 		// Collect active DB credentials & soft-removed paired machines in the same read snapshot
@@ -202,7 +218,8 @@ func (s *Store) Bootstrap(ctx context.Context, machineMeta map[string]protocol.M
 
 		// Machines
 		mRows, err := tx.QueryContext(ctx, `
-			SELECT machine_id, transport_mode, status, capabilities_json, adapters_json, resources_json,
+			SELECT machine_id, transport_mode, status, role, os_name, allowed_roots_json,
+			       capabilities_json, adapters_json, resources_json,
 			       agents_json, display_alias, runner_caps_json,
 			       runner_version, last_seen_at, updated_at
 			FROM machines
@@ -215,11 +232,12 @@ func (s *Store) Bootstrap(ctx context.Context, machineMeta map[string]protocol.M
 
 		for mRows.Next() {
 			var mv protocol.MachineView
-			var transport, status, capsJSON, adaptersJSON, resJSON, agentsJSON, displayAlias, runnerCapsJSON string
+			var transport, status, roleStr, osName, allowedRootsJSON, capsJSON, adaptersJSON, resJSON, agentsJSON, displayAlias, runnerCapsJSON string
 			var runnerVer sql.NullString
 			var lastSeen sql.NullInt64
 			if err := mRows.Scan(
-				&mv.MachineID, &transport, &status, &capsJSON, &adaptersJSON, &resJSON,
+				&mv.MachineID, &transport, &status, &roleStr, &osName, &allowedRootsJSON,
+				&capsJSON, &adaptersJSON, &resJSON,
 				&agentsJSON, &displayAlias, &runnerCapsJSON,
 				&runnerVer, &lastSeen, &mv.UpdatedAt,
 			); err != nil {
@@ -234,6 +252,15 @@ func (s *Store) Bootstrap(ctx context.Context, machineMeta map[string]protocol.M
 
 			mv.TransportMode = protocol.TransportMode(transport)
 			mv.Status = protocol.MachineStatus(status)
+			if roleStr != "" {
+				mv.Role = protocol.MachineRole(roleStr)
+			} else if mv.TransportMode == protocol.TransportSSHOutbound {
+				mv.Role = protocol.MachineRoleWorker
+			} else {
+				mv.Role = protocol.MachineRoleFull
+			}
+			mv.OS = strings.TrimSpace(osName)
+			_ = json.Unmarshal([]byte(allowedRootsJSON), &mv.AllowedRoots)
 			mv.DisplayName = mv.MachineID
 			mv.DisplayAlias = strings.TrimSpace(displayAlias)
 			if inYAML {
@@ -395,42 +422,54 @@ func scanInboxItem(scanner interface{ Scan(...any) error }) (protocol.InboxItemV
 // GetProject returns a single project view by ID.
 func (s *Store) GetProject(ctx context.Context, projectID string) (protocol.ProjectView, error) {
 	var pv protocol.ProjectView
-	var cfgJSON, srcStr string
-	var archived int
-	err := s.ro.QueryRowContext(ctx, `
-		SELECT project_id, display_name, repo_identity, default_branch,
-		       mirror_bare_path, config_json, archived, source, updated_at
-		FROM projects WHERE project_id = ?
-	`, projectID).Scan(
-		&pv.ProjectID, &pv.DisplayName, &pv.RepoIdentity, &pv.DefaultBranch,
-		&pv.MirrorBarePath, &cfgJSON, &archived, &srcStr, &pv.UpdatedAt,
-	)
-	if errors.Is(err, sql.ErrNoRows) {
-		return pv, ErrNotFound
-	}
-	if err != nil {
-		return pv, err
-	}
-	pv.Archived = archived != 0
-	if srcStr != "" {
-		pv.Source = protocol.ProjectSource(srcStr)
-	} else {
-		pv.Source = protocol.ProjectSourceYAML
-	}
-	var cfg protocol.ProjectConfig
-	if err := json.Unmarshal([]byte(cfgJSON), &cfg); err == nil {
-		pv.DefaultCapability = cfg.DefaultCapability
-		pv.DefaultAdapter = cfg.DefaultAdapter
-		pv.IDEScheme = cfg.IDEScheme
-		pv.Anchors = cfg.Anchors
-	}
-	if pv.Anchors == nil {
-		pv.Anchors = map[string]protocol.ProjectAnchorConfig{}
-	}
-	if pv.IDEScheme == "" {
-		pv.IDEScheme = protocol.IDECursor
-	}
-	return pv, nil
+	err := s.WithReadTx(ctx, func(tx *sql.Tx) error {
+		var cfgJSON, sysPrompt, sharedEnvJSON, srcStr string
+		var archived int
+		err := tx.QueryRowContext(ctx, `
+			SELECT project_id, display_name, repo_identity, default_branch,
+			       mirror_bare_path, config_json, system_prompt, shared_env_json,
+			       archived, source, updated_at
+			FROM projects WHERE project_id = ?
+		`, projectID).Scan(
+			&pv.ProjectID, &pv.DisplayName, &pv.RepoIdentity, &pv.DefaultBranch,
+			&pv.MirrorBarePath, &cfgJSON, &sysPrompt, &sharedEnvJSON,
+			&archived, &srcStr, &pv.UpdatedAt,
+		)
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+		pv.SystemPrompt = sysPrompt
+		_ = json.Unmarshal([]byte(sharedEnvJSON), &pv.SharedEnv)
+		pv.Archived = archived != 0
+		if srcStr != "" {
+			pv.Source = protocol.ProjectSource(srcStr)
+		} else {
+			pv.Source = protocol.ProjectSourceYAML
+		}
+		var cfg protocol.ProjectConfig
+		if err := json.Unmarshal([]byte(cfgJSON), &cfg); err == nil {
+			pv.DefaultCapability = cfg.DefaultCapability
+			pv.DefaultAdapter = cfg.DefaultAdapter
+			pv.IDEScheme = cfg.IDEScheme
+			pv.Anchors = cfg.Anchors
+		}
+		if pv.Anchors == nil {
+			pv.Anchors = map[string]protocol.ProjectAnchorConfig{}
+		}
+		if pv.IDEScheme == "" {
+			pv.IDEScheme = protocol.IDECursor
+		}
+		if partsMap, err := loadProjectPartsTx(ctx, tx, projectID); err == nil {
+			pv.Parts = partsMap[projectID]
+		} else {
+			return err
+		}
+		return nil
+	})
+	return pv, err
 }
 
 const taskSummarySelectSQL = `
@@ -552,6 +591,7 @@ func (s *Store) GetTaskTimeline(ctx context.Context, taskID string, beforeSeq in
 		// Attempts
 		aRows, err := tx.QueryContext(ctx, `
 			SELECT attempt_id, task_id, project_id, attempt_no, machine_id, adapter,
+			       part_id, location_id, isolation, folder_changes_json,
 			       trigger_kind, trigger_payload_json, worktree_path, base_sha, output_delivery_id,
 			       state, completion_source, error_code, error_detail, started_at, finished_at
 			FROM attempts
@@ -798,16 +838,33 @@ func truncatePromptText(prompt string) string {
 func scanAttemptView(scanner interface{ Scan(...any) error }) (protocol.AttemptView, error) {
 	var a protocol.AttemptView
 	var adapter, trigger, triggerPayloadJSON, state string
+	var partID, locationID, isolation, folderChangesJSON sql.NullString
 	var worktree, baseSHA, outDlv, compSrc, errCode, errDetail sql.NullString
 	var finishedAt sql.NullInt64
 	if err := scanner.Scan(
 		&a.AttemptID, &a.TaskID, &a.ProjectID, &a.AttemptNo, &a.MachineID, &adapter,
+		&partID, &locationID, &isolation, &folderChangesJSON,
 		&trigger, &triggerPayloadJSON, &worktree, &baseSHA, &outDlv,
 		&state, &compSrc, &errCode, &errDetail, &a.StartedAt, &finishedAt,
 	); err != nil {
 		return a, err
 	}
 	a.Adapter = protocol.Adapter(adapter)
+	if partID.Valid {
+		a.PartID = partID.String
+	}
+	if locationID.Valid {
+		a.LocationID = locationID.String
+	}
+	if isolation.Valid {
+		a.Isolation = protocol.LocationIsolation(isolation.String)
+	}
+	if folderChangesJSON.Valid && strings.TrimSpace(folderChangesJSON.String) != "" {
+		var fc protocol.FolderChangesSummary
+		if json.Unmarshal([]byte(folderChangesJSON.String), &fc) == nil {
+			a.FolderChanges = &fc
+		}
+	}
 	a.TriggerKind = protocol.TriggerKind(trigger)
 	a.PromptText = extractBoundedPromptText(triggerPayloadJSON)
 	a.State = protocol.AttemptState(state)
@@ -1275,6 +1332,7 @@ func loadManualImportExisting(ctx context.Context, tx *sql.Tx, taskID, attemptID
 
 	aRow := tx.QueryRowContext(ctx, `
 		SELECT attempt_id, task_id, project_id, attempt_no, machine_id, adapter,
+		       part_id, location_id, isolation, folder_changes_json,
 		       trigger_kind, trigger_payload_json, worktree_path, base_sha, output_delivery_id,
 		       state, completion_source, error_code, error_detail, started_at, finished_at
 		FROM attempts WHERE attempt_id = ?

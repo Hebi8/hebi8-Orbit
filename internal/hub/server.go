@@ -334,7 +334,16 @@ func (s *Server) buildRouter() http.Handler {
 		api.Get("/machines/{machineId}/dirs", s.handleListMachineDirs)
 
 		api.Post("/projects", s.handleCreateProject)
+		api.Patch("/projects/{projectId}", s.handleUpdateProjectSettings)
 		api.Delete("/projects/{projectId}", s.handleDeleteProject)
+		api.Post("/projects/{projectId}/parts", s.handleCreateProjectPart)
+		api.Delete("/projects/{projectId}/parts/{partId}", s.handleDeleteProjectPart)
+		api.Post("/projects/{projectId}/parts/{partId}/locations", s.handleCreateProjectLocation)
+		api.Patch("/projects/{projectId}/parts/{partId}/locations/{locationId}", s.handleUpdateProjectLocation)
+		api.Delete("/projects/{projectId}/parts/{partId}/locations/{locationId}", s.handleDeleteProjectLocation)
+		api.Post("/projects/{projectId}/locations/refresh", s.handleRefreshProjectLocations)
+		api.Get("/projects/{projectId}/suggestions", s.handleGetProjectSuggestions)
+		api.Post("/projects/{projectId}/parts/{partId}/suggestions/dismiss", s.handleDismissProjectSuggestion)
 
 		api.Get("/network/settings", s.handleGetNetworkSettings)
 		api.Patch("/network/settings", s.handleUpdateNetworkSettings)
@@ -348,6 +357,8 @@ func (s *Server) buildRouter() http.Handler {
 		api.Post("/tasks/{taskId}/followup", s.handleFollowupTask)
 		api.Post("/tasks/{taskId}/cancel", s.handleCancelTask)
 		api.Post("/tasks/{taskId}/retry", s.handleRetryTask)
+		api.Get("/tasks/{taskId}/folder-file", s.handleDownloadTaskFolderFile)
+		api.Post("/tasks/{taskId}/folder-changes/promote", s.handlePromoteFolderChanges)
 
 		api.Get("/tasks/{taskId}/queue", s.handleListQueue)
 		api.Post("/tasks/{taskId}/queue", s.handleEnqueueInput)

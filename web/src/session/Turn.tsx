@@ -3,6 +3,7 @@ import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { FileSpreadsheet, FileText, Layers, Presentation, Table } from 'lucide-react';
 import type { AttemptView, TaskTimelineResponse } from '../generated/protocol';
 import { ApprovalNotice } from '../components/ApprovalNotice';
+import { FolderChangesCard } from '../components/FolderChangesCard';
 import { CaretIcon } from '../components/Icons';
 import { useAttemptRaw } from '../hooks/queries';
 import { api, errMsg } from '../lib/api';
@@ -299,6 +300,15 @@ export function Turn({
             ))}
           </div>
         </div>
+      )}
+
+      {/* Plain-folder in-place changes card (no shadow Git) */}
+      {!compact && attempt.folderChanges && attempt.folderChanges.files.length > 0 && (
+        <FolderChangesCard
+          taskId={tl.task.taskId}
+          attemptId={attempt.attemptId}
+          changes={attempt.folderChanges}
+        />
       )}
 
       {/* Quiet Source Diff line when code changes were produced */}

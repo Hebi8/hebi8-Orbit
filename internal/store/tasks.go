@@ -72,6 +72,9 @@ type CreateTaskParams struct {
 	IdempotencyKey     string
 	Sources            []protocol.CreateTaskSourceInput
 	MachineID          string
+	PartID             string
+	LocationID         string
+	Isolation          protocol.LocationIsolation
 	Anchor             *protocol.ProjectAnchorConfig
 	AnchorCapability   string
 	WorktreePath       string
@@ -216,15 +219,25 @@ func (s *Store) CreateTask(ctx context.Context, p CreateTaskParams) (CreateTaskR
 			idempVal = p.IdempotencyKey
 		}
 
+		var partVal, locVal any
+		if strings.TrimSpace(p.PartID) != "" {
+			partVal = strings.TrimSpace(p.PartID)
+		}
+		if strings.TrimSpace(p.LocationID) != "" {
+			locVal = strings.TrimSpace(p.LocationID)
+		}
+
 		taskID := newID("tsk")
 		_, err = tx.ExecContext(ctx, `
 			INSERT INTO tasks (
 				task_id, project_id, parent_task_id, title, goal,
 				required_capability, required_resources, preferred_adapter, desired_config_json,
+				part_id, location_id,
 				state, created_by, idempotency_key, version, created_at, updated_at
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, 1, ?, ?)
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, 1, ?, ?)
 		`, taskID, p.ProjectID, parentVal, title, p.Goal,
 			p.RequiredCapability, string(reqResJSON), string(p.Adapter), string(cfgJSON),
+			partVal, locVal,
 			string(p.CreatedBy), idempVal, now, now)
 		if err != nil {
 			return fmt.Errorf("insert task: %w", err)
@@ -286,6 +299,9 @@ func (s *Store) CreateTask(ctx context.Context, p CreateTaskParams) (CreateTaskR
 				ProjectID:         p.ProjectID,
 				MachineID:         p.MachineID,
 				Adapter:           p.Adapter,
+				PartID:            p.PartID,
+				LocationID:        p.LocationID,
+				Isolation:         p.Isolation,
 				TriggerKind:       p.TriggerKind,
 				TriggerPayload:    p.TriggerPayload,
 				Prompt:            p.Prompt,
@@ -460,6 +476,9 @@ type CreateNextAttemptParams struct {
 	TaskID            string
 	MachineID         string
 	Adapter           protocol.Adapter
+	PartID            string
+	LocationID        string
+	Isolation         protocol.LocationIsolation
 	TriggerKind       protocol.TriggerKind
 	TriggerPayload    map[string]any
 	Prompt            string
@@ -614,6 +633,9 @@ func (s *Store) CreateNextAttempt(ctx context.Context, p CreateNextAttemptParams
 			ProjectID:         projectID,
 			MachineID:         p.MachineID,
 			Adapter:           adapter,
+			PartID:            p.PartID,
+			LocationID:        p.LocationID,
+			Isolation:         p.Isolation,
 			TriggerKind:       p.TriggerKind,
 			TriggerPayload:    triggerPayload,
 			Prompt:            prompt,
@@ -665,6 +687,9 @@ type createAttemptTxParams struct {
 	ProjectID         string
 	MachineID         string
 	Adapter           protocol.Adapter
+	PartID            string
+	LocationID        string
+	Isolation         protocol.LocationIsolation
 	TriggerKind       protocol.TriggerKind
 	TriggerPayload    map[string]any
 	Prompt            string
@@ -822,15 +847,28 @@ func createAttemptInTx(ctx context.Context, tx *sql.Tx, p createAttemptTxParams)
 		inputDlvVal = p.InputDeliveryID
 	}
 
+	var partVal, locVal, isoVal any
+	if strings.TrimSpace(p.PartID) != "" {
+		partVal = strings.TrimSpace(p.PartID)
+	}
+	if strings.TrimSpace(p.LocationID) != "" {
+		locVal = strings.TrimSpace(p.LocationID)
+	}
+	if p.Isolation != "" {
+		isoVal = string(p.Isolation)
+	}
+
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO attempts (
 			attempt_id, task_id, project_id, attempt_no, machine_id, adapter,
+			part_id, location_id, isolation,
 			wb_session_id, trigger_kind, trigger_payload_json, worktree_path,
 			input_delivery_id, base_sha, state, lease_token, lease_expires_at,
 			last_acked_outbox, started_at,
 			desired_config_json, required_resources_json, anchor_json
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'leased', ?, ?, 0, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'leased', ?, ?, 0, ?, ?, ?, ?)
 	`, attemptID, p.TaskID, p.ProjectID, nextAttemptNo, machineID, string(p.Adapter),
+		partVal, locVal, isoVal,
 		wbSessionVal, string(p.TriggerKind), string(payloadBytes), worktreeVal,
 		inputDlvVal, baseSHAVal, leaseToken, leaseExpiresAt, p.Now,
 		string(cfgBytes), string(reqResBytes), anchorVal)
@@ -916,6 +954,7 @@ func (s *Store) GetAttemptRecord(ctx context.Context, attemptID string) (Attempt
 func loadAttemptRecordTx(ctx context.Context, tx *sql.Tx, attemptID string) (AttemptRecord, error) {
 	var a AttemptRecord
 	var adapter, trigger, state string
+	var partID, locationID, isolation, folderChangesJSON sql.NullString
 	var wbSessID, worktree, inputDlv, baseSHA, outDlv, compSrc, errCode, errDetail sql.NullString
 	var runnerInst, resumeState, targetEnv, deployPhase sql.NullString
 	var cancelReasonKind, steerInputID sql.NullString
@@ -927,6 +966,7 @@ func loadAttemptRecordTx(ctx context.Context, tx *sql.Tx, attemptID string) (Att
 
 	err := tx.QueryRowContext(ctx, `
 		SELECT a.attempt_id, a.task_id, a.project_id, a.attempt_no, a.machine_id, a.adapter,
+		       a.part_id, a.location_id, a.isolation, a.folder_changes_json,
 		       a.wb_session_id, a.trigger_kind, a.trigger_payload_json, a.worktree_path,
 		       a.input_delivery_id, a.base_sha, a.output_delivery_id, a.target_env, a.deploy_phase,
 		       a.state, a.resume_state, a.completion_source, a.lease_token, a.lease_expires_at,
@@ -942,6 +982,7 @@ func loadAttemptRecordTx(ctx context.Context, tx *sql.Tx, attemptID string) (Att
 		WHERE a.attempt_id = ?
 	`, attemptID).Scan(
 		&a.AttemptID, &a.TaskID, &a.ProjectID, &a.AttemptNo, &a.MachineID, &adapter,
+		&partID, &locationID, &isolation, &folderChangesJSON,
 		&wbSessID, &trigger, &a.TriggerPayloadJSON, &worktree,
 		&inputDlv, &baseSHA, &outDlv, &targetEnv, &deployPhase,
 		&state, &resumeState, &compSrc, &a.LeaseToken, &a.LeaseExpiresAt,
@@ -959,6 +1000,21 @@ func loadAttemptRecordTx(ctx context.Context, tx *sql.Tx, attemptID string) (Att
 		return a, err
 	}
 	a.Adapter = protocol.Adapter(adapter)
+	if partID.Valid {
+		a.PartID = partID.String
+	}
+	if locationID.Valid {
+		a.LocationID = locationID.String
+	}
+	if isolation.Valid {
+		a.Isolation = protocol.LocationIsolation(isolation.String)
+	}
+	if folderChangesJSON.Valid && strings.TrimSpace(folderChangesJSON.String) != "" {
+		var fc protocol.FolderChangesSummary
+		if json.Unmarshal([]byte(folderChangesJSON.String), &fc) == nil {
+			a.FolderChanges = &fc
+		}
+	}
 	a.TriggerKind = protocol.TriggerKind(trigger)
 	a.State = protocol.AttemptState(state)
 	a.PromptText = extractBoundedPromptText(a.TriggerPayloadJSON)

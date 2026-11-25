@@ -20,11 +20,14 @@ import (
 // DynamicNetworkSettings persists Hub-managed sharing and display settings in hub_settings
 // without modifying hub.yaml.
 type DynamicNetworkSettings struct {
-	WorkspaceName   string   `json:"workspaceName,omitempty"`
-	ExtraOrigins    []string `json:"extraOrigins,omitempty"`
-	ExtraLogins     []string `json:"extraLogins,omitempty"`
-	TailscaleOrigin string   `json:"tailscaleOrigin,omitempty"`
-	TailscaleShared bool     `json:"tailscaleShared,omitempty"`
+	WorkspaceName          string   `json:"workspaceName,omitempty"`
+	DiscoveryID            string   `json:"discoveryId,omitempty"`
+	DutyPriority           []string `json:"dutyPriority,omitempty"`
+	ExternalGatewayEnabled *bool    `json:"externalGatewayEnabled,omitempty"`
+	ExtraOrigins           []string `json:"extraOrigins,omitempty"`
+	ExtraLogins            []string `json:"extraLogins,omitempty"`
+	TailscaleOrigin        string   `json:"tailscaleOrigin,omitempty"`
+	TailscaleShared        bool     `json:"tailscaleShared,omitempty"`
 }
 
 // ClientTokenInfo identifies an authenticated client token record.
@@ -39,6 +42,7 @@ type ClientTokenInfo struct {
 type PairingCodeRecord struct {
 	ID               string
 	Scope            protocol.PairingScope
+	Role             protocol.MachineRole
 	BindMachineID    string
 	CreatedBy        string
 	CreatedAt        int64
@@ -52,6 +56,7 @@ type PairingCodeRecord struct {
 type CreatePairingCodeParams struct {
 	CodeHash      string
 	Scope         protocol.PairingScope
+	Role          protocol.MachineRole
 	BindMachineID string
 	CreatedBy     string
 	TTLSeconds    int
@@ -316,6 +321,13 @@ func (s *Store) CreatePairingCode(ctx context.Context, p CreatePairingCodeParams
 	if maxActive <= 0 {
 		maxActive = 5
 	}
+	role := p.Role
+	if role == "" {
+		role = protocol.MachineRoleFull
+	}
+	if !role.IsValid() {
+		return rec, fmt.Errorf("%w: invalid machine role %q", ErrInvalidInput, role)
+	}
 	now := time.Now().UnixMilli()
 	exp := now + int64(ttl)*1000
 	id := newID("pair")
@@ -354,9 +366,9 @@ func (s *Store) CreatePairingCode(ctx context.Context, p CreatePairingCodeParams
 			}
 		}
 		_, err := tx.ExecContext(ctx, `
-			INSERT INTO pairing_codes (id, code_hash, scope, bind_machine_id, created_by, created_at, expires_at, state)
-			VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
-		`, id, p.CodeHash, string(p.Scope), strings.TrimSpace(p.BindMachineID), p.CreatedBy, now, exp)
+			INSERT INTO pairing_codes (id, code_hash, scope, role, bind_machine_id, created_by, created_at, expires_at, state)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+		`, id, p.CodeHash, string(p.Scope), string(role), strings.TrimSpace(p.BindMachineID), p.CreatedBy, now, exp)
 		return err
 	})
 	if err != nil {
@@ -365,6 +377,7 @@ func (s *Store) CreatePairingCode(ctx context.Context, p CreatePairingCodeParams
 	rec = PairingCodeRecord{
 		ID:            id,
 		Scope:         p.Scope,
+		Role:          role,
 		BindMachineID: strings.TrimSpace(p.BindMachineID),
 		CreatedBy:     p.CreatedBy,
 		CreatedAt:     now,
@@ -380,13 +393,13 @@ func (s *Store) GetPairingCode(ctx context.Context, id string, nowMs int64) (Pai
 		nowMs = time.Now().UnixMilli()
 	}
 	var rec PairingCodeRecord
-	var scope, state string
+	var scope, roleStr, state string
 	var claimedAt sql.NullInt64
 	err := s.ro.QueryRowContext(ctx, `
-		SELECT id, scope, bind_machine_id, created_by, created_at, expires_at, state, claimed_at, claimed_machine_id
+		SELECT id, scope, role, bind_machine_id, created_by, created_at, expires_at, state, claimed_at, claimed_machine_id
 		FROM pairing_codes WHERE id = ?
 	`, id).Scan(
-		&rec.ID, &scope, &rec.BindMachineID, &rec.CreatedBy,
+		&rec.ID, &scope, &roleStr, &rec.BindMachineID, &rec.CreatedBy,
 		&rec.CreatedAt, &rec.ExpiresAt, &state, &claimedAt, &rec.ClaimedMachineID,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -396,6 +409,11 @@ func (s *Store) GetPairingCode(ctx context.Context, id string, nowMs int64) (Pai
 		return rec, err
 	}
 	rec.Scope = protocol.PairingScope(scope)
+	if roleStr != "" {
+		rec.Role = protocol.MachineRole(roleStr)
+	} else {
+		rec.Role = protocol.MachineRoleFull
+	}
 	rec.State = protocol.PairingCodeState(state)
 	if claimedAt.Valid {
 		v := claimedAt.Int64
@@ -468,17 +486,21 @@ func (s *Store) ClaimPairingCode(ctx context.Context, p ClaimPairingCodeParams) 
 
 	err := s.WithWriteTx(ctx, func(tx *sql.Tx) error {
 		// 1. Read row first to validate scope before atomic consume
-		var id, scopeStr, bindMachineID, stateStr string
+		var id, scopeStr, roleStr, bindMachineID, stateStr string
 		var expiresAt int64
 		err := tx.QueryRowContext(ctx, `
-			SELECT id, scope, bind_machine_id, state, expires_at
+			SELECT id, scope, role, bind_machine_id, state, expires_at
 			FROM pairing_codes WHERE code_hash = ?
-		`, p.CodeHash).Scan(&id, &scopeStr, &bindMachineID, &stateStr, &expiresAt)
+		`, p.CodeHash).Scan(&id, &scopeStr, &roleStr, &bindMachineID, &stateStr, &expiresAt)
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrPairingInvalid
 		}
 		if err != nil {
 			return err
+		}
+		machineRole := protocol.MachineRole(roleStr)
+		if !machineRole.IsValid() {
+			machineRole = protocol.MachineRoleFull
 		}
 		scope := protocol.PairingScope(scopeStr)
 		if stateStr != string(protocol.PairingCodePending) || expiresAt <= now {
@@ -567,20 +589,26 @@ func (s *Store) ClaimPairingCode(ctx context.Context, p ClaimPairingCodeParams) 
 				}
 				adpsJSON, _ := json.Marshal(adps)
 
+				osName := ""
+				if p.Machine != nil {
+					osName = strings.TrimSpace(p.Machine.OS)
+				}
 				if _, err := tx.ExecContext(ctx, `
-					INSERT INTO registry_machines (machine_id, display_name, transport_mode, capabilities_json, tailscale_host, ssh_alias, created_at)
-					VALUES (?, ?, 'remote_ws', ?, '', '', ?)
-				`, machineID, displayName, string(capsJSON), now); err != nil {
+					INSERT INTO registry_machines (machine_id, display_name, transport_mode, role, capabilities_json, tailscale_host, ssh_alias, created_at)
+					VALUES (?, ?, 'remote_ws', ?, ?, '', '', ?)
+				`, machineID, displayName, string(machineRole), string(capsJSON), now); err != nil {
 					return fmt.Errorf("insert registry machine: %w", err)
 				}
 				if _, err := tx.ExecContext(ctx, `
-					INSERT INTO machines (machine_id, transport_mode, status, capabilities_json, adapters_json, resources_json, runner_version, last_seen_at, updated_at)
-					VALUES (?, 'remote_ws', 'offline', ?, ?, '{}', ?, ?, ?)
+					INSERT INTO machines (machine_id, transport_mode, status, role, os_name, capabilities_json, adapters_json, resources_json, runner_version, last_seen_at, updated_at)
+					VALUES (?, 'remote_ws', 'offline', ?, ?, ?, ?, '{}', ?, ?, ?)
 					ON CONFLICT(machine_id) DO UPDATE SET
 						transport_mode = 'remote_ws',
+						role = excluded.role,
+						os_name = CASE WHEN excluded.os_name != '' THEN excluded.os_name ELSE machines.os_name END,
 						capabilities_json = excluded.capabilities_json,
 						updated_at = excluded.updated_at
-				`, machineID, string(capsJSON), string(adpsJSON), runnerVersionOrNil(p.Machine), now, now); err != nil {
+				`, machineID, string(machineRole), osName, string(capsJSON), string(adpsJSON), runnerVersionOrNil(p.Machine), now, now); err != nil {
 					return fmt.Errorf("upsert paired machine: %w", err)
 				}
 			}
@@ -1243,6 +1271,9 @@ func (s *Store) CreateDynamicProject(
 				updated_at = excluded.updated_at
 		`, finalProjectID, cfg.DisplayName, cfg.RepoIdentity, cfg.DefaultBranch, finalMirrorPath, string(cfgJSON), now); err != nil {
 			return err
+		}
+		if err := ensureDefaultPartAndLocationsTx(ctx, tx, finalProjectID, cfg.DisplayName, cfg.RepoIdentity, string(cfgJSON), now); err != nil {
+			return fmt.Errorf("init project parts: %w", err)
 		}
 		ev, err = insertEventTx(ctx, tx, eventInsert{
 			StreamID:   "global",

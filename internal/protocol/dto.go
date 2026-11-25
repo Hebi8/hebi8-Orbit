@@ -15,6 +15,59 @@ type ResourceState struct {
 	Reason string `json:"reason,omitempty"`
 }
 
+// ProjectEnvVar defines one project-level shared environment variable.
+type ProjectEnvVar struct {
+	Key    string `json:"key"`
+	Value  string `json:"value"`
+	Secret bool   `json:"secret,omitempty"`
+}
+
+// LocationRuntimeState describes live filesystem / Git status probed on a location's host machine.
+type LocationRuntimeState struct {
+	Exists    bool   `json:"exists"`
+	IsGit     bool   `json:"isGit"`
+	Branch    string `json:"branch,omitempty"`
+	HeadSHA   string `json:"headSha,omitempty"`
+	Dirty     bool   `json:"dirty,omitempty"`
+	Ahead     int    `json:"ahead,omitempty"`
+	Behind    int    `json:"behind,omitempty"`
+	CheckedAt int64  `json:"checkedAt,omitempty"`
+}
+
+// ProjectLocationView represents one explicit directory binding on a device under a ProjectPart.
+type ProjectLocationView struct {
+	LocationID string                `json:"locationId"`
+	PartID     string                `json:"partId"`
+	MachineID  string                `json:"machineId"`
+	AbsPath    string                `json:"absPath"`
+	IsDefault  bool                  `json:"isDefault"`
+	Isolation  LocationIsolation     `json:"isolation"`
+	Runtime    *LocationRuntimeState `json:"runtime,omitempty"`
+	CreatedAt  int64                 `json:"createdAt"`
+	UpdatedAt  int64                 `json:"updatedAt"`
+}
+
+// ProjectSuggestionView represents an optional shallow-scanned Git repo recommendation on another machine.
+type ProjectSuggestionView struct {
+	PartID       string `json:"partId"`
+	MachineID    string `json:"machineId"`
+	AbsPath      string `json:"absPath"`
+	Branch       string `json:"branch,omitempty"`
+	RepoIdentity string `json:"repoIdentity,omitempty"`
+}
+
+// ProjectPartView represents one logical component (Git repo or plain folder) inside a Project.
+type ProjectPartView struct {
+	PartID       string                  `json:"partId"`
+	ProjectID    string                  `json:"projectId"`
+	Name         string                  `json:"name"`
+	Kind         ProjectPartKind         `json:"kind"`
+	RepoIdentity string                  `json:"repoIdentity,omitempty"`
+	SortOrder    int                     `json:"sortOrder"`
+	Locations    []ProjectLocationView   `json:"locations"`
+	Suggestions  []ProjectSuggestionView `json:"suggestions,omitempty"`
+}
+
 // ProjectView is the read model for a logical project in bootstrap & lists.
 type ProjectView struct {
 	ProjectID         string                         `json:"projectId"`
@@ -25,6 +78,9 @@ type ProjectView struct {
 	DefaultCapability string                         `json:"defaultCapability"`
 	DefaultAdapter    Adapter                        `json:"defaultAdapter"`
 	IDEScheme         IDEScheme                      `json:"ideScheme"`
+	SystemPrompt      string                         `json:"systemPrompt,omitempty"`
+	SharedEnv         []ProjectEnvVar                `json:"sharedEnv,omitempty"`
+	Parts             []ProjectPartView              `json:"parts,omitempty"`
 	Anchors           map[string]ProjectAnchorConfig `json:"anchors"`
 	ActiveTaskCount   int                            `json:"activeTaskCount"`
 	BlockedTaskCount  int                            `json:"blockedTaskCount"`
@@ -38,6 +94,9 @@ type MachineView struct {
 	MachineID          string                   `json:"machineId"`
 	DisplayName        string                   `json:"displayName"`
 	DisplayAlias       string                   `json:"displayAlias,omitempty"`
+	Role               MachineRole              `json:"role,omitempty"`
+	OS                 string                   `json:"os,omitempty"`
+	AllowedRoots       []string                 `json:"allowedRoots,omitempty"`
 	Source             MachineSource            `json:"source,omitempty"`
 	HasCredentials     bool                     `json:"hasCredentials,omitempty"`
 	TransportMode      TransportMode            `json:"transportMode"`
@@ -57,14 +116,17 @@ type MachineView struct {
 
 // SetupStatusView summarizes onboarding readiness and sharing status in bootstrap.
 type SetupStatusView struct {
-	NeedsOnboarding    bool   `json:"needsOnboarding"`
-	ReadyAgents        int    `json:"readyAgents"`
-	OnlineMachines     int    `json:"onlineMachines"`
-	CurrentMachineID   string `json:"currentMachineId,omitempty"`
-	HubOrigin          string `json:"hubOrigin,omitempty"`
-	TailscaleAvailable bool   `json:"tailscaleAvailable"`
-	TailscaleShared    bool   `json:"tailscaleShared"`
-	TailscaleOrigin    string `json:"tailscaleOrigin,omitempty"`
+	NeedsOnboarding     bool     `json:"needsOnboarding"`
+	ReadyAgents         int      `json:"readyAgents"`
+	OnlineMachines      int      `json:"onlineMachines"`
+	CurrentMachineID    string   `json:"currentMachineId,omitempty"`
+	DiscoveryID         string   `json:"discoveryId,omitempty"`
+	DutyPriority        []string `json:"dutyPriority,omitempty"`
+	ActiveDutyMachineID string   `json:"activeDutyMachineId,omitempty"`
+	HubOrigin           string   `json:"hubOrigin,omitempty"`
+	TailscaleAvailable  bool     `json:"tailscaleAvailable"`
+	TailscaleShared     bool     `json:"tailscaleShared"`
+	TailscaleOrigin     string   `json:"tailscaleOrigin,omitempty"`
 }
 
 // InboxItemView represents an open or historical low-noise inbox card.
@@ -193,25 +255,46 @@ type DeliveryView struct {
 	OpenAnnotations   int                `json:"openAnnotations"`
 }
 
+// FolderChangeItem describes one file modified during an in-place plain-folder attempt.
+type FolderChangeItem struct {
+	Path       string `json:"path"`
+	Kind       string `json:"kind"` // add | mod | del
+	Insertions int    `json:"insertions"`
+	Deletions  int    `json:"deletions"`
+	SizeBytes  int64  `json:"sizeBytes,omitempty"`
+}
+
+// FolderChangesSummary captures lightweight before/after changes for a plain-folder execution (no shadow Git).
+type FolderChangesSummary struct {
+	TotalAdds int                `json:"totalAdds"`
+	TotalDels int                `json:"totalDels"`
+	Files     []FolderChangeItem `json:"files"`
+	Promoted  bool               `json:"promoted,omitempty"`
+}
+
 // AttemptView represents one execution attempt of a task.
 type AttemptView struct {
-	AttemptID        string            `json:"attemptId"`
-	TaskID           string            `json:"taskId"`
-	ProjectID        string            `json:"projectId"`
-	AttemptNo        int               `json:"attemptNo"`
-	MachineID        string            `json:"machineId"`
-	Adapter          Adapter           `json:"adapter"`
-	TriggerKind      TriggerKind       `json:"triggerKind"`
-	PromptText       string            `json:"promptText,omitempty"`
-	WorktreePath     string            `json:"worktreePath,omitempty"`
-	BaseSHA          string            `json:"baseSha,omitempty"`
-	OutputDeliveryID string            `json:"outputDeliveryId,omitempty"`
-	State            AttemptState      `json:"state"`
-	CompletionSource *CompletionSource `json:"completionSource,omitempty"`
-	ErrorCode        string            `json:"errorCode,omitempty"`
-	ErrorDetail      string            `json:"errorDetail,omitempty"`
-	StartedAt        int64             `json:"startedAt"`
-	FinishedAt       *int64            `json:"finishedAt,omitempty"`
+	AttemptID        string                `json:"attemptId"`
+	TaskID           string                `json:"taskId"`
+	ProjectID        string                `json:"projectId"`
+	AttemptNo        int                   `json:"attemptNo"`
+	MachineID        string                `json:"machineId"`
+	Adapter          Adapter               `json:"adapter"`
+	PartID           string                `json:"partId,omitempty"`
+	LocationID       string                `json:"locationId,omitempty"`
+	Isolation        LocationIsolation     `json:"isolation,omitempty"`
+	TriggerKind      TriggerKind           `json:"triggerKind"`
+	PromptText       string                `json:"promptText,omitempty"`
+	WorktreePath     string                `json:"worktreePath,omitempty"`
+	BaseSHA          string                `json:"baseSha,omitempty"`
+	OutputDeliveryID string                `json:"outputDeliveryId,omitempty"`
+	FolderChanges    *FolderChangesSummary `json:"folderChanges,omitempty"`
+	State            AttemptState          `json:"state"`
+	CompletionSource *CompletionSource     `json:"completionSource,omitempty"`
+	ErrorCode        string                `json:"errorCode,omitempty"`
+	ErrorDetail      string                `json:"errorDetail,omitempty"`
+	StartedAt        int64                 `json:"startedAt"`
+	FinishedAt       *int64                `json:"finishedAt,omitempty"`
 }
 
 // TaskSummary represents a logical task in list & timeline headers.
@@ -623,6 +706,8 @@ type CreateTaskRequest struct {
 	Goal                 string                  `json:"goal"`
 	ParentTaskID         string                  `json:"parentTaskId,omitempty"`
 	MachineID            string                  `json:"machineId,omitempty"`
+	PartID               string                  `json:"partId,omitempty"`
+	LocationID           string                  `json:"locationId,omitempty"`
 	RequiredCapability   string                  `json:"requiredCapability,omitempty"`
 	RequiredResources    []string                `json:"requiredResources,omitempty"`
 	Adapter              Adapter                 `json:"adapter,omitempty"`
@@ -817,6 +902,7 @@ type PAChatResponse struct {
 // CreatePairingCodeRequest creates a short-lived one-time pairing code for joining a machine/client.
 type CreatePairingCodeRequest struct {
 	Scope         PairingScope `json:"scope,omitempty"`
+	Role          MachineRole  `json:"role,omitempty"`
 	BindMachineID string       `json:"bindMachineId,omitempty"`
 	TTLSeconds    int          `json:"ttlSec,omitempty"`
 }
@@ -826,6 +912,9 @@ type CreatePairingCodeResponse struct {
 	ID            string       `json:"id"`
 	Code          string       `json:"code"`
 	Scope         PairingScope `json:"scope"`
+	Role          MachineRole  `json:"role,omitempty"`
+	DiscoveryID   string       `json:"discoveryId,omitempty"`
+	Fingerprint   string       `json:"fingerprint,omitempty"`
 	BindMachineID string       `json:"bindMachineId,omitempty"`
 	ExpiresAt     int64        `json:"expiresAt"`
 	JoinCommand   string       `json:"joinCommand"`
@@ -836,6 +925,8 @@ type CreatePairingCodeResponse struct {
 type PairingCodeStatusResponse struct {
 	ID            string           `json:"id"`
 	Scope         PairingScope     `json:"scope"`
+	Role          MachineRole      `json:"role,omitempty"`
+	Fingerprint   string           `json:"fingerprint,omitempty"`
 	BindMachineID string           `json:"bindMachineId,omitempty"`
 	State         PairingCodeState `json:"state"`
 	MachineID     string           `json:"machineId,omitempty"`
@@ -897,9 +988,11 @@ type ListMachinesResponse struct {
 	Machines []MachineView `json:"machines"`
 }
 
-// UpdateMachineRequest updates mutable metadata (display alias) on a machine.
+// UpdateMachineRequest updates mutable metadata (display alias, role, allowed roots) on a machine.
 type UpdateMachineRequest struct {
-	DisplayAlias *string `json:"displayAlias,omitempty"`
+	DisplayAlias *string      `json:"displayAlias,omitempty"`
+	Role         *MachineRole `json:"role,omitempty"`
+	AllowedRoots []string     `json:"allowedRoots,omitempty"`
 }
 
 // UpdateMachineAgentRequest patches dynamic per-machine agent overrides stored in SQLite.
@@ -924,6 +1017,7 @@ type DirEntryView struct {
 	Name      string `json:"name"`
 	Path      string `json:"path"`
 	IsGitRepo bool   `json:"isGitRepo"`
+	Branch    string `json:"branch,omitempty"`
 }
 
 // ListDirsResponse returns safe directory listing for adding a project on a target machine.
@@ -935,23 +1029,31 @@ type ListDirsResponse struct {
 	Entries    []DirEntryView `json:"entries"`
 }
 
-// CheckRepoResponse validates whether a directory on a machine is a Git repository.
+// CheckRepoResponse validates a directory on a machine (Git repository or plain folder).
 type CheckRepoResponse struct {
 	Valid         bool   `json:"valid"`
+	Exists        bool   `json:"exists,omitempty"`
+	IsGit         bool   `json:"isGit,omitempty"`
 	RepoRoot      string `json:"repoRoot,omitempty"`
 	DefaultBranch string `json:"defaultBranch,omitempty"`
 	RepoIdentity  string `json:"repoIdentity,omitempty"`
+	RootCommit    string `json:"rootCommit,omitempty"`
+	HeadSHA       string `json:"headSha,omitempty"`
+	Dirty         bool   `json:"dirty,omitempty"`
+	Ahead         int    `json:"ahead,omitempty"`
+	Behind        int    `json:"behind,omitempty"`
 	DisplayName   string `json:"displayName,omitempty"`
 	Error         string `json:"error,omitempty"`
 }
 
-// CreateProjectRequest registers a local Git repository dynamically via Hub API.
+// CreateProjectRequest registers a local Git repository or plain folder dynamically via Hub API.
 type CreateProjectRequest struct {
 	MachineID      string  `json:"machineId"`
 	RepoPath       string  `json:"repoPath"`
 	DisplayName    string  `json:"displayName,omitempty"`
 	ProjectID      string  `json:"projectId,omitempty"`
 	DefaultAdapter Adapter `json:"defaultAdapter,omitempty"`
+	AllowFolder    bool    `json:"allowFolder,omitempty"`
 }
 
 // CreateProjectResponse returns the newly registered project view.
@@ -959,22 +1061,78 @@ type CreateProjectResponse struct {
 	Project ProjectView `json:"project"`
 }
 
-// NetworkSettingsView exposes current workspace name, sharing origins, and Tailscale readiness.
-type NetworkSettingsView struct {
-	WorkspaceName         string   `json:"workspaceName"`
-	HubOrigin             string   `json:"hubOrigin"`
-	ExtraOrigins          []string `json:"extraOrigins,omitempty"`
-	ExtraLogins           []string `json:"extraLogins,omitempty"`
-	TailscaleAvailable    bool     `json:"tailscaleAvailable"`
-	TailscaleShared       bool     `json:"tailscaleShared"`
-	TailscaleOrigin       string   `json:"tailscaleOrigin,omitempty"`
-	TailscalePortConflict bool     `json:"tailscalePortConflict,omitempty"`
-	TailscaleHint         string   `json:"tailscaleHint,omitempty"`
+// UpdateProjectSettingsRequest updates project name, default adapter, shared ENV, and system prompt.
+type UpdateProjectSettingsRequest struct {
+	DisplayName    *string         `json:"displayName,omitempty"`
+	DefaultAdapter *Adapter        `json:"defaultAdapter,omitempty"`
+	SystemPrompt   *string         `json:"systemPrompt,omitempty"`
+	SharedEnv      []ProjectEnvVar `json:"sharedEnv,omitempty"`
 }
 
-// UpdateNetworkSettingsRequest updates workspace display name in Hub dynamic settings.
+// CreateProjectPartRequest adds a new logical component (Git repo or folder) to a project.
+type CreateProjectPartRequest struct {
+	Name      string          `json:"name"`
+	Kind      ProjectPartKind `json:"kind,omitempty"`
+	MachineID string          `json:"machineId,omitempty"`
+	AbsPath   string          `json:"absPath,omitempty"`
+}
+
+// CreateProjectLocationRequest binds an explicit directory on a device to a project part.
+type CreateProjectLocationRequest struct {
+	MachineID string            `json:"machineId"`
+	AbsPath   string            `json:"absPath"`
+	IsDefault bool              `json:"isDefault,omitempty"`
+	Isolation LocationIsolation `json:"isolation,omitempty"`
+}
+
+// UpdateProjectLocationRequest updates default flag or isolation mode for a location.
+type UpdateProjectLocationRequest struct {
+	IsDefault *bool              `json:"isDefault,omitempty"`
+	Isolation *LocationIsolation `json:"isolation,omitempty"`
+}
+
+// DismissSuggestionRequest permanently ignores one shallow Git recommendation for a part.
+type DismissSuggestionRequest struct {
+	MachineID string `json:"machineId"`
+	AbsPath   string `json:"absPath"`
+}
+
+// ProjectSuggestionsResponse returns optional shallow Git recommendations for a project.
+type ProjectSuggestionsResponse struct {
+	ProjectID   string                  `json:"projectId"`
+	Suggestions []ProjectSuggestionView `json:"suggestions"`
+}
+
+// PromoteFolderChangesResponse returns the artifact delivery created from plain-folder changes.
+type PromoteFolderChangesResponse struct {
+	TaskID   string       `json:"taskId"`
+	Delivery DeliveryView `json:"delivery"`
+	Promoted bool         `json:"promoted"`
+}
+
+// NetworkSettingsView exposes current workspace name, duty priority, discovery ID, and external gateway status.
+type NetworkSettingsView struct {
+	WorkspaceName          string   `json:"workspaceName"`
+	DiscoveryID            string   `json:"discoveryId,omitempty"`
+	DutyPriority           []string `json:"dutyPriority,omitempty"`
+	ActiveDutyMachineID    string   `json:"activeDutyMachineId,omitempty"`
+	ExternalGatewayEnabled bool     `json:"externalGatewayEnabled"`
+	ExternalGatewayCount   int      `json:"externalGatewayCount"`
+	HubOrigin              string   `json:"hubOrigin"`
+	ExtraOrigins           []string `json:"extraOrigins,omitempty"`
+	ExtraLogins            []string `json:"extraLogins,omitempty"`
+	TailscaleAvailable     bool     `json:"tailscaleAvailable"`
+	TailscaleShared        bool     `json:"tailscaleShared"`
+	TailscaleOrigin        string   `json:"tailscaleOrigin,omitempty"`
+	TailscalePortConflict  bool     `json:"tailscalePortConflict,omitempty"`
+	TailscaleHint          string   `json:"tailscaleHint,omitempty"`
+}
+
+// UpdateNetworkSettingsRequest updates workspace display name, controller priority, and gateway toggle.
 type UpdateNetworkSettingsRequest struct {
-	WorkspaceName *string `json:"workspaceName,omitempty"`
+	WorkspaceName          *string  `json:"workspaceName,omitempty"`
+	DutyPriority           []string `json:"dutyPriority,omitempty"`
+	ExternalGatewayEnabled *bool    `json:"externalGatewayEnabled,omitempty"`
 }
 
 // TailscaleEnableRequest requests enabling Tailscale Serve multi-machine sharing.

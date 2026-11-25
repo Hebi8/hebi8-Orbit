@@ -151,7 +151,7 @@ type InputDeliveryRef struct {
 	Blobs      []BlobManifestItem `json:"blobs,omitempty"`
 }
 
-// AttemptDispatchFrame instructs a Runner to execute an Attempt in an isolated worktree.
+// AttemptDispatchFrame instructs a Runner to execute an Attempt in an isolated worktree or in-place folder.
 type AttemptDispatchFrame struct {
 	Type               RunnerWSMessageType `json:"type"`
 	AttemptID          string              `json:"attemptId"`
@@ -162,6 +162,9 @@ type AttemptDispatchFrame struct {
 	WBSessionID        string              `json:"wbSessionId"`
 	ProviderSessionID  string              `json:"providerSessionId,omitempty"`
 	ExpectedSessionCWD string              `json:"expectedSessionCwd,omitempty"`
+	LocationID         string              `json:"locationId,omitempty"`
+	Isolation          LocationIsolation   `json:"isolation,omitempty"`
+	IsPlainFolder      bool                `json:"isPlainFolder,omitempty"`
 	RepoPath           string              `json:"repoPath,omitempty"`
 	WorktreeRoot       string              `json:"worktreeRoot,omitempty"`
 	WorktreePath       string              `json:"worktreePath,omitempty"`
@@ -170,6 +173,7 @@ type AttemptDispatchFrame struct {
 	BaseSHA            string              `json:"baseSha,omitempty"`
 	DefaultBranch      string              `json:"defaultBranch,omitempty"`
 	DesiredConfig      map[string]string   `json:"desiredConfig,omitempty"`
+	ProjectEnv         map[string]string   `json:"projectEnv,omitempty"`
 	SystemPromptAppend string              `json:"systemPromptAppend,omitempty"`
 	InputDelivery      *InputDeliveryRef   `json:"inputDelivery,omitempty"`
 	Prompt             string              `json:"prompt"`

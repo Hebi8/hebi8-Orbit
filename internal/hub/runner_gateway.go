@@ -490,6 +490,9 @@ func (s *Server) handleRunnerWS(w http.ResponseWriter, r *http.Request) {
 		_ = conn.Close(websocket.StatusInternalError, "reconcile failed")
 		return
 	}
+	if hello.OS != "" {
+		_ = s.store.UpdateMachineOS(r.Context(), hello.MachineID, hello.OS)
+	}
 	if len(recRes.Events) > 0 {
 		s.broker.Broadcast(recRes.Events...)
 	}
@@ -547,7 +550,7 @@ func (s *Server) handleRunnerWS(w http.ResponseWriter, r *http.Request) {
 		ServerTime:          time.Now().UnixMilli(),
 		HeartbeatIntervalMs: s.heartbeatInterval.Milliseconds(),
 		LeaseTtlMs:          s.leaseTTL.Milliseconds(),
-		Capabilities:        []string{protocol.RunnerCapAgentsV1, protocol.RunnerCapFSV1},
+		Capabilities:        []string{protocol.RunnerCapAgentsV1, protocol.RunnerCapFSV1, protocol.RunnerCapFSPlainV1},
 		Config:              cfgPayload,
 		Reconcile:           recRes.Reconcile,
 	}

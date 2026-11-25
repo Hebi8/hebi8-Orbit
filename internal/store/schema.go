@@ -517,3 +517,65 @@ CREATE TABLE IF NOT EXISTS machine_agent_settings (
 		protocol.SQLInClause(protocol.AllSessionAdapters),
 	)
 }
+
+// BuildMigrationV6DDL constructs the v3.2 3-level project composition tables
+// (Project -> Part -> Location), live location runtime state, and dismissed Git suggestions.
+func BuildMigrationV6DDL() string {
+	return fmt.Sprintf(`
+CREATE TABLE IF NOT EXISTS project_parts (
+  part_id       TEXT PRIMARY KEY,
+  project_id    TEXT NOT NULL REFERENCES projects(project_id),
+  name          TEXT NOT NULL,
+  kind          TEXT NOT NULL CHECK (kind IN (%s)),
+  repo_identity TEXT NOT NULL DEFAULT '',
+  sort_order    INTEGER NOT NULL DEFAULT 0,
+  created_at    INTEGER NOT NULL,
+  updated_at    INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_project_parts_project
+  ON project_parts(project_id, sort_order ASC, created_at ASC);
+
+CREATE TABLE IF NOT EXISTS project_locations (
+  location_id TEXT PRIMARY KEY,
+  part_id     TEXT NOT NULL REFERENCES project_parts(part_id) ON DELETE CASCADE,
+  project_id  TEXT NOT NULL REFERENCES projects(project_id),
+  machine_id  TEXT NOT NULL,
+  abs_path    TEXT NOT NULL,
+  is_default  INTEGER NOT NULL DEFAULT 0,
+  isolation   TEXT NOT NULL DEFAULT 'worktree' CHECK (isolation IN (%s)),
+  created_at  INTEGER NOT NULL,
+  updated_at  INTEGER NOT NULL,
+  UNIQUE (part_id, machine_id, abs_path)
+);
+
+CREATE INDEX IF NOT EXISTS idx_project_locations_part
+  ON project_locations(part_id, is_default DESC, created_at ASC);
+
+CREATE INDEX IF NOT EXISTS idx_project_locations_project
+  ON project_locations(project_id);
+
+CREATE TABLE IF NOT EXISTS location_runtime_state (
+  location_id TEXT PRIMARY KEY REFERENCES project_locations(location_id) ON DELETE CASCADE,
+  exists_flag INTEGER NOT NULL DEFAULT 1,
+  is_git      INTEGER NOT NULL DEFAULT 0,
+  branch      TEXT NOT NULL DEFAULT '',
+  head_sha    TEXT NOT NULL DEFAULT '',
+  dirty       INTEGER NOT NULL DEFAULT 0,
+  ahead       INTEGER NOT NULL DEFAULT 0,
+  behind      INTEGER NOT NULL DEFAULT 0,
+  checked_at  INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS project_dismissed_suggestions (
+  part_id      TEXT NOT NULL REFERENCES project_parts(part_id) ON DELETE CASCADE,
+  machine_id   TEXT NOT NULL,
+  abs_path     TEXT NOT NULL,
+  dismissed_at INTEGER NOT NULL,
+  PRIMARY KEY (part_id, machine_id, abs_path)
+);
+`,
+		protocol.SQLInClause(protocol.AllProjectPartKinds),
+		protocol.SQLInClause(protocol.AllLocationIsolations),
+	)
+}

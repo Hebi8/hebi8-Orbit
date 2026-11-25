@@ -210,15 +210,20 @@ func (s *Server) buildSetupStatus(ctx context.Context, machines []protocol.Machi
 		}
 	}
 	tsAvail, tsShared, tsOrigin, _, _ := s.probeTailscaleState(ctx)
+	discID, _ := s.store.EnsureDiscoveryID(ctx)
+	dutyPriority, activeDuty := s.effectiveDutyPriority(ctx, machines)
 	return protocol.SetupStatusView{
-		NeedsOnboarding:    !done,
-		ReadyAgents:        readyAgents,
-		OnlineMachines:     onlineMachines,
-		CurrentMachineID:   currentMachineID,
-		HubOrigin:          s.effectiveHubOrigin(),
-		TailscaleAvailable: tsAvail,
-		TailscaleShared:    tsShared,
-		TailscaleOrigin:    tsOrigin,
+		NeedsOnboarding:     !done,
+		ReadyAgents:         readyAgents,
+		OnlineMachines:      onlineMachines,
+		CurrentMachineID:    currentMachineID,
+		DiscoveryID:         discID,
+		DutyPriority:        dutyPriority,
+		ActiveDutyMachineID: activeDuty,
+		HubOrigin:           s.effectiveHubOrigin(),
+		TailscaleAvailable:  tsAvail,
+		TailscaleShared:     tsShared,
+		TailscaleOrigin:     tsOrigin,
 	}
 }
 
@@ -277,10 +282,14 @@ func (s *Server) handleUpdateMachine(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusBadRequest, "ERR_INVALID_JSON", "invalid request body")
 		return
 	}
-	if req.DisplayAlias != nil {
-		ev, err := s.store.UpdateMachineAlias(r.Context(), machineID, *req.DisplayAlias, actorFromContext(r.Context()))
+	if req.DisplayAlias != nil || req.Role != nil || req.AllowedRoots != nil {
+		ev, err := s.store.UpdateMachineMetadata(r.Context(), machineID, req, actorFromContext(r.Context()))
 		if errors.Is(err, store.ErrNotFound) {
 			writeAPIError(w, http.StatusNotFound, "ERR_MACHINE_NOT_FOUND", err.Error())
+			return
+		}
+		if errors.Is(err, store.ErrInvalidInput) {
+			writeAPIError(w, http.StatusBadRequest, "ERR_INVALID_INPUT", err.Error())
 			return
 		}
 		if err != nil {
@@ -527,8 +536,13 @@ func (s *Server) handleListMachineDirs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	allowedRoots := s.store.GetMachineAllowedRoots(r.Context(), machineID)
 	if s.runners.IsConnected(machineID) && s.runners.HasCapability(machineID, protocol.RunnerCapFSV1) {
-		res, err := s.runners.CallRPC(r.Context(), machineID, "list_dirs", map[string]any{"path": reqPath}, 15*time.Second)
+		rpcArgs := map[string]any{"path": reqPath}
+		if len(allowedRoots) > 0 {
+			rpcArgs["allowedRoots"] = allowedRoots
+		}
+		res, err := s.runners.CallRPC(r.Context(), machineID, "list_dirs", rpcArgs, 15*time.Second)
 		if err != nil {
 			writeAPIError(w, http.StatusBadGateway, "ERR_RUNNER_RPC", err.Error())
 			return
@@ -551,7 +565,7 @@ func (s *Server) handleListMachineDirs(w http.ResponseWriter, r *http.Request) {
 
 	// Safe local fallback ONLY when target is Hub's own local_ws machine
 	if mCfg.Transport == protocol.TransportLocalWS {
-		out, err := gitops.ListSubdirs(reqPath, nil, false)
+		out, err := gitops.ListSubdirs(reqPath, allowedRoots, false)
 		if err != nil {
 			writeAPIError(w, http.StatusBadRequest, "ERR_LIST_DIRS", err.Error())
 			return
@@ -586,7 +600,14 @@ func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var repoCheck protocol.CheckRepoResponse
-	if s.runners.IsConnected(machineID) && s.runners.HasCapability(machineID, protocol.RunnerCapFSV1) {
+	if req.AllowFolder {
+		insp, st, code, err := s.inspectMachineDirectory(r.Context(), machineID, repoPath)
+		if err != nil {
+			writeAPIError(w, st, code, err.Error())
+			return
+		}
+		repoCheck = insp
+	} else if s.runners.IsConnected(machineID) && s.runners.HasCapability(machineID, protocol.RunnerCapFSV1) {
 		res, err := s.runners.CallRPC(r.Context(), machineID, "check_repo", map[string]any{"path": repoPath}, 15*time.Second)
 		if err != nil {
 			writeAPIError(w, http.StatusBadGateway, "ERR_RUNNER_RPC", err.Error())
@@ -595,11 +616,19 @@ func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
 		if raw, err := json.Marshal(res.Data); err == nil {
 			_ = json.Unmarshal(raw, &repoCheck)
 		}
+		if repoCheck.Valid {
+			repoCheck.Exists = true
+			repoCheck.IsGit = true
+		}
 		if !res.OK && repoCheck.Error == "" {
 			repoCheck.Error = res.Error
 		}
 	} else if mCfg.Transport == protocol.TransportLocalWS {
-		repoCheck = gitops.CheckGitRepo(r.Context(), repoPath, nil)
+		repoCheck = gitops.CheckGitRepo(r.Context(), repoPath, s.store.GetMachineAllowedRoots(r.Context(), machineID))
+		if repoCheck.Valid {
+			repoCheck.Exists = true
+			repoCheck.IsGit = true
+		}
 	} else {
 		writeAPIError(w, http.StatusServiceUnavailable, "ERR_MACHINE_OFFLINE", "target machine runner is offline")
 		return
@@ -636,7 +665,14 @@ func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cfg := s.hubConfigSnapshot()
-	mirrorPath := filepath.Join(cfg.DataDir, "git", projID+".git")
+	mirrorPath := ""
+	var mirrorPrep func(finalMirrorPath string) error
+	if repoCheck.IsGit {
+		mirrorPath = filepath.Join(cfg.DataDir, "git", projID+".git")
+		mirrorPrep = func(finalMirrorPath string) error {
+			return gitops.EnsureBareMirror(context.WithoutCancel(r.Context()), finalMirrorPath)
+		}
+	}
 
 	projCfg := protocol.ProjectConfig{
 		DisplayName:       displayName,
@@ -653,9 +689,7 @@ func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 
-	pv, ev, err := s.store.CreateDynamicProject(r.Context(), projID, projCfg, mirrorPath, actorFromContext(r.Context()), func(finalMirrorPath string) error {
-		return gitops.EnsureBareMirror(context.WithoutCancel(r.Context()), finalMirrorPath)
-	})
+	pv, ev, err := s.store.CreateDynamicProject(r.Context(), projID, projCfg, mirrorPath, actorFromContext(r.Context()), mirrorPrep)
 	if errors.Is(err, store.ErrConflict) {
 		writeAPIError(w, http.StatusConflict, "ERR_PROJECT_EXISTS", err.Error())
 		return
@@ -663,6 +697,13 @@ func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeAPIError(w, http.StatusInternalServerError, "ERR_PROJECT_CREATE", err.Error())
 		return
+	}
+	// Persist initial probed runtime state onto the newly created default location!
+	if len(pv.Parts) > 0 && len(pv.Parts[0].Locations) > 0 {
+		_ = s.store.UpsertLocationRuntimeState(r.Context(), pv.Parts[0].Locations[0].LocationID, *checkRepoToRuntimeState(repoCheck))
+		if refreshed, rErr := s.store.GetProject(r.Context(), pv.ProjectID); rErr == nil {
+			pv = refreshed
+		}
 	}
 
 	if err := s.refreshEffectiveRegistry(context.WithoutCancel(r.Context())); err != nil {
@@ -743,6 +784,23 @@ func (s *Server) handleUpdateNetworkSettings(w http.ResponseWriter, r *http.Requ
 	}
 	if req.WorkspaceName != nil {
 		cur.WorkspaceName = strings.TrimSpace(*req.WorkspaceName)
+	}
+	if req.DutyPriority != nil {
+		cleaned := make([]string, 0, len(req.DutyPriority))
+		seen := map[string]bool{}
+		for _, id := range req.DutyPriority {
+			t := strings.TrimSpace(id)
+			if t == "" || seen[t] {
+				continue
+			}
+			seen[t] = true
+			cleaned = append(cleaned, t)
+		}
+		cur.DutyPriority = cleaned
+	}
+	if req.ExternalGatewayEnabled != nil {
+		v := *req.ExternalGatewayEnabled
+		cur.ExternalGatewayEnabled = &v
 	}
 	ev, err := s.store.SaveDynamicNetworkSettings(r.Context(), cur, actorFromContext(r.Context()))
 	if err != nil {
@@ -889,16 +947,33 @@ func (s *Server) buildNetworkSettingsView(ctx context.Context) protocol.NetworkS
 	dyn := s.dynNet
 	s.mu.RUnlock()
 	tsAvail, tsShared, tsOrigin, conflict, conflictDetail := s.probeTailscaleState(ctx)
+	discID, _ := s.store.EnsureDiscoveryID(ctx)
+	dutyPriority, activeDuty := s.effectiveDutyPriority(ctx, nil)
+	gwEnabled := tsShared
+	if dyn.ExternalGatewayEnabled != nil {
+		gwEnabled = *dyn.ExternalGatewayEnabled || tsShared
+	}
+	gwCount := 0
+	if tsShared {
+		gwCount = 1
+	} else if gwEnabled {
+		gwCount = 1
+	}
 	return protocol.NetworkSettingsView{
-		WorkspaceName:         s.effectiveWorkspaceName(),
-		HubOrigin:             s.effectiveHubOrigin(),
-		ExtraOrigins:          dyn.ExtraOrigins,
-		ExtraLogins:           dyn.ExtraLogins,
-		TailscaleAvailable:    tsAvail,
-		TailscaleShared:       tsShared,
-		TailscaleOrigin:       tsOrigin,
-		TailscalePortConflict: conflict,
-		TailscaleHint:         conflictDetail,
+		WorkspaceName:          s.effectiveWorkspaceName(),
+		DiscoveryID:            discID,
+		DutyPriority:           dutyPriority,
+		ActiveDutyMachineID:    activeDuty,
+		ExternalGatewayEnabled: gwEnabled,
+		ExternalGatewayCount:   gwCount,
+		HubOrigin:              s.effectiveHubOrigin(),
+		ExtraOrigins:           dyn.ExtraOrigins,
+		ExtraLogins:            dyn.ExtraLogins,
+		TailscaleAvailable:     tsAvail,
+		TailscaleShared:        tsShared,
+		TailscaleOrigin:        tsOrigin,
+		TailscalePortConflict:  conflict,
+		TailscaleHint:          conflictDetail,
 	}
 }
 

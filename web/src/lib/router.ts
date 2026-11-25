@@ -1,7 +1,7 @@
 import { useSyncExternalStore } from 'react';
 
 export type NewMode = 'pa' | 'chat' | 'project';
-export type ProjectTab = 'threads' | 'deliveries';
+export type ProjectTab = 'threads' | 'deliveries' | 'settings';
 
 export type Route =
   | { name: 'home' }
@@ -58,7 +58,10 @@ export function parseHash(hash: string): Route {
     }
     case 'p':
       if (segs[1]) {
-        return { name: 'project', projectId: segs[1], tab: q.get('tab') === 'deliveries' ? 'deliveries' : 'threads' };
+        const t = q.get('tab');
+        const tab: ProjectTab =
+          t === 'settings' ? 'settings' : t === 'deliveries' || t === 'artifacts' ? 'deliveries' : 'threads';
+        return { name: 'project', projectId: segs[1], tab };
       }
       return { name: 'projects' };
     case 'projects':

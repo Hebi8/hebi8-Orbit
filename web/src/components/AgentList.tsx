@@ -73,7 +73,7 @@ function AgentRow({ machine, probe, canControl, showAdvanced, onRefreshDone }: A
     try {
       const res = await api.testMachineAgent(machine.machineId, probe.adapter);
       if (res.probe?.lastTest?.ok) {
-        toast(`${name} 连接正常（${res.probe.lastTest.latencyMs ?? 0}ms）`);
+        toast(`${name} 连通正常`);
       } else {
         toast(res.probe?.detail || `${name} 连通性检查未通过`, 'err');
       }
@@ -89,7 +89,7 @@ function AgentRow({ machine, probe, canControl, showAdvanced, onRefreshDone }: A
     setBusy('install');
     try {
       await api.installMachineAgent(machine.machineId, probe.adapter);
-      toast(`${name} 连接组件已安装并就绪`);
+      toast(`${name} 已配置就绪`);
       onRefreshDone();
     } catch (e) {
       toast(errMsg(e), 'err');
@@ -134,24 +134,18 @@ function AgentRow({ machine, probe, canControl, showAdvanced, onRefreshDone }: A
     }
   };
 
+  // Clean v3.2 status copy: version only when ready (ZERO ms latency clutter).
   let statusNote = '';
   if (busy === 'install' || probe.state === 'installing') {
-    statusNote = '正在安装连接组件…';
+    statusNote = '正在配置…';
   } else if (busy === 'test' || probe.state === 'checking') {
-    statusNote = '正在测试连接…';
+    statusNote = '检查中…';
   } else if (probe.state === 'ready') {
-    if (probe.lastTest?.ok && probe.lastTest.latencyMs) {
-      statusNote = `${probe.bridgeVersion ? `${probe.bridgeVersion} · ` : ''}${probe.lastTest.latencyMs}ms`;
-    } else if (probe.bridgeVersion) {
-      statusNote = probe.bridgeVersion;
-    }
+    statusNote = probe.bridgeVersion || '';
   } else if (probe.state === 'missing_bridge') {
-    statusNote =
-      probe.hintCode === 'missing_npm'
-        ? `已装 ${name}，请先安装 Node.js 再装连接组件`
-        : `已装 ${name}，还差一个连接组件`;
+    statusNote = probe.hintCode === 'missing_npm' ? '需先安装 Node.js' : '未就绪';
   } else if (probe.state === 'needs_login') {
-    statusNote = '需要在这台机器上登录一次';
+    statusNote = '未登录';
   } else if (probe.state === 'disabled') {
     statusNote = '已停用';
   } else if (probe.state === 'error') {
@@ -169,14 +163,17 @@ function AgentRow({ machine, probe, canControl, showAdvanced, onRefreshDone }: A
               type="button"
               className="ag-expand"
               onClick={() => setExpanded((v) => !v)}
-              aria-label={`展开 ${name} 更多配置`}
+              aria-label={`展开 ${name} 配置`}
             >
               {expanded ? <ChevronDown size={13} strokeWidth={1.7} /> : <ChevronRight size={13} strokeWidth={1.7} />}
             </button>
           ) : null}
           <span className="ag-name">{name}</span>
           {statusNote && (
-            <span className={`ag-note ell ${probe.state === 'error' ? 'bad-t' : ''}`} title={probe.detail || statusNote}>
+            <span
+              className={`ag-note mono ell ${probe.state === 'error' ? 'bad-t' : ''}`}
+              title={probe.detail || statusNote}
+            >
               {statusNote}
             </span>
           )}
@@ -185,7 +182,7 @@ function AgentRow({ machine, probe, canControl, showAdvanced, onRefreshDone }: A
         <div className="ag-right">
           {probe.state === 'missing_bridge' && probe.hintCode !== 'missing_npm' && online && canControl && (
             <button type="button" className="btn pri sm" disabled={busy !== null} onClick={() => void runInstall()}>
-              {busy === 'install' ? '安装中…' : '安装'}
+              {busy === 'install' ? '配置中…' : '一键配置'}
             </button>
           )}
           {probe.state === 'needs_login' && (
@@ -206,9 +203,9 @@ function AgentRow({ machine, probe, canControl, showAdvanced, onRefreshDone }: A
               <Copy size={11} strokeWidth={1.7} /> 复制安装命令
             </button>
           )}
-          {(probe.state === 'ready' || probe.state === 'needs_login' || probe.state === 'error') && online && canControl && (
+          {probe.state === 'error' && online && canControl && (
             <button type="button" className="btn ghost sm" disabled={busy !== null} onClick={() => void runTest()}>
-              {busy === 'test' ? '测试中…' : '测试'}
+              {busy === 'test' ? '检查中…' : '重试'}
             </button>
           )}
 
@@ -235,7 +232,7 @@ function AgentRow({ machine, probe, canControl, showAdvanced, onRefreshDone }: A
                 disabled={busy !== null}
                 onChange={(e) => void toggleEnabled(e.target.checked)}
               />
-              <span>{probe.enabled ? '允许调度到这台机器' : '已停用'}</span>
+              <span>{probe.enabled ? '允许调度到这台设备' : '已停用'}</span>
             </label>
           </div>
           <div className="ag-adv-row">
@@ -284,6 +281,16 @@ function AgentRow({ machine, probe, canControl, showAdvanced, onRefreshDone }: A
             />
           </div>
           <div className="ag-adv-foot">
+            {online && canControl && (
+              <button
+                type="button"
+                className="btn ghost sm"
+                disabled={busy !== null}
+                onClick={() => void runTest()}
+              >
+                {busy === 'test' ? '检查中…' : '验证连通性'}
+              </button>
+            )}
             <button type="button" className="btn pri sm" disabled={busy !== null} onClick={() => void saveAdvanced()}>
               保存
             </button>
@@ -318,7 +325,7 @@ export function AgentList({
     try {
       await api.probeMachineAgents(machine.machineId);
       refresh();
-      toast('已完成重新检查');
+      toast('已刷新 Agent 状态');
     } catch (e) {
       toast(errMsg(e), 'err');
     } finally {
@@ -327,25 +334,34 @@ export function AgentList({
   };
 
   return (
-    <div className="ag-list">
-      {agents.map((probe) => (
-        <AgentRow
-          key={probe.adapter}
-          machine={machine}
-          probe={probe}
-          canControl={canControl}
-          showAdvanced={showAdvanced}
-          onRefreshDone={refresh}
-        />
-      ))}
-      {online && canControl && (
-        <div className="ag-list-foot">
-          <button type="button" className="btn ghost sm" disabled={probing} onClick={() => void runProbeAll()}>
-            <RefreshCw size={12} strokeWidth={1.7} />
-            {probing ? '检查中…' : '重新检查'}
+    <div className="ag-block">
+      <div className="ag-block-hd">
+        <span className="ag-block-lbl">Agent</span>
+        {online && canControl && (
+          <button
+            type="button"
+            className="ib"
+            title="刷新 Agent 状态"
+            aria-label="刷新 Agent 状态"
+            disabled={probing}
+            onClick={() => void runProbeAll()}
+          >
+            <RefreshCw size={12.5} strokeWidth={1.7} className={probing ? 'spin-ico' : ''} />
           </button>
-        </div>
-      )}
+        )}
+      </div>
+      <div className="ag-list">
+        {agents.map((probe) => (
+          <AgentRow
+            key={probe.adapter}
+            machine={machine}
+            probe={probe}
+            canControl={canControl}
+            showAdvanced={showAdvanced}
+            onRefreshDone={refresh}
+          />
+        ))}
+      </div>
     </div>
   );
 }

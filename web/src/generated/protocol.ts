@@ -132,6 +132,15 @@ export type MachineSource = (typeof MachineSourceValues)[number];
 export const ProjectSourceValues = ["yaml", "ui"] as const;
 export type ProjectSource = (typeof ProjectSourceValues)[number];
 
+export const MachineRoleValues = ["full", "worker"] as const;
+export type MachineRole = (typeof MachineRoleValues)[number];
+
+export const ProjectPartKindValues = ["git", "folder"] as const;
+export type ProjectPartKind = (typeof ProjectPartKindValues)[number];
+
+export const LocationIsolationValues = ["worktree", "in_place"] as const;
+export type LocationIsolation = (typeof LocationIsolationValues)[number];
+
 export interface APIError {
   code: string;
   message: string;
@@ -161,6 +170,54 @@ export interface ProjectAnchorConfig {
   deployStrategy?: DeployStrategyConfig | null;
 }
 
+export interface ProjectEnvVar {
+  key: string;
+  value: string;
+  secret?: boolean;
+}
+
+export interface LocationRuntimeState {
+  exists: boolean;
+  isGit: boolean;
+  branch?: string;
+  headSha?: string;
+  dirty?: boolean;
+  ahead?: number;
+  behind?: number;
+  checkedAt?: number;
+}
+
+export interface ProjectLocationView {
+  locationId: string;
+  partId: string;
+  machineId: string;
+  absPath: string;
+  isDefault: boolean;
+  isolation: LocationIsolation;
+  runtime?: LocationRuntimeState | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface ProjectSuggestionView {
+  partId: string;
+  machineId: string;
+  absPath: string;
+  branch?: string;
+  repoIdentity?: string;
+}
+
+export interface ProjectPartView {
+  partId: string;
+  projectId: string;
+  name: string;
+  kind: ProjectPartKind;
+  repoIdentity?: string;
+  sortOrder: number;
+  locations: ProjectLocationView[];
+  suggestions?: ProjectSuggestionView[];
+}
+
 export interface ProjectView {
   projectId: string;
   displayName: string;
@@ -170,6 +227,9 @@ export interface ProjectView {
   defaultCapability: string;
   defaultAdapter: Adapter;
   ideScheme: IDEScheme;
+  systemPrompt?: string;
+  sharedEnv?: ProjectEnvVar[];
+  parts?: ProjectPartView[];
   anchors: Record<string, ProjectAnchorConfig>;
   activeTaskCount: number;
   blockedTaskCount: number;
@@ -207,6 +267,9 @@ export interface MachineView {
   machineId: string;
   displayName: string;
   displayAlias?: string;
+  role?: MachineRole;
+  os?: string;
+  allowedRoots?: string[];
   source?: MachineSource;
   hasCredentials?: boolean;
   transportMode: TransportMode;
@@ -229,6 +292,9 @@ export interface SetupStatusView {
   readyAgents: number;
   onlineMachines: number;
   currentMachineId?: string;
+  discoveryId?: string;
+  dutyPriority?: string[];
+  activeDutyMachineId?: string;
   hubOrigin?: string;
   tailscaleAvailable: boolean;
   tailscaleShared: boolean;
@@ -394,6 +460,21 @@ export interface DeliveryView {
   openAnnotations: number;
 }
 
+export interface FolderChangeItem {
+  path: string;
+  kind: string;
+  insertions: number;
+  deletions: number;
+  sizeBytes?: number;
+}
+
+export interface FolderChangesSummary {
+  totalAdds: number;
+  totalDels: number;
+  files: FolderChangeItem[];
+  promoted?: boolean;
+}
+
 export interface AttemptView {
   attemptId: string;
   taskId: string;
@@ -401,11 +482,15 @@ export interface AttemptView {
   attemptNo: number;
   machineId: string;
   adapter: Adapter;
+  partId?: string;
+  locationId?: string;
+  isolation?: LocationIsolation;
   triggerKind: TriggerKind;
   promptText?: string;
   worktreePath?: string;
   baseSha?: string;
   outputDeliveryId?: string;
+  folderChanges?: FolderChangesSummary | null;
   state: AttemptState;
   completionSource?: CompletionSource | null;
   errorCode?: string;
@@ -742,6 +827,8 @@ export interface CreateTaskRequest {
   goal: string;
   parentTaskId?: string;
   machineId?: string;
+  partId?: string;
+  locationId?: string;
   requiredCapability?: string;
   requiredResources?: string[];
   adapter?: Adapter;
@@ -912,6 +999,7 @@ export interface PAChatResponse {
 
 export interface CreatePairingCodeRequest {
   scope?: PairingScope;
+  role?: MachineRole;
   bindMachineId?: string;
   ttlSec?: number;
 }
@@ -920,6 +1008,9 @@ export interface CreatePairingCodeResponse {
   id: string;
   code: string;
   scope: PairingScope;
+  role?: MachineRole;
+  discoveryId?: string;
+  fingerprint?: string;
   bindMachineId?: string;
   expiresAt: number;
   joinCommand: string;
@@ -929,6 +1020,8 @@ export interface CreatePairingCodeResponse {
 export interface PairingCodeStatusResponse {
   id: string;
   scope: PairingScope;
+  role?: MachineRole;
+  fingerprint?: string;
   bindMachineId?: string;
   state: PairingCodeState;
   machineId?: string;
@@ -985,6 +1078,8 @@ export interface ListMachinesResponse {
 
 export interface UpdateMachineRequest {
   displayAlias?: string | null;
+  role?: MachineRole | null;
+  allowedRoots?: string[];
 }
 
 export interface UpdateMachineAgentRequest {
@@ -1006,6 +1101,7 @@ export interface DirEntryView {
   name: string;
   path: string;
   isGitRepo: boolean;
+  branch?: string;
 }
 
 export interface ListDirsResponse {
@@ -1018,9 +1114,16 @@ export interface ListDirsResponse {
 
 export interface CheckRepoResponse {
   valid: boolean;
+  exists?: boolean;
+  isGit?: boolean;
   repoRoot?: string;
   defaultBranch?: string;
   repoIdentity?: string;
+  rootCommit?: string;
+  headSha?: string;
+  dirty?: boolean;
+  ahead?: number;
+  behind?: number;
   displayName?: string;
   error?: string;
 }
@@ -1031,14 +1134,62 @@ export interface CreateProjectRequest {
   displayName?: string;
   projectId?: string;
   defaultAdapter?: Adapter;
+  allowFolder?: boolean;
 }
 
 export interface CreateProjectResponse {
   project: ProjectView;
 }
 
+export interface UpdateProjectSettingsRequest {
+  displayName?: string | null;
+  defaultAdapter?: Adapter | null;
+  systemPrompt?: string | null;
+  sharedEnv?: ProjectEnvVar[];
+}
+
+export interface CreateProjectPartRequest {
+  name: string;
+  kind?: ProjectPartKind;
+  machineId?: string;
+  absPath?: string;
+}
+
+export interface CreateProjectLocationRequest {
+  machineId: string;
+  absPath: string;
+  isDefault?: boolean;
+  isolation?: LocationIsolation;
+}
+
+export interface UpdateProjectLocationRequest {
+  isDefault?: boolean | null;
+  isolation?: LocationIsolation | null;
+}
+
+export interface DismissSuggestionRequest {
+  machineId: string;
+  absPath: string;
+}
+
+export interface ProjectSuggestionsResponse {
+  projectId: string;
+  suggestions: ProjectSuggestionView[];
+}
+
+export interface PromoteFolderChangesResponse {
+  taskId: string;
+  delivery: DeliveryView;
+  promoted: boolean;
+}
+
 export interface NetworkSettingsView {
   workspaceName: string;
+  discoveryId?: string;
+  dutyPriority?: string[];
+  activeDutyMachineId?: string;
+  externalGatewayEnabled: boolean;
+  externalGatewayCount: number;
   hubOrigin: string;
   extraOrigins?: string[];
   extraLogins?: string[];
@@ -1051,6 +1202,8 @@ export interface NetworkSettingsView {
 
 export interface UpdateNetworkSettingsRequest {
   workspaceName?: string | null;
+  dutyPriority?: string[];
+  externalGatewayEnabled?: boolean | null;
 }
 
 export interface TailscaleEnableRequest {
@@ -1195,6 +1348,9 @@ export interface AttemptDispatchFrame {
   wbSessionId: string;
   providerSessionId?: string;
   expectedSessionCwd?: string;
+  locationId?: string;
+  isolation?: LocationIsolation;
+  isPlainFolder?: boolean;
   repoPath?: string;
   worktreeRoot?: string;
   worktreePath?: string;
@@ -1203,6 +1359,7 @@ export interface AttemptDispatchFrame {
   baseSha?: string;
   defaultBranch?: string;
   desiredConfig?: Record<string, string>;
+  projectEnv?: Record<string, string>;
   systemPromptAppend?: string;
   inputDelivery?: InputDeliveryRef | null;
   prompt: string;

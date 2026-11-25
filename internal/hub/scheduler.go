@@ -17,12 +17,16 @@ import (
 )
 
 type resolvedRoute struct {
-	MachineID  string
-	MachineCfg protocol.MachineConfig
-	Capability string
-	Adapter    protocol.Adapter
-	Anchor     protocol.ProjectAnchorConfig
-	HasAnchor  bool
+	MachineID     string
+	MachineCfg    protocol.MachineConfig
+	Capability    string
+	Adapter       protocol.Adapter
+	Anchor        protocol.ProjectAnchorConfig
+	HasAnchor     bool
+	PartID        string
+	LocationID    string
+	Isolation     protocol.LocationIsolation
+	IsPlainFolder bool
 }
 
 // resolveExecutionRoute resolves capability, anchor, machine, and adapter from project & machine registries.
@@ -32,6 +36,21 @@ func (s *Server) resolveExecutionRoute(
 	reqAdapter protocol.Adapter,
 	reqMachineID ...string,
 ) (resolvedRoute, error) {
+	mid := ""
+	if len(reqMachineID) > 0 {
+		mid = reqMachineID[0]
+	}
+	return s.resolveExecutionRouteWithLocation(proj, reqCap, reqAdapter, mid, "", "")
+}
+
+func (s *Server) resolveExecutionRouteWithLocation(
+	proj protocol.ProjectView,
+	reqCap string,
+	reqAdapter protocol.Adapter,
+	reqMachineID string,
+	reqPartID string,
+	reqLocationID string,
+) (resolvedRoute, error) {
 	s.mu.RLock()
 	machines := make(map[string]protocol.MachineConfig, len(s.machines.Machines))
 	for k, v := range s.machines.Machines {
@@ -39,9 +58,130 @@ func (s *Server) resolveExecutionRoute(
 	}
 	s.mu.RUnlock()
 
-	explicitMachine := ""
-	if len(reqMachineID) > 0 {
-		explicitMachine = strings.TrimSpace(reqMachineID[0])
+	explicitMachine := strings.TrimSpace(reqMachineID)
+	explicitPart := strings.TrimSpace(reqPartID)
+	explicitLoc := strings.TrimSpace(reqLocationID)
+
+	// 3-level Part -> Location resolution when explicit part/location is requested, or for standard non-deploy tasks with bound parts.
+	if proj.ProjectID != protocol.ScratchProjectID && len(proj.Parts) > 0 && strings.TrimSpace(reqCap) != "deploy-node" {
+		var matchedPart *protocol.ProjectPartView
+		var matchedLoc *protocol.ProjectLocationView
+
+		if explicitLoc != "" {
+			for i := range proj.Parts {
+				for j := range proj.Parts[i].Locations {
+					if proj.Parts[i].Locations[j].LocationID == explicitLoc {
+						matchedPart = &proj.Parts[i]
+						matchedLoc = &proj.Parts[i].Locations[j]
+						break
+					}
+				}
+				if matchedLoc != nil {
+					break
+				}
+			}
+			if matchedLoc == nil {
+				return resolvedRoute{}, fmt.Errorf("location %q not found in project %q", explicitLoc, proj.ProjectID)
+			}
+		} else if explicitPart != "" {
+			for i := range proj.Parts {
+				if proj.Parts[i].PartID == explicitPart {
+					matchedPart = &proj.Parts[i]
+					break
+				}
+			}
+			if matchedPart == nil {
+				return resolvedRoute{}, fmt.Errorf("part %q not found in project %q", explicitPart, proj.ProjectID)
+			}
+			for j := range matchedPart.Locations {
+				if explicitMachine != "" && matchedPart.Locations[j].MachineID == explicitMachine {
+					matchedLoc = &matchedPart.Locations[j]
+					break
+				}
+				if explicitMachine == "" && matchedPart.Locations[j].IsDefault {
+					matchedLoc = &matchedPart.Locations[j]
+					break
+				}
+			}
+			if matchedLoc == nil && len(matchedPart.Locations) > 0 && explicitMachine == "" {
+				matchedLoc = &matchedPart.Locations[0]
+			}
+			if matchedLoc == nil {
+				return resolvedRoute{}, fmt.Errorf("part %q has no bound location for machine %q", matchedPart.Name, explicitMachine)
+			}
+		} else if strings.TrimSpace(reqCap) == "" {
+			if explicitMachine != "" {
+				for i := range proj.Parts {
+					for j := range proj.Parts[i].Locations {
+						if proj.Parts[i].Locations[j].MachineID == explicitMachine {
+							matchedPart = &proj.Parts[i]
+							matchedLoc = &proj.Parts[i].Locations[j]
+							break
+						}
+					}
+					if matchedLoc != nil {
+						break
+					}
+				}
+			} else if len(proj.Parts[0].Locations) > 0 {
+				matchedPart = &proj.Parts[0]
+				for j := range matchedPart.Locations {
+					if matchedPart.Locations[j].IsDefault {
+						matchedLoc = &matchedPart.Locations[j]
+						break
+					}
+				}
+				if matchedLoc == nil {
+					matchedLoc = &matchedPart.Locations[0]
+				}
+			}
+		}
+
+		if matchedPart != nil && matchedLoc != nil {
+			mCfg, hasM := machines[matchedLoc.MachineID]
+			if !hasM && len(machines) > 0 && (explicitLoc != "" || explicitPart != "") {
+				return resolvedRoute{}, fmt.Errorf("unknown machine %q", matchedLoc.MachineID)
+			}
+			capName := strings.TrimSpace(reqCap)
+			if capName == "" {
+				capName = proj.DefaultCapability
+			}
+			if capName == "" {
+				capName = "primary-dev"
+			}
+			adapter := reqAdapter
+			if adapter == "" {
+				if proj.DefaultAdapter != "" {
+					adapter = proj.DefaultAdapter
+				} else if reported := s.runners.ReportedAdapters(matchedLoc.MachineID); len(reported) > 0 {
+					adapter = reported[0]
+				} else {
+					adapter = protocol.AdapterAgy
+				}
+			}
+			iso := matchedLoc.Isolation
+			isPlain := matchedPart.Kind == protocol.ProjectPartFolder || iso == protocol.IsolationInPlace
+			if isPlain {
+				iso = protocol.IsolationInPlace
+			} else if iso == "" {
+				iso = protocol.IsolationWorktree
+			}
+			return resolvedRoute{
+				MachineID:  matchedLoc.MachineID,
+				MachineCfg: mCfg,
+				Capability: capName,
+				Adapter:    adapter,
+				Anchor: protocol.ProjectAnchorConfig{
+					Machine:  matchedLoc.MachineID,
+					RepoPath: matchedLoc.AbsPath,
+				},
+				HasAnchor:     true,
+				PartID:        matchedPart.PartID,
+				LocationID:    matchedLoc.LocationID,
+				Isolation:     iso,
+				IsPlainFolder: isPlain,
+			}, nil
+		}
 	}
 
 	capName := strings.TrimSpace(reqCap)
@@ -259,15 +399,29 @@ func (s *Server) resolveWorktreeRoot(proj protocol.ProjectView, anchor protocol.
 	return filepath.Join(cfg.DataDir, "worktrees", proj.ProjectID)
 }
 
-func buildOrbitSystemPromptAppend(taskID, projectID, attemptID string) string {
-	return fmt.Sprintf(
-		"hebi8-Orbit Execution Contract: project=%s task=%s attempt=%s. "+
-			"Your working directory is an isolated task worktree. "+
-			"Keep architectural decisions in repository docs/decisions/ (never write AGENTS.md/CLAUDE.md). "+
-			"When your work is ready to deliver, run `orbit deliver --summary \"<concise summary>\" --final` "+
-			"(if using native swarm, kill all workers before passing `--final`; omit `--final` only for intermediate preview snapshots).",
-		projectID, taskID, attemptID,
-	)
+func buildOrbitSystemPromptAppend(taskID, projectID, attemptID string, isPlainFolder bool, projectSystemPrompt string) string {
+	var base string
+	if isPlainFolder {
+		base = fmt.Sprintf(
+			"hebi8-Orbit Execution Contract: project=%s task=%s attempt=%s. "+
+				"Your working directory is a local project folder (in-place execution, NOT a Git worktree; do NOT initialize a .git repository or run `orbit deliver`). "+
+				"Edit or create files directly in place as requested and summarize your changes clearly.",
+			projectID, taskID, attemptID,
+		)
+	} else {
+		base = fmt.Sprintf(
+			"hebi8-Orbit Execution Contract: project=%s task=%s attempt=%s. "+
+				"Your working directory is an isolated task worktree. "+
+				"Keep architectural decisions in repository docs/decisions/ (never write AGENTS.md/CLAUDE.md). "+
+				"When your work is ready to deliver, run `orbit deliver --summary \"<concise summary>\" --final` "+
+				"(if using native swarm, kill all workers before passing `--final`; omit `--final` only for intermediate preview snapshots).",
+			projectID, taskID, attemptID,
+		)
+	}
+	if custom := strings.TrimSpace(projectSystemPrompt); custom != "" {
+		return base + "\n\nProject Instructions:\n" + custom
+	}
+	return base
 }
 
 func (s *Server) buildAttemptDispatchFrame(
@@ -350,16 +504,47 @@ func (s *Server) buildAttemptDispatchFrame(
 		}
 	}
 
+	isPlainFolder := att.Isolation == protocol.IsolationInPlace || strings.HasPrefix(strings.ToLower(strings.TrimSpace(proj.RepoIdentity)), "folder:")
+	if !isPlainFolder && att.PartID != "" {
+		for _, p := range proj.Parts {
+			if p.PartID == att.PartID && p.Kind == protocol.ProjectPartFolder {
+				isPlainFolder = true
+				break
+			}
+		}
+	}
+	isolation := att.Isolation
+	if isPlainFolder {
+		isolation = protocol.IsolationInPlace
+	} else if isolation == "" {
+		isolation = protocol.IsolationWorktree
+	}
+
 	repoPath := strings.TrimSpace(effAnchor.RepoPath)
 	if !isRemoteMachine {
 		repoPath = protocol.ExpandPath(repoPath)
 	}
 	mirrorBarePath := proj.MirrorBarePath
-	if isRemoteMachine && proj.ProjectID != protocol.ScratchProjectID && strings.TrimSpace(proj.MirrorBarePath) != "" {
+	if isPlainFolder {
+		mirrorBarePath = ""
+		if repoPath != "" {
+			worktreePath = repoPath
+		}
+	} else if isRemoteMachine && proj.ProjectID != protocol.ScratchProjectID && strings.TrimSpace(proj.MirrorBarePath) != "" {
 		// Only switch to Hub HTTP bundle transport when the connected Runner negotiates bundle.v1,
 		// so older Runners with pre-configured remote mirror paths continue working cleanly.
 		if s.runners.HasCapability(att.MachineID, protocol.RunnerCapBundleV1) {
 			mirrorBarePath = "orbit-hub://" + proj.ProjectID
+		}
+	}
+
+	var projectEnv map[string]string
+	if len(proj.SharedEnv) > 0 {
+		projectEnv = make(map[string]string, len(proj.SharedEnv))
+		for _, item := range proj.SharedEnv {
+			if k := strings.TrimSpace(item.Key); k != "" {
+				projectEnv[k] = item.Value
+			}
 		}
 	}
 
@@ -375,13 +560,17 @@ func (s *Server) buildAttemptDispatchFrame(
 		ExpectedSessionCWD: expectedCWD,
 		RepoPath:           repoPath,
 		RepoIdentity:       proj.RepoIdentity,
+		LocationID:         att.LocationID,
+		Isolation:          isolation,
+		IsPlainFolder:      isPlainFolder,
 		WorktreeRoot:       worktreeRoot,
 		WorktreePath:       worktreePath,
 		MirrorBarePath:     mirrorBarePath,
 		BaseSHA:            att.BaseSHA,
 		DefaultBranch:      proj.DefaultBranch,
 		DesiredConfig:      att.DesiredConfig,
-		SystemPromptAppend: buildOrbitSystemPromptAppend(att.TaskID, att.ProjectID, att.AttemptID),
+		ProjectEnv:         projectEnv,
+		SystemPromptAppend: buildOrbitSystemPromptAppend(att.TaskID, att.ProjectID, att.AttemptID, isPlainFolder, proj.SystemPrompt),
 		InputDelivery:      inputDlv,
 		Prompt:             prompt,
 		RequiredResources:  att.RequiredResources,

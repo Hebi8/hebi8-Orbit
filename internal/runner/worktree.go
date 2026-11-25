@@ -42,6 +42,23 @@ func PrepareWorktree(ctx context.Context, dispatch protocol.AttemptDispatchFrame
 		return absWorktree, "", nil
 	}
 
+	// Plain-folder or explicit in-place location: run directly inside RepoPath (zero worktree, zero shadow Git).
+	if dispatch.IsPlainFolder || dispatch.Isolation == protocol.IsolationInPlace {
+		repoPath := protocol.ExpandPath(strings.TrimSpace(dispatch.RepoPath))
+		if repoPath == "" {
+			return "", "", fmt.Errorf("in-place folder execution requires repoPath")
+		}
+		absDir, err := filepath.Abs(repoPath)
+		if err != nil {
+			return "", "", fmt.Errorf("resolve in-place dir: %w", err)
+		}
+		fi, err := os.Stat(absDir)
+		if err != nil || !fi.IsDir() {
+			return "", "", fmt.Errorf("in-place directory does not exist: %s", absDir)
+		}
+		return absDir, "", nil
+	}
+
 	repoPath := protocol.ExpandPath(strings.TrimSpace(dispatch.RepoPath))
 	rawMirror := strings.TrimSpace(dispatch.MirrorBarePath)
 	mirrorPath := ""

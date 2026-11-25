@@ -1,5 +1,5 @@
 import { useMemo } from 'react';
-import { Layers, LayoutGrid, PanelLeftClose, Plus, Search } from 'lucide-react';
+import { Layers, LayoutGrid, PanelLeftClose, Plus, Search, Settings } from 'lucide-react';
 import type { BootstrapResponse, MachineView, ProjectView, TaskSummary } from '../generated/protocol';
 import { useManyProjectTasks } from '../hooks/queries';
 import { useHubLatency } from '../hooks/useHubLatency';
@@ -153,6 +153,15 @@ export function Sidebar({
                   </button>
                   <button type="button" className="pname" onClick={() => navigate(paths.project(p.projectId))}>
                     <span className="pn ell">{p.displayName}</span>
+                  </button>
+                  <button
+                    type="button"
+                    className="padd"
+                    title={`${p.displayName} 设置`}
+                    aria-label={`${p.displayName} 设置`}
+                    onClick={() => navigate(paths.project(p.projectId, 'settings'))}
+                  >
+                    <Settings size={12} strokeWidth={1.6} />
                   </button>
                   <button
                     type="button"

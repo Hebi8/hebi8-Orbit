@@ -152,10 +152,16 @@ export function SessionPage({ boot, taskId, worker }: { boot: BootstrapResponse;
     (project ? project.anchors[task.requiredCapability || project.defaultCapability]?.machine : '') ||
     '';
   const hostMachine = boot.machines.find((m) => m.machineId === machineId);
-  const hostLabel = machineId ? resolveMachineSshAlias(hostMachine, machineId) : '';
-  const gitMeta = latestCode?.headSha
-    ? shortSha(latestCode.headSha)
-    : project?.defaultBranch || '';
+  const hostLabel = machineId ? hostMachine?.displayAlias || resolveMachineSshAlias(hostMachine, machineId) : '';
+  const isPlainFolderTask =
+    lastAttempt?.isolation === 'in_place' ||
+    (!!lastAttempt?.partId && project?.parts?.find((p) => p.partId === lastAttempt.partId)?.kind === 'folder') ||
+    (!!project?.repoIdentity && project.repoIdentity.startsWith('folder:'));
+  const gitMeta = isPlainFolderTask
+    ? ''
+    : latestCode?.headSha
+      ? shortSha(latestCode.headSha)
+      : project?.defaultBranch || '';
 
   const hasCardContent = formalCodeDeliveries.length > 0 || sessionArtifacts.length > 0 || hasSwarm || tl.sources.length > 0;
   const cardVisible = hasCardContent ? cardOpen : manualCardOpen;

@@ -198,6 +198,15 @@ func (s *Server) handleCreatePairingCode(w http.ResponseWriter, r *http.Request)
 		}
 	}
 
+	role := req.Role
+	if role == "" {
+		role = protocol.MachineRoleFull
+	}
+	if !role.IsValid() {
+		writeAPIError(w, http.StatusBadRequest, "ERR_INVALID_ROLE", "role must be full or worker")
+		return
+	}
+
 	formatted, normalized, err := generatePairingCode()
 	if err != nil {
 		writeAPIError(w, http.StatusInternalServerError, "ERR_PAIRING_GEN", err.Error())
@@ -206,6 +215,7 @@ func (s *Server) handleCreatePairingCode(w http.ResponseWriter, r *http.Request)
 	rec, err := s.store.CreatePairingCode(r.Context(), store.CreatePairingCodeParams{
 		CodeHash:      store.HashSecret(normalized),
 		Scope:         scope,
+		Role:          role,
 		BindMachineID: bindID,
 		CreatedBy:     actorFromContext(r.Context()),
 		TTLSeconds:    req.TTLSeconds,
@@ -220,6 +230,8 @@ func (s *Server) handleCreatePairingCode(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	discID, _ := s.store.EnsureDiscoveryID(r.Context())
+	fp := derivePairingFingerprint(normalized, discID)
 	origin := s.effectiveHubOrigin()
 	joinCmd := fmt.Sprintf("orbit join %s %s", origin, formatted)
 	joinLink := fmt.Sprintf("%s/#/join/%s", origin, formatted)
@@ -231,16 +243,45 @@ func (s *Server) handleCreatePairingCode(w http.ResponseWriter, r *http.Request)
 		joinCmd += " --runner-only"
 		joinLink += "?scope=runner"
 	}
+	if role == protocol.MachineRoleWorker {
+		joinCmd += " --role worker"
+	}
 
 	writeJSON(w, http.StatusCreated, protocol.CreatePairingCodeResponse{
 		ID:            rec.ID,
 		Code:          formatted,
 		Scope:         rec.Scope,
+		Role:          rec.Role,
+		DiscoveryID:   discID,
+		Fingerprint:   fp,
 		BindMachineID: rec.BindMachineID,
 		ExpiresAt:     rec.ExpiresAt,
 		JoinCommand:   joinCmd,
 		JoinLink:      joinLink,
 	})
+}
+
+func derivePairingFingerprint(normalizedCode, discoveryID string) string {
+	h := store.HashSecret(normalizedCode + ":" + discoveryID)
+	var num uint32
+	for i := 0; i < 8 && i < len(h); i++ {
+		num = num*16 + uint32(hexNib(h[i]))
+	}
+	six := num % 1000000
+	return fmt.Sprintf("%03d %03d", six/1000, six%1000)
+}
+
+func hexNib(c byte) byte {
+	switch {
+	case c >= '0' && c <= '9':
+		return c - '0'
+	case c >= 'a' && c <= 'f':
+		return c - 'a' + 10
+	case c >= 'A' && c <= 'F':
+		return c - 'A' + 10
+	default:
+		return 0
+	}
 }
 
 func (s *Server) handleGetPairingCode(w http.ResponseWriter, r *http.Request) {
@@ -258,6 +299,7 @@ func (s *Server) handleGetPairingCode(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, protocol.PairingCodeStatusResponse{
 		ID:            rec.ID,
 		Scope:         rec.Scope,
+		Role:          rec.Role,
 		BindMachineID: rec.BindMachineID,
 		State:         rec.State,
 		MachineID:     rec.ClaimedMachineID,
@@ -288,6 +330,7 @@ func (s *Server) handleRevokePairingCode(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, http.StatusOK, protocol.PairingCodeStatusResponse{
 		ID:            rec.ID,
 		Scope:         rec.Scope,
+		Role:          rec.Role,
 		BindMachineID: rec.BindMachineID,
 		State:         rec.State,
 		MachineID:     rec.ClaimedMachineID,

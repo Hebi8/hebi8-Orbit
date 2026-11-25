@@ -1,14 +1,36 @@
-import { useMemo, useState } from 'react';
-import { useQueries } from '@tanstack/react-query';
-import { ArrowUpRight, Plus } from 'lucide-react';
-import type { BootstrapResponse, DeliveryView, TaskSummary } from '../generated/protocol';
+import { useEffect, useMemo, useState } from 'react';
+import { useQueries, useQueryClient } from '@tanstack/react-query';
+import {
+  ArrowUpRight,
+  Eye,
+  EyeOff,
+  Folder,
+  GitBranch,
+  Lock,
+  Plus,
+  RefreshCw,
+  Trash2,
+} from 'lucide-react';
+import type {
+  BootstrapResponse,
+  DeliveryView,
+  ProjectEnvVar,
+  ProjectLocationView,
+  ProjectPartView,
+  ProjectView,
+  TaskSummary,
+} from '../generated/protocol';
+import { DeviceRoleIcon } from '../components/DeviceRoleIcon';
+import { DirBrowseModal } from '../components/DirBrowseModal';
+import { GitZshBadge } from '../components/GitZshBadge';
 import { ArtIcon, DiffIcon } from '../components/Icons';
 import { IdeOpenButton } from '../components/IdeOpenButton';
 import { PageHeader } from '../components/PageHeader';
 import { StatusMark } from '../components/StatusMark';
-import { useProjectTasks } from '../hooks/queries';
-import { api } from '../lib/api';
+import { useProjectSuggestions, useProjectTasks } from '../hooks/queries';
+import { api, errMsg } from '../lib/api';
 import {
+  cleanMachineName,
   displayMarkRank,
   indexInboxByTask,
   relTime,
@@ -17,9 +39,9 @@ import {
   taskTitle,
   type SessionMark,
 } from '../lib/format';
-import { buildIDEJump, launchIDE } from '../lib/ide';
+import { buildIDEJump, launchIDE, resolveEffectiveLocalMachineId } from '../lib/ide';
 import { navigate, paths, type ProjectTab } from '../lib/router';
-import { useWorkbenchStore } from '../store/useWorkbenchStore';
+import { toast, useWorkbenchStore } from '../store/useWorkbenchStore';
 
 function ThreadRow({ t, mark }: { t: TaskSummary; mark: SessionMark }) {
   return (
@@ -31,6 +53,491 @@ function ThreadRow({ t, mark }: { t: TaskSummary; mark: SessionMark }) {
 }
 
 const CODE_KINDS = new Set(['code_diff', 'mixed', 'workspace_snapshot']);
+
+function ProjectSettingsTab({
+  boot,
+  project,
+}: {
+  boot: BootstrapResponse;
+  project: ProjectView;
+}) {
+  const qc = useQueryClient();
+  const storedLocalId = useWorkbenchStore((s) => s.localMachineId);
+  const effectiveLocalId = resolveEffectiveLocalMachineId(
+    boot.machines,
+    boot.setup?.currentMachineId || storedLocalId,
+  );
+  const activeDutyId = boot.setup?.activeDutyMachineId ?? '';
+
+  const parts: ProjectPartView[] = project.parts ?? [];
+  const collapseSinglePart = parts.length <= 1;
+
+  const suggestionsQ = useProjectSuggestions(project.projectId, true);
+  const suggestions = suggestionsQ.data?.suggestions ?? [];
+
+  const [refreshingLocs, setRefreshingLocs] = useState(false);
+  const [browseTarget, setBrowseTarget] = useState<
+    | null
+    | { kind: 'location'; partId: string; partName: string }
+    | { kind: 'part' }
+  >(null);
+
+  // Shared ENV state
+  const [envRows, setEnvRows] = useState<ProjectEnvVar[]>(() => project.sharedEnv ?? []);
+  const [revealed, setRevealed] = useState<Record<number, boolean>>({});
+  const [savingEnv, setSavingEnv] = useState(false);
+
+  // System Prompt state
+  const [sysPrompt, setSysPrompt] = useState(project.systemPrompt ?? '');
+  const [savingPrompt, setSavingPrompt] = useState(false);
+
+  useEffect(() => {
+    setEnvRows(project.sharedEnv ?? []);
+    setSysPrompt(project.systemPrompt ?? '');
+  }, [project.projectId, project.updatedAt]);
+
+  const invalidate = () => {
+    void qc.invalidateQueries({ queryKey: ['bootstrap'] });
+    void qc.invalidateQueries({ queryKey: ['project-suggestions', project.projectId] });
+  };
+
+  const machineById = (mid: string) => boot.machines.find((m) => m.machineId === mid);
+
+  const handleRefreshLocations = async () => {
+    setRefreshingLocs(true);
+    try {
+      await api.refreshProjectLocations(project.projectId);
+      invalidate();
+      toast('已刷新各设备目录状态');
+    } catch (e) {
+      toast(errMsg(e), 'err');
+    } finally {
+      setRefreshingLocs(false);
+    }
+  };
+
+  const handleAddSuggestion = async (partId: string, machineId: string, absPath: string) => {
+    try {
+      await api.createProjectLocation(project.projectId, partId, { machineId, absPath });
+      invalidate();
+      toast('已添加设备位置');
+    } catch (e) {
+      toast(errMsg(e), 'err');
+    }
+  };
+
+  const handleDismissSuggestion = async (partId: string, machineId: string, absPath: string) => {
+    try {
+      await api.dismissProjectSuggestion(project.projectId, partId, { machineId, absPath });
+      void qc.invalidateQueries({ queryKey: ['project-suggestions', project.projectId] });
+    } catch (e) {
+      toast(errMsg(e), 'err');
+    }
+  };
+
+  const handleSetDefaultLoc = async (partId: string, loc: ProjectLocationView) => {
+    try {
+      await api.updateProjectLocation(project.projectId, partId, loc.locationId, { isDefault: true });
+      invalidate();
+      toast('已设为默认位置');
+    } catch (e) {
+      toast(errMsg(e), 'err');
+    }
+  };
+
+  const handleToggleIsolation = async (partId: string, loc: ProjectLocationView) => {
+    const next = loc.isolation === 'in_place' ? 'worktree' : 'in_place';
+    try {
+      await api.updateProjectLocation(project.projectId, partId, loc.locationId, { isolation: next });
+      invalidate();
+    } catch (e) {
+      toast(errMsg(e), 'err');
+    }
+  };
+
+  const handleDeleteLocation = async (partId: string, loc: ProjectLocationView) => {
+    try {
+      await api.deleteProjectLocation(project.projectId, partId, loc.locationId);
+      invalidate();
+      toast('已移除设备位置');
+    } catch (e) {
+      toast(errMsg(e), 'err');
+    }
+  };
+
+  const handleDeletePart = async (part: ProjectPartView) => {
+    try {
+      await api.deleteProjectPart(project.projectId, part.partId);
+      invalidate();
+      toast(`已移除 ${part.name}`);
+    } catch (e) {
+      toast(errMsg(e), 'err');
+    }
+  };
+
+  const saveEnv = async () => {
+    setSavingEnv(true);
+    try {
+      const cleaned = envRows.filter((r) => r.key.trim());
+      await api.updateProjectSettings(project.projectId, { sharedEnv: cleaned });
+      invalidate();
+      toast('已保存公用环境变量');
+    } catch (e) {
+      toast(errMsg(e), 'err');
+    } finally {
+      setSavingEnv(false);
+    }
+  };
+
+  const savePrompt = async () => {
+    setSavingPrompt(true);
+    try {
+      await api.updateProjectSettings(project.projectId, { systemPrompt: sysPrompt });
+      invalidate();
+      toast('已保存默认提示词');
+    } catch (e) {
+      toast(errMsg(e), 'err');
+    } finally {
+      setSavingPrompt(false);
+    }
+  };
+
+  const removeProject = async () => {
+    try {
+      await api.deleteProject(project.projectId);
+      invalidate();
+      toast(`已移除项目 ${project.displayName}`);
+      navigate(paths.home());
+    } catch (e) {
+      toast(errMsg(e), 'err');
+    }
+  };
+
+  return (
+    <div className="pset-wrap">
+      {/* Section 1: 目录组成 */}
+      <section className="pset-sec">
+        <div className="pset-hd">
+          <h3>目录组成</h3>
+          <div className="pset-hd-acts">
+            <button
+              type="button"
+              className="ib"
+              title="刷新目录与分支状态"
+              aria-label="刷新目录状态"
+              disabled={refreshingLocs}
+              onClick={() => void handleRefreshLocations()}
+            >
+              <RefreshCw size={13} strokeWidth={1.7} className={refreshingLocs ? 'spin-ico' : ''} />
+            </button>
+            {collapseSinglePart && parts[0] && (
+              <button
+                type="button"
+                className="btn ghost sm"
+                onClick={() =>
+                  setBrowseTarget({ kind: 'location', partId: parts[0].partId, partName: parts[0].name })
+                }
+              >
+                <Plus size={12} strokeWidth={1.8} /> 添加位置
+              </button>
+            )}
+            <button
+              type="button"
+              className="btn ghost sm"
+              onClick={() => setBrowseTarget({ kind: 'part' })}
+            >
+              <Plus size={12} strokeWidth={1.8} /> 添加组成部分
+            </button>
+          </div>
+        </div>
+
+        {parts.length === 0 ? (
+          <div className="quiet">还没有绑定任何目录位置</div>
+        ) : (
+          <div className="pset-parts">
+            {parts.map((part) => {
+              const partSugs = suggestions.filter((s) => s.partId === part.partId);
+              const isGitPart = part.kind === 'git';
+              return (
+                <div className={`pset-part ${collapseSinglePart ? 'is-single' : ''}`} key={part.partId}>
+                  {!collapseSinglePart && (
+                    <div className="pset-part-hd">
+                      {isGitPart ? (
+                        <GitBranch size={13.5} strokeWidth={1.7} className="muted" />
+                      ) : (
+                        <Folder size={13.5} strokeWidth={1.6} className="muted" />
+                      )}
+                      <span className="pset-part-name">{part.name}</span>
+                      <div className="pset-part-acts">
+                        <button
+                          type="button"
+                          className="btn ghost sm"
+                          onClick={() =>
+                            setBrowseTarget({ kind: 'location', partId: part.partId, partName: part.name })
+                          }
+                        >
+                          <Plus size={11.5} strokeWidth={1.8} /> 添加位置
+                        </button>
+                        {parts.length > 1 && (
+                          <button
+                            type="button"
+                            className="ib"
+                            title={`移除 ${part.name}`}
+                            aria-label={`移除 ${part.name}`}
+                            onClick={() => void handleDeletePart(part)}
+                          >
+                            <Trash2 size={12.5} strokeWidth={1.6} />
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  )}
+
+                  <div className="pset-loc-list">
+                    {part.locations.length === 0 ? (
+                      <div className="pset-loc-empty muted">尚未在任何设备绑定目录</div>
+                    ) : (
+                      part.locations.map((loc) => {
+                        const m = machineById(loc.machineId);
+                        const mLabel = m ? m.displayAlias || cleanMachineName(m) : loc.machineId;
+                        return (
+                          <div className="pset-loc-row" key={loc.locationId}>
+                            {m ? (
+                              <DeviceRoleIcon
+                                machine={m}
+                                isActiveDuty={m.machineId === activeDutyId}
+                                isCurrentDevice={m.machineId === effectiveLocalId}
+                                size={13.5}
+                              />
+                            ) : (
+                              <Folder size={13} className="muted" />
+                            )}
+                            <span className="pset-loc-mach">{mLabel}</span>
+                            <span className="pset-loc-path mono ell" title={loc.absPath}>
+                              {loc.absPath}
+                            </span>
+                            <GitZshBadge
+                              runtime={loc.runtime}
+                              fallbackBranch={project.defaultBranch}
+                              isGit={isGitPart}
+                            />
+                            <div className="pset-loc-acts">
+                              {loc.isDefault ? (
+                                <span className="pset-def-mark">默认</span>
+                              ) : (
+                                <button
+                                  type="button"
+                                  className="pset-hover-act"
+                                  onClick={() => void handleSetDefaultLoc(part.partId, loc)}
+                                >
+                                  设为默认
+                                </button>
+                              )}
+                              {isGitPart && (
+                                <button
+                                  type="button"
+                                  className="pset-hover-act mono"
+                                  title="切换 worktree 隔离 / 原位执行"
+                                  onClick={() => void handleToggleIsolation(part.partId, loc)}
+                                >
+                                  {loc.isolation === 'in_place' ? 'in_place' : 'worktree'}
+                                </button>
+                              )}
+                              {part.locations.length > 1 && (
+                                <button
+                                  type="button"
+                                  className="ib pset-del-loc"
+                                  title="移除该设备位置"
+                                  aria-label="移除该设备位置"
+                                  onClick={() => void handleDeleteLocation(part.partId, loc)}
+                                >
+                                  <Trash2 size={12} strokeWidth={1.6} />
+                                </button>
+                              )}
+                            </div>
+                          </div>
+                        );
+                      })
+                    )}
+
+                    {/* Quiet optional Git suggestions (never auto-bound) */}
+                    {partSugs.map((sug) => {
+                      const sm = machineById(sug.machineId);
+                      const smLabel = sm ? sm.displayAlias || cleanMachineName(sm) : sug.machineId;
+                      return (
+                        <div className="pset-sug-row" key={`${sug.machineId}:${sug.absPath}`}>
+                          <span className="pset-sug-label">发现于 {smLabel}</span>
+                          <span className="pset-loc-path mono ell" title={sug.absPath}>
+                            {sug.absPath}
+                          </span>
+                          {sug.branch && <GitZshBadge fallbackBranch={sug.branch} isGit />}
+                          <div className="pset-sug-acts">
+                            <button
+                              type="button"
+                              className="btn ghost sm"
+                              onClick={() => void handleAddSuggestion(part.partId, sug.machineId, sug.absPath)}
+                            >
+                              添加
+                            </button>
+                            <button
+                              type="button"
+                              className="btn ghost sm muted"
+                              onClick={() => void handleDismissSuggestion(part.partId, sug.machineId, sug.absPath)}
+                            >
+                              忽略
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </section>
+
+      {/* Section 2: 公用环境变量 */}
+      <section className="pset-sec">
+        <div className="pset-hd">
+          <h3>公用环境变量</h3>
+          <div className="pset-hd-acts">
+            <button
+              type="button"
+              className="btn ghost sm"
+              onClick={() => setEnvRows((rows) => [...rows, { key: '', value: '', secret: false }])}
+            >
+              <Plus size={12} strokeWidth={1.8} /> 添加变量
+            </button>
+            <button type="button" className="btn pri sm" disabled={savingEnv} onClick={() => void saveEnv()}>
+              {savingEnv ? '保存中…' : '保存'}
+            </button>
+          </div>
+        </div>
+        {envRows.length === 0 ? (
+          <div className="quiet">暂无项目公用环境变量，添加后将在各设备执行任务时注入。</div>
+        ) : (
+          <div className="pset-env-list">
+            {envRows.map((row, idx) => {
+              const isHidden = !!row.secret && !revealed[idx];
+              return (
+                <div className="pset-env-row" key={idx}>
+                  <input
+                    className="field mono pset-env-k"
+                    placeholder="KEY"
+                    value={row.key}
+                    onChange={(e) =>
+                      setEnvRows((rs) => rs.map((r, i) => (i === idx ? { ...r, key: e.target.value } : r)))
+                    }
+                  />
+                  <div className="pset-env-vwrap">
+                    <input
+                      type={isHidden ? 'password' : 'text'}
+                      className="field mono grow"
+                      placeholder="VALUE"
+                      value={row.value}
+                      onChange={(e) =>
+                        setEnvRows((rs) => rs.map((r, i) => (i === idx ? { ...r, value: e.target.value } : r)))
+                      }
+                    />
+                    {row.secret && (
+                      <button
+                        type="button"
+                        className="ib"
+                        title={isHidden ? '显示' : '隐藏'}
+                        onClick={() => setRevealed((rv) => ({ ...rv, [idx]: !rv[idx] }))}
+                      >
+                        {isHidden ? <Eye size={13} /> : <EyeOff size={13} />}
+                      </button>
+                    )}
+                  </div>
+                  <button
+                    type="button"
+                    className={`ib ${row.secret ? 'on' : ''}`}
+                    title={row.secret ? '已标记为密钥' : '标记为密钥（默认掩码）'}
+                    onClick={() =>
+                      setEnvRows((rs) => rs.map((r, i) => (i === idx ? { ...r, secret: !r.secret } : r)))
+                    }
+                  >
+                    <Lock size={12.5} strokeWidth={1.7} />
+                  </button>
+                  <button
+                    type="button"
+                    className="ib"
+                    title="删除变量"
+                    onClick={() => setEnvRows((rs) => rs.filter((_, i) => i !== idx))}
+                  >
+                    <Trash2 size={12.5} strokeWidth={1.6} />
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </section>
+
+      {/* Section 3: 默认提示词 */}
+      <section className="pset-sec">
+        <div className="pset-hd">
+          <h3>默认提示词</h3>
+          <button type="button" className="btn pri sm" disabled={savingPrompt} onClick={() => void savePrompt()}>
+            {savingPrompt ? '保存中…' : '保存'}
+          </button>
+        </div>
+        <textarea
+          className="field pset-prompt-ta"
+          rows={5}
+          placeholder="填写该项目每次启动新会话时自动附带的背景说明或编码约束…"
+          value={sysPrompt}
+          onChange={(e) => setSysPrompt(e.target.value)}
+        />
+      </section>
+
+      {project.source === 'ui' && (
+        <div className="pset-danger">
+          <button type="button" className="btn ghost sm bad-t" onClick={() => void removeProject()}>
+            <Trash2 size={12.5} strokeWidth={1.7} /> 移除项目
+          </button>
+        </div>
+      )}
+
+      <DirBrowseModal
+        open={browseTarget !== null}
+        title={
+          browseTarget?.kind === 'location'
+            ? `为「${browseTarget.partName}」添加设备位置`
+            : '添加组成部分（Git 仓库或文件夹）'
+        }
+        confirmLabel={browseTarget?.kind === 'location' ? '绑定此位置' : '添加组成部分'}
+        machines={boot.machines}
+        defaultMachineId={effectiveLocalId || boot.setup?.currentMachineId}
+        activeDutyMachineId={activeDutyId}
+        currentMachineId={effectiveLocalId}
+        extraFieldLabel={browseTarget?.kind === 'part' ? '名称' : undefined}
+        extraFieldPlaceholder={browseTarget?.kind === 'part' ? '留空则默认使用目录名' : undefined}
+        onConfirm={async ({ machineId, absPath, extraValue }) => {
+          if (browseTarget?.kind === 'location') {
+            await api.createProjectLocation(project.projectId, browseTarget.partId, {
+              machineId,
+              absPath,
+            });
+            toast('已添加设备位置');
+          } else {
+            await api.createProjectPart(project.projectId, {
+              name: extraValue || absPath.split('/').pop() || '目录',
+              machineId,
+              absPath,
+            });
+            toast('已添加组成部分');
+          }
+          invalidate();
+        }}
+        onClose={() => setBrowseTarget(null)}
+      />
+    </div>
+  );
+}
 
 export function ProjectPage({ boot, projectId, tab }: { boot: BootstrapResponse; projectId: string; tab: ProjectTab }) {
   const project = boot.projects.find((p) => p.projectId === projectId);
@@ -78,7 +585,9 @@ export function ProjectPage({ boot, projectId, tab }: { boot: BootstrapResponse;
     );
   }
 
-  const nonDefaultBranch = project.defaultBranch && project.defaultBranch !== 'main' && project.defaultBranch !== 'master';
+  const isPureFolder =
+    (project.parts?.length ?? 0) > 0 && project.parts!.every((pt) => pt.kind === 'folder');
+  const firstGitLoc = project.parts?.find((pt) => pt.kind === 'git')?.locations?.[0];
 
   return (
     <main className="main">
@@ -95,16 +604,27 @@ export function ProjectPage({ boot, projectId, tab }: { boot: BootstrapResponse;
             <div style={{ minWidth: 0 }}>
               <h1>{project.displayName}</h1>
               <div className="meta">
-                <span className="mono">{project.repoIdentity}</span>
-                {nonDefaultBranch && (
-                  <span>
-                    分支 <span className="mono">{project.defaultBranch}</span>
-                  </span>
+                {!isPureFolder && project.repoIdentity && !project.repoIdentity.startsWith('folder:') && (
+                  <span className="mono">{project.repoIdentity}</span>
+                )}
+                {!isPureFolder && (
+                  <GitZshBadge
+                    runtime={firstGitLoc?.runtime}
+                    fallbackBranch={project.defaultBranch}
+                    isGit
+                  />
+                )}
+                {isPureFolder && project.parts?.[0]?.locations?.[0]?.absPath && (
+                  <span className="mono">{project.parts[0].locations[0].absPath}</span>
                 )}
               </div>
             </div>
             <div className="r">
-              <button type="button" className="btn ghost" onClick={() => navigate(paths.newThread('project', project.projectId))}>
+              <button
+                type="button"
+                className="btn ghost"
+                onClick={() => navigate(paths.newThread('project', project.projectId))}
+              >
                 <Plus size={13} strokeWidth={1.6} /> 新线程
               </button>
               <IdeOpenButton project={project} machines={boot.machines} />
@@ -112,24 +632,51 @@ export function ProjectPage({ boot, projectId, tab }: { boot: BootstrapResponse;
           </div>
 
           <div className="tabs" role="tablist">
-            <button type="button" className={tab === 'threads' ? 'on' : ''} onClick={() => navigate(paths.project(projectId, 'threads'))}>
-              线程
+            <button
+              type="button"
+              role="tab"
+              aria-selected={tab === 'threads'}
+              className={tab === 'threads' ? 'on' : ''}
+              onClick={() => navigate(paths.project(projectId, 'threads'))}
+            >
+              会话
             </button>
-            <button type="button" className={tab === 'deliveries' ? 'on' : ''} onClick={() => navigate(paths.project(projectId, 'deliveries'))}>
-              交付
+            <button
+              type="button"
+              role="tab"
+              aria-selected={tab === 'deliveries'}
+              className={tab === 'deliveries' ? 'on' : ''}
+              onClick={() => navigate(paths.project(projectId, 'deliveries'))}
+            >
+              Artifacts
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={tab === 'settings'}
+              className={tab === 'settings' ? 'on' : ''}
+              onClick={() => navigate(paths.project(projectId, 'settings'))}
+            >
+              设置
             </button>
             {tab === 'threads' && threads.length > 10 && (
               <span className="sp">
-                <input className="field" placeholder="搜索线程…" value={q} onChange={(e) => setQ(e.target.value)} aria-label="搜索线程" />
+                <input
+                  className="field"
+                  placeholder="搜索会话…"
+                  value={q}
+                  onChange={(e) => setQ(e.target.value)}
+                  aria-label="搜索会话"
+                />
               </span>
             )}
           </div>
 
           {tab === 'threads' &&
             (tasksQ.isLoading ? (
-              <div className="quiet">载入线程…</div>
+              <div className="quiet">载入会话…</div>
             ) : ranked.length === 0 ? (
-              <div className="quiet">{q ? '没有匹配的线程' : '这个项目还没有线程'}</div>
+              <div className="quiet">{q ? '没有匹配的会话' : '这个项目还没有会话'}</div>
             ) : (
               <>
                 {markedRows.map(({ t, mark }) => (
@@ -144,7 +691,7 @@ export function ProjectPage({ boot, projectId, tab }: { boot: BootstrapResponse;
 
           {tab === 'deliveries' &&
             (withDeliveries.length === 0 ? (
-              <div className="quiet">还没有交付</div>
+              <div className="quiet">还没有 Artifacts 或交付</div>
             ) : (
               deliveries.map(({ d, v, task }) => {
                 const ide = buildIDEJump({
@@ -154,6 +701,7 @@ export function ProjectPage({ boot, projectId, tab }: { boot: BootstrapResponse;
                   project,
                   machines: boot.machines,
                 });
+                const hasArt = (d.ryugiBindings?.length ?? 0) > 0 || (d.manifest.blobs?.length ?? 0) > 0;
                 return (
                   <div className="drow" key={d.deliveryId}>
                     <span className="v mono">v{v}</span>
@@ -161,24 +709,40 @@ export function ProjectPage({ boot, projectId, tab }: { boot: BootstrapResponse;
                       {d.summary || taskTitle(task)}
                       <span className="faint"> · {taskTitle(task)}</span>
                     </span>
-                    <span className="mono faint no-mobile">{shortSha(d.headSha)}</span>
+                    {d.headSha && <span className="mono faint no-mobile">{shortSha(d.headSha)}</span>}
                     <span className="mono">
-                      <span className="add">+{d.manifest.insertions}</span> <span className="del">−{d.manifest.deletions}</span>
+                      <span className="add">+{d.manifest.insertions}</span>{' '}
+                      <span className="del">−{d.manifest.deletions}</span>
                     </span>
                     <span className="faint no-mobile">{relTime(d.createdAt)}</span>
                     <span className="acts">
-                      {CODE_KINDS.has(d.kind) && (
-                        <button type="button" className="ib" title="审阅代码" onClick={() => openReview('code', d.taskId, d.deliveryId)}>
+                      {CODE_KINDS.has(d.kind) && d.headSha && (
+                        <button
+                          type="button"
+                          className="ib"
+                          title="审阅代码"
+                          onClick={() => openReview('code', d.taskId, d.deliveryId)}
+                        >
                           <DiffIcon size={13} />
                         </button>
                       )}
-                      {(d.ryugiBindings?.length ?? 0) > 0 && (
-                        <button type="button" className="ib" title="审阅设计稿" onClick={() => openReview('art', d.taskId, d.deliveryId)}>
+                      {hasArt && (
+                        <button
+                          type="button"
+                          className="ib"
+                          title="查看 Artifacts"
+                          onClick={() => openReview('art', d.taskId, d.deliveryId)}
+                        >
                           <ArtIcon size={13} />
                         </button>
                       )}
                       {ide && (
-                        <button type="button" className="ib no-mobile" title={`在 Cursor 打开 · ${ide.targetLabel}`} onClick={() => launchIDE(ide.uri)}>
+                        <button
+                          type="button"
+                          className="ib no-mobile"
+                          title={`在 Cursor 打开 · ${ide.targetLabel}`}
+                          onClick={() => launchIDE(ide.uri)}
+                        >
                           <ArrowUpRight size={13} strokeWidth={1.6} />
                         </button>
                       )}
@@ -187,6 +751,8 @@ export function ProjectPage({ boot, projectId, tab }: { boot: BootstrapResponse;
                 );
               })
             ))}
+
+          {tab === 'settings' && <ProjectSettingsTab boot={boot} project={project} />}
         </div>
       </div>
     </main>

@@ -977,11 +977,57 @@ var AllProjectSources = []ProjectSource{
 
 func (v ProjectSource) IsValid() bool { return slices.Contains(AllProjectSources, v) }
 
+// MachineRole distinguishes full peer nodes (can take primary controller duty) from restricted workers (e.g. VPS).
+type MachineRole string
+
+const (
+	MachineRoleFull   MachineRole = "full"
+	MachineRoleWorker MachineRole = "worker"
+)
+
+var AllMachineRoles = []MachineRole{
+	MachineRoleFull,
+	MachineRoleWorker,
+}
+
+func (v MachineRole) IsValid() bool { return slices.Contains(AllMachineRoles, v) }
+
+// ProjectPartKind distinguishes Git repositories from plain folders inside a Project.
+type ProjectPartKind string
+
+const (
+	ProjectPartGit    ProjectPartKind = "git"
+	ProjectPartFolder ProjectPartKind = "folder"
+)
+
+var AllProjectPartKinds = []ProjectPartKind{
+	ProjectPartGit,
+	ProjectPartFolder,
+}
+
+func (v ProjectPartKind) IsValid() bool { return slices.Contains(AllProjectPartKinds, v) }
+
+// LocationIsolation controls whether tasks run in a Git worktree or directly in-place.
+type LocationIsolation string
+
+const (
+	IsolationWorktree LocationIsolation = "worktree"
+	IsolationInPlace  LocationIsolation = "in_place"
+)
+
+var AllLocationIsolations = []LocationIsolation{
+	IsolationWorktree,
+	IsolationInPlace,
+}
+
+func (v LocationIsolation) IsValid() bool { return slices.Contains(AllLocationIsolations, v) }
+
 // Runner control-plane capability flags negotiated in runner.hello / hub.welcome.
 const (
-	RunnerCapAgentsV1 = "agents.v1"
-	RunnerCapFSV1     = "fs.v1"
-	RunnerCapBundleV1 = "bundle.v1"
+	RunnerCapAgentsV1  = "agents.v1"
+	RunnerCapFSV1      = "fs.v1"
+	RunnerCapBundleV1  = "bundle.v1"
+	RunnerCapFSPlainV1 = "fs.plain.v1"
 )
 
 // PinnedBridgePackages defines the exact whitelisted npm packages installed into <dataDir>/acp-adapters.

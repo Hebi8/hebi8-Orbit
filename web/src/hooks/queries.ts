@@ -32,6 +32,15 @@ export function useProjectTasks(projectId: string | undefined, enabled = true) {
   });
 }
 
+export function useProjectSuggestions(projectId: string | undefined, enabled = true) {
+  return useQuery({
+    queryKey: ['project-suggestions', projectId],
+    queryFn: () => api.getProjectSuggestions(projectId!),
+    enabled: !!projectId && enabled,
+    staleTime: 30_000,
+  });
+}
+
 /** Fetches task lists for many projects at once (sidebar tree, ⌘K search, "全部" session filter). */
 export function useManyProjectTasks(projects: ProjectView[], enabled = true) {
   const results = useQueries({

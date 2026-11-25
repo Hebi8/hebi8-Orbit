@@ -205,13 +205,17 @@ export function App() {
   useEffect(() => applyThemeToDocument(theme), [theme]);
 
   const boot = bootQ.data;
+  const storedLocalMachineId = useWorkbenchStore((s) => s.localMachineId);
+  const setLocalMachineId = useWorkbenchStore((s) => s.setLocalMachineId);
 
-  // Redirect to first-run onboarding ONLY when needsOnboarding is true AND user lands on #/.
+  // Auto-hydrate current client device identity from server-authenticated bootstrap
+  // (fixes Mac mini desktop client mistakenly displaying hub's local_ws machine as "本机").
   useEffect(() => {
-    if (boot?.setup?.needsOnboarding && route.name === 'home') {
-      replaceHash(paths.onboarding());
+    const serverCurrent = boot?.setup?.currentMachineId;
+    if (serverCurrent && serverCurrent !== storedLocalMachineId) {
+      setLocalMachineId(serverCurrent);
     }
-  }, [boot?.setup?.needsOnboarding, route.name]);
+  }, [boot?.setup?.currentMachineId, storedLocalMachineId, setLocalMachineId]);
 
   if (route.name === 'auth') {
     return <AuthHandoffScreen code={route.code} />;
@@ -278,11 +282,20 @@ export function App() {
       </div>
       <ReviewOverlay boot={boot} />
       {cmdkOpen && <CommandPalette boot={boot} />}
-      {machinesOpen && <MachinesPopover machines={boot.machines} defaultWorkspaceName={boot.workspaceName} />}
+      {machinesOpen && (
+        <MachinesPopover
+          machines={boot.machines}
+          defaultWorkspaceName={boot.workspaceName}
+          activeDutyMachineId={boot.setup?.activeDutyMachineId}
+          currentMachineId={boot.setup?.currentMachineId}
+        />
+      )}
       <AddProjectModal
         open={addProjectOpen}
         machines={boot.machines}
         defaultMachineId={boot.setup?.currentMachineId}
+        activeDutyMachineId={boot.setup?.activeDutyMachineId}
+        currentMachineId={boot.setup?.currentMachineId}
         onClose={() => setAddProjectOpen(false)}
       />
       <Toast />

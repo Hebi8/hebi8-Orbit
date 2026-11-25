@@ -1,7 +1,12 @@
 import { useCallback, useEffect, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import { Check, Copy, RefreshCw, X } from 'lucide-react';
-import type { CreatePairingCodeResponse, MachineView, PairingCodeStatusResponse } from '../generated/protocol';
+import { Check, Copy, Laptop, RefreshCw, Server, ShieldCheck, X } from 'lucide-react';
+import type {
+  CreatePairingCodeResponse,
+  MachineRole,
+  MachineView,
+  PairingCodeStatusResponse,
+} from '../generated/protocol';
 import { api, errMsg } from '../lib/api';
 import { toast } from '../store/useWorkbenchStore';
 import { AgentList } from './AgentList';
@@ -25,6 +30,7 @@ export function PairDialog({
   onClose: () => void;
 }) {
   const qc = useQueryClient();
+  const [role, setRole] = useState<MachineRole>('full');
   const [asRunner, setAsRunner] = useState(true);
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState('');
@@ -33,13 +39,14 @@ export function PairDialog({
   const [now, setNow] = useState(() => Date.now());
 
   const createCode = useCallback(
-    async (wantRunner: boolean) => {
+    async (wantRunner: boolean, targetRole: MachineRole) => {
       setCreating(true);
       setError('');
       setStatus(null);
       try {
         const res = await api.createPairingCode({
           scope: wantRunner || bindMachineId ? 'both' : 'client',
+          role: targetRole,
           bindMachineId: bindMachineId || undefined,
           ttlSec: 600,
         });
@@ -61,8 +68,9 @@ export function PairDialog({
       setError('');
       return;
     }
+    setRole('full');
     setAsRunner(true);
-    void createCode(true);
+    void createCode(true, 'full');
   }, [open, createCode]);
 
   useEffect(() => {
@@ -72,7 +80,8 @@ export function PairDialog({
   }, [open, codeResp]);
 
   const remainingMs = codeResp ? codeResp.expiresAt - now : 0;
-  const expired = status?.state === 'expired' || (codeResp !== null && remainingMs <= 0 && status?.state !== 'claimed');
+  const expired =
+    status?.state === 'expired' || (codeResp !== null && remainingMs <= 0 && status?.state !== 'claimed');
   const claimed = status?.state === 'claimed';
   const pairedMachine = status?.machineId
     ? machines.find((m) => m.machineId === status.machineId)
@@ -108,11 +117,18 @@ export function PairDialog({
 
   if (!open) return null;
 
+  const regenerate = (nextRunner: boolean, nextRole: MachineRole) => {
+    if (codeResp && !claimed && !expired) {
+      void api.revokePairingCode(codeResp.id).catch(() => {});
+    }
+    void createCode(nextRunner, nextRole);
+  };
+
   const copyCommand = async () => {
     if (!codeResp) return;
     try {
       await navigator.clipboard.writeText(codeResp.joinCommand);
-      toast('已复制命令');
+      toast('已复制加入命令');
     } catch {
       toast(codeResp.joinCommand);
     }
@@ -134,26 +150,68 @@ export function PairDialog({
       <section
         className="modal-card pair-modal"
         role="dialog"
-        aria-label={bindMachineId ? `连接 ${bindMachineId}` : '添加机器'}
+        aria-label={bindMachineId ? `连接 ${bindMachineId}` : '添加设备'}
         onClick={(e) => e.stopPropagation()}
       >
         <div className="modal-hd">
-          <h3>{bindMachineId ? `连接 ${bindMachineId}` : '添加机器'}</h3>
+          <h3>{bindMachineId ? `连接 ${bindMachineId}` : '添加设备'}</h3>
           <button type="button" className="ib" onClick={() => void handleClose()} aria-label="关闭">
             <X size={15} strokeWidth={1.7} />
           </button>
         </div>
 
         <div className="modal-body">
+          {!bindMachineId && !isOnline && (
+            <div className="pair-role-seg" role="radiogroup" aria-label="设备角色">
+              <button
+                type="button"
+                role="radio"
+                aria-checked={role === 'full'}
+                className={`pair-role-opt ${role === 'full' ? 'on' : ''}`}
+                disabled={creating || claimed}
+                onClick={() => {
+                  if (role === 'full') return;
+                  setRole('full');
+                  regenerate(asRunner, 'full');
+                }}
+              >
+                <Laptop size={14} strokeWidth={1.75} />
+                <div>
+                  <div className="pair-role-t">完整设备</div>
+                  <div className="pair-role-d">可参与主控接力，同步工作区配置</div>
+                </div>
+              </button>
+              <button
+                type="button"
+                role="radio"
+                aria-checked={role === 'worker'}
+                className={`pair-role-opt ${role === 'worker' ? 'on' : ''}`}
+                disabled={creating || claimed}
+                onClick={() => {
+                  if (role === 'worker') return;
+                  setRole('worker');
+                  setAsRunner(true);
+                  regenerate(true, 'worker');
+                }}
+              >
+                <Server size={14} strokeWidth={1.75} />
+                <div>
+                  <div className="pair-role-t">受限节点</div>
+                  <div className="pair-role-d">如云端服务器，仅执行任务，不接管主控</div>
+                </div>
+              </button>
+            </div>
+          )}
+
           {error ? (
             <div className="pair-err">
               <p className="bad-t">{error}</p>
-              <button type="button" className="btn pri sm" onClick={() => void createCode(asRunner)}>
+              <button type="button" className="btn pri sm" onClick={() => void createCode(asRunner, role)}>
                 重试
               </button>
             </div>
           ) : creating && !codeResp ? (
-            <div className="pair-wait">正在生成邀请命令…</div>
+            <div className="pair-wait muted">正在生成配对命令…</div>
           ) : isOnline ? (
             <div className="pair-done">
               <div className="pair-ok-line">
@@ -173,19 +231,29 @@ export function PairDialog({
             </div>
           ) : codeResp ? (
             <>
-              <div className="pair-label">在要加入的机器上运行：</div>
+              <div className="pair-label">在目标设备的终端运行，或粘贴到 Orbit 桌面端：</div>
               <div className="pair-cmd-box">
                 <code className="mono ell">{codeResp.joinCommand}</code>
                 <button type="button" className="btn ghost sm" onClick={() => void copyCommand()}>
                   <Copy size={12} strokeWidth={1.7} /> 复制
                 </button>
               </div>
-              <div className="pair-sub">
-                或在那台机器的 Orbit 桌面端选「连到已有的」，粘贴上面这一行。
-              </div>
+
+              {codeResp.fingerprint && (
+                <div className="pair-fp-box">
+                  <ShieldCheck size={14} strokeWidth={1.8} className="ok-t" />
+                  <span className="muted">配对校验指纹</span>
+                  <span className="pair-fp-code mono">{codeResp.fingerprint}</span>
+                  {codeResp.discoveryId && (
+                    <span className="faint mono" style={{ marginLeft: 'auto', fontSize: 11 }}>
+                      {codeResp.discoveryId}
+                    </span>
+                  )}
+                </div>
+              )}
 
               <div className="pair-meta">
-                {!bindMachineId ? (
+                {!bindMachineId && role === 'full' ? (
                   <label className="chk">
                     <input
                       type="checkbox"
@@ -194,16 +262,15 @@ export function PairDialog({
                       onChange={(e) => {
                         const next = e.target.checked;
                         setAsRunner(next);
-                        if (codeResp) {
-                          void api.revokePairingCode(codeResp.id).catch(() => {});
-                        }
-                        void createCode(next);
+                        regenerate(next, role);
                       }}
                     />
-                    <span>让它执行任务</span>
+                    <span>同时作为执行节点运行任务</span>
                   </label>
                 ) : (
-                  <span className="muted">将为节点 {bindMachineId} 签发连接凭据</span>
+                  <span className="muted">
+                    {bindMachineId ? `将为 ${bindMachineId} 签发连接凭据` : '受限执行节点凭据'}
+                  </span>
                 )}
                 <span className="mono muted">
                   {expired ? '已失效' : `${formatCountdown(remainingMs)} 后失效`}
@@ -212,13 +279,15 @@ export function PairDialog({
 
               <div className="pair-state">
                 {expired ? (
-                  <button type="button" className="btn ghost sm" onClick={() => void createCode(asRunner)}>
+                  <button
+                    type="button"
+                    className="btn ghost sm"
+                    onClick={() => void createCode(asRunner, role)}
+                  >
                     <RefreshCw size={12} strokeWidth={1.7} /> 重新生成
                   </button>
                 ) : claimed ? (
-                  <span className="ok-t">
-                    已认领（{status?.machineId}），正在等待节点上线…
-                  </span>
+                  <span className="ok-t">已认领（{status?.machineId}），正在等待节点上线…</span>
                 ) : (
                   <span className="muted pair-waiting">
                     <span className="static-dots" aria-hidden="true">
@@ -226,7 +295,7 @@ export function PairDialog({
                       <span />
                       <span />
                     </span>
-                    等待连接
+                    等待对方确认并加入
                   </span>
                 )}
               </div>

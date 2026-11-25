@@ -80,23 +80,35 @@ func main() {
 	defer closeSetupSrv()
 
 	initialURL := setupOrigin + "/"
-	if !*forceSetup && cfg.HubURL != "" {
-		switch cfg.Mode {
-		case "local":
-			// Always check local Hub & local Runner independently (even if Hub is already attached).
-			if hubURL, _, _, sErr := runtimeMgr.StartOrAttachLocal(context.Background(), *configDir); sErr == nil {
+	if !*forceSetup {
+		if cfg.HubURL == "" {
+			// Zero-fork first launch: start or attach local Hub + Runner directly without blocking setup fork.
+			if hubURL, _, _, sErr := runtimeMgr.StartOrAttachLocal(context.Background(), *configDir); sErr == nil && hubURL != "" {
 				setHubState(hubURL, "local")
 				cfg.HubURL = hubURL
+				cfg.Mode = "local"
+				initialURL = runtimeMgr.BuildOpenURL(context.Background(), *configDir, getHubURL(), "")
+			} else if sErr != nil {
+				log.Printf("orbit-client: auto-start local hub unavailable (%v); showing setup screen", sErr)
 			}
-		case "remote":
-			// Restore managed remote Runner if user opted in ("让这台机器执行任务") during join.
-			if cfg.RunLocalRunner {
-				if rErr := runtimeMgr.EnsureRemoteRunner(*configDir); rErr != nil {
-					log.Printf("orbit-client: warning restoring remote runner: %v", rErr)
+		} else {
+			switch cfg.Mode {
+			case "local":
+				// Always check local Hub & local Runner independently (even if Hub is already attached).
+				if hubURL, _, _, sErr := runtimeMgr.StartOrAttachLocal(context.Background(), *configDir); sErr == nil {
+					setHubState(hubURL, "local")
+					cfg.HubURL = hubURL
+				}
+			case "remote":
+				// Restore managed remote Runner if user opted in ("让这台机器执行任务") during join.
+				if cfg.RunLocalRunner {
+					if rErr := runtimeMgr.EnsureRemoteRunner(*configDir); rErr != nil {
+						log.Printf("orbit-client: warning restoring remote runner: %v", rErr)
+					}
 				}
 			}
+			initialURL = runtimeMgr.BuildOpenURL(context.Background(), *configDir, getHubURL(), "")
 		}
-		initialURL = runtimeMgr.BuildOpenURL(context.Background(), *configDir, getHubURL(), "")
 	}
 
 	mygo.App.SetName("hebi8-Orbit")

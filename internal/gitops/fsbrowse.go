@@ -129,10 +129,16 @@ func ListSubdirs(rawPath string, allowedRoots []string, includeHidden bool) (pro
 			continue
 		}
 		_, gitErr := os.Stat(filepath.Join(full, ".git"))
+		isGit := gitErr == nil
+		branch := ""
+		if isGit {
+			branch = QuickReadGitBranch(full)
+		}
 		out = append(out, protocol.DirEntryView{
 			Name:      name,
 			Path:      full,
-			IsGitRepo: gitErr == nil,
+			IsGitRepo: isGit,
+			Branch:    branch,
 		})
 		if len(out) >= maxDirEntries {
 			break

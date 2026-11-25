@@ -8,6 +8,7 @@ import { cleanMachineName, humanResourceLabel, relTime } from '../lib/format';
 import { resolveEffectiveLocalMachineId } from '../lib/ide';
 import { navigate, paths } from '../lib/router';
 import { toast, useWorkbenchStore } from '../store/useWorkbenchStore';
+import { DeviceRoleIcon } from './DeviceRoleIcon';
 
 const OK_RESOURCE_STATES = new Set(['free', 'available', 'ok', 'idle', 'ready', 'unlocked', 'online']);
 
@@ -17,7 +18,17 @@ function nodeTone(m: MachineView, latency?: number | null): 'good' | 'mid' | 'of
   return 'good';
 }
 
-function NodeRow({ m, latency, isLocal }: { m: MachineView; latency?: number | null; isLocal: boolean }) {
+function NodeRow({
+  m,
+  latency,
+  isActiveDuty,
+  isLocal,
+}: {
+  m: MachineView;
+  latency?: number | null;
+  isActiveDuty: boolean;
+  isLocal: boolean;
+}) {
   const res = Object.entries(m.resources ?? {});
   const busyRes = res.filter(([, v]) => !OK_RESOURCE_STATES.has((v.state || '').toLowerCase()));
   const tone = nodeTone(m, latency);
@@ -34,11 +45,10 @@ function NodeRow({ m, latency, isLocal }: { m: MachineView; latency?: number | n
   return (
     <div className={`node-row-wrap ${tone === 'off' ? 'is-off' : ''}`}>
       <div className={`node-row ${tone === 'off' ? 'is-off' : ''}`}>
-        <span className={`node-dot ${tone}`} aria-hidden="true" />
+        <DeviceRoleIcon machine={m} isActiveDuty={isActiveDuty} isCurrentDevice={isLocal} size={13.5} />
         <span className="node-name" title={m.runnerVersion ? `${m.machineId} · ${m.runnerVersion}` : m.machineId}>
           {m.displayAlias || cleanMachineName(m)}
         </span>
-        {isLocal && <span className="node-local-pill">本机</span>}
         <span className={`node-right mono ${tone}`}>{rightText}</span>
       </div>
       {busyRes.length > 0 && (
@@ -57,9 +67,13 @@ function NodeRow({ m, latency, isLocal }: { m: MachineView; latency?: number | n
 export function MachinesPopover({
   machines,
   defaultWorkspaceName,
+  activeDutyMachineId,
+  currentMachineId,
 }: {
   machines: MachineView[];
   defaultWorkspaceName?: string;
+  activeDutyMachineId?: string;
+  currentMachineId?: string;
 }) {
   const qc = useQueryClient();
   const setOpen = useWorkbenchStore((s) => s.setMachinesOpen);
@@ -72,7 +86,7 @@ export function MachinesPopover({
   const [renaming, setRenaming] = useState(false);
   const [draftName, setDraftName] = useState(workspaceName);
 
-  const effectiveLocalId = resolveEffectiveLocalMachineId(machines, storedLocalId);
+  const effectiveLocalId = resolveEffectiveLocalMachineId(machines, currentMachineId || storedLocalId);
   const onlineCount = machines.filter((m) => m.status === 'online').length;
   const anyOnline = machines.length === 0 || onlineCount > 0;
   const headerTone = latency === null || !anyOnline ? 'off' : typeof latency === 'number' && latency >= 80 ? 'mid' : 'good';
@@ -158,7 +172,8 @@ export function MachinesPopover({
                     key={m.machineId}
                     m={m}
                     latency={isHubLocal ? latency : undefined}
-                    isLocal={effectiveLocalId ? m.machineId === effectiveLocalId : isHubLocal}
+                    isActiveDuty={activeDutyMachineId ? m.machineId === activeDutyMachineId : isHubLocal}
+                    isLocal={!!effectiveLocalId && m.machineId === effectiveLocalId}
                   />
                 );
               })

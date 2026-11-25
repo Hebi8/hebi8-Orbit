@@ -14,6 +14,8 @@ import type {
   CreateAnnotationResponse,
   CreatePairingCodeRequest,
   CreatePairingCodeResponse,
+  CreateProjectLocationRequest,
+  CreateProjectPartRequest,
   CreateProjectRequest,
   CreateProjectResponse,
   CreateTaskRequest,
@@ -24,6 +26,7 @@ import type {
   DeleteAnnotationResponse,
   DeliveryDetailResponse,
   DeliveryDiffResponse,
+  DismissSuggestionRequest,
   DispatchAnnotationsRequest,
   DispatchAnnotationsResponse,
   FollowupTaskRequest,
@@ -44,6 +47,11 @@ import type {
   PairingCodeStatusResponse,
   PendingInput,
   PostBoardMessageRequest,
+  ProjectLocationView,
+  ProjectPartView,
+  ProjectSuggestionsResponse,
+  ProjectView,
+  PromoteFolderChangesResponse,
   RetryTaskRequest,
   RetryTaskResponse,
   RyugiSyncResponse,
@@ -56,6 +64,8 @@ import type {
   UpdateMachineAgentRequest,
   UpdateMachineRequest,
   UpdateNetworkSettingsRequest,
+  UpdateProjectLocationRequest,
+  UpdateProjectSettingsRequest,
   WSTicketResponse,
   WorkerStreamResponse,
 } from '../generated/protocol';
@@ -518,8 +528,115 @@ export const api = {
     });
   },
 
+  updateProjectSettings(projectId: string, req: UpdateProjectSettingsRequest): Promise<CreateProjectResponse> {
+    return apiFetch<CreateProjectResponse>(`/api/projects/${enc(projectId)}`, {
+      method: 'PATCH',
+      json: req,
+    });
+  },
+
   deleteProject(projectId: string): Promise<{ removed: boolean; projectId: string }> {
     return apiFetch(`/api/projects/${enc(projectId)}`, { method: 'DELETE' });
+  },
+
+  createProjectPart(
+    projectId: string,
+    req: CreateProjectPartRequest,
+  ): Promise<{ project: ProjectView; part: ProjectPartView }> {
+    return apiFetch(`/api/projects/${enc(projectId)}/parts`, {
+      method: 'POST',
+      json: req,
+    });
+  },
+
+  deleteProjectPart(projectId: string, partId: string): Promise<{ project: ProjectView }> {
+    return apiFetch(`/api/projects/${enc(projectId)}/parts/${enc(partId)}`, { method: 'DELETE' });
+  },
+
+  createProjectLocation(
+    projectId: string,
+    partId: string,
+    req: CreateProjectLocationRequest,
+  ): Promise<{ project: ProjectView; location: ProjectLocationView }> {
+    return apiFetch(`/api/projects/${enc(projectId)}/parts/${enc(partId)}/locations`, {
+      method: 'POST',
+      json: req,
+    });
+  },
+
+  updateProjectLocation(
+    projectId: string,
+    partId: string,
+    locationId: string,
+    req: UpdateProjectLocationRequest,
+  ): Promise<{ project: ProjectView }> {
+    return apiFetch(`/api/projects/${enc(projectId)}/parts/${enc(partId)}/locations/${enc(locationId)}`, {
+      method: 'PATCH',
+      json: req,
+    });
+  },
+
+  deleteProjectLocation(projectId: string, partId: string, locationId: string): Promise<{ project: ProjectView }> {
+    return apiFetch(`/api/projects/${enc(projectId)}/parts/${enc(partId)}/locations/${enc(locationId)}`, {
+      method: 'DELETE',
+    });
+  },
+
+  refreshProjectLocations(projectId: string): Promise<{ project: ProjectView }> {
+    return apiFetch(`/api/projects/${enc(projectId)}/locations/refresh`, {
+      method: 'POST',
+      json: {},
+    });
+  },
+
+  getProjectSuggestions(projectId: string): Promise<ProjectSuggestionsResponse> {
+    return apiFetch<ProjectSuggestionsResponse>(`/api/projects/${enc(projectId)}/suggestions`);
+  },
+
+  dismissProjectSuggestion(projectId: string, partId: string, req: DismissSuggestionRequest): Promise<{ dismissed: boolean }> {
+    return apiFetch(`/api/projects/${enc(projectId)}/parts/${enc(partId)}/suggestions/dismiss`, {
+      method: 'POST',
+      json: req,
+    });
+  },
+
+  async downloadTaskFolderFile(taskId: string, relPath: string, attemptId?: string): Promise<void> {
+    const headers = new Headers();
+    const clientToken = getStoredClientToken();
+    const devToken = getStoredDevToken();
+    if (clientToken) {
+      headers.set('Authorization', `Bearer ${clientToken}`);
+    } else if (devToken) {
+      headers.set('X-Orbit-Dev-Token', devToken);
+    }
+    const q = new URLSearchParams({ path: relPath });
+    if (attemptId) q.set('attemptId', attemptId);
+    const resp = await fetch(`/api/tasks/${enc(taskId)}/folder-file?${q.toString()}`, {
+      headers,
+      credentials: 'omit',
+    });
+    if (!resp.ok) {
+      throw new ApiError(resp.status, '', `下载文件失败 (HTTP ${resp.status})`);
+    }
+    const blob = await resp.blob();
+    const objUrl = URL.createObjectURL(blob);
+    try {
+      const a = document.createElement('a');
+      a.href = objUrl;
+      a.download = relPath.split('/').pop() || relPath;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    } finally {
+      window.setTimeout(() => URL.revokeObjectURL(objUrl), 10_000);
+    }
+  },
+
+  promoteFolderChanges(taskId: string, attemptId?: string): Promise<PromoteFolderChangesResponse> {
+    return apiFetch<PromoteFolderChangesResponse>(`/api/tasks/${enc(taskId)}/folder-changes/promote`, {
+      method: 'POST',
+      json: attemptId ? { attemptId } : {},
+    });
   },
 
   getNetworkSettings(): Promise<NetworkSettingsView> {

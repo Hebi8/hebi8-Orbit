@@ -87,6 +87,11 @@ func Open(ctx context.Context, dbPath string) (*Store, error) {
 		return nil, fmt.Errorf("backup before v5 migration: %w", err)
 	}
 
+	if err := backupBeforeV6Migration(ctx, rw, absPath); err != nil {
+		_ = rw.Close()
+		return nil, fmt.Errorf("backup before v6 migration: %w", err)
+	}
+
 	if err := applySchema(ctx, rw); err != nil {
 		_ = rw.Close()
 		return nil, fmt.Errorf("apply schema: %w", err)
@@ -339,6 +344,73 @@ func applySchema(ctx context.Context, db *sql.DB) error {
 		}
 	}
 
+	// Smooth versioned migration v6 (v3.2 3-level project model, device roles, duty priority, plain-folder changes).
+	var hasV6 int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version = 6`).Scan(&hasV6); err != nil {
+		return err
+	}
+	if hasV6 == 0 {
+		if _, err := tx.ExecContext(ctx, BuildMigrationV6DDL()); err != nil {
+			return fmt.Errorf("apply v6 ddl: %w", err)
+		}
+		if err := ensureColumnTx(ctx, tx, "projects", "system_prompt", "TEXT NOT NULL DEFAULT ''"); err != nil {
+			return err
+		}
+		if err := ensureColumnTx(ctx, tx, "projects", "shared_env_json", "TEXT NOT NULL DEFAULT '[]'"); err != nil {
+			return err
+		}
+		if err := ensureColumnTx(ctx, tx, "machines", "role", "TEXT NOT NULL DEFAULT 'full'"); err != nil {
+			return err
+		}
+		if err := ensureColumnTx(ctx, tx, "machines", "os_name", "TEXT NOT NULL DEFAULT ''"); err != nil {
+			return err
+		}
+		if err := ensureColumnTx(ctx, tx, "machines", "allowed_roots_json", "TEXT NOT NULL DEFAULT '[]'"); err != nil {
+			return err
+		}
+		if err := ensureColumnTx(ctx, tx, "registry_machines", "role", "TEXT NOT NULL DEFAULT 'full'"); err != nil {
+			return err
+		}
+		if err := ensureColumnTx(ctx, tx, "pairing_codes", "role", "TEXT NOT NULL DEFAULT 'full'"); err != nil {
+			return err
+		}
+		if err := ensureColumnTx(ctx, tx, "tasks", "part_id", "TEXT"); err != nil {
+			return err
+		}
+		if err := ensureColumnTx(ctx, tx, "tasks", "location_id", "TEXT"); err != nil {
+			return err
+		}
+		if err := ensureColumnTx(ctx, tx, "attempts", "part_id", "TEXT"); err != nil {
+			return err
+		}
+		if err := ensureColumnTx(ctx, tx, "attempts", "location_id", "TEXT"); err != nil {
+			return err
+		}
+		if err := ensureColumnTx(ctx, tx, "attempts", "isolation", "TEXT"); err != nil {
+			return err
+		}
+		if err := ensureColumnTx(ctx, tx, "attempts", "folder_changes_json", "TEXT"); err != nil {
+			return err
+		}
+		// Backfill role for existing ssh_outbound targets as restricted workers.
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE machines SET role = 'worker' WHERE transport_mode = 'ssh_outbound' AND role = 'full'
+		`); err != nil {
+			return fmt.Errorf("backfill ssh_outbound machine role: %w", err)
+		}
+		if err := backfillV6ProjectsTx(ctx, tx, now); err != nil {
+			return fmt.Errorf("backfill v6 projects: %w", err)
+		}
+		if err := ensureV6NetworkDefaultsTx(ctx, tx, now); err != nil {
+			return fmt.Errorf("ensure v6 network defaults: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO schema_migrations (version, applied_at) VALUES (6, ?)
+		`, now); err != nil {
+			return err
+		}
+	}
+
 	// Idempotently ensure the built-in virtual _scratch project exists on every startup.
 	if err := ensureScratchProjectTx(ctx, tx, now); err != nil {
 		return err
@@ -553,6 +625,45 @@ func backupBeforeV5Migration(ctx context.Context, db *sql.DB, absPath string) er
 	if err := os.Rename(tmpPath, bakPath); err != nil {
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("finalize pre-v5 backup: %w", err)
+	}
+	return nil
+}
+
+// backupBeforeV6Migration takes a consistent VACUUM INTO hot backup once before applying v6
+// on an existing on-disk database (schema_migrations exists and version 6 has not yet run).
+func backupBeforeV6Migration(ctx context.Context, db *sql.DB, absPath string) error {
+	if absPath == "" || absPath == ":memory:" {
+		return nil
+	}
+	var tableExists int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='schema_migrations'`).Scan(&tableExists); err != nil {
+		return fmt.Errorf("check schema_migrations table: %w", err)
+	}
+	if tableExists == 0 {
+		return nil
+	}
+	var hasV6 int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version = 6`).Scan(&hasV6); err != nil {
+		return fmt.Errorf("check schema version 6: %w", err)
+	}
+	if hasV6 > 0 {
+		return nil
+	}
+	bakPath := absPath + ".pre-v6.bak"
+	if _, err := os.Stat(bakPath); err == nil {
+		return nil
+	}
+	tmpPath := fmt.Sprintf("%s.tmp.%d", bakPath, time.Now().UnixNano())
+	_ = os.Remove(tmpPath)
+	escaped := filepath.ToSlash(tmpPath)
+	escaped = fmt.Sprintf("'%s'", replaceAllSingleQuotes(escaped))
+	if _, err := db.ExecContext(ctx, "VACUUM INTO "+escaped); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("vacuum pre-v6 backup: %w", err)
+	}
+	if err := os.Rename(tmpPath, bakPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("finalize pre-v6 backup: %w", err)
 	}
 	return nil
 }

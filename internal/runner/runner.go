@@ -3,6 +3,7 @@ package runner
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -94,6 +95,7 @@ type attemptContext struct {
 	driver                  AcpAdapterDriver
 	worktreePath            string
 	baseSHA                 string
+	beforeFolderSnap        *gitops.FolderSnapshot
 	state                   protocol.AttemptState
 	resumeState             protocol.ResumeState
 	providerSessionID       acp.SessionId
@@ -703,7 +705,18 @@ func (r *Runner) executeAttempt(ctx context.Context, att *attemptContext) {
 	})
 
 	// 2. Acquire exclusive machine resources atomically in lexicographical order
-	if len(dispatch.RequiredResources) > 0 {
+	isInPlace := dispatch.IsPlainFolder || dispatch.Isolation == protocol.IsolationInPlace
+	reqResources := append([]string(nil), dispatch.RequiredResources...)
+	if isInPlace {
+		locKey := strings.TrimSpace(dispatch.LocationID)
+		if locKey == "" && strings.TrimSpace(dispatch.RepoPath) != "" {
+			locKey = canonicalPath(protocol.ExpandPath(dispatch.RepoPath))
+		}
+		if locKey != "" {
+			reqResources = append(reqResources, "location:"+locKey)
+		}
+	}
+	if len(reqResources) > 0 {
 		for {
 			if err := ctx.Err(); err != nil {
 				r.finalizeAttemptDurable(att, protocol.AttemptCancelled, map[string]any{
@@ -713,7 +726,7 @@ func (r *Runner) executeAttempt(ctx context.Context, att *attemptContext) {
 				})
 				return
 			}
-			ok, reason := r.tryAcquireResources(ctx, att, dispatch.RequiredResources)
+			ok, reason := r.tryAcquireResources(ctx, att, reqResources)
 			if ok {
 				break
 			}
@@ -766,9 +779,16 @@ func (r *Runner) executeAttempt(ctx context.Context, att *attemptContext) {
 		})
 		return
 	}
+	var beforeSnap *gitops.FolderSnapshot
+	if isInPlace {
+		if snap, snapErr := gitops.CaptureFolderSnapshot(worktreePath); snapErr == nil {
+			beforeSnap = snap
+		}
+	}
 	att.mu.Lock()
 	att.worktreePath = worktreePath
 	att.baseSHA = baseSHA
+	att.beforeFolderSnap = beforeSnap
 	att.mu.Unlock()
 
 	// 4. Per-wbSessionId single-flight serialization (prevents close vs dispatch race!)
@@ -1014,11 +1034,9 @@ func (r *Runner) executeAttempt(ctx context.Context, att *attemptContext) {
 	_, _, rejCount, nonZeroCount := att.tracker.Stats()
 	unresRej, unresNonZero := att.tracker.UnresolvedCounts()
 
-	// B1 & B13: Non-_scratch project turns MUST have a verified delivery before succeeding.
-	// If a locally persisted final delivery is still awaiting mirror-push / blob-upload retry (B13),
-	// keep the attempt open so background retry (or `--resume`) publishes and finalizes it formally
-	// instead of failing early with NO_VERIFIED_DELIVERY!
-	if dispatch.ProjectID != protocol.ScratchProjectID && !hasDelivery {
+	// B1 & B13: Non-_scratch Git project turns MUST have a verified delivery before succeeding.
+	// Plain-folder / in-place turns skip shadow Git and instead capture a lightweight before/after file diff!
+	if dispatch.ProjectID != protocol.ScratchProjectID && !hasDelivery && !isInPlace {
 		if hasPendingFinal, err := r.outbox.HasUnemittedFinalDelivery(ctx, dispatch.AttemptID); err == nil && hasPendingFinal {
 			go r.retryPendingDeliveries(r.runCtx)
 			<-ctx.Done()
@@ -1061,6 +1079,18 @@ func (r *Runner) executeAttempt(ctx context.Context, att *attemptContext) {
 		"nonZeroExitCount":            nonZeroCount,
 		"unresolvedRejectedToolCount": unresRej,
 		"unresolvedNonZeroExitCount":  unresNonZero,
+	}
+	if isInPlace {
+		att.mu.Lock()
+		bSnap := att.beforeFolderSnap
+		wt := att.worktreePath
+		att.mu.Unlock()
+		if afterSnap, snapErr := gitops.CaptureFolderSnapshot(wt); snapErr == nil {
+			fc := gitops.DiffFolderSnapshots(bSnap, afterSnap)
+			if len(fc.Files) > 0 {
+				payload["folderChanges"] = fc
+			}
+		}
 	}
 	if promptResp.Usage != nil {
 		payload["tokenUsage"] = map[string]any{
@@ -3753,7 +3783,7 @@ func (r *Runner) buildRunnerHello(ctx context.Context) protocol.RunnerHelloFrame
 	hostname, _ := os.Hostname()
 	var agentProbes []protocol.AgentProbe
 	var configRev int64
-	caps := []string{protocol.RunnerCapFSV1, protocol.RunnerCapBundleV1}
+	caps := []string{protocol.RunnerCapFSV1, protocol.RunnerCapBundleV1, protocol.RunnerCapFSPlainV1}
 	if r.agentMgr != nil {
 		caps = append(caps, protocol.RunnerCapAgentsV1)
 		agentProbes = r.agentMgr.SnapshotProbes()
@@ -3854,7 +3884,7 @@ func (r *Runner) handleRunnerRPC(ctx context.Context, req protocol.RunnerRPCFram
 
 	case "list_dirs":
 		pathArg, _ := req.Args["path"].(string)
-		out, err := gitops.ListSubdirs(pathArg, r.cfg.AllowedBrowseRoots, false)
+		out, err := gitops.ListSubdirs(pathArg, r.effectiveBrowseRoots(req.Args), false)
 		if err != nil {
 			res.Error = err.Error()
 		} else {
@@ -3865,7 +3895,7 @@ func (r *Runner) handleRunnerRPC(ctx context.Context, req protocol.RunnerRPCFram
 
 	case "check_repo":
 		pathArg, _ := req.Args["path"].(string)
-		out := gitops.CheckGitRepo(ctx, pathArg, r.cfg.AllowedBrowseRoots)
+		out := gitops.CheckGitRepo(ctx, pathArg, r.effectiveBrowseRoots(req.Args))
 		raw, _ := json.Marshal(out)
 		_ = json.Unmarshal(raw, &res.Data)
 		res.OK = out.Valid
@@ -3873,11 +3903,63 @@ func (r *Runner) handleRunnerRPC(ctx context.Context, req protocol.RunnerRPCFram
 			res.Error = out.Error
 		}
 
+	case "inspect_dir":
+		pathArg, _ := req.Args["path"].(string)
+		out := gitops.InspectDirectory(ctx, pathArg, r.effectiveBrowseRoots(req.Args))
+		raw, _ := json.Marshal(out)
+		_ = json.Unmarshal(raw, &res.Data)
+		res.OK = out.Valid
+		if !out.Valid {
+			res.Error = out.Error
+		}
+
+	case "scan_repos":
+		repos, err := gitops.ScanGitSuggestions(ctx, r.effectiveBrowseRoots(req.Args))
+		if err != nil {
+			res.Error = err.Error()
+		} else {
+			res.OK = true
+			res.Data = map[string]any{"repos": repos}
+		}
+
+	case "read_folder_file":
+		rootDir, _ := req.Args["rootDir"].(string)
+		relPath, _ := req.Args["relPath"].(string)
+		data, name, err := gitops.ReadFolderFile(rootDir, relPath, r.effectiveBrowseRoots(req.Args), 20*1024*1024)
+		if err != nil {
+			res.Error = err.Error()
+		} else {
+			res.OK = true
+			res.Data = map[string]any{
+				"filename":      name,
+				"contentBase64": base64.StdEncoding.EncodeToString(data),
+				"sizeBytes":     len(data),
+			}
+		}
+
 	default:
 		res.Error = fmt.Sprintf("unknown rpc op %q", req.Op)
 	}
 
 	_ = r.sendWSJSON(res)
+}
+
+func (r *Runner) effectiveBrowseRoots(args map[string]any) []string {
+	if len(r.cfg.AllowedBrowseRoots) > 0 {
+		return r.cfg.AllowedBrowseRoots
+	}
+	if rawRoots, ok := args["allowedRoots"].([]any); ok && len(rawRoots) > 0 {
+		out := make([]string, 0, len(rawRoots))
+		for _, item := range rawRoots {
+			if s, ok := item.(string); ok && strings.TrimSpace(s) != "" {
+				out = append(out, strings.TrimSpace(s))
+			}
+		}
+		if len(out) > 0 {
+			return out
+		}
+	}
+	return r.cfg.AllowedBrowseRoots
 }
 
 func (r *Runner) buildHeartbeat(ctx context.Context) protocol.RunnerHeartbeatFrame {
