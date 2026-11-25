@@ -75,8 +75,8 @@ func (s *Store) SyncRegistry(ctx context.Context, dataDir string, projects proto
 				return err
 			}
 			_, err = tx.ExecContext(ctx, `
-				INSERT INTO projects (project_id, display_name, repo_identity, default_branch, mirror_bare_path, config_json, archived, updated_at)
-				VALUES (?, ?, ?, ?, ?, ?, 0, ?)
+				INSERT INTO projects (project_id, display_name, repo_identity, default_branch, mirror_bare_path, config_json, archived, source, updated_at)
+				VALUES (?, ?, ?, ?, ?, ?, 0, 'yaml', ?)
 				ON CONFLICT(project_id) DO UPDATE SET
 					display_name = excluded.display_name,
 					repo_identity = excluded.repo_identity,
@@ -84,6 +84,7 @@ func (s *Store) SyncRegistry(ctx context.Context, dataDir string, projects proto
 					mirror_bare_path = excluded.mirror_bare_path,
 					config_json = excluded.config_json,
 					archived = 0,
+					source = 'yaml',
 					updated_at = excluded.updated_at
 			`, projectID, p.DisplayName, p.RepoIdentity, branch, mirrorPath, string(cfgJSON), now)
 			if err != nil {
@@ -120,7 +121,7 @@ func (s *Store) Bootstrap(ctx context.Context, machineMeta map[string]protocol.M
 		// Projects with live active & blocked counts (real projects first, _scratch last)
 		rows, err := tx.QueryContext(ctx, `
 			SELECT p.project_id, p.display_name, p.repo_identity, p.default_branch,
-			       p.mirror_bare_path, p.config_json, p.archived, p.updated_at,
+			       p.mirror_bare_path, p.config_json, p.archived, p.source, p.updated_at,
 			       COALESCE(SUM(CASE WHEN t.state IN ('queued','running','waiting_approval','in_review') THEN 1 ELSE 0 END), 0) AS active_count,
 			       COALESCE(SUM(CASE WHEN t.state IN ('waiting_resource','failed') THEN 1 ELSE 0 END), 0) AS blocked_count
 			FROM projects p
@@ -136,16 +137,21 @@ func (s *Store) Bootstrap(ctx context.Context, machineMeta map[string]protocol.M
 
 		for rows.Next() {
 			var pv protocol.ProjectView
-			var cfgJSON string
+			var cfgJSON, srcStr string
 			var archived int
 			if err := rows.Scan(
 				&pv.ProjectID, &pv.DisplayName, &pv.RepoIdentity, &pv.DefaultBranch,
-				&pv.MirrorBarePath, &cfgJSON, &archived, &pv.UpdatedAt,
+				&pv.MirrorBarePath, &cfgJSON, &archived, &srcStr, &pv.UpdatedAt,
 				&pv.ActiveTaskCount, &pv.BlockedTaskCount,
 			); err != nil {
 				return err
 			}
 			pv.Archived = archived != 0
+			if srcStr != "" {
+				pv.Source = protocol.ProjectSource(srcStr)
+			} else {
+				pv.Source = protocol.ProjectSourceYAML
+			}
 			var cfg protocol.ProjectConfig
 			if err := json.Unmarshal([]byte(cfgJSON), &cfg); err == nil {
 				pv.DefaultCapability = cfg.DefaultCapability
@@ -165,9 +171,39 @@ func (s *Store) Bootstrap(ctx context.Context, machineMeta map[string]protocol.M
 			return err
 		}
 
+		// Collect active DB credentials & soft-removed paired machines in the same read snapshot
+		dbCreds := map[string]bool{}
+		if cRows, err := tx.QueryContext(ctx, `SELECT DISTINCT machine_id FROM machine_credentials WHERE revoked_at IS NULL`); err == nil {
+			for cRows.Next() {
+				var mid string
+				if cRows.Scan(&mid) == nil {
+					dbCreds[mid] = true
+				}
+			}
+			cRows.Close()
+		}
+		regInfo := map[string]struct {
+			displayName string
+			removed     bool
+		}{}
+		if rRows, err := tx.QueryContext(ctx, `SELECT machine_id, display_name, removed_at IS NOT NULL FROM registry_machines`); err == nil {
+			for rRows.Next() {
+				var mid, dn string
+				var rem bool
+				if rRows.Scan(&mid, &dn, &rem) == nil {
+					regInfo[mid] = struct {
+						displayName string
+						removed     bool
+					}{displayName: dn, removed: rem}
+				}
+			}
+			rRows.Close()
+		}
+
 		// Machines
 		mRows, err := tx.QueryContext(ctx, `
 			SELECT machine_id, transport_mode, status, capabilities_json, adapters_json, resources_json,
+			       agents_json, display_alias, runner_caps_json,
 			       runner_version, last_seen_at, updated_at
 			FROM machines
 			ORDER BY machine_id ASC
@@ -179,24 +215,45 @@ func (s *Store) Bootstrap(ctx context.Context, machineMeta map[string]protocol.M
 
 		for mRows.Next() {
 			var mv protocol.MachineView
-			var transport, status, capsJSON, adaptersJSON, resJSON string
+			var transport, status, capsJSON, adaptersJSON, resJSON, agentsJSON, displayAlias, runnerCapsJSON string
 			var runnerVer sql.NullString
 			var lastSeen sql.NullInt64
 			if err := mRows.Scan(
 				&mv.MachineID, &transport, &status, &capsJSON, &adaptersJSON, &resJSON,
+				&agentsJSON, &displayAlias, &runnerCapsJSON,
 				&runnerVer, &lastSeen, &mv.UpdatedAt,
 			); err != nil {
 				return err
 			}
+			cfg, inYAML := machineMeta[mv.MachineID]
+			ri, inReg := regInfo[mv.MachineID]
+			// Hide soft-removed paired machines unless declared in YAML
+			if !inYAML && inReg && ri.removed {
+				continue
+			}
+
 			mv.TransportMode = protocol.TransportMode(transport)
 			mv.Status = protocol.MachineStatus(status)
 			mv.DisplayName = mv.MachineID
-			if cfg, ok := machineMeta[mv.MachineID]; ok {
+			mv.DisplayAlias = strings.TrimSpace(displayAlias)
+			if inYAML {
+				mv.Source = protocol.MachineSourceYAML
 				if cfg.DisplayName != "" {
 					mv.DisplayName = cfg.DisplayName
 				}
 				mv.TailscaleHost = cfg.TailscaleHost
 				mv.SSHAlias = cfg.SSHAlias
+				if strings.TrimSpace(cfg.TokenHash) != "" {
+					mv.HasCredentials = true
+				}
+			} else {
+				mv.Source = protocol.MachineSourcePaired
+				if inReg && ri.displayName != "" {
+					mv.DisplayName = ri.displayName
+				}
+			}
+			if dbCreds[mv.MachineID] {
+				mv.HasCredentials = true
 			}
 			if runnerVer.Valid {
 				mv.RunnerVersion = runnerVer.String
@@ -216,6 +273,14 @@ func (s *Store) Bootstrap(ctx context.Context, machineMeta map[string]protocol.M
 			_ = json.Unmarshal([]byte(resJSON), &mv.Resources)
 			if mv.Resources == nil {
 				mv.Resources = map[string]protocol.ResourceState{}
+			}
+			_ = json.Unmarshal([]byte(agentsJSON), &mv.Agents)
+			if mv.Agents == nil {
+				mv.Agents = []protocol.AgentProbe{}
+			}
+			_ = json.Unmarshal([]byte(runnerCapsJSON), &mv.RunnerCapabilities)
+			if mv.RunnerCapabilities == nil {
+				mv.RunnerCapabilities = []string{}
 			}
 			resp.Machines = append(resp.Machines, mv)
 		}
@@ -330,15 +395,15 @@ func scanInboxItem(scanner interface{ Scan(...any) error }) (protocol.InboxItemV
 // GetProject returns a single project view by ID.
 func (s *Store) GetProject(ctx context.Context, projectID string) (protocol.ProjectView, error) {
 	var pv protocol.ProjectView
-	var cfgJSON string
+	var cfgJSON, srcStr string
 	var archived int
 	err := s.ro.QueryRowContext(ctx, `
 		SELECT project_id, display_name, repo_identity, default_branch,
-		       mirror_bare_path, config_json, archived, updated_at
+		       mirror_bare_path, config_json, archived, source, updated_at
 		FROM projects WHERE project_id = ?
 	`, projectID).Scan(
 		&pv.ProjectID, &pv.DisplayName, &pv.RepoIdentity, &pv.DefaultBranch,
-		&pv.MirrorBarePath, &cfgJSON, &archived, &pv.UpdatedAt,
+		&pv.MirrorBarePath, &cfgJSON, &archived, &srcStr, &pv.UpdatedAt,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return pv, ErrNotFound
@@ -347,6 +412,11 @@ func (s *Store) GetProject(ctx context.Context, projectID string) (protocol.Proj
 		return pv, err
 	}
 	pv.Archived = archived != 0
+	if srcStr != "" {
+		pv.Source = protocol.ProjectSource(srcStr)
+	} else {
+		pv.Source = protocol.ProjectSourceYAML
+	}
 	var cfg protocol.ProjectConfig
 	if err := json.Unmarshal([]byte(cfgJSON), &cfg); err == nil {
 		pv.DefaultCapability = cfg.DefaultCapability

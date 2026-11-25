@@ -3,16 +3,16 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>连接 hebi8-Orbit Hub</title>
+  <title>开始使用 hebi8-Orbit</title>
   <style>
     :root {
-      --bg: #0f0f11; --panel: #151518; --raised: #1c1c20; --line: rgba(255,255,255,.09);
+      --bg: #0f0f11; --panel: #151518; --raised: #1c1c20; --line: rgba(255,255,255,.09); --line-on: rgba(163,184,255,.45);
       --fg: #ececef; --muted: #8a8a93; --accent: #a3b8ff; --bad: #ef7f7f; --ok: #72cf98;
       color-scheme: dark light;
     }
     @media (prefers-color-scheme: light) {
       :root {
-        --bg: #fcfcfb; --panel: #ffffff; --raised: #f4f4f2; --line: rgba(0,0,0,.1);
+        --bg: #fcfcfb; --panel: #ffffff; --raised: #f4f4f2; --line: rgba(0,0,0,.1); --line-on: rgba(53,85,208,.45);
         --fg: #18181b; --muted: #6e6e77; --accent: #3555d0; --bad: #d24646; --ok: #177a41;
       }
     }
@@ -21,77 +21,228 @@
       margin: 0; height: 100%; background: var(--bg); color: var(--fg);
       font: 13px/1.5 -apple-system, BlinkMacSystemFont, "Inter", "PingFang SC", sans-serif;
       display: grid; place-items: center;
+      -webkit-font-smoothing: antialiased;
     }
-    .card {
-      width: min(440px, calc(100vw - 32px)); background: var(--panel);
-      border: 1px solid var(--line); border-radius: 14px; padding: 24px 26px;
+    .wrap {
+      width: min(420px, calc(100vw - 32px));
     }
-    .brand { display: flex; align-items: center; gap: 9px; font-weight: 600; font-size: 14px; margin-bottom: 18px; }
-    .mark { width: 18px; height: 18px; border-radius: 50%; border: 1.5px solid var(--fg); position: relative; }
-    .mark::after { content: ""; position: absolute; width: 5px; height: 5px; border-radius: 50%; background: var(--accent); top: -2px; right: 0; }
-    h1 { font-size: 17px; font-weight: 600; margin: 0 0 6px; letter-spacing: -.01em; }
-    p { margin: 0 0 18px; color: var(--muted); font-size: 12.5px; }
-    label { display: block; font-size: 11.5px; color: var(--muted); margin-bottom: 6px; }
-    input {
-      width: 100%; height: 36px; border-radius: 8px; border: 1px solid var(--line);
-      background: var(--raised); color: var(--fg); padding: 0 11px; font: 13px ui-monospace, Menlo, monospace; outline: none;
+    .brand {
+      display: flex; align-items: center; gap: 9px; font-weight: 600; font-size: 14px;
+      margin-bottom: 22px; letter-spacing: -.01em;
     }
-    input:focus { border-color: var(--accent); }
-    .row { display: flex; align-items: center; justify-content: flex-end; gap: 8px; margin-top: 14px; }
-    button {
-      height: 32px; padding: 0 14px; border-radius: 8px; border: 0; cursor: pointer;
+    .mark {
+      width: 18px; height: 18px; border-radius: 50%; border: 1.5px solid var(--fg); position: relative;
+    }
+    .mark::after {
+      content: ""; position: absolute; width: 5px; height: 5px; border-radius: 50%;
+      background: var(--accent); top: -2px; right: 0;
+    }
+    .cards { display: flex; flex-direction: column; gap: 10px; }
+    .opt {
+      background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+      padding: 15px 16px; cursor: pointer; transition: border-color .14s ease, background .14s ease;
+    }
+    .opt.on { border-color: var(--line-on); background: var(--panel); }
+    .opt-head { display: flex; align-items: flex-start; gap: 10px; }
+    .radio {
+      width: 15px; height: 15px; border-radius: 50%; border: 1.5px solid var(--muted);
+      margin-top: 2px; flex-shrink: 0; display: grid; place-items: center;
+    }
+    .opt.on .radio { border-color: var(--accent); }
+    .opt.on .radio::after {
+      content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--accent);
+    }
+    .opt-title { font-size: 14px; font-weight: 600; letter-spacing: -.01em; }
+    .opt-sub { font-size: 12px; color: var(--muted); margin-top: 2px; }
+    .opt-body { margin-top: 13px; padding-left: 25px; display: none; }
+    .opt.on .opt-body { display: block; }
+    input[type="text"] {
+      width: 100%; height: 35px; border-radius: 8px; border: 1px solid var(--line);
+      background: var(--raised); color: var(--fg); padding: 0 11px;
+      font: 12.5px ui-monospace, Menlo, monospace; outline: none;
+    }
+    input[type="text"]:focus { border-color: var(--accent); }
+    .chk {
+      display: flex; align-items: center; gap: 7px; margin-top: 10px;
+      font-size: 12px; color: var(--muted); user-select: none; cursor: pointer;
+    }
+    .chk input { margin: 0; accent-color: var(--accent); }
+    .foot {
+      display: flex; align-items: center; justify-content: flex-end; gap: 8px; margin-top: 14px;
+    }
+    button.pri {
+      height: 32px; padding: 0 15px; border-radius: 8px; border: 0; cursor: pointer;
       font: 500 12.5px inherit; background: var(--fg); color: var(--bg);
     }
-    button:disabled { opacity: .45; cursor: default; }
-    .msg { margin-top: 12px; font-size: 12px; min-height: 18px; color: var(--muted); }
-    .msg.err { color: var(--bad); }
-    .msg.ok { color: var(--ok); }
+    button.pri:disabled { opacity: .45; cursor: default; }
+    .status {
+      margin-top: 14px; min-height: 20px; font-size: 12px; color: var(--muted);
+      display: flex; align-items: center; gap: 8px;
+    }
+    .status.err { color: var(--bad); }
+    .status.ok { color: var(--ok); }
+    .dots { display: inline-flex; gap: 3px; }
+    .dots span { width: 4px; height: 4px; border-radius: 50%; background: currentColor; opacity: .55; }
   </style>
 </head>
 <body>
-  <form class="card" id="f">
+  <div class="wrap">
     <div class="brand"><span class="mark"></span>hebi8-Orbit</div>
-    <h1>连接到 Orbit Hub</h1>
-    <p>输入你的 Tailscale HTTPS 或本机 Hub 地址，配置将保存在 ~/.config/hebi8-orbit/client.yaml。</p>
-    <label for="u">Hub 地址</label>
-    <input id="u" type="url" placeholder="https://orbit.example.ts.net" autocomplete="off" spellcheck="false" required />
-    <div class="row">
-      <button type="submit" id="btn">连接</button>
+
+    <div class="cards" id="cards">
+      <div class="opt on" data-mode="local" tabindex="0" role="radio" aria-checked="true">
+        <div class="opt-head">
+          <span class="radio"></span>
+          <div>
+            <div class="opt-title">就在这台机器用</div>
+            <div class="opt-sub">之后随时可以添加其他机器</div>
+          </div>
+        </div>
+        <div class="opt-body">
+          <div class="foot">
+            <button type="button" class="pri" id="btnLocal">开始使用</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="opt" data-mode="remote" tabindex="0" role="radio" aria-checked="false">
+        <div class="opt-head">
+          <span class="radio"></span>
+          <div>
+            <div class="opt-title">连到已有的 Orbit</div>
+            <div class="opt-sub">使用另一台机器上的邀请命令、链接或地址</div>
+          </div>
+        </div>
+        <div class="opt-body">
+          <input id="joinInput" type="text" placeholder="粘贴邀请命令，或输入地址" autocomplete="off" spellcheck="false" />
+          <label class="chk">
+            <input id="asRunner" type="checkbox" checked />
+            <span>也让这台机器执行任务</span>
+          </label>
+          <div class="foot">
+            <button type="button" class="pri" id="btnJoin">连接</button>
+          </div>
+        </div>
+      </div>
     </div>
-    <div class="msg" id="msg"></div>
-  </form>
+
+    <div class="status" id="status" role="status"></div>
+  </div>
+
   <script>
-    const input = document.getElementById('u');
-    const btn = document.getElementById('btn');
-    const msg = document.getElementById('msg');
-    fetch('/api/current').then(r => r.json()).then(d => {
-      if (d.hubUrl) input.value = d.hubUrl;
-      input.focus();
-    }).catch(() => {});
-    document.getElementById('f').addEventListener('submit', async (e) => {
-      e.preventDefault();
-      const raw = input.value.trim();
-      if (!raw) return;
-      btn.disabled = true;
-      msg.className = 'msg';
-      msg.textContent = '检查 Hub 连通性…';
+    let mode = 'local';
+    let busy = false;
+    const cards = Array.from(document.querySelectorAll('.opt'));
+    const joinInput = document.getElementById('joinInput');
+    const asRunner = document.getElementById('asRunner');
+    const btnLocal = document.getElementById('btnLocal');
+    const btnJoin = document.getElementById('btnJoin');
+    const statusEl = document.getElementById('status');
+
+    function setMode(next) {
+      if (busy) return;
+      mode = next;
+      cards.forEach(c => {
+        const on = c.dataset.mode === next;
+        c.classList.toggle('on', on);
+        c.setAttribute('aria-checked', on ? 'true' : 'false');
+      });
+      statusEl.className = 'status';
+      statusEl.textContent = '';
+      if (next === 'remote') {
+        setTimeout(() => joinInput.focus(), 10);
+      }
+    }
+
+    cards.forEach(c => {
+      c.addEventListener('click', (e) => {
+        if (e.target.closest('button, input, label')) return;
+        setMode(c.dataset.mode);
+      });
+    });
+
+    function setBusy(on, text, cls) {
+      busy = on;
+      btnLocal.disabled = on;
+      btnJoin.disabled = on;
+      joinInput.disabled = on;
+      asRunner.disabled = on;
+      statusEl.className = 'status' + (cls ? ' ' + cls : '');
+      statusEl.innerHTML = on
+        ? '<span class="dots"><span></span><span></span><span></span></span><span>' + text + '</span>'
+        : text;
+    }
+
+    async function startLocal() {
+      if (busy) return;
+      setBusy(true, '正在准备本机环境…');
       try {
-        const res = await fetch('/api/connect', {
+        const res = await fetch('/api/local-start', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ hubUrl: raw }),
+          headers: { 'X-Orbit-Setup': '1' },
         });
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
-        msg.className = 'msg ok';
-        msg.textContent = '已连接，正在进入工作台…';
-        window.location.href = data.hubUrl + '/';
+        setBusy(false, '已就绪，正在进入…', 'ok');
+        window.location.href = data.openUrl || (data.hubUrl + '/');
       } catch (err) {
-        msg.className = 'msg err';
-        msg.textContent = err.message || String(err);
-        btn.disabled = false;
+        setBusy(false, err.message || String(err), 'err');
+      }
+    }
+
+    async function joinRemote() {
+      if (busy) return;
+      const raw = joinInput.value.trim();
+      if (!raw) {
+        joinInput.focus();
+        return;
+      }
+      setBusy(true, '正在连接…');
+      try {
+        const res = await fetch('/api/join', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-Orbit-Setup': '1' },
+          body: JSON.stringify({ input: raw, asRunner: asRunner.checked }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
+        if (data.runnerError) {
+          setBusy(false, '客户端已连接，但本机执行节点启动失败：' + data.runnerError, 'err');
+          setTimeout(() => { window.location.href = data.openUrl || (data.hubUrl + '/'); }, 2200);
+          return;
+        }
+        setBusy(
+          false,
+          data.runnerStarted
+            ? '客户端与本机执行节点已上线，正在进入…'
+            : (asRunner.checked ? '客户端已连接，执行节点正在后台连接…' : '已连接，正在进入…'),
+          'ok',
+        );
+        window.location.href = data.openUrl || (data.hubUrl + '/');
+      } catch (err) {
+        setBusy(false, err.message || String(err), 'err');
+      }
+    }
+
+    btnLocal.addEventListener('click', startLocal);
+    btnJoin.addEventListener('click', joinRemote);
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.isComposing) {
+        if (mode === 'local') {
+          e.preventDefault();
+          startLocal();
+        } else if (document.activeElement === joinInput) {
+          e.preventDefault();
+          joinRemote();
+        }
       }
     });
+
+    fetch('/api/current').then(r => r.json()).then(d => {
+      if (d.hubUrl && d.mode === 'remote') {
+        joinInput.value = d.hubUrl;
+      }
+    }).catch(() => {});
   </script>
 </body>
 </html>

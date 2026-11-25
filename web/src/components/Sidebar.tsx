@@ -66,7 +66,15 @@ function WorkspaceFooterButton({
   );
 }
 
-export function Sidebar({ boot, route }: { boot: BootstrapResponse; route: Route }) {
+export function Sidebar({
+  boot,
+  route,
+  onAddProject,
+}: {
+  boot: BootstrapResponse;
+  route: Route;
+  onAddProject?: () => void;
+}) {
   const expanded = useWorkbenchStore((s) => s.expandedProjects);
   const setExpanded = useWorkbenchStore((s) => s.setProjectExpanded);
   const toggleSidebar = useWorkbenchStore((s) => s.toggleSidebar);
@@ -126,7 +134,7 @@ export function Sidebar({ boot, route }: { boot: BootstrapResponse; route: Route
           </button>
         </div>
         <nav className="projects" aria-label="项目">
-          {projects.length === 0 && <div className="quiet" style={{ padding: '4px 8px' }}>还没有注册项目</div>}
+          {projects.length === 0 && <div className="quiet" style={{ padding: '4px 8px' }}>还没有项目</div>}
           {projects.map((p) => {
             const open = isOpen(p);
             const allProjTasks = tasksByProject[p.projectId] ?? [];
@@ -202,6 +210,12 @@ export function Sidebar({ boot, route }: { boot: BootstrapResponse; route: Route
                 );
               })}
             </>
+          )}
+          {onAddProject && (
+            <button type="button" className="side-add-proj" onClick={onAddProject}>
+              <Plus size={12.5} strokeWidth={1.7} />
+              <span>添加项目</span>
+            </button>
           )}
         </nav>
         <div className="sfoot">

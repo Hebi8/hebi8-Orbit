@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strings"
@@ -39,6 +38,7 @@ func main() {
 		codexBin    = flag.String("codex-bin", "", "override codex-acp executable path")
 		orbitBinDir = flag.String("orbit-bin-dir", "", "directory containing `orbit` CLI to prepend to child PATH")
 		idleClose   = flag.Int("idle-close-seconds", -1, "idle ACP session close timeout in seconds (0 disables)")
+		parentPID   = flag.Int("parent-pid", 0, "optional parent PID to watch; exits cleanly if parent disappears")
 		showVersion = flag.Bool("version", false, "print orbit-runner version and exit")
 	)
 	flag.Parse()
@@ -50,11 +50,15 @@ func main() {
 
 	expCfgDir := protocol.ExpandPath(*configDir)
 	hubCfg, _ := protocol.LoadHubConfig(filepath.Join(expCfgDir, "hub.yaml"))
+	runnerLocalCfg, hasRunnerYAML := protocol.LoadRunnerLocalConfig(filepath.Join(expCfgDir, "runner.yaml"))
 	machinesCfg, _ := protocol.LoadMachinesConfig(filepath.Join(expCfgDir, "machines.yaml"))
 
 	mid := strings.TrimSpace(*machineID)
 	if mid == "" {
 		mid = strings.TrimSpace(os.Getenv("ORBIT_MACHINE_ID"))
+	}
+	if mid == "" && hasRunnerYAML == nil && strings.TrimSpace(runnerLocalCfg.MachineID) != "" {
+		mid = strings.TrimSpace(runnerLocalCfg.MachineID)
 	}
 	if mid == "" {
 		for id, m := range machinesCfg.Machines {
@@ -69,6 +73,9 @@ func main() {
 	}
 
 	expDataDir := strings.TrimSpace(*dataDir)
+	if expDataDir == "" && hasRunnerYAML == nil && strings.TrimSpace(runnerLocalCfg.DataDir) != "" {
+		expDataDir = runnerLocalCfg.DataDir
+	}
 	if expDataDir == "" {
 		expDataDir = hubCfg.DataDir
 	}
@@ -79,6 +86,24 @@ func main() {
 
 	wsURL := strings.TrimSpace(*hubWS)
 	httpURL := strings.TrimSpace(*hubHTTP)
+	if wsURL == "" && hasRunnerYAML == nil {
+		if strings.TrimSpace(runnerLocalCfg.HubWSURL) != "" {
+			wsURL = strings.TrimSpace(runnerLocalCfg.HubWSURL)
+		}
+		if strings.TrimSpace(runnerLocalCfg.HubURL) != "" {
+			if httpURL == "" {
+				httpURL = strings.TrimRight(strings.TrimSpace(runnerLocalCfg.HubURL), "/")
+			}
+			if wsURL == "" {
+				u := strings.TrimRight(strings.TrimSpace(runnerLocalCfg.HubURL), "/")
+				if strings.HasPrefix(u, "https://") {
+					wsURL = "wss://" + strings.TrimPrefix(u, "https://") + "/ws/runner"
+				} else if strings.HasPrefix(u, "http://") {
+					wsURL = "ws://" + strings.TrimPrefix(u, "http://") + "/ws/runner"
+				}
+			}
+		}
+	}
 	if wsURL == "" {
 		addr := hubCfg.ListenAddr
 		if addr == "" {
@@ -129,79 +154,22 @@ func main() {
 		protocol.AdapterCodex:  strings.TrimSpace(*codexBin),
 	}
 
-	drivers := map[protocol.Adapter]runner.AcpAdapterDriver{}
-	var supported []protocol.Adapter
-	var adapterDesc []string
 	idleSec := 1200
 	maxLiveWorkers := 0
-
-	mCfg, hasMachineCfg := machinesCfg.Machines[mid]
-	for _, adp := range protocol.Phase1ImplementedSessionAdapters {
-		var aCfg protocol.AdapterConfig
-		configured := false
-		if hasMachineCfg {
-			aCfg, configured = mCfg.Adapters[string(adp)]
-		}
-		bin := binOverrides[adp]
-		if bin == "" && configured {
-			bin = strings.TrimSpace(aCfg.Bin)
-		}
-		bin = protocol.ExpandPath(bin)
-
-		// If not explicitly configured in machines.yaml, auto-detect optional adapters only when executable exists.
-		if !configured && bin == "" {
-			defaultBin := defaultAdapterBin(adp)
-			if resolved, ok := resolveExecutable(defaultBin, binDir); ok {
-				bin = resolved
-			} else if adp == protocol.AdapterAgy && !hasMachineCfg {
-				bin = defaultBin
-			} else {
-				continue
+	fileConfigs := map[protocol.Adapter]protocol.AdapterConfig{}
+	if mCfg, ok := machinesCfg.Machines[mid]; ok {
+		for k, aCfg := range mCfg.Adapters {
+			adp := protocol.Adapter(k)
+			if protocol.IsSessionAdapterImplemented(adp) {
+				fileConfigs[adp] = aCfg
+				if aCfg.IdleCloseSeconds > 0 && (adp == protocol.AdapterAgy || idleSec == 1200) {
+					idleSec = aCfg.IdleCloseSeconds
+				}
+				if aCfg.MaxLiveWorkers > maxLiveWorkers {
+					maxLiveWorkers = aCfg.MaxLiveWorkers
+				}
 			}
-		} else if bin == "" {
-			bin = defaultAdapterBin(adp)
 		}
-
-		if resolved, ok := resolveExecutable(bin, binDir); ok {
-			bin = resolved
-		} else if configured {
-			log.Printf("orbit-runner: configured adapter %s binary %q not found on PATH; skipping", adp, bin)
-			continue
-		}
-
-		if aCfg.IdleCloseSeconds > 0 && (adp == protocol.AdapterAgy || idleSec == 1200) {
-			idleSec = aCfg.IdleCloseSeconds
-		}
-		if aCfg.MaxLiveWorkers > maxLiveWorkers {
-			maxLiveWorkers = aCfg.MaxLiveWorkers
-		}
-
-		drivers[adp] = runner.NewAdapterDriver(adp, runner.AgyDriverConfig{
-			Adapter:       adp,
-			Bin:           bin,
-			Args:          aCfg.DefaultArgs,
-			RunnerSock:    sock,
-			OrbitBinDir:   binDir,
-			RunnerVersion: Version,
-		})
-		supported = append(supported, adp)
-		adapterDesc = append(adapterDesc, fmt.Sprintf("%s=%s", adp, bin))
-	}
-
-	if len(drivers) == 0 {
-		fallbackBin := binOverrides[protocol.AdapterAgy]
-		if fallbackBin == "" {
-			fallbackBin = "agy"
-		}
-		drivers[protocol.AdapterAgy] = runner.NewAdapterDriver(protocol.AdapterAgy, runner.AgyDriverConfig{
-			Adapter:       protocol.AdapterAgy,
-			Bin:           fallbackBin,
-			RunnerSock:    sock,
-			OrbitBinDir:   binDir,
-			RunnerVersion: Version,
-		})
-		supported = []protocol.Adapter{protocol.AdapterAgy}
-		adapterDesc = []string{"agy=" + fallbackBin}
 	}
 
 	if *idleClose >= 0 {
@@ -211,18 +179,39 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	if *parentPID > 0 {
+		protocol.StartParentWatchdog(ctx, *parentPID, func() {
+			log.Printf("orbit-runner: parent pid %d exited; shutting down", *parentPID)
+			stop()
+		})
+	}
+
+	runnerLock, err := protocol.AcquireFileLock(filepath.Join(expDataDir, "runner-"+mid+".lock"))
+	if err != nil {
+		log.Fatalf("orbit-runner single-instance lock: %v", err)
+	}
+	defer runnerLock.Release()
+
+	agentMgr := runner.NewAgentManager(runner.AgentManagerConfig{
+		DataDir:       expDataDir,
+		OrbitBinDir:   binDir,
+		SocketPath:    sock,
+		RunnerVersion: Version,
+		FlagBins:      binOverrides,
+		FileConfigs:   fileConfigs,
+	})
+
 	r, err := runner.New(ctx, runner.Config{
-		MachineID:         mid,
-		HubWSURL:          wsURL,
-		HubHTTPURL:        httpURL,
-		BearerToken:       bearer,
-		DataDir:           expDataDir,
-		SocketPath:        sock,
-		RunnerVersion:     Version,
-		Drivers:           drivers,
-		SupportedAdapters: supported,
-		MaxLiveWorkers:    maxLiveWorkers,
-		IdleCloseSeconds:  idleSec,
+		MachineID:        mid,
+		HubWSURL:         wsURL,
+		HubHTTPURL:       httpURL,
+		BearerToken:      bearer,
+		DataDir:          expDataDir,
+		SocketPath:       sock,
+		RunnerVersion:    Version,
+		AgentManager:     agentMgr,
+		MaxLiveWorkers:   maxLiveWorkers,
+		IdleCloseSeconds: idleSec,
 	})
 	if err != nil {
 		log.Fatalf("init orbit-runner: %v", err)
@@ -231,8 +220,13 @@ func main() {
 	if err := r.Start(ctx); err != nil {
 		log.Fatalf("start orbit-runner: %v", err)
 	}
-	log.Printf("orbit-runner started (version=%s machine=%s instance=%s hub=%s sock=%s adapters=[%s])",
-		Version, mid, r.InstanceID(), wsURL, r.SocketPath(), strings.Join(adapterDesc, ", "))
+	probes := agentMgr.SnapshotProbes()
+	var probeDesc []string
+	for _, p := range probes {
+		probeDesc = append(probeDesc, fmt.Sprintf("%s=%s", p.Adapter, p.State))
+	}
+	log.Printf("orbit-runner started (version=%s machine=%s instance=%s hub=%s sock=%s agents=[%s])",
+		Version, mid, r.InstanceID(), wsURL, r.SocketPath(), strings.Join(probeDesc, ", "))
 
 	<-ctx.Done()
 	log.Printf("orbit-runner shutting down...")
@@ -241,37 +235,4 @@ func main() {
 	if err := r.Close(shutCtx); err != nil {
 		log.Printf("orbit-runner shutdown error: %v", err)
 	}
-}
-
-func defaultAdapterBin(adp protocol.Adapter) string {
-	switch adp {
-	case protocol.AdapterClaude:
-		return "claude-agent-acp"
-	case protocol.AdapterCodex:
-		return "codex-acp"
-	default:
-		return "agy"
-	}
-}
-
-func resolveExecutable(bin, extraDir string) (string, bool) {
-	if bin == "" {
-		return "", false
-	}
-	if strings.Contains(bin, string(os.PathSeparator)) {
-		if fi, err := os.Stat(bin); err == nil && !fi.IsDir() {
-			return bin, true
-		}
-		return "", false
-	}
-	if extraDir != "" {
-		cand := filepath.Join(extraDir, bin)
-		if fi, err := os.Stat(cand); err == nil && !fi.IsDir() {
-			return cand, true
-		}
-	}
-	if found, err := exec.LookPath(bin); err == nil {
-		return found, true
-	}
-	return "", false
 }

@@ -73,6 +73,20 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	}
 
 	switch args[0] {
+	case "up":
+		return runUp(ctx, args[1:], stdout, stderr)
+	case "pair":
+		return runPair(ctx, args[1:], stdout, stderr)
+	case "join":
+		return runJoin(ctx, args[1:], stdout, stderr)
+	case "agents", "agent":
+		return runAgents(ctx, args[1:], stdout, stderr)
+	case "machines", "machine":
+		return runMachines(ctx, args[1:], stdout, stderr)
+	case "projects", "project":
+		return runProjects(ctx, args[1:], stdout, stderr)
+	case "service":
+		return runService(ctx, args[1:], stdout, stderr)
 	case "init":
 		return runInit(ctx, args[1:], os.Stdin, stdout, stderr)
 	case "version", "--version", "-v":
@@ -104,6 +118,13 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 
 func printUsage(w io.Writer) {
 	fmt.Fprintln(w, `Usage:
+  orbit up [--no-runner] [--service] [--json]               Start or attach to local Orbit on this machine
+  orbit pair [--runner|--client|--both] [--machine <id>]    Generate a one-time pairing code & wait for node
+  orbit join <hub-url> <pair-code> [--no-runner] [--service] Join an existing Orbit network
+  orbit agents [list|check|test|install|enable|disable] ... Inspect and configure machine Agents
+  orbit machines [ls|rename|rm] ...                         Manage connected machines
+  orbit projects [ls|add|rm] ...                            Manage registered projects
+  orbit service [install|uninstall|status] [hub|runner|all] Manage background user services
   orbit init [--connect <url> | --hub | --runner --hub-url <url> | --project [dir]]
   orbit status [--hub <url>] [--json]
   orbit tasks [list|new|show|followup|cancel|retry] ...
@@ -122,13 +143,14 @@ Environment variables:
   ORBIT_RUNNER_SOCK Local runner Unix domain socket (auto-injected for ACP agent deliveries)
   ORBIT_ATTEMPT_ID  Optional active attempt ID override for runner socket delivery
   ORBIT_TASK_ID     Optional active task ID override for runner socket delivery
-  ORBIT_HUB_URL     Hub HTTP base URL (default from hub.yaml or http://127.0.0.1:4310)
+  ORBIT_HUB_URL     Hub HTTP base URL (default from client.yaml/hub.yaml or http://127.0.0.1:4310)
   ORBIT_CONFIG_DIR  Config directory (default ~/.config/hebi8-orbit)
   ORBIT_DATA_DIR    Data directory (default from hub.yaml or ~/.local/share/hebi8-orbit)
+  ORBIT_CLIENT_TOKEN Optional paired client Bearer token (ock_...)
   ORBIT_DEV_TOKEN   Optional loopback dev token header`)
 }
 
-func resolveHubDefaults(configDirFlag, dataDirFlag, hubURLFlag, tokenFlag string) (hubURL, dataDir, devToken string) {
+func resolveHubAuth(configDirFlag, dataDirFlag, hubURLFlag, tokenFlag string) (hubURL, dataDir, devToken, clientToken string) {
 	cfgDir := configDirFlag
 	if cfgDir == "" {
 		cfgDir = os.Getenv("ORBIT_CONFIG_DIR")
@@ -140,8 +162,9 @@ func resolveHubDefaults(configDirFlag, dataDirFlag, hubURLFlag, tokenFlag string
 
 	hubCfg, _ := protocol.LoadHubConfig(filepath.Join(cfgDir, "hub.yaml"))
 	var clientCfg struct {
-		HubURL   string `yaml:"hubUrl"`
-		DevToken string `yaml:"devToken"`
+		HubURL      string `yaml:"hubUrl"`
+		DevToken    string `yaml:"devToken"`
+		ClientToken string `yaml:"clientToken"`
 	}
 	if raw, err := os.ReadFile(filepath.Join(cfgDir, "client.yaml")); err == nil {
 		_ = yaml.Unmarshal(raw, &clientCfg)
@@ -163,29 +186,62 @@ func resolveHubDefaults(configDirFlag, dataDirFlag, hubURLFlag, tokenFlag string
 	if hubURL == "" && strings.TrimSpace(clientCfg.HubURL) != "" {
 		hubURL = strings.TrimSpace(clientCfg.HubURL)
 	}
-	if hubURL == "" {
+	localHubURL := ""
+	{
 		addr := hubCfg.ListenAddr
 		if addr == "" {
 			addr = "127.0.0.1:4310"
 		}
 		if strings.HasPrefix(addr, "http://") || strings.HasPrefix(addr, "https://") {
-			hubURL = addr
+			localHubURL = strings.TrimRight(addr, "/")
 		} else {
-			hubURL = "http://" + addr
+			localHubURL = "http://" + strings.TrimRight(addr, "/")
 		}
+	}
+	if hubURL == "" {
+		hubURL = localHubURL
 	}
 	hubURL = strings.TrimRight(hubURL, "/")
 
-	devToken = tokenFlag
+	// Bind saved credentials strictly to their normalized origin so overriding --hub / ORBIT_HUB_URL
+	// never leaks tokens from another Orbit Hub.
+	clientOriginMatch := strings.TrimSpace(clientCfg.HubURL) != "" && sameOriginURL(hubURL, clientCfg.HubURL)
+	hubOriginMatch := sameOriginURL(hubURL, localHubURL) || (strings.TrimSpace(hubCfg.HubOrigin) != "" && sameOriginURL(hubURL, hubCfg.HubOrigin))
+
+	if strings.HasPrefix(strings.TrimSpace(tokenFlag), "ock_") {
+		clientToken = strings.TrimSpace(tokenFlag)
+	} else {
+		devToken = tokenFlag
+	}
+	if clientToken == "" {
+		clientToken = strings.TrimSpace(os.Getenv("ORBIT_CLIENT_TOKEN"))
+	}
+	if clientToken == "" && clientOriginMatch {
+		clientToken = strings.TrimSpace(clientCfg.ClientToken)
+	}
 	if devToken == "" {
 		devToken = os.Getenv("ORBIT_DEV_TOKEN")
 	}
-	if devToken == "" && strings.TrimSpace(clientCfg.DevToken) != "" {
+	if devToken == "" && clientOriginMatch && strings.TrimSpace(clientCfg.DevToken) != "" {
 		devToken = strings.TrimSpace(clientCfg.DevToken)
 	}
-	if devToken == "" {
+	if devToken == "" && hubOriginMatch {
 		devToken = hubCfg.DevToken
 	}
+	return hubURL, dataDir, devToken, clientToken
+}
+
+func sameOriginURL(a, b string) bool {
+	na, err1 := normalizeHubBaseURL(a)
+	nb, err2 := normalizeHubBaseURL(b)
+	if err1 != nil || err2 != nil {
+		return strings.EqualFold(strings.TrimRight(strings.TrimSpace(a), "/"), strings.TrimRight(strings.TrimSpace(b), "/"))
+	}
+	return strings.EqualFold(na, nb)
+}
+
+func resolveHubDefaults(configDirFlag, dataDirFlag, hubURLFlag, tokenFlag string) (hubURL, dataDir, devToken string) {
+	hubURL, dataDir, devToken, _ = resolveHubAuth(configDirFlag, dataDirFlag, hubURLFlag, tokenFlag)
 	return hubURL, dataDir, devToken
 }
 
@@ -607,14 +663,16 @@ func runStatus(ctx context.Context, args []string, stdout, stderr io.Writer) err
 		return err
 	}
 
-	hubURL, _, devToken := resolveHubDefaults(*configDir, *dataDirFlg, *hubURLFlag, *tokenFlag)
+	hubURL, _, devToken, clientToken := resolveHubAuth(*configDir, *dataDirFlg, *hubURLFlag, *tokenFlag)
 	client := &http.Client{Timeout: 15 * time.Second}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, hubURL+"/api/bootstrap", nil)
 	if err != nil {
 		return err
 	}
-	if devToken != "" {
+	if clientToken != "" {
+		req.Header.Set("Authorization", "Bearer "+clientToken)
+	} else if devToken != "" {
 		req.Header.Set("X-Orbit-Dev-Token", devToken)
 	}
 

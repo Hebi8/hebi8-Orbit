@@ -592,6 +592,10 @@ const (
 	EventTaskSourceAdded         EventKind = "task.source_added"
 	EventTaskSourceRemoved       EventKind = "task.source_removed"
 	EventMachineStateChanged     EventKind = "machine.state_changed"
+	EventPairingUpdated          EventKind = "pairing.updated"
+	EventMachineAgentsUpdated    EventKind = "machine.agents_updated"
+	EventProjectChanged          EventKind = "project.changed"
+	EventNetworkSettingsChanged  EventKind = "network.settings_changed"
 )
 
 var AllEventKinds = []EventKind{
@@ -631,6 +635,10 @@ var AllEventKinds = []EventKind{
 	EventTaskSourceAdded,
 	EventTaskSourceRemoved,
 	EventMachineStateChanged,
+	EventPairingUpdated,
+	EventMachineAgentsUpdated,
+	EventProjectChanged,
+	EventNetworkSettingsChanged,
 }
 
 // IDEScheme defines supported URI schemes for one-click IDE jump.
@@ -690,6 +698,10 @@ const (
 	RunnerMsgOutboxBatch     RunnerWSMessageType = "attempt.outbox_batch"
 	RunnerMsgOutboxAck       RunnerWSMessageType = "hub.outbox_ack"
 	RunnerMsgBoardMessage    RunnerWSMessageType = "board.message"
+	RunnerMsgConfig          RunnerWSMessageType = "runner.config"
+	RunnerMsgRPC             RunnerWSMessageType = "runner.rpc"
+	RunnerMsgAgentsReport    RunnerWSMessageType = "runner.agents_report"
+	RunnerMsgRPCResult       RunnerWSMessageType = "runner.rpc_result"
 )
 
 var AllRunnerWSMessageTypes = []RunnerWSMessageType{
@@ -703,6 +715,10 @@ var AllRunnerWSMessageTypes = []RunnerWSMessageType{
 	RunnerMsgOutboxBatch,
 	RunnerMsgOutboxAck,
 	RunnerMsgBoardMessage,
+	RunnerMsgConfig,
+	RunnerMsgRPC,
+	RunnerMsgAgentsReport,
+	RunnerMsgRPCResult,
 }
 
 func (v RunnerWSMessageType) IsValid() bool { return slices.Contains(AllRunnerWSMessageTypes, v) }
@@ -867,6 +883,112 @@ var AllPAMessageRoles = []PAMessageRole{
 }
 
 func (v PAMessageRole) IsValid() bool { return slices.Contains(AllPAMessageRoles, v) }
+
+// AgentState describes the probed readiness of one ACP agent adapter on a machine.
+type AgentState string
+
+const (
+	AgentStateReady         AgentState = "ready"
+	AgentStateNeedsLogin    AgentState = "needs_login"
+	AgentStateMissingBridge AgentState = "missing_bridge"
+	AgentStateNotInstalled  AgentState = "not_installed"
+	AgentStateError         AgentState = "error"
+	AgentStateDisabled      AgentState = "disabled"
+	AgentStateChecking      AgentState = "checking"
+	AgentStateInstalling    AgentState = "installing"
+)
+
+var AllAgentStates = []AgentState{
+	AgentStateReady,
+	AgentStateNeedsLogin,
+	AgentStateMissingBridge,
+	AgentStateNotInstalled,
+	AgentStateError,
+	AgentStateDisabled,
+	AgentStateChecking,
+	AgentStateInstalling,
+}
+
+func (v AgentState) IsValid() bool { return slices.Contains(AllAgentStates, v) }
+
+// PairingScope defines which credentials a one-time pairing code is allowed to issue.
+type PairingScope string
+
+const (
+	PairingScopeRunner PairingScope = "runner"
+	PairingScopeClient PairingScope = "client"
+	PairingScopeBoth   PairingScope = "both"
+)
+
+var AllPairingScopes = []PairingScope{
+	PairingScopeRunner,
+	PairingScopeClient,
+	PairingScopeBoth,
+}
+
+func (v PairingScope) IsValid() bool { return slices.Contains(AllPairingScopes, v) }
+
+// PairingCodeState tracks the lifecycle of a one-time pairing code.
+type PairingCodeState string
+
+const (
+	PairingCodePending PairingCodeState = "pending"
+	PairingCodeClaimed PairingCodeState = "claimed"
+	PairingCodeExpired PairingCodeState = "expired"
+	PairingCodeRevoked PairingCodeState = "revoked"
+)
+
+var AllPairingCodeStates = []PairingCodeState{
+	PairingCodePending,
+	PairingCodeClaimed,
+	PairingCodeExpired,
+	PairingCodeRevoked,
+}
+
+func (v PairingCodeState) IsValid() bool { return slices.Contains(AllPairingCodeStates, v) }
+
+// MachineSource distinguishes static YAML-managed machines from dynamically paired machines.
+type MachineSource string
+
+const (
+	MachineSourceYAML   MachineSource = "yaml"
+	MachineSourcePaired MachineSource = "paired"
+)
+
+var AllMachineSources = []MachineSource{
+	MachineSourceYAML,
+	MachineSourcePaired,
+}
+
+func (v MachineSource) IsValid() bool { return slices.Contains(AllMachineSources, v) }
+
+// ProjectSource distinguishes static YAML-managed projects from UI/API-registered projects.
+type ProjectSource string
+
+const (
+	ProjectSourceYAML ProjectSource = "yaml"
+	ProjectSourceUI   ProjectSource = "ui"
+)
+
+var AllProjectSources = []ProjectSource{
+	ProjectSourceYAML,
+	ProjectSourceUI,
+}
+
+func (v ProjectSource) IsValid() bool { return slices.Contains(AllProjectSources, v) }
+
+// Runner control-plane capability flags negotiated in runner.hello / hub.welcome.
+const (
+	RunnerCapAgentsV1 = "agents.v1"
+	RunnerCapFSV1     = "fs.v1"
+	RunnerCapBundleV1 = "bundle.v1"
+)
+
+// PinnedBridgePackages defines the exact whitelisted npm packages installed into <dataDir>/acp-adapters.
+var PinnedBridgePackages = map[Adapter]string{
+	AdapterClaude: "@agentclientprotocol/claude-agent-acp@0.112.0",
+	AdapterCodex:  "@agentclientprotocol/codex-acp@2.12.0",
+}
 
 // IsActiveAttemptState reports whether st holds task/session exclusivity.
 func IsActiveAttemptState(st AttemptState) bool {

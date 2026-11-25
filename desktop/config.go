@@ -10,16 +10,23 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// ClientConfig persists user preferences for the thin desktop shell in ~/.config/hebi8-orbit/client.yaml.
+// ClientConfig persists user preferences for the desktop shell in ~/.config/hebi8-orbit/client.yaml.
 type ClientConfig struct {
-	HubURL     string `yaml:"hubUrl"`
-	PAShortcut string `yaml:"paShortcut,omitempty"`
+	HubURL         string `yaml:"hubUrl"`
+	DevToken       string `yaml:"devToken,omitempty"`
+	ClientToken    string `yaml:"clientToken,omitempty"`
+	MachineID      string `yaml:"machineId,omitempty"`
+	Mode           string `yaml:"mode,omitempty"` // local | remote
+	RunLocalRunner bool   `yaml:"runLocalRunner,omitempty"`
+	PAShortcut     string `yaml:"paShortcut,omitempty"`
 }
 
-// hubConfigFallback reads just hubOrigin / listenAddr from hub.yaml when client.yaml is absent.
+// hubConfigFallback reads hub.yaml when client.yaml is absent.
 type hubConfigFallback struct {
 	HubOrigin  string `yaml:"hubOrigin"`
 	ListenAddr string `yaml:"listenAddr"`
+	DevToken   string `yaml:"devToken"`
+	DataDir    string `yaml:"dataDir"`
 }
 
 func defaultConfigDir() string {
@@ -71,6 +78,19 @@ func LoadClientConfig(configDir, explicitURLFlag string) (ClientConfig, error) {
 		if strings.TrimSpace(saved.HubURL) != "" {
 			cfg.HubURL = saved.HubURL
 		}
+		if strings.TrimSpace(saved.DevToken) != "" {
+			cfg.DevToken = strings.TrimSpace(saved.DevToken)
+		}
+		if strings.TrimSpace(saved.ClientToken) != "" {
+			cfg.ClientToken = strings.TrimSpace(saved.ClientToken)
+		}
+		if strings.TrimSpace(saved.MachineID) != "" {
+			cfg.MachineID = strings.TrimSpace(saved.MachineID)
+		}
+		if strings.TrimSpace(saved.Mode) != "" {
+			cfg.Mode = strings.TrimSpace(saved.Mode)
+		}
+		cfg.RunLocalRunner = saved.RunLocalRunner
 		if strings.TrimSpace(saved.PAShortcut) != "" {
 			cfg.PAShortcut = strings.TrimSpace(saved.PAShortcut)
 		}
@@ -85,15 +105,32 @@ func LoadClientConfig(configDir, explicitURLFlag string) (ClientConfig, error) {
 				} else if strings.TrimSpace(hc.ListenAddr) != "" {
 					cfg.HubURL = hc.ListenAddr
 				}
+				if cfg.DevToken == "" && strings.TrimSpace(hc.DevToken) != "" {
+					cfg.DevToken = strings.TrimSpace(hc.DevToken)
+				}
+				if cfg.Mode == "" && cfg.HubURL != "" {
+					cfg.Mode = "local"
+				}
 			}
 		}
 	}
 
+	savedNormOrigin := ""
+	if cfg.HubURL != "" {
+		if norm, err := NormalizeHubURL(cfg.HubURL); err == nil {
+			savedNormOrigin = norm
+		}
+	}
+
+	overrideURL := ""
 	if envURL := strings.TrimSpace(os.Getenv("ORBIT_HUB_URL")); envURL != "" {
-		cfg.HubURL = envURL
+		overrideURL = envURL
 	}
 	if flagURL := strings.TrimSpace(explicitURLFlag); flagURL != "" {
-		cfg.HubURL = flagURL
+		overrideURL = flagURL
+	}
+	if overrideURL != "" {
+		cfg.HubURL = overrideURL
 	}
 
 	if cfg.HubURL != "" {
@@ -102,6 +139,21 @@ func LoadClientConfig(configDir, explicitURLFlag string) (ClientConfig, error) {
 			return cfg, err
 		}
 		cfg.HubURL = norm
+		// Origin-scope saved credentials: never leak Hub A's token when overriding to Hub B!
+		if overrideURL != "" && savedNormOrigin != "" && !sameOriginStrings(norm, savedNormOrigin) {
+			cfg.ClientToken = ""
+			cfg.DevToken = ""
+			cfg.MachineID = ""
+			cfg.Mode = "remote"
+			cfg.RunLocalRunner = false
+		}
+	}
+
+	if envClientTok := strings.TrimSpace(os.Getenv("ORBIT_CLIENT_TOKEN")); envClientTok != "" {
+		cfg.ClientToken = envClientTok
+	}
+	if envDevTok := strings.TrimSpace(os.Getenv("ORBIT_DEV_TOKEN")); envDevTok != "" {
+		cfg.DevToken = envDevTok
 	}
 	return cfg, nil
 }
@@ -189,4 +241,84 @@ func sameOrigin(u *url.URL, baseRaw string) bool {
 		return false
 	}
 	return strings.EqualFold(u.Scheme, b.Scheme) && strings.EqualFold(u.Host, b.Host)
+}
+
+func sameOriginStrings(a, b string) bool {
+	ua, err := url.Parse(strings.TrimSpace(a))
+	if err != nil || ua.Host == "" {
+		return false
+	}
+	return sameOrigin(ua, b)
+}
+
+// ParseJoinInput parses either a pasted `orbit join <url> <code>`, an invite link
+// `<url>/#/join/<code>`, `<url> <code>`, or a plain Hub address `<url>`.
+func ParseJoinInput(raw string) (hubURL, code string, noRunnerHint bool, err error) {
+	hubURL, code, noRunnerHint, _, err = ParseJoinInputWithScope(raw)
+	return hubURL, code, noRunnerHint, err
+}
+
+// ParseJoinInputWithScope parses join input including --no-runner / --runner-only / ?scope=... hints.
+func ParseJoinInputWithScope(raw string) (hubURL, code string, noRunnerHint bool, runnerOnlyHint bool, err error) {
+	s := strings.TrimSpace(raw)
+	s = strings.Trim(s, `"'`)
+	if s == "" {
+		return "", "", false, false, fmt.Errorf("请输入地址或粘贴邀请命令")
+	}
+	tokens := strings.Fields(s)
+	if len(tokens) >= 2 && strings.EqualFold(filepath.Base(tokens[0]), "orbit") && strings.EqualFold(tokens[1], "join") {
+		tokens = tokens[2:]
+	}
+
+	var positional []string
+	for i := 0; i < len(tokens); i++ {
+		tok := tokens[i]
+		switch {
+		case tok == "--no-runner":
+			noRunnerHint = true
+		case tok == "--runner-only":
+			runnerOnlyHint = true
+		case tok == "--code" && i+1 < len(tokens):
+			code = strings.TrimSpace(tokens[i+1])
+			i++
+		case strings.HasPrefix(tok, "--code="):
+			code = strings.TrimSpace(strings.TrimPrefix(tok, "--code="))
+		case strings.HasPrefix(tok, "-"):
+		default:
+			positional = append(positional, tok)
+		}
+	}
+	if len(positional) == 0 {
+		return "", "", false, false, fmt.Errorf("请输入有效的地址或邀请命令")
+	}
+
+	rawURL := positional[0]
+	if code == "" && len(positional) >= 2 {
+		code = strings.TrimSpace(positional[1])
+	}
+	if idx := strings.Index(rawURL, "#/join/"); idx >= 0 {
+		rest := rawURL[idx+len("#/join/"):]
+		codePart := rest
+		if qIdx := strings.Index(rest, "?"); qIdx >= 0 {
+			codePart = rest[:qIdx]
+			if qVals, qErr := url.ParseQuery(rest[qIdx+1:]); qErr == nil {
+				switch strings.ToLower(strings.TrimSpace(qVals.Get("scope"))) {
+				case "client":
+					noRunnerHint = true
+				case "runner":
+					runnerOnlyHint = true
+				}
+			}
+		}
+		if code == "" {
+			code = strings.Trim(codePart, "/ ")
+		}
+		rawURL = rawURL[:idx]
+	}
+
+	norm, err := NormalizeHubURL(rawURL)
+	if err != nil {
+		return "", "", false, false, err
+	}
+	return norm, code, noRunnerHint, runnerOnlyHint, nil
 }

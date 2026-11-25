@@ -82,6 +82,11 @@ func Open(ctx context.Context, dbPath string) (*Store, error) {
 		return nil, fmt.Errorf("apply write pragmas: %w", err)
 	}
 
+	if err := backupBeforeV5Migration(ctx, rw, absPath); err != nil {
+		_ = rw.Close()
+		return nil, fmt.Errorf("backup before v5 migration: %w", err)
+	}
+
 	if err := applySchema(ctx, rw); err != nil {
 		_ = rw.Close()
 		return nil, fmt.Errorf("apply schema: %w", err)
@@ -286,6 +291,54 @@ func applySchema(ctx context.Context, db *sql.DB) error {
 		}
 	}
 
+	// Smooth versioned migration v5 (onboarding, dynamic pairing, credentials, per-machine agents, UI projects).
+	var hasV5 int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version = 5`).Scan(&hasV5); err != nil {
+		return err
+	}
+	if hasV5 == 0 {
+		if _, err := tx.ExecContext(ctx, BuildMigrationV5DDL()); err != nil {
+			return fmt.Errorf("apply v5 ddl: %w", err)
+		}
+		if err := ensureColumnTx(ctx, tx, "machines", "agents_json", "TEXT NOT NULL DEFAULT '[]'"); err != nil {
+			return err
+		}
+		if err := ensureColumnTx(ctx, tx, "machines", "display_alias", "TEXT NOT NULL DEFAULT ''"); err != nil {
+			return err
+		}
+		if err := ensureColumnTx(ctx, tx, "machines", "runner_caps_json", "TEXT NOT NULL DEFAULT '[]'"); err != nil {
+			return err
+		}
+		if err := ensureColumnTx(ctx, tx, "projects", "source", "TEXT NOT NULL DEFAULT 'yaml'"); err != nil {
+			return err
+		}
+		// One-time existing-environment detection: if this database already has tasks,
+		// non-scratch projects, or >=2 machines, mark onboarding done so existing setups
+		// are never intercepted after upgrade.
+		var taskCount, projCount, machCount int
+		_ = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM tasks`).Scan(&taskCount)
+		_ = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM projects WHERE project_id != ? AND archived = 0`, protocol.ScratchProjectID).Scan(&projCount)
+		_ = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM machines`).Scan(&machCount)
+		if taskCount > 0 || projCount > 0 || machCount >= 2 {
+			val, _ := json.Marshal(map[string]any{
+				"done":   true,
+				"reason": "migrated",
+				"at":     now,
+			})
+			if _, err := tx.ExecContext(ctx, `
+				INSERT OR IGNORE INTO hub_settings (key, value_json, updated_at)
+				VALUES ('onboarding_done', ?, ?)
+			`, string(val), now); err != nil {
+				return fmt.Errorf("mark migrated onboarding_done: %w", err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO schema_migrations (version, applied_at) VALUES (5, ?)
+		`, now); err != nil {
+			return err
+		}
+	}
+
 	// Idempotently ensure the built-in virtual _scratch project exists on every startup.
 	if err := ensureScratchProjectTx(ctx, tx, now); err != nil {
 		return err
@@ -462,4 +515,56 @@ func (s *Store) BackupTo(ctx context.Context, destPath string) error {
 
 func newID(prefix string) string {
 	return prefix + "_" + ulid.Make().String()
+}
+
+// backupBeforeV5Migration takes a consistent VACUUM INTO hot backup once before applying v5
+// on an existing on-disk database (schema_migrations exists and version 5 has not yet run).
+func backupBeforeV5Migration(ctx context.Context, db *sql.DB, absPath string) error {
+	if absPath == "" || absPath == ":memory:" {
+		return nil
+	}
+	var tableExists int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='schema_migrations'`).Scan(&tableExists); err != nil {
+		return fmt.Errorf("check schema_migrations table: %w", err)
+	}
+	if tableExists == 0 {
+		return nil
+	}
+	var hasV5 int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version = 5`).Scan(&hasV5); err != nil {
+		return fmt.Errorf("check schema version 5: %w", err)
+	}
+	if hasV5 > 0 {
+		return nil
+	}
+	bakPath := absPath + ".pre-v5.bak"
+	if _, err := os.Stat(bakPath); err == nil {
+		return nil
+	}
+	tmpPath := fmt.Sprintf("%s.tmp.%d", bakPath, time.Now().UnixNano())
+	_ = os.Remove(tmpPath)
+	escaped := filepath.ToSlash(tmpPath)
+	// SQLite VACUUM INTO takes a string literal path; single quotes escaped defensively.
+	escaped = fmt.Sprintf("'%s'", replaceAllSingleQuotes(escaped))
+	if _, err := db.ExecContext(ctx, "VACUUM INTO "+escaped); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("vacuum pre-v5 backup: %w", err)
+	}
+	if err := os.Rename(tmpPath, bakPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("finalize pre-v5 backup: %w", err)
+	}
+	return nil
+}
+
+func replaceAllSingleQuotes(s string) string {
+	out := make([]byte, 0, len(s))
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\'' {
+			out = append(out, '\'', '\'')
+		} else {
+			out = append(out, s[i])
+		}
+	}
+	return string(out)
 }

@@ -29,23 +29,42 @@ type ProjectView struct {
 	ActiveTaskCount   int                            `json:"activeTaskCount"`
 	BlockedTaskCount  int                            `json:"blockedTaskCount"`
 	Archived          bool                           `json:"archived"`
+	Source            ProjectSource                  `json:"source,omitempty"`
 	UpdatedAt         int64                          `json:"updatedAt"`
 }
 
 // MachineView is the runtime view of a registered machine.
 type MachineView struct {
-	MachineID     string                   `json:"machineId"`
-	DisplayName   string                   `json:"displayName"`
-	TransportMode TransportMode            `json:"transportMode"`
-	TailscaleHost string                   `json:"tailscaleHost,omitempty"`
-	SSHAlias      string                   `json:"sshAlias,omitempty"`
-	Status        MachineStatus            `json:"status"`
-	Capabilities  []string                 `json:"capabilities"`
-	Adapters      []Adapter                `json:"adapters,omitempty"`
-	Resources     map[string]ResourceState `json:"resources"`
-	RunnerVersion string                   `json:"runnerVersion,omitempty"`
-	LastSeenAt    *int64                   `json:"lastSeenAt,omitempty"`
-	UpdatedAt     int64                    `json:"updatedAt"`
+	MachineID          string                   `json:"machineId"`
+	DisplayName        string                   `json:"displayName"`
+	DisplayAlias       string                   `json:"displayAlias,omitempty"`
+	Source             MachineSource            `json:"source,omitempty"`
+	HasCredentials     bool                     `json:"hasCredentials,omitempty"`
+	TransportMode      TransportMode            `json:"transportMode"`
+	TailscaleHost      string                   `json:"tailscaleHost,omitempty"`
+	SSHAlias           string                   `json:"sshAlias,omitempty"`
+	Status             MachineStatus            `json:"status"`
+	Capabilities       []string                 `json:"capabilities"`
+	RunnerCapabilities []string                 `json:"runnerCapabilities,omitempty"`
+	Adapters           []Adapter                `json:"adapters,omitempty"`
+	Agents             []AgentProbe             `json:"agents,omitempty"`
+	LockedFields       []string                 `json:"lockedFields,omitempty"`
+	Resources          map[string]ResourceState `json:"resources"`
+	RunnerVersion      string                   `json:"runnerVersion,omitempty"`
+	LastSeenAt         *int64                   `json:"lastSeenAt,omitempty"`
+	UpdatedAt          int64                    `json:"updatedAt"`
+}
+
+// SetupStatusView summarizes onboarding readiness and sharing status in bootstrap.
+type SetupStatusView struct {
+	NeedsOnboarding    bool   `json:"needsOnboarding"`
+	ReadyAgents        int    `json:"readyAgents"`
+	OnlineMachines     int    `json:"onlineMachines"`
+	CurrentMachineID   string `json:"currentMachineId,omitempty"`
+	HubOrigin          string `json:"hubOrigin,omitempty"`
+	TailscaleAvailable bool   `json:"tailscaleAvailable"`
+	TailscaleShared    bool   `json:"tailscaleShared"`
+	TailscaleOrigin    string `json:"tailscaleOrigin,omitempty"`
 }
 
 // InboxItemView represents an open or historical low-noise inbox card.
@@ -66,14 +85,15 @@ type InboxItemView struct {
 
 // BootstrapResponse is captured in a single read-only SQLite transaction.
 type BootstrapResponse struct {
-	WorkspaceName  string          `json:"workspaceName,omitempty"`
-	Projects       []ProjectView   `json:"projects"`
-	Machines       []MachineView   `json:"machines"`
-	OpenInboxItems []InboxItemView `json:"openInboxItems"`
-	ActiveTasks    []TaskSummary   `json:"activeTasks"`
-	PAThreads      []PAThread      `json:"paThreads"`
-	PAState        PAStateView     `json:"paState"`
-	SnapshotSeq    int64           `json:"snapshotSeq"`
+	WorkspaceName  string           `json:"workspaceName,omitempty"`
+	Setup          *SetupStatusView `json:"setup,omitempty"`
+	Projects       []ProjectView    `json:"projects"`
+	Machines       []MachineView    `json:"machines"`
+	OpenInboxItems []InboxItemView  `json:"openInboxItems"`
+	ActiveTasks    []TaskSummary    `json:"activeTasks"`
+	PAThreads      []PAThread       `json:"paThreads"`
+	PAState        PAStateView      `json:"paState"`
+	SnapshotSeq    int64            `json:"snapshotSeq"`
 }
 
 // BlobManifestItem references a content-addressed attachment blob.
@@ -602,6 +622,7 @@ type CreateTaskRequest struct {
 	Title                string                  `json:"title,omitempty"`
 	Goal                 string                  `json:"goal"`
 	ParentTaskID         string                  `json:"parentTaskId,omitempty"`
+	MachineID            string                  `json:"machineId,omitempty"`
 	RequiredCapability   string                  `json:"requiredCapability,omitempty"`
 	RequiredResources    []string                `json:"requiredResources,omitempty"`
 	Adapter              Adapter                 `json:"adapter,omitempty"`
@@ -791,4 +812,195 @@ type PAChatResponse struct {
 	FoldedRange      string           `json:"foldedRange,omitempty"`
 	Actions          []PAActionResult `json:"actions,omitempty"`
 	PAState          PAStateView      `json:"paState"`
+}
+
+// CreatePairingCodeRequest creates a short-lived one-time pairing code for joining a machine/client.
+type CreatePairingCodeRequest struct {
+	Scope         PairingScope `json:"scope,omitempty"`
+	BindMachineID string       `json:"bindMachineId,omitempty"`
+	TTLSeconds    int          `json:"ttlSec,omitempty"`
+}
+
+// CreatePairingCodeResponse returns the newly minted pairing code (plain code shown once).
+type CreatePairingCodeResponse struct {
+	ID            string       `json:"id"`
+	Code          string       `json:"code"`
+	Scope         PairingScope `json:"scope"`
+	BindMachineID string       `json:"bindMachineId,omitempty"`
+	ExpiresAt     int64        `json:"expiresAt"`
+	JoinCommand   string       `json:"joinCommand"`
+	JoinLink      string       `json:"joinLink"`
+}
+
+// PairingCodeStatusResponse reports live pairing code status for polling / WS confirmation.
+type PairingCodeStatusResponse struct {
+	ID            string           `json:"id"`
+	Scope         PairingScope     `json:"scope"`
+	BindMachineID string           `json:"bindMachineId,omitempty"`
+	State         PairingCodeState `json:"state"`
+	MachineID     string           `json:"machineId,omitempty"`
+	Online        bool             `json:"online"`
+	ExpiresAt     int64            `json:"expiresAt"`
+	ClaimedAt     *int64           `json:"claimedAt,omitempty"`
+}
+
+// ClaimMachineInfo carries self-reported metadata from the joining machine.
+type ClaimMachineInfo struct {
+	ProposedID    string    `json:"proposedId,omitempty"`
+	DisplayName   string    `json:"displayName,omitempty"`
+	OS            string    `json:"os,omitempty"`
+	Arch          string    `json:"arch,omitempty"`
+	Hostname      string    `json:"hostname,omitempty"`
+	RunnerVersion string    `json:"runnerVersion,omitempty"`
+	Capabilities  []string  `json:"capabilities,omitempty"`
+	Adapters      []Adapter `json:"adapters,omitempty"`
+}
+
+// ClaimPairingRequest redeems a one-time pairing code for durable runner/client credentials.
+type ClaimPairingRequest struct {
+	Code       string            `json:"code"`
+	WantRunner bool              `json:"wantRunner"`
+	WantClient bool              `json:"wantClient"`
+	Machine    *ClaimMachineInfo `json:"machine,omitempty"`
+}
+
+// ClaimPairingResponse delivers newly minted credentials to the joining node.
+type ClaimPairingResponse struct {
+	MachineID     string `json:"machineId,omitempty"`
+	DisplayName   string `json:"displayName,omitempty"`
+	WorkspaceName string `json:"workspaceName,omitempty"`
+	HubOrigin     string `json:"hubOrigin"`
+	WSURL         string `json:"wsUrl"`
+	RunnerToken   string `json:"runnerToken,omitempty"`
+	ClientToken   string `json:"clientToken,omitempty"`
+}
+
+// AuthHandoffResponse returns a 30-second single-use fragment handoff code for browser/desktop login.
+type AuthHandoffResponse struct {
+	Code      string `json:"code"`
+	ExpiresAt int64  `json:"expiresAt"`
+}
+
+// ClaimAuthHandoffRequest exchanges a short-lived handoff code for a browser client token.
+type ClaimAuthHandoffRequest struct {
+	Code string `json:"code"`
+}
+
+// ClaimAuthHandoffResponse returns the minted browser client token and optional local machineId.
+type ClaimAuthHandoffResponse struct {
+	ClientToken string `json:"clientToken"`
+	MachineID   string `json:"machineId,omitempty"`
+}
+
+// ListMachinesResponse returns the full merged machine & agent status list.
+type ListMachinesResponse struct {
+	Machines []MachineView `json:"machines"`
+}
+
+// UpdateMachineRequest updates mutable metadata (display alias) on a machine.
+type UpdateMachineRequest struct {
+	DisplayAlias *string `json:"displayAlias,omitempty"`
+}
+
+// UpdateMachineAgentRequest patches dynamic per-machine agent overrides stored in SQLite.
+type UpdateMachineAgentRequest struct {
+	Enabled        *bool    `json:"enabled,omitempty"`
+	Bin            *string  `json:"bin,omitempty"`
+	Args           []string `json:"args,omitempty"`
+	DefaultModel   *string  `json:"defaultModel,omitempty"`
+	MaxLiveWorkers *int     `json:"maxLiveWorkers,omitempty"`
+}
+
+// MachineAgentActionResponse returns updated agent probe(s) after probe/test/install/update.
+type MachineAgentActionResponse struct {
+	MachineID string       `json:"machineId"`
+	Adapter   Adapter      `json:"adapter,omitempty"`
+	Probe     *AgentProbe  `json:"probe,omitempty"`
+	Agents    []AgentProbe `json:"agents"`
+}
+
+// DirEntryView describes one child directory returned by safe machine directory browsing.
+type DirEntryView struct {
+	Name      string `json:"name"`
+	Path      string `json:"path"`
+	IsGitRepo bool   `json:"isGitRepo"`
+}
+
+// ListDirsResponse returns safe directory listing for adding a project on a target machine.
+type ListDirsResponse struct {
+	MachineID  string         `json:"machineId"`
+	Path       string         `json:"path"`
+	ParentPath string         `json:"parentPath,omitempty"`
+	HomePath   string         `json:"homePath"`
+	Entries    []DirEntryView `json:"entries"`
+}
+
+// CheckRepoResponse validates whether a directory on a machine is a Git repository.
+type CheckRepoResponse struct {
+	Valid         bool   `json:"valid"`
+	RepoRoot      string `json:"repoRoot,omitempty"`
+	DefaultBranch string `json:"defaultBranch,omitempty"`
+	RepoIdentity  string `json:"repoIdentity,omitempty"`
+	DisplayName   string `json:"displayName,omitempty"`
+	Error         string `json:"error,omitempty"`
+}
+
+// CreateProjectRequest registers a local Git repository dynamically via Hub API.
+type CreateProjectRequest struct {
+	MachineID      string  `json:"machineId"`
+	RepoPath       string  `json:"repoPath"`
+	DisplayName    string  `json:"displayName,omitempty"`
+	ProjectID      string  `json:"projectId,omitempty"`
+	DefaultAdapter Adapter `json:"defaultAdapter,omitempty"`
+}
+
+// CreateProjectResponse returns the newly registered project view.
+type CreateProjectResponse struct {
+	Project ProjectView `json:"project"`
+}
+
+// NetworkSettingsView exposes current workspace name, sharing origins, and Tailscale readiness.
+type NetworkSettingsView struct {
+	WorkspaceName         string   `json:"workspaceName"`
+	HubOrigin             string   `json:"hubOrigin"`
+	ExtraOrigins          []string `json:"extraOrigins,omitempty"`
+	ExtraLogins           []string `json:"extraLogins,omitempty"`
+	TailscaleAvailable    bool     `json:"tailscaleAvailable"`
+	TailscaleShared       bool     `json:"tailscaleShared"`
+	TailscaleOrigin       string   `json:"tailscaleOrigin,omitempty"`
+	TailscalePortConflict bool     `json:"tailscalePortConflict,omitempty"`
+	TailscaleHint         string   `json:"tailscaleHint,omitempty"`
+}
+
+// UpdateNetworkSettingsRequest updates workspace display name in Hub dynamic settings.
+type UpdateNetworkSettingsRequest struct {
+	WorkspaceName *string `json:"workspaceName,omitempty"`
+}
+
+// TailscaleEnableRequest requests enabling Tailscale Serve multi-machine sharing.
+type TailscaleEnableRequest struct {
+	Port    int  `json:"port,omitempty"`
+	Confirm bool `json:"confirm,omitempty"`
+}
+
+// TailscaleEnableResponse reports whether Tailscale Serve sharing was enabled or needs port confirmation.
+type TailscaleEnableResponse struct {
+	Enabled        bool                `json:"enabled"`
+	Origin         string              `json:"origin,omitempty"`
+	NeedsConfirm   bool                `json:"needsConfirm,omitempty"`
+	SuggestedPort  int                 `json:"suggestedPort,omitempty"`
+	ConflictDetail string              `json:"conflictDetail,omitempty"`
+	Command        string              `json:"command,omitempty"`
+	Settings       NetworkSettingsView `json:"settings"`
+}
+
+// CompleteOnboardingRequest marks first-run onboarding completed (or skipped).
+type CompleteOnboardingRequest struct {
+	Skipped bool `json:"skipped,omitempty"`
+}
+
+// CompleteOnboardingResponse returns updated onboarding setup state.
+type CompleteOnboardingResponse struct {
+	Completed bool            `json:"completed"`
+	Setup     SetupStatusView `json:"setup"`
 }

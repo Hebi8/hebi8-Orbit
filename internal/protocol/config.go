@@ -240,3 +240,47 @@ func (c ProjectsConfig) Validate() error {
 	}
 	return nil
 }
+
+// RunnerLocalConfig persists connection metadata for a paired or local orbit-runner in runner.yaml.
+type RunnerLocalConfig struct {
+	SchemaVersion int    `yaml:"schemaVersion" json:"schemaVersion"`
+	MachineID     string `yaml:"machineId" json:"machineId"`
+	HubURL        string `yaml:"hubUrl" json:"hubUrl"`
+	HubWSURL      string `yaml:"hubWsUrl,omitempty" json:"hubWsUrl,omitempty"`
+	DataDir       string `yaml:"dataDir,omitempty" json:"dataDir,omitempty"`
+}
+
+// LoadRunnerLocalConfig loads runner.yaml if present.
+func LoadRunnerLocalConfig(path string) (RunnerLocalConfig, error) {
+	cfg := RunnerLocalConfig{SchemaVersion: 1}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return cfg, err
+	}
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return cfg, fmt.Errorf("parse runner.yaml %s: %w", path, err)
+	}
+	if cfg.SchemaVersion == 0 {
+		cfg.SchemaVersion = 1
+	}
+	return cfg, nil
+}
+
+// SaveRunnerLocalConfig atomically writes runner.yaml with 0600 permissions.
+func SaveRunnerLocalConfig(path string, cfg RunnerLocalConfig) error {
+	if cfg.SchemaVersion == 0 {
+		cfg.SchemaVersion = 1
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	raw, err := yaml.Marshal(cfg)
+	if err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}

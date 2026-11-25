@@ -7,10 +7,14 @@ export type Route =
   | { name: 'home' }
   | { name: 'pa'; threadId?: string }
   | { name: 'artifacts' }
-  | { name: 'new'; mode?: NewMode; projectId?: string }
+  | { name: 'new'; mode?: NewMode; projectId?: string; machineId?: string; adapter?: string }
   | { name: 'project'; projectId: string; tab: ProjectTab }
   | { name: 'session'; taskId: string; worker?: string }
-  | { name: 'projects' };
+  | { name: 'projects' }
+  | { name: 'onboarding' }
+  | { name: 'settings' }
+  | { name: 'auth'; code: string }
+  | { name: 'join'; code: string; scope?: string };
 
 export function parseHash(hash: string): Route {
   const raw = hash.replace(/^#/, '');
@@ -27,6 +31,16 @@ export function parseHash(hash: string): Route {
     case undefined:
     case 'home':
       return { name: 'home' };
+    case 'auth':
+      if (segs[1]) return { name: 'auth', code: segs[1] };
+      return { name: 'home' };
+    case 'join':
+      if (segs[1]) return { name: 'join', code: segs[1], scope: q.get('scope') ?? undefined };
+      return { name: 'home' };
+    case 'onboarding':
+      return { name: 'onboarding' };
+    case 'settings':
+      return { name: 'settings' };
     case 'pa':
       return { name: 'pa', threadId: segs[1] };
     case 'artifacts':
@@ -34,7 +48,13 @@ export function parseHash(hash: string): Route {
     case 'new': {
       const m = q.get('mode');
       const mode: NewMode | undefined = m === 'pa' || m === 'chat' || m === 'project' ? m : undefined;
-      return { name: 'new', mode, projectId: q.get('project') ?? undefined };
+      return {
+        name: 'new',
+        mode,
+        projectId: q.get('project') ?? undefined,
+        machineId: q.get('machine') ?? undefined,
+        adapter: q.get('adapter') ?? undefined,
+      };
     }
     case 'p':
       if (segs[1]) {
@@ -57,12 +77,16 @@ const e = encodeURIComponent;
 
 export const paths = {
   home: () => '#/',
+  onboarding: () => '#/onboarding',
+  settings: () => '#/settings',
   pa: (threadId?: string) => (threadId ? `#/pa/${e(threadId)}` : '#/pa'),
   artifacts: () => '#/artifacts',
-  newThread: (mode?: NewMode, projectId?: string) => {
+  newThread: (mode?: NewMode, projectId?: string, opts?: { machineId?: string; adapter?: string }) => {
     const q = new URLSearchParams();
     if (mode) q.set('mode', mode);
     if (projectId) q.set('project', projectId);
+    if (opts?.machineId) q.set('machine', opts.machineId);
+    if (opts?.adapter) q.set('adapter', opts.adapter);
     const s = q.toString();
     return s ? `#/new?${s}` : '#/new';
   },
@@ -76,6 +100,11 @@ export const paths = {
 export function navigate(hash: string) {
   if (window.location.hash === hash) return;
   window.location.hash = hash;
+}
+
+export function replaceHash(hash: string) {
+  window.history.replaceState(null, '', hash);
+  window.dispatchEvent(new Event('hashchange'));
 }
 
 function subscribe(cb: () => void) {

@@ -84,7 +84,7 @@ export type InboxCategory = (typeof InboxCategoryValues)[number];
 export const InboxStateValues = ["open", "resolved", "dismissed"] as const;
 export type InboxState = (typeof InboxStateValues)[number];
 
-export const EventKindValues = ["task.created", "task.state_changed", "task.cancelled", "attempt.started", "attempt.state_changed", "attempt.finished", "resource.waiting", "resource.acquired", "delivery.published", "delivery.verified", "delivery.ryugi_updated", "delivery.review_completed", "annotation.created", "annotation.addressed", "approval.requested", "approval.decided", "approval.expired", "approval.consumed", "deploy.started", "deploy.verified", "deploy.failed", "acp.message_batch", "acp.thought_batch", "acp.tool_call", "acp.unsolicited_update", "acp.usage", "pa.turn", "pa.action_executed", "pa.thread_created", "board.message_posted", "board.member_updated", "queue.updated", "task.project_bound", "task.source_added", "task.source_removed", "machine.state_changed"] as const;
+export const EventKindValues = ["task.created", "task.state_changed", "task.cancelled", "attempt.started", "attempt.state_changed", "attempt.finished", "resource.waiting", "resource.acquired", "delivery.published", "delivery.verified", "delivery.ryugi_updated", "delivery.review_completed", "annotation.created", "annotation.addressed", "approval.requested", "approval.decided", "approval.expired", "approval.consumed", "deploy.started", "deploy.verified", "deploy.failed", "acp.message_batch", "acp.thought_batch", "acp.tool_call", "acp.unsolicited_update", "acp.usage", "pa.turn", "pa.action_executed", "pa.thread_created", "board.message_posted", "board.member_updated", "queue.updated", "task.project_bound", "task.source_added", "task.source_removed", "machine.state_changed", "pairing.updated", "machine.agents_updated", "project.changed", "network.settings_changed"] as const;
 export type EventKind = (typeof EventKindValues)[number];
 
 export const IDESchemeValues = ["cursor", "vscode", "zed", "antigravity"] as const;
@@ -93,7 +93,7 @@ export type IDEScheme = (typeof IDESchemeValues)[number];
 export const WSMessageTypeValues = ["replay", "replay_end", "event", "ping"] as const;
 export type WSMessageType = (typeof WSMessageTypeValues)[number];
 
-export const RunnerWSMessageTypeValues = ["runner.hello", "hub.welcome", "attempt.dispatch", "attempt.cancel", "approval.decision", "session.close", "runner.heartbeat", "attempt.outbox_batch", "hub.outbox_ack", "board.message"] as const;
+export const RunnerWSMessageTypeValues = ["runner.hello", "hub.welcome", "attempt.dispatch", "attempt.cancel", "approval.decision", "session.close", "runner.heartbeat", "attempt.outbox_batch", "hub.outbox_ack", "board.message", "runner.config", "runner.rpc", "runner.agents_report", "runner.rpc_result"] as const;
 export type RunnerWSMessageType = (typeof RunnerWSMessageTypeValues)[number];
 
 export const OutboxFrameTypeValues = ["events", "state", "approval_request", "approval_ack", "delivery_published", "board_message", "board_member", "board_message_ack"] as const;
@@ -116,6 +116,21 @@ export type PAThreadStatus = (typeof PAThreadStatusValues)[number];
 
 export const PAMessageRoleValues = ["user", "assistant", "system"] as const;
 export type PAMessageRole = (typeof PAMessageRoleValues)[number];
+
+export const AgentStateValues = ["ready", "needs_login", "missing_bridge", "not_installed", "error", "disabled", "checking", "installing"] as const;
+export type AgentState = (typeof AgentStateValues)[number];
+
+export const PairingScopeValues = ["runner", "client", "both"] as const;
+export type PairingScope = (typeof PairingScopeValues)[number];
+
+export const PairingCodeStateValues = ["pending", "claimed", "expired", "revoked"] as const;
+export type PairingCodeState = (typeof PairingCodeStateValues)[number];
+
+export const MachineSourceValues = ["yaml", "paired"] as const;
+export type MachineSource = (typeof MachineSourceValues)[number];
+
+export const ProjectSourceValues = ["yaml", "ui"] as const;
+export type ProjectSource = (typeof ProjectSourceValues)[number];
 
 export interface APIError {
   code: string;
@@ -159,22 +174,65 @@ export interface ProjectView {
   activeTaskCount: number;
   blockedTaskCount: number;
   archived: boolean;
+  source?: ProjectSource;
   updatedAt: number;
+}
+
+export interface AgentTestResult {
+  ok: boolean;
+  at: number;
+  latencyMs?: number;
+  error?: string;
+}
+
+export interface AgentProbe {
+  adapter: Adapter;
+  state: AgentState;
+  enabled: boolean;
+  bridgeBin?: string;
+  bridgeVersion?: string;
+  mainCli?: string;
+  source?: string;
+  hintCode?: string;
+  detail?: string;
+  defaultModel?: string;
+  models?: string[];
+  maxLiveWorkers?: number;
+  lockedFields?: string[];
+  lastTest?: AgentTestResult | null;
+  probedAt?: number;
 }
 
 export interface MachineView {
   machineId: string;
   displayName: string;
+  displayAlias?: string;
+  source?: MachineSource;
+  hasCredentials?: boolean;
   transportMode: TransportMode;
   tailscaleHost?: string;
   sshAlias?: string;
   status: MachineStatus;
   capabilities: string[];
+  runnerCapabilities?: string[];
   adapters?: Adapter[];
+  agents?: AgentProbe[];
+  lockedFields?: string[];
   resources: Record<string, ResourceState>;
   runnerVersion?: string;
   lastSeenAt?: number | null;
   updatedAt: number;
+}
+
+export interface SetupStatusView {
+  needsOnboarding: boolean;
+  readyAgents: number;
+  onlineMachines: number;
+  currentMachineId?: string;
+  hubOrigin?: string;
+  tailscaleAvailable: boolean;
+  tailscaleShared: boolean;
+  tailscaleOrigin?: string;
 }
 
 export interface InboxItemView {
@@ -237,6 +295,7 @@ export interface PAMessage {
 
 export interface BootstrapResponse {
   workspaceName?: string;
+  setup?: SetupStatusView | null;
   projects: ProjectView[];
   machines: MachineView[];
   openInboxItems: InboxItemView[];
@@ -682,6 +741,7 @@ export interface CreateTaskRequest {
   title?: string;
   goal: string;
   parentTaskId?: string;
+  machineId?: string;
   requiredCapability?: string;
   requiredResources?: string[];
   adapter?: Adapter;
@@ -850,6 +910,173 @@ export interface PAChatResponse {
   paState: PAStateView;
 }
 
+export interface CreatePairingCodeRequest {
+  scope?: PairingScope;
+  bindMachineId?: string;
+  ttlSec?: number;
+}
+
+export interface CreatePairingCodeResponse {
+  id: string;
+  code: string;
+  scope: PairingScope;
+  bindMachineId?: string;
+  expiresAt: number;
+  joinCommand: string;
+  joinLink: string;
+}
+
+export interface PairingCodeStatusResponse {
+  id: string;
+  scope: PairingScope;
+  bindMachineId?: string;
+  state: PairingCodeState;
+  machineId?: string;
+  online: boolean;
+  expiresAt: number;
+  claimedAt?: number | null;
+}
+
+export interface ClaimMachineInfo {
+  proposedId?: string;
+  displayName?: string;
+  os?: string;
+  arch?: string;
+  hostname?: string;
+  runnerVersion?: string;
+  capabilities?: string[];
+  adapters?: Adapter[];
+}
+
+export interface ClaimPairingRequest {
+  code: string;
+  wantRunner: boolean;
+  wantClient: boolean;
+  machine?: ClaimMachineInfo | null;
+}
+
+export interface ClaimPairingResponse {
+  machineId?: string;
+  displayName?: string;
+  workspaceName?: string;
+  hubOrigin: string;
+  wsUrl: string;
+  runnerToken?: string;
+  clientToken?: string;
+}
+
+export interface AuthHandoffResponse {
+  code: string;
+  expiresAt: number;
+}
+
+export interface ClaimAuthHandoffRequest {
+  code: string;
+}
+
+export interface ClaimAuthHandoffResponse {
+  clientToken: string;
+  machineId?: string;
+}
+
+export interface ListMachinesResponse {
+  machines: MachineView[];
+}
+
+export interface UpdateMachineRequest {
+  displayAlias?: string | null;
+}
+
+export interface UpdateMachineAgentRequest {
+  enabled?: boolean | null;
+  bin?: string | null;
+  args?: string[];
+  defaultModel?: string | null;
+  maxLiveWorkers?: number | null;
+}
+
+export interface MachineAgentActionResponse {
+  machineId: string;
+  adapter?: Adapter;
+  probe?: AgentProbe | null;
+  agents: AgentProbe[];
+}
+
+export interface DirEntryView {
+  name: string;
+  path: string;
+  isGitRepo: boolean;
+}
+
+export interface ListDirsResponse {
+  machineId: string;
+  path: string;
+  parentPath?: string;
+  homePath: string;
+  entries: DirEntryView[];
+}
+
+export interface CheckRepoResponse {
+  valid: boolean;
+  repoRoot?: string;
+  defaultBranch?: string;
+  repoIdentity?: string;
+  displayName?: string;
+  error?: string;
+}
+
+export interface CreateProjectRequest {
+  machineId: string;
+  repoPath: string;
+  displayName?: string;
+  projectId?: string;
+  defaultAdapter?: Adapter;
+}
+
+export interface CreateProjectResponse {
+  project: ProjectView;
+}
+
+export interface NetworkSettingsView {
+  workspaceName: string;
+  hubOrigin: string;
+  extraOrigins?: string[];
+  extraLogins?: string[];
+  tailscaleAvailable: boolean;
+  tailscaleShared: boolean;
+  tailscaleOrigin?: string;
+  tailscalePortConflict?: boolean;
+  tailscaleHint?: string;
+}
+
+export interface UpdateNetworkSettingsRequest {
+  workspaceName?: string | null;
+}
+
+export interface TailscaleEnableRequest {
+  port?: number;
+  confirm?: boolean;
+}
+
+export interface TailscaleEnableResponse {
+  enabled: boolean;
+  origin?: string;
+  needsConfirm?: boolean;
+  suggestedPort?: number;
+  conflictDetail?: string;
+  command?: string;
+  settings: NetworkSettingsView;
+}
+
+export interface CompleteOnboardingRequest {
+  skipped?: boolean;
+}
+
+export interface CompleteOnboardingResponse {
+  completed: boolean;
+  setup: SetupStatusView;
+}
+
 export interface LiveAttemptInfo {
   attemptId: string;
   leaseToken: string;
@@ -864,13 +1091,60 @@ export interface HandledApprovalDecision {
   outcome: ApprovalState;
 }
 
+export interface RunnerAgentConfig {
+  enabled?: boolean | null;
+  bin?: string;
+  args?: string[];
+  defaultModel?: string;
+  maxLiveWorkers?: number;
+}
+
+export interface RunnerConfigPayload {
+  configRev: number;
+  agents?: Record<string, RunnerAgentConfig>;
+}
+
+export interface RunnerConfigFrame {
+  type: RunnerWSMessageType;
+  configRev: number;
+  agents?: Record<string, RunnerAgentConfig>;
+}
+
+export interface RunnerAgentsReportFrame {
+  type: RunnerWSMessageType;
+  machineId: string;
+  configRev: number;
+  agents: AgentProbe[];
+}
+
+export interface RunnerRPCFrame {
+  type: RunnerWSMessageType;
+  requestId: string;
+  op: string;
+  args?: Record<string, unknown>;
+}
+
+export interface RunnerRPCResultFrame {
+  type: RunnerWSMessageType;
+  requestId: string;
+  ok: boolean;
+  data?: Record<string, unknown>;
+  error?: string;
+}
+
 export interface RunnerHelloFrame {
   type: RunnerWSMessageType;
   protocolVersion: number;
   machineId: string;
   runnerInstanceId: string;
   runnerVersion: string;
+  os?: string;
+  arch?: string;
+  hostname?: string;
+  capabilities?: string[];
   adapters?: Adapter[];
+  agentProbes?: AgentProbe[];
+  configRev?: number;
   liveAttempts: LiveAttemptInfo[];
   livePendingApprovalIds: string[];
   handledApprovalDecisions: HandledApprovalDecision[];
@@ -899,6 +1173,8 @@ export interface HubWelcomeFrame {
   serverTime: number;
   heartbeatIntervalMs: number;
   leaseTtlMs: number;
+  capabilities?: string[];
+  config?: RunnerConfigPayload | null;
   reconcile: HubWelcomeReconcile;
 }
 

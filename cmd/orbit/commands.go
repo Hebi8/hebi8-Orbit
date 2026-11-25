@@ -19,17 +19,30 @@ import (
 )
 
 type hubClient struct {
-	baseURL  string
-	devToken string
-	http     *http.Client
+	baseURL     string
+	devToken    string
+	clientToken string
+	http        *http.Client
 }
 
 func newHubClient(configDir, dataDir, hubURLFlag, tokenFlag string) *hubClient {
-	hubURL, _, devToken := resolveHubDefaults(configDir, dataDir, hubURLFlag, tokenFlag)
+	hubURL, _, devToken, clientToken := resolveHubAuth(configDir, dataDir, hubURLFlag, tokenFlag)
 	return &hubClient{
-		baseURL:  hubURL,
-		devToken: devToken,
-		http:     &http.Client{Timeout: 30 * time.Second},
+		baseURL:     hubURL,
+		devToken:    devToken,
+		clientToken: clientToken,
+		http: &http.Client{
+			Timeout: 30 * time.Second,
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				if len(via) >= 5 {
+					return fmt.Errorf("too many redirects")
+				}
+				if !sameOriginURL(req.URL.Scheme+"://"+req.URL.Host, hubURL) {
+					return fmt.Errorf("refusing cross-origin redirect to %s", req.URL.Host)
+				}
+				return nil
+			},
+		},
 	}
 }
 
@@ -52,7 +65,9 @@ func (c *hubClient) doJSON(ctx context.Context, method, path string, reqBody any
 	if method != http.MethodGet && method != http.MethodHead {
 		req.Header.Set("X-Orbit-Request", "1")
 	}
-	if c.devToken != "" {
+	if c.clientToken != "" {
+		req.Header.Set("Authorization", "Bearer "+c.clientToken)
+	} else if c.devToken != "" {
 		req.Header.Set("X-Orbit-Dev-Token", c.devToken)
 	}
 	resp, err := c.http.Do(req)
@@ -262,7 +277,7 @@ func runTasksShow(ctx context.Context, args []string, stdout, stderr io.Writer) 
 		dataDirFlg = fs.String("data-dir", "", "orbit data directory")
 		jsonOut    = fs.Bool("json", false, "output JSON")
 	)
-	if err := fs.Parse(args); err != nil {
+	if err := parseFlagsPermuted(fs, args); err != nil {
 		return err
 	}
 	if fs.NArg() < 1 {
@@ -323,7 +338,7 @@ func runTasksFollowup(ctx context.Context, args []string, stdout, stderr io.Writ
 		dataDirFlg = fs.String("data-dir", "", "orbit data directory")
 		jsonOut    = fs.Bool("json", false, "output JSON")
 	)
-	if err := fs.Parse(args); err != nil {
+	if err := parseFlagsPermuted(fs, args); err != nil {
 		return err
 	}
 	if fs.NArg() < 1 {
@@ -382,7 +397,7 @@ func runTasksCancel(ctx context.Context, args []string, stdout, stderr io.Writer
 		dataDirFlg = fs.String("data-dir", "", "orbit data directory")
 		jsonOut    = fs.Bool("json", false, "output JSON")
 	)
-	if err := fs.Parse(args); err != nil {
+	if err := parseFlagsPermuted(fs, args); err != nil {
 		return err
 	}
 	if fs.NArg() < 1 {
@@ -412,7 +427,7 @@ func runTasksRetry(ctx context.Context, args []string, stdout, stderr io.Writer)
 		dataDirFlg = fs.String("data-dir", "", "orbit data directory")
 		jsonOut    = fs.Bool("json", false, "output JSON")
 	)
-	if err := fs.Parse(args); err != nil {
+	if err := parseFlagsPermuted(fs, args); err != nil {
 		return err
 	}
 	if fs.NArg() < 1 {
@@ -504,7 +519,7 @@ func runApprovalDecide(ctx context.Context, allow bool, args []string, stdout, s
 		dataDirFlg = fs.String("data-dir", "", "orbit data directory")
 		jsonOut    = fs.Bool("json", false, "output JSON")
 	)
-	if err := fs.Parse(args); err != nil {
+	if err := parseFlagsPermuted(fs, args); err != nil {
 		return err
 	}
 	if fs.NArg() < 1 {
@@ -748,7 +763,7 @@ func runDoctor(ctx context.Context, args []string, stdout, stderr io.Writer) err
 	return nil
 }
 
-func runOpen(_ context.Context, args []string, stdout, stderr io.Writer) error {
+func runOpen(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("open", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	var (
@@ -760,24 +775,36 @@ func runOpen(_ context.Context, args []string, stdout, stderr io.Writer) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	hubURL, _, _ := resolveHubDefaults(*configDir, *dataDirFlg, *hubURLFlag, "")
+	c := newHubClient(*configDir, *dataDirFlg, *hubURLFlag, "")
+	targetURL := c.baseURL + "/"
+	// Best-effort short-lived auth handoff so opening in system browser signs in seamlessly.
+	if !*printOnly && (c.clientToken != "" || c.devToken != "") {
+		hctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		if raw, err := c.doJSON(hctx, http.MethodPost, "/api/auth/handoff", map[string]any{}); err == nil {
+			var ho protocol.AuthHandoffResponse
+			if json.Unmarshal(raw, &ho) == nil && ho.Code != "" {
+				targetURL = c.baseURL + "/#/auth/" + url.PathEscape(ho.Code)
+			}
+		}
+		cancel()
+	}
 	if *printOnly {
-		fmt.Fprintln(stdout, hubURL)
+		fmt.Fprintln(stdout, c.baseURL)
 		return nil
 	}
 	var cmd *exec.Cmd
 	switch runtime.GOOS {
 	case "darwin":
-		cmd = exec.Command("open", hubURL)
+		cmd = exec.Command("open", targetURL)
 	case "windows":
-		cmd = exec.Command("cmd", "/c", "start", "", hubURL)
+		cmd = exec.Command("cmd", "/c", "start", "", targetURL)
 	default:
-		cmd = exec.Command("xdg-open", hubURL)
+		cmd = exec.Command("xdg-open", targetURL)
 	}
 	if err := cmd.Start(); err != nil {
-		fmt.Fprintf(stdout, "%s\n", hubURL)
+		fmt.Fprintf(stdout, "%s\n", c.baseURL)
 		return fmt.Errorf("launch browser: %w", err)
 	}
-	fmt.Fprintf(stdout, "Opened %s\n", hubURL)
+	fmt.Fprintf(stdout, "Opened %s\n", c.baseURL)
 	return nil
 }

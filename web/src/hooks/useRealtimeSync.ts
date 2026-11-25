@@ -1,7 +1,7 @@
 import { useEffect, useRef } from 'react';
 import { useQueryClient, type QueryClient } from '@tanstack/react-query';
 import type { EventRecord, WSServerMessage } from '../generated/protocol';
-import { api, getStoredDevToken } from '../lib/api';
+import { api, getStoredClientToken, getStoredDevToken } from '../lib/api';
 import { useWorkbenchStore } from '../store/useWorkbenchStore';
 
 const strField = (payload: Record<string, unknown> | undefined, key: string): string => {
@@ -71,8 +71,14 @@ export function collectInvalidations(events: EventRecord[]): unknown[][] {
       add('bootstrap');
       continue;
     }
-    if (kind === 'machine.state_changed') {
+    if (kind === 'machine.state_changed' || kind === 'machine.agents_updated' || kind === 'pairing.updated') {
       add('bootstrap');
+      add('machines');
+      continue;
+    }
+    if (kind === 'project.changed' || kind === 'network.settings_changed') {
+      add('bootstrap');
+      add('network-settings');
       continue;
     }
     if (kind.startsWith('annotation.')) {
@@ -205,9 +211,9 @@ export function useRealtimeSync(snapshotSeq: number | undefined) {
 
       const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       let qs = `sinceSeq=${lastAppliedSeqRef.current}`;
-      // S6: In devToken mode, browsers cannot attach X-Orbit-Dev-Token to WS handshakes;
+      // Browsers cannot attach Bearer / X-Orbit-Dev-Token headers to WS handshakes;
       // obtain a short-lived single-use ticket via POST /api/ws-ticket first.
-      if (getStoredDevToken()) {
+      if (getStoredClientToken() || getStoredDevToken()) {
         try {
           const { ticket } = await api.createWSTicket();
           if (cancelled) return;

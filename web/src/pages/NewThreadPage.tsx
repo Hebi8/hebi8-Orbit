@@ -9,10 +9,11 @@ import type {
   TaskSourceKind,
 } from '../generated/protocol';
 import { SessionAdapterValues } from '../generated/protocol';
+import { agentDisplayName } from '../components/AgentList';
 import { SendUpIcon } from '../components/Icons';
 import { PageHeader } from '../components/PageHeader';
 import { api, errMsg } from '../lib/api';
-import { SCRATCH_PROJECT_ID } from '../lib/format';
+import { SCRATCH_PROJECT_ID, cleanMachineName } from '../lib/format';
 import { navigate, paths, type NewMode } from '../lib/router';
 import { toast } from '../store/useWorkbenchStore';
 
@@ -66,13 +67,28 @@ const MODE_COPY: Record<NewMode, ModeCopy> = {
   },
 };
 
-export function NewThreadPage({ boot, mode, projectId }: { boot: BootstrapResponse; mode?: NewMode; projectId?: string }) {
+export function NewThreadPage({
+  boot,
+  mode,
+  projectId,
+  initialMachineId,
+  initialAdapter,
+}: {
+  boot: BootstrapResponse;
+  mode?: NewMode;
+  projectId?: string;
+  initialMachineId?: string;
+  initialAdapter?: string;
+}) {
   const qc = useQueryClient();
   const projects = useMemo(() => boot.projects.filter((p) => p.projectId !== SCRATCH_PROJECT_ID && !p.archived), [boot.projects]);
+  const execMachines = useMemo(() => boot.machines.filter((mach) => mach.transportMode !== 'ssh_outbound'), [boot.machines]);
+
   const [m, setM] = useState<NewMode>(mode ?? (projects.length ? 'project' : 'chat'));
   const [pid, setPid] = useState<string>(projectId ?? projects[0]?.projectId ?? '');
   const [text, setText] = useState('');
-  const [adapter, setAdapter] = useState<string>('');
+  const [machineId, setMachineId] = useState<string>(initialMachineId ?? '');
+  const [adapter, setAdapter] = useState<string>(initialAdapter ?? '');
   const [model, setModel] = useState('');
   const [advOpen, setAdvOpen] = useState(false);
   const [capability, setCapability] = useState('');
@@ -91,25 +107,107 @@ export function NewThreadPage({ boot, mode, projectId }: { boot: BootstrapRespon
   }, [projectId]);
 
   const project = projects.find((p) => p.projectId === pid);
-  const availableAdapters = useMemo(() => {
-    const list: SessionAdapter[] = [];
-    const seen = new Set<string>();
-    for (const mach of boot.machines) {
-      for (const adp of mach.adapters ?? []) {
-        if ((SessionAdapterValues as readonly string[]).includes(adp) && !seen.has(adp)) {
-          seen.add(adp);
-          list.push(adp as SessionAdapter);
-        }
+
+  // Smart target machine pre-selection: explicit query > project anchor > lastPick > client machine > first online machine with ready agent.
+  useEffect(() => {
+    if (initialMachineId && execMachines.some((x) => x.machineId === initialMachineId)) {
+      setMachineId(initialMachineId);
+      return;
+    }
+    if (m === 'project' && project) {
+      const anchorMach = project.anchors[project.defaultCapability]?.machine;
+      if (anchorMach && execMachines.some((x) => x.machineId === anchorMach)) {
+        setMachineId(anchorMach);
+        return;
       }
     }
-    if (list.length === 0) list.push('agy');
-    return list;
-  }, [boot.machines]);
+    try {
+      const saved = JSON.parse(localStorage.getItem('orbit.lastPick') || '{}') as Record<
+        string,
+        { machineId?: string; adapter?: string }
+      >;
+      const rec = saved[m === 'project' && pid ? pid : SCRATCH_PROJECT_ID];
+      if (rec?.machineId && execMachines.some((x) => x.machineId === rec.machineId && x.status === 'online')) {
+        setMachineId(rec.machineId);
+        if (rec.adapter && !initialAdapter) setAdapter(rec.adapter);
+        return;
+      }
+    } catch {
+      // ignore storage errors
+    }
+    const clientMach = boot.setup?.currentMachineId;
+    if (clientMach && execMachines.some((x) => x.machineId === clientMach && x.status === 'online')) {
+      setMachineId(clientMach);
+      return;
+    }
+    const firstReady = execMachines.find(
+      (x) => x.status === 'online' && (x.agents ?? []).some((a) => a.state === 'ready' && a.enabled),
+    );
+    if (firstReady) {
+      setMachineId(firstReady.machineId);
+    } else if (execMachines[0]) {
+      setMachineId(execMachines[0].machineId);
+    }
+  }, [m, pid, project, execMachines, boot.setup?.currentMachineId, initialMachineId, initialAdapter]);
+
+  const selectedMachine = execMachines.find((x) => x.machineId === machineId) ?? execMachines[0];
+  const machineProbes = selectedMachine?.agents ?? [];
+
+  const totalReadyAgents = useMemo(() => {
+    let n = 0;
+    for (const mach of execMachines) {
+      if (mach.status !== 'online') continue;
+      for (const ag of mach.agents ?? []) {
+        if (ag.state === 'ready' && ag.enabled) n++;
+      }
+    }
+    return n;
+  }, [execMachines]);
+
+  const readyAdaptersOnMachine = useMemo(() => {
+    const ready: SessionAdapter[] = [];
+    for (const adp of SessionAdapterValues) {
+      const probe = machineProbes.find((p) => p.adapter === adp);
+      if (probe ? probe.state === 'ready' && probe.enabled : (selectedMachine?.adapters ?? []).includes(adp)) {
+        ready.push(adp);
+      }
+    }
+    return ready;
+  }, [machineProbes, selectedMachine]);
+
+  const machineHasReadyAgent = readyAdaptersOnMachine.length > 0;
+  const isRemoteSelectedMachine =
+    !!selectedMachine?.transportMode && selectedMachine.transportMode !== 'local_ws';
+
+  const defaultDisplayedAdapter: SessionAdapter | '' = useMemo(() => {
+    if (!machineHasReadyAgent) return '';
+    const def = project?.defaultAdapter;
+    if (m === 'project' && def && (readyAdaptersOnMachine as readonly string[]).includes(def)) {
+      return def as SessionAdapter;
+    }
+    return readyAdaptersOnMachine[0];
+  }, [m, project, machineHasReadyAgent, readyAdaptersOnMachine]);
+
+  // Clear explicit adapter whenever it is not ready on the currently selected machine (including 0-ready state) (#17).
+  useEffect(() => {
+    if (adapter && !(readyAdaptersOnMachine as readonly string[]).includes(adapter)) {
+      setAdapter('');
+    }
+  }, [adapter, readyAdaptersOnMachine]);
+
+  // Disable dirty workspace import automatically when switching to a remote machine (#6).
+  useEffect(() => {
+    if (isRemoteSelectedMachine && importDirty) {
+      setImportDirty(false);
+    }
+  }, [isRemoteSelectedMachine, importDirty]);
 
   useEffect(() => {
     setCapability('');
-    setAdapter('');
-  }, [pid]);
+    if (!initialAdapter) {
+      setAdapter('');
+    }
+  }, [pid, initialAdapter]);
 
   const submit = useMutation({
     mutationFn: async () => {
@@ -119,9 +217,24 @@ export function NewThreadPage({ boot, mode, projectId }: { boot: BootstrapRespon
         const res = await api.paChat({ threadId: created.thread.paThreadId, message: goal });
         return { kind: 'pa' as const, id: res.thread.paThreadId };
       }
+      if (!machineHasReadyAgent) {
+        throw new Error('当前机器没有可用的 Agent，请先到设置页启用或安装');
+      }
+      const effectiveAdapter = (adapter || defaultDisplayedAdapter) as SessionAdapter;
       const req: CreateTaskRequest = { goal };
-      if (adapter) req.adapter = adapter as SessionAdapter;
+      if (machineId) req.machineId = machineId;
+      if (effectiveAdapter) req.adapter = effectiveAdapter;
       if (model.trim()) req.config = { model: model.trim() };
+
+      try {
+        const key = m === 'project' && pid ? pid : SCRATCH_PROJECT_ID;
+        const prev = JSON.parse(localStorage.getItem('orbit.lastPick') || '{}') as Record<string, unknown>;
+        prev[key] = { machineId, adapter: effectiveAdapter };
+        localStorage.setItem('orbit.lastPick', JSON.stringify(prev));
+      } catch {
+        // ignore
+      }
+
       if (m === 'chat') {
         const res = await api.createTask(SCRATCH_PROJECT_ID, req);
         return { kind: 'task' as const, id: res.task.taskId, pid: SCRATCH_PROJECT_ID };
@@ -150,7 +263,11 @@ export function NewThreadPage({ boot, mode, projectId }: { boot: BootstrapRespon
     onError: (e) => toast(errMsg(e), 'err'),
   });
 
-  const canSend = !!text.trim() && !submit.isPending && (m !== 'project' || !!pid);
+  const canSend =
+    !!text.trim() &&
+    !submit.isPending &&
+    (m !== 'project' || !!pid) &&
+    (m === 'pa' || machineHasReadyAgent);
   const send = () => canSend && submit.mutate();
   const copy = MODE_COPY[m];
 
@@ -197,6 +314,15 @@ export function NewThreadPage({ boot, mode, projectId }: { boot: BootstrapRespon
             <p className="nt-hint">{copy.hint}</p>
           </div>
 
+          {m !== 'pa' && (totalReadyAgents === 0 || !machineHasReadyAgent) && (
+            <div className="nt-no-agent">
+              <span>{totalReadyAgents === 0 ? '还没有可用的 Agent' : '当前机器还没有可用的 Agent'}</span>
+              <button type="button" className="nt-no-agent-link" onClick={() => navigate(paths.settings())}>
+                去设置
+              </button>
+            </div>
+          )}
+
           <div className="composer-card">
             <textarea
               ref={taRef}
@@ -227,6 +353,49 @@ export function NewThreadPage({ boot, mode, projectId }: { boot: BootstrapRespon
                     </select>
                   </label>
                 )}
+                {m !== 'pa' && execMachines.length > 1 && (
+                  <label className="pill-select">
+                    <select value={machineId} onChange={(e) => setMachineId(e.target.value)} aria-label="机器">
+                      {execMachines.map((mach) => (
+                        <option key={mach.machineId} value={mach.machineId}>
+                          {mach.displayAlias || cleanMachineName(mach)}
+                          {mach.status !== 'online' ? ' (离线)' : ''}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                )}
+                {m !== 'pa' && (
+                  <label className="pill-select">
+                    <select
+                      value={adapter}
+                      disabled={!machineHasReadyAgent}
+                      onChange={(e) => setAdapter(e.target.value)}
+                      aria-label="Agent"
+                    >
+                      <option value="">
+                        {defaultDisplayedAdapter
+                          ? `默认 · ${agentDisplayName(defaultDisplayedAdapter)}`
+                          : '无可用 Agent'}
+                      </option>
+                      {SessionAdapterValues.map((adp) => {
+                        const probe = machineProbes.find((p) => p.adapter === adp);
+                        const ready = readyAdaptersOnMachine.includes(adp);
+                        return (
+                          <option
+                            key={adp}
+                            value={adp}
+                            disabled={!ready}
+                            title={!ready ? probe?.detail || '该机器尚未就绪' : undefined}
+                          >
+                            {agentDisplayName(adp)}
+                            {!ready ? '（未就绪）' : ''}
+                          </option>
+                        );
+                      })}
+                    </select>
+                  </label>
+                )}
                 {m !== 'pa' && (
                   <button
                     type="button"
@@ -253,17 +422,6 @@ export function NewThreadPage({ boot, mode, projectId }: { boot: BootstrapRespon
 
             {m !== 'pa' && advOpen && (
               <div className="adv">
-                <span>Agent</span>
-                <select className="field" value={adapter} onChange={(e) => setAdapter(e.target.value)} aria-label="Agent">
-                  <option value="">
-                    {m === 'project' && project ? `默认 · ${project.defaultAdapter}` : `默认 · ${availableAdapters[0]}`}
-                  </option>
-                  {availableAdapters.map((a) => (
-                    <option key={a} value={a}>
-                      {a}
-                    </option>
-                  ))}
-                </select>
                 <span>模型</span>
                 <input className="field" value={model} onChange={(e) => setModel(e.target.value)} placeholder="默认" aria-label="模型" />
                 {m === 'project' && project && (
@@ -278,9 +436,14 @@ export function NewThreadPage({ boot, mode, projectId }: { boot: BootstrapRespon
                       ))}
                     </select>
                     <span>工作区</span>
-                    <label className="chk">
-                      <input type="checkbox" checked={importDirty} onChange={(e) => setImportDirty(e.target.checked)} />
-                      带入当前未提交改动
+                    <label className="chk" title={isRemoteSelectedMachine ? '远程机器项目暂不支持带入未提交改动' : undefined}>
+                      <input
+                        type="checkbox"
+                        checked={importDirty}
+                        disabled={isRemoteSelectedMachine}
+                        onChange={(e) => setImportDirty(e.target.checked)}
+                      />
+                      带入当前未提交改动{isRemoteSelectedMachine ? '（仅本机项目支持）' : ''}
                     </label>
                     <span style={{ alignSelf: 'start', paddingTop: 6 }}>参考</span>
                     <div className="srcs">

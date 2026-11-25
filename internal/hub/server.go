@@ -41,10 +41,14 @@ type ServerOptions struct {
 
 // Server serves the Orbit REST API, client/runner WebSockets, blob storage, and embedded SPA.
 type Server struct {
-	mu       sync.RWMutex
-	hubCfg   protocol.HubConfig
-	projects protocol.ProjectsConfig
-	machines protocol.MachinesConfig
+	mu                sync.RWMutex
+	registryRefreshMu sync.Mutex
+	hubCfg            protocol.HubConfig
+	yamlProjects protocol.ProjectsConfig
+	yamlMachines protocol.MachinesConfig
+	projects     protocol.ProjectsConfig
+	machines     protocol.MachinesConfig
+	dynNet       store.DynamicNetworkSettings
 
 	gcPaused    bool
 	gcReason    string
@@ -59,6 +63,11 @@ type Server struct {
 
 	wsTicketsMu sync.Mutex
 	wsTickets   map[string]wsTicketEntry
+
+	handoffMu    sync.Mutex
+	handoffCodes map[string]authHandoffEntry
+
+	pairLimiter *pairingRateLimiter
 
 	store   *store.Store
 	broker  *EventBroker
@@ -116,11 +125,15 @@ func NewServer(ctx context.Context, opts ServerOptions) (*Server, error) {
 
 	s := &Server{
 		hubCfg:              cfg,
+		yamlProjects:        protocol.ProjectsConfig{SchemaVersion: 1, Projects: map[string]protocol.ProjectConfig{}},
+		yamlMachines:        protocol.MachinesConfig{SchemaVersion: 1, Machines: map[string]protocol.MachineConfig{}},
 		projects:            protocol.ProjectsConfig{SchemaVersion: 1, Projects: map[string]protocol.ProjectConfig{}},
 		machines:            protocol.MachinesConfig{SchemaVersion: 1, Machines: map[string]protocol.MachineConfig{}},
 		heartbeatInterval:   hbInterval,
 		leaseTTL:            leaseTTL,
 		maintenanceInterval: maintInterval,
+		handoffCodes:        map[string]authHandoffEntry{},
+		pairLimiter:         newPairingRateLimiter(),
 		store:               opts.Store,
 		broker:              broker,
 		runners:             NewRunnerGateway(),
@@ -142,6 +155,10 @@ func NewServer(ctx context.Context, opts ServerOptions) (*Server, error) {
 	// Best-effort initial config load if projects.yaml / machines.yaml exist in configDir
 	if cfg.ConfigDir != "" {
 		if _, err := s.ReloadConfig(ctx); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
+	} else {
+		if err := s.refreshEffectiveRegistry(ctx); err != nil {
 			return nil, err
 		}
 	}
@@ -227,13 +244,33 @@ func (s *Server) ReloadConfig(ctx context.Context) (protocol.ReloadConfigRespons
 	}
 
 	s.mu.Lock()
-	s.projects = projects
-	s.machines = machines
+	s.yamlProjects = projects
+	s.yamlMachines = machines
 	s.mu.Unlock()
 
+	if err := s.refreshEffectiveRegistry(ctx); err != nil {
+		return protocol.ReloadConfigResponse{}, err
+	}
+
+	// Ensure bare mirrors exist for dynamic UI-created projects as well
+	s.mu.RLock()
+	effProjects := make([]string, 0, len(s.projects.Projects))
+	for pid := range s.projects.Projects {
+		effProjects = append(effProjects, pid)
+	}
+	effMachCount := len(s.machines.Machines)
+	s.mu.RUnlock()
+
+	for _, projectID := range effProjects {
+		mirrorPath := filepath.Join(cfg.DataDir, "git", projectID+".git")
+		if err := gitops.EnsureBareMirror(ctx, mirrorPath); err != nil {
+			return protocol.ReloadConfigResponse{}, fmt.Errorf("ensure bare mirror for %s: %w", projectID, err)
+		}
+	}
+
 	return protocol.ReloadConfigResponse{
-		ProjectsLoaded: len(projects.Projects),
-		MachinesLoaded: len(machines.Machines),
+		ProjectsLoaded: len(effProjects),
+		MachinesLoaded: effMachCount,
 	}, nil
 }
 
@@ -245,9 +282,14 @@ func (s *Server) buildRouter() http.Handler {
 	r.Get("/api/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"ok":      true,
+			"service": "hebi8-orbit-hub",
 			"version": "0.2.0-phase1",
 		})
 	})
+
+	// One-time code claim endpoints (self-authenticated via code, strict origin/rate limits)
+	r.Post("/api/pairing/claim", s.handleClaimPairingCode)
+	r.Post("/api/auth/handoff/claim", s.handleClaimAuthHandoff)
 
 	// WebSocket endpoints handle their own auth prior to upgrade
 	r.Get("/ws/client", s.handleClientWS)
@@ -261,12 +303,43 @@ func (s *Server) buildRouter() http.Handler {
 		blobs.Head("/{sha256}", s.handleHeadBlob)
 	})
 
+	// Runner-authenticated git bundle transport for remote_ws cross-OS project deliveries
+	r.Route("/api/runner", func(rr chi.Router) {
+		rr.Use(s.runnerAuthMiddleware)
+		rr.Get("/projects/{projectId}/mirror-heads", s.handleGetRunnerMirrorHeads)
+		rr.Put("/projects/{projectId}/deliveries/{deliveryId}/bundle", s.handlePutRunnerDeliveryBundle)
+		rr.Get("/projects/{projectId}/deliveries/{deliveryId}/bundle", s.handleGetRunnerDeliveryBundle)
+	})
+
 	// Authenticated REST API
 	r.Route("/api", func(api chi.Router) {
 		api.Use(s.authMiddleware)
 
 		api.Post("/ws-ticket", s.handleCreateWSTicket)
+		api.Post("/auth/handoff", s.handleCreateAuthHandoff)
 		api.Get("/bootstrap", s.handleBootstrap)
+		api.Post("/onboarding/complete", s.handleCompleteOnboarding)
+
+		api.Post("/pairing/codes", s.handleCreatePairingCode)
+		api.Get("/pairing/codes/{pairingId}", s.handleGetPairingCode)
+		api.Delete("/pairing/codes/{pairingId}", s.handleRevokePairingCode)
+
+		api.Get("/machines", s.handleListMachines)
+		api.Patch("/machines/{machineId}", s.handleUpdateMachine)
+		api.Delete("/machines/{machineId}", s.handleDeleteMachine)
+		api.Post("/machines/{machineId}/agents/probe", s.handleProbeMachineAgents)
+		api.Post("/machines/{machineId}/agents/{adapter}/test", s.handleTestMachineAgent)
+		api.Post("/machines/{machineId}/agents/{adapter}/install", s.handleInstallMachineAgent)
+		api.Patch("/machines/{machineId}/agents/{adapter}", s.handleUpdateMachineAgent)
+		api.Get("/machines/{machineId}/dirs", s.handleListMachineDirs)
+
+		api.Post("/projects", s.handleCreateProject)
+		api.Delete("/projects/{projectId}", s.handleDeleteProject)
+
+		api.Get("/network/settings", s.handleGetNetworkSettings)
+		api.Patch("/network/settings", s.handleUpdateNetworkSettings)
+		api.Post("/network/tailscale-enable", s.handleTailscaleEnable)
+
 		api.Get("/projects/{projectId}/tasks", s.handleListProjectTasks)
 		api.Post("/projects/{projectId}/tasks", s.handleCreateTask)
 
@@ -325,19 +398,18 @@ func (s *Server) buildRouter() http.Handler {
 
 func (s *Server) handleBootstrap(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
-	machineMeta := s.machines.Machines
-	wsName := strings.TrimSpace(s.hubCfg.WorkspaceName)
+	yamlMachineMeta := s.yamlMachines.Machines
 	s.mu.RUnlock()
 
-	resp, err := s.store.Bootstrap(r.Context(), machineMeta)
+	resp, err := s.store.Bootstrap(r.Context(), yamlMachineMeta)
 	if err != nil {
 		writeAPIError(w, http.StatusInternalServerError, "ERR_BOOTSTRAP_FAILED", err.Error())
 		return
 	}
-	if wsName == "" {
-		wsName = "Home LAN"
-	}
-	resp.WorkspaceName = wsName
+	resp.WorkspaceName = s.effectiveWorkspaceName()
+	resp.Machines = s.enrichMachineViews(r.Context(), resp.Machines)
+	setup := s.buildSetupStatus(r.Context(), resp.Machines, clientMachineIDFromContext(r.Context()))
+	resp.Setup = &setup
 	writeJSON(w, http.StatusOK, resp)
 }
 

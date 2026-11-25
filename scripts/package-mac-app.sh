@@ -16,13 +16,30 @@ LDFLAGS="-s -w -X main.Version=${VERSION} -X main.Commit=${COMMIT} -X main.Build
 mkdir -p "$OUT_DIR"
 APP_DIR="${OUT_DIR}/Orbit.app"
 rm -rf "$APP_DIR"
-mkdir -p "${APP_DIR}/Contents/MacOS" "${APP_DIR}/Contents/Resources"
+mkdir -p "${APP_DIR}/Contents/MacOS" "${APP_DIR}/Contents/Resources/bin"
 
-echo "==> Building pure-Go desktop client (darwin/arm64, version=${VERSION})"
+if [[ ! -f "web/dist/index.html" ]] || [[ ! -d "web/dist/assets" ]]; then
+  if command -v pnpm >/dev/null 2>&1; then
+    echo "==> web/dist missing; building embedded Web workbench first"
+    make build-web
+  else
+    echo "ERROR: web/dist/index.html (and assets) missing; run 'make build-web' before packaging Orbit.app" >&2
+    exit 1
+  fi
+fi
+if [[ ! -f "web/dist/index.html" ]]; then
+  echo "ERROR: web/dist/index.html still missing after build-web; aborting packaging" >&2
+  exit 1
+fi
+
+echo "==> Building pure-Go desktop client + bundled runtime (darwin/arm64, version=${VERSION})"
 (
   cd desktop
   CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags "$LDFLAGS" -o "../${APP_DIR}/Contents/MacOS/orbit-client" .
 )
+CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags "$LDFLAGS" -o "${APP_DIR}/Contents/Resources/bin/orbit-hub" ./cmd/orbit-hub
+CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags "$LDFLAGS" -o "${APP_DIR}/Contents/Resources/bin/orbit-runner" ./cmd/orbit-runner
+CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags "$LDFLAGS" -o "${APP_DIR}/Contents/Resources/bin/orbit" ./cmd/orbit
 
 cat > "${APP_DIR}/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>

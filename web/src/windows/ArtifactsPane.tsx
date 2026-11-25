@@ -5,7 +5,7 @@ import type { TaskTimelineResponse } from '../generated/protocol';
 import { ArtIcon } from '../components/Icons';
 import { Md } from '../components/Md';
 import { useDelivery } from '../hooks/queries';
-import { api, errMsg, getStoredDevToken, makeIdempotencyKey } from '../lib/api';
+import { api, errMsg, makeIdempotencyKey } from '../lib/api';
 import type { SessionArtifactItem } from '../lib/artifacts';
 import { artifactShortLabel, basename } from '../lib/format';
 import { toast } from '../store/useWorkbenchStore';
@@ -35,13 +35,8 @@ function formatBytes(n?: number): string {
   return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-async function fetchBlobText(sha256: string): Promise<string> {
-  const headers: Record<string, string> = {};
-  const tok = getStoredDevToken();
-  if (tok) headers['X-Orbit-Dev-Token'] = tok;
-  const res = await fetch(api.blobUrl(sha256), { headers });
-  if (!res.ok) throw new Error(`读取失败 (${res.status})`);
-  return res.text();
+function fetchBlobText(sha256: string): Promise<string> {
+  return api.fetchBlobText(sha256);
 }
 
 /**
@@ -212,14 +207,15 @@ export function ArtifactsPane({
               >
                 <Plus size={12} strokeWidth={1.8} /> 批注
               </button>
-              <a
+              <button
+                type="button"
                 className="ib"
-                href={api.blobUrl(activeArt.blobSha256)}
-                download={activeArt.title}
                 title="下载文件"
+                aria-label="下载文件"
+                onClick={() => void api.downloadBlob(activeArt.blobSha256!, activeArt.title).catch((e) => toast(errMsg(e), 'err'))}
               >
                 <Download size={14} strokeWidth={1.6} />
-              </a>
+              </button>
             </>
           )}
           {headerEnd}
@@ -278,9 +274,13 @@ export function ArtifactsPane({
                   </div>
                 </div>
                 {activeArt.blobSha256 && (
-                  <a className="btn pri" href={api.blobUrl(activeArt.blobSha256)} download={activeArt.title}>
+                  <button
+                    type="button"
+                    className="btn pri"
+                    onClick={() => void api.downloadBlob(activeArt.blobSha256!, activeArt.title).catch((e) => toast(errMsg(e), 'err'))}
+                  >
                     <Download size={12} strokeWidth={1.7} /> 下载
-                  </a>
+                  </button>
                 )}
               </div>
             )}

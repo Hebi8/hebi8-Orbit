@@ -1,9 +1,12 @@
 import { useState } from 'react';
+import { useQueryClient } from '@tanstack/react-query';
 import { SlidersHorizontal } from 'lucide-react';
 import type { MachineView } from '../generated/protocol';
 import { useHubLatency } from '../hooks/useHubLatency';
+import { api, errMsg } from '../lib/api';
 import { cleanMachineName, humanResourceLabel, relTime } from '../lib/format';
 import { resolveEffectiveLocalMachineId } from '../lib/ide';
+import { navigate, paths } from '../lib/router';
 import { toast, useWorkbenchStore } from '../store/useWorkbenchStore';
 
 const OK_RESOURCE_STATES = new Set(['free', 'available', 'ok', 'idle', 'ready', 'unlocked', 'online']);
@@ -32,8 +35,8 @@ function NodeRow({ m, latency, isLocal }: { m: MachineView; latency?: number | n
     <div className={`node-row-wrap ${tone === 'off' ? 'is-off' : ''}`}>
       <div className={`node-row ${tone === 'off' ? 'is-off' : ''}`}>
         <span className={`node-dot ${tone}`} aria-hidden="true" />
-        <span className="node-name" title={m.runnerVersion ? `${m.machineId} · Runner ${m.runnerVersion}` : m.machineId}>
-          {cleanMachineName(m)}
+        <span className="node-name" title={m.runnerVersion ? `${m.machineId} · ${m.runnerVersion}` : m.machineId}>
+          {m.displayAlias || cleanMachineName(m)}
         </span>
         {isLocal && <span className="node-local-pill">本机</span>}
         <span className={`node-right mono ${tone}`}>{rightText}</span>
@@ -58,6 +61,7 @@ export function MachinesPopover({
   machines: MachineView[];
   defaultWorkspaceName?: string;
 }) {
+  const qc = useQueryClient();
   const setOpen = useWorkbenchStore((s) => s.setMachinesOpen);
   const storedLocalId = useWorkbenchStore((s) => s.localMachineId);
   const workspaceNameOverride = useWorkbenchStore((s) => s.workspaceNameOverride);
@@ -73,10 +77,18 @@ export function MachinesPopover({
   const anyOnline = machines.length === 0 || onlineCount > 0;
   const headerTone = latency === null || !anyOnline ? 'off' : typeof latency === 'number' && latency >= 80 ? 'mid' : 'good';
 
-  const saveName = () => {
-    setWorkspaceNameOverride(draftName);
-    setRenaming(false);
-    toast(`已更新空间名称：${draftName.trim() || defaultWorkspaceName || 'Home LAN'}`);
+  const saveName = async () => {
+    const trimmed = draftName.trim();
+    try {
+      await api.updateNetworkSettings({ workspaceName: trimmed });
+      setWorkspaceNameOverride('');
+      setRenaming(false);
+      void qc.invalidateQueries({ queryKey: ['bootstrap'] });
+      void qc.invalidateQueries({ queryKey: ['network-settings'] });
+      toast(`已更新空间名称：${trimmed || defaultWorkspaceName || 'Home LAN'}`);
+    } catch (e) {
+      toast(errMsg(e), 'err');
+    }
   };
 
   return (
@@ -159,7 +171,7 @@ export function MachinesPopover({
               className="ws-settings-btn"
               onClick={() => {
                 setOpen(false);
-                toast('节点增删可在 ~/.config/hebi8-orbit/machines.yaml 配置后热重载');
+                navigate(paths.settings());
               }}
             >
               <SlidersHorizontal size={12} strokeWidth={1.6} />

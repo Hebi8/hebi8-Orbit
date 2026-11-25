@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/Hebi8/hebi8-Orbit/internal/gitops"
 	"github.com/Hebi8/hebi8-Orbit/internal/protocol"
 )
 
@@ -42,7 +43,11 @@ func PrepareWorktree(ctx context.Context, dispatch protocol.AttemptDispatchFrame
 	}
 
 	repoPath := protocol.ExpandPath(strings.TrimSpace(dispatch.RepoPath))
-	mirrorPath := protocol.ExpandPath(strings.TrimSpace(dispatch.MirrorBarePath))
+	rawMirror := strings.TrimSpace(dispatch.MirrorBarePath)
+	mirrorPath := ""
+	if rawMirror != "" && !strings.HasPrefix(rawMirror, "orbit-hub://") {
+		mirrorPath = protocol.ExpandPath(rawMirror)
+	}
 
 	// If local repoPath is omitted, we can still work directly from mirrorPath if present
 	gitSource := repoPath
@@ -50,13 +55,14 @@ func PrepareWorktree(ctx context.Context, dispatch protocol.AttemptDispatchFrame
 		gitSource = mirrorPath
 	}
 
-	// If gitSource defines an origin remote and dispatch declares RepoIdentity, verify they match.
+	// If gitSource defines an origin remote and dispatch declares RepoIdentity, verify they match
+	// using the shared credential-stripping identity sanitizer (never log raw remote URLs!).
 	if wantID := strings.TrimSpace(dispatch.RepoIdentity); wantID != "" {
 		if srcOrigin, err := runGitCmdTrim(ctx, gitSource, "remote", "get-url", "origin"); err == nil && srcOrigin != "" {
-			normSrc := normalizeRepoIdentity(srcOrigin)
-			normWant := normalizeRepoIdentity(wantID)
+			normSrc := canonicalRepoIdentity(srcOrigin)
+			normWant := canonicalRepoIdentity(wantID)
 			if normSrc != normWant && !strings.HasSuffix(normSrc, "/"+normWant) && !strings.HasSuffix(normWant, "/"+normSrc) {
-				return "", "", fmt.Errorf("ERR_REPO_IDENTITY_MISMATCH: source repo origin %q != project repoIdentity %q", srcOrigin, wantID)
+				return "", "", fmt.Errorf("ERR_REPO_IDENTITY_MISMATCH: source repo identity %q != project repoIdentity %q", normSrc, normWant)
 			}
 		}
 	}
@@ -178,18 +184,20 @@ func validateExistingWorktree(ctx context.Context, absWorktree, gitSource, baseS
 		return fmt.Errorf("ERR_WORKTREE_REPO_MISMATCH: worktree %s common dir %s != expected repo %s", absWorktree, wtCommon, srcCommon)
 	}
 
-	// If both worktree and dispatch carry an origin URL / repoIdentity, ensure no conflict.
+	// If both worktree and dispatch carry an origin URL / repoIdentity, ensure no conflict
+	// using the shared credential-stripping identity sanitizer (never log raw remote URLs!).
 	if wtOrigin, err := runGitCmdTrim(ctx, absWorktree, "remote", "get-url", "origin"); err == nil && wtOrigin != "" {
+		normWT := canonicalRepoIdentity(wtOrigin)
 		if srcOrigin, err := runGitCmdTrim(ctx, gitSource, "remote", "get-url", "origin"); err == nil && srcOrigin != "" {
-			if normalizeRepoIdentity(wtOrigin) != normalizeRepoIdentity(srcOrigin) {
-				return fmt.Errorf("ERR_WORKTREE_IDENTITY_MISMATCH: origin %q != source %q", wtOrigin, srcOrigin)
+			normSrc := canonicalRepoIdentity(srcOrigin)
+			if normWT != normSrc {
+				return fmt.Errorf("ERR_WORKTREE_IDENTITY_MISMATCH: origin %q != source %q", normWT, normSrc)
 			}
 		}
 		if wantID := strings.TrimSpace(dispatch.RepoIdentity); wantID != "" {
-			normWT := normalizeRepoIdentity(wtOrigin)
-			normWant := normalizeRepoIdentity(wantID)
+			normWant := canonicalRepoIdentity(wantID)
 			if normWT != normWant && !strings.HasSuffix(normWT, "/"+normWant) && !strings.HasSuffix(normWant, "/"+normWT) {
-				return fmt.Errorf("ERR_WORKTREE_IDENTITY_MISMATCH: worktree origin %q != project repoIdentity %q", wtOrigin, wantID)
+				return fmt.Errorf("ERR_WORKTREE_IDENTITY_MISMATCH: worktree origin %q != project repoIdentity %q", normWT, normWant)
 			}
 		}
 	}
@@ -271,6 +279,13 @@ func runGitCmd(ctx context.Context, dir string, args ...string) (string, error) 
 		return "", fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
 	}
 	return stdout.String(), nil
+}
+
+func canonicalRepoIdentity(raw string) string {
+	if sanitized := gitops.SanitizeGitRemoteIdentity(raw); sanitized != "" {
+		return strings.ToLower(sanitized)
+	}
+	return normalizeRepoIdentity(raw)
 }
 
 func runGitCmdTrim(ctx context.Context, dir string, args ...string) (string, error) {

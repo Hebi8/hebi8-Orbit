@@ -40,6 +40,7 @@ func main() {
 		ryugiPort         = flag.Int("ryugi-port", -1, "override ryugi server port (0 = default)")
 		ryugiPublicOrigin = flag.String("ryugi-public-origin", "", "override public origin for ryugi Open URLs")
 		ryugiPollSec      = flag.Int("ryugi-poll-seconds", -1, "override ryugi polling interval seconds (0 disables background poller)")
+		parentPID         = flag.Int("parent-pid", 0, "optional parent PID to watch; exits cleanly if parent disappears")
 		showVersion       = flag.Bool("version", false, "print orbit-hub version and exit")
 	)
 	flag.Parse()
@@ -101,6 +102,23 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	if *parentPID > 0 {
+		protocol.StartParentWatchdog(ctx, *parentPID, func() {
+			log.Printf("orbit-hub: parent pid %d exited; shutting down", *parentPID)
+			stop()
+		})
+	}
+
+	hubLock, err := protocol.AcquireFileLock(filepath.Join(cfg.DataDir, "hub.lock"))
+	if err != nil {
+		log.Fatalf("orbit-hub single-instance lock: %v", err)
+	}
+	defer hubLock.Release()
+
+	if cfg.DevOpen {
+		log.Printf("WARNING: orbit-hub running with --dev-open (development only)")
+	}
 
 	dbPath := filepath.Join(cfg.DataDir, "orbit.sqlite")
 	st, err := store.Open(ctx, dbPath)

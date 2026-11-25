@@ -97,78 +97,44 @@ func runInit(ctx context.Context, args []string, stdin io.Reader, stdout, stderr
 
 	fmt.Fprintf(stdout, "hebi8-Orbit Init (%s)\n", Version)
 	fmt.Fprintf(stdout, "Config directory: %s\n\n", cfgDirAbs)
-	fmt.Fprintln(stdout, "Choose how to set up this machine:")
-	fmt.Fprintln(stdout, "  [1] Connect to an existing Orbit Hub (CLI + Desktop App)")
-	fmt.Fprintln(stdout, "  [2] Initialize a new Orbit Hub + local Runner on this machine")
-	fmt.Fprintln(stdout, "  [3] Join an existing Orbit Hub as a Runner node (remote worker)")
-	fmt.Fprintln(stdout, "  [4] Register current Git repository as an Orbit project")
+	fmt.Fprintln(stdout, "选择配置方式：")
+	fmt.Fprintln(stdout, "  [1] 就在这台机器先用（自动初始化并启动本机 Orbit，等价 orbit up）")
+	fmt.Fprintln(stdout, "  [2] 加入已有的 Orbit 网络（粘贴配对命令或链接，等价 orbit join）")
+	fmt.Fprintln(stdout, "  [3] 添加当前 Git 仓库为项目（等价 orbit projects add）")
 
-	choice, err := promptLine(reader, stdout, "\nSelect [1-4]", "1")
+	choice, err := promptLine(reader, stdout, "\n选择 [1-3]", "1")
 	if err != nil {
 		return err
 	}
 
 	switch strings.TrimSpace(choice) {
-	case "1", "connect":
-		defaultURL := existingClientHubURL(cfgDirAbs)
-		if defaultURL == "" {
-			defaultURL = "http://127.0.0.1:4310"
-		}
-		hubURL, err := promptLine(reader, stdout, "Hub URL (e.g. https://orbit.example.ts.net)", defaultURL)
-		if err != nil {
-			return err
-		}
-		return initConnectMode(ctx, cfgDirAbs, hubURL, *tokenFlag, true, stdout)
+	case "1", "up", "local", "hub":
+		return runUp(ctx, []string{"--config-dir", cfgDirAbs, "--data-dir", dataDir}, stdout, stderr)
 
-	case "2", "hub":
-		defMachine := defaultMachineID(*machineFlag)
-		machineID, err := promptLine(reader, stdout, "Local machine ID", defMachine)
+	case "2", "join", "connect", "runner":
+		raw, err := promptLine(reader, stdout, "粘贴邀请命令、链接或 Hub 地址", existingClientHubURL(cfgDirAbs))
 		if err != nil {
 			return err
 		}
-		wsName, err := promptLine(reader, stdout, "Workspace display name", *workspaceFlag)
-		if err != nil {
-			return err
+		if strings.TrimSpace(raw) == "" {
+			return fmt.Errorf("需要邀请命令或地址")
 		}
-		listenAddr, err := promptLine(reader, stdout, "Hub listen address", *listenFlag)
-		if err != nil {
-			return err
+		_, code, _, pErr := parseJoinInput([]string{raw}, "")
+		if pErr == nil && code != "" {
+			return runJoin(ctx, []string{"--config-dir", cfgDirAbs, "--data-dir", dataDir, raw}, stdout, stderr)
 		}
-		origin, err := promptLine(reader, stdout, "Public Hub origin (blank = http://"+listenAddr+")", *originFlag)
-		if err != nil {
-			return err
-		}
-		return initHubMode(cfgDirAbs, dataDir, machineID, wsName, listenAddr, origin, *force, stdout)
+		return initConnectMode(ctx, cfgDirAbs, raw, *tokenFlag, true, stdout)
 
-	case "3", "runner":
-		defaultURL := existingClientHubURL(cfgDirAbs)
-		hubURL, err := promptLine(reader, stdout, "Hub URL (e.g. https://orbit.example.ts.net)", defaultURL)
-		if err != nil {
-			return err
-		}
-		if strings.TrimSpace(hubURL) == "" {
-			return fmt.Errorf("hub URL is required")
-		}
-		machineID, err := promptLine(reader, stdout, "Machine ID for this node", defaultMachineID(*machineFlag))
-		if err != nil {
-			return err
-		}
-		tok, err := promptLine(reader, stdout, "Runner token (leave blank to generate a new one)", *tokenFlag)
-		if err != nil {
-			return err
-		}
-		return initRunnerMode(ctx, cfgDirAbs, hubURL, machineID, tok, *force, stdout)
-
-	case "4", "project":
+	case "3", "4", "project":
 		cwd, _ := os.Getwd()
-		dir, err := promptLine(reader, stdout, "Repository path", cwd)
+		dir, err := promptLine(reader, stdout, "项目目录", cwd)
 		if err != nil {
 			return err
 		}
-		return initProjectMode(cfgDirAbs, dataDir, dir, *machineFlag, *projectIDFlag, *projectNameFlag, *adapterFlag, stdout)
+		return runProjects(ctx, []string{"add", "--config-dir", cfgDirAbs, "--data-dir", dataDir, dir}, stdout, stderr)
 
 	default:
-		return fmt.Errorf("invalid choice %q (expected 1-4)", choice)
+		return fmt.Errorf("invalid choice %q (expected 1-3)", choice)
 	}
 }
 

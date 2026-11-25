@@ -2,8 +2,17 @@ import { useQueries, useQuery, useQueryClient } from '@tanstack/react-query';
 import type { EventRecord, ProjectView, TaskSummary } from '../generated/protocol';
 import { api } from '../lib/api';
 
-export function useBootstrap() {
-  return useQuery({ queryKey: ['bootstrap'], queryFn: api.bootstrap, staleTime: 10_000 });
+export function useBootstrap(enabled = true) {
+  return useQuery({ queryKey: ['bootstrap'], queryFn: api.bootstrap, enabled, staleTime: 10_000 });
+}
+
+export function useNetworkSettings(enabled = true) {
+  return useQuery({
+    queryKey: ['network-settings'],
+    queryFn: api.getNetworkSettings,
+    enabled,
+    staleTime: 15_000,
+  });
 }
 
 export function useGlobalArtifacts(enabled = true) {

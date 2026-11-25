@@ -56,7 +56,7 @@ func (s *Server) createTaskInternalWithPA(
 		return resp, nil, http.StatusInternalServerError, "ERR_PROJECT_LOOKUP", err
 	}
 
-	route, err := s.resolveExecutionRoute(proj, req.RequiredCapability, req.Adapter)
+	route, err := s.resolveExecutionRoute(proj, req.RequiredCapability, req.Adapter, req.MachineID)
 	if err != nil {
 		return resp, nil, http.StatusBadRequest, "ERR_ROUTE_FAILED", err
 	}
@@ -66,8 +66,17 @@ func (s *Server) createTaskInternalWithPA(
 	if st, code, err := s.validateAdapterSupport(route); err != nil {
 		return resp, nil, st, code, err
 	}
+	// If dispatching a dynamic UI remote project to an already-connected legacy Runner lacking bundle.v1, surface upgrade guidance early.
+	if proj.Source == protocol.ProjectSourceUI &&
+		route.MachineCfg.Transport != "" && route.MachineCfg.Transport != protocol.TransportLocalWS &&
+		s.runners.IsConnected(route.MachineID) && !s.runners.HasCapability(route.MachineID, protocol.RunnerCapBundleV1) {
+		return resp, nil, http.StatusUpgradeRequired, "ERR_RUNNER_UPGRADE_REQUIRED", fmt.Errorf(
+			"machine %s is running an older orbit-runner without bundle.v1 delivery support; please upgrade orbit-runner on %s",
+			route.MachineID, route.MachineID,
+		)
+	}
 
-	// Merge default project model config with request overrides
+	// Merge project defaults -> machine agent defaultModel -> explicit request overrides
 	desiredCfg := map[string]string{}
 	s.mu.RLock()
 	if pCfg, ok := s.projects.Projects[projectID]; ok {
@@ -82,6 +91,11 @@ func (s *Server) createTaskInternalWithPA(
 		}
 	}
 	s.mu.RUnlock()
+	if agentSettings, _, err := s.store.GetMachineAgentSettings(ctx, route.MachineID); err == nil {
+		if ac, ok := agentSettings[string(route.Adapter)]; ok && strings.TrimSpace(ac.DefaultModel) != "" {
+			desiredCfg["model"] = strings.TrimSpace(ac.DefaultModel)
+		}
+	}
 	for k, v := range req.Config {
 		if strings.TrimSpace(v) != "" {
 			desiredCfg[k] = v
@@ -91,6 +105,9 @@ func (s *Server) createTaskInternalWithPA(
 	triggerKind := protocol.TriggerInitial
 	baseSHA := ""
 	if req.ImportDirtyWorkspace && projectID != protocol.ScratchProjectID && strings.TrimSpace(route.Anchor.RepoPath) != "" {
+		if route.MachineCfg.Transport != "" && route.MachineCfg.Transport != protocol.TransportLocalWS {
+			return resp, nil, http.StatusBadRequest, "ERR_REMOTE_DIRTY_IMPORT_UNSUPPORTED", errors.New("远程机器项目暂不支持直接带入未提交改动，请先在该机器提交后再发起任务")
+		}
 		repoPath := protocol.ExpandPath(route.Anchor.RepoPath)
 		snapID := "dlv_" + ulid.Make().String()
 		pkg, err := gitops.PackageCheckpoint(ctx, gitops.PackageOptions{
@@ -366,6 +383,15 @@ func (s *Server) followupTaskInternalWithPA(
 	}
 	if st, code, err := s.validateAdapterSupport(route); err != nil {
 		return resp, nil, st, code, err
+	}
+	// If dispatching a dynamic UI remote project to an already-connected legacy Runner lacking bundle.v1, surface upgrade guidance early.
+	if proj.Source == protocol.ProjectSourceUI &&
+		route.MachineCfg.Transport != "" && route.MachineCfg.Transport != protocol.TransportLocalWS &&
+		s.runners.IsConnected(route.MachineID) && !s.runners.HasCapability(route.MachineID, protocol.RunnerCapBundleV1) {
+		return resp, nil, http.StatusUpgradeRequired, "ERR_RUNNER_UPGRADE_REQUIRED", fmt.Errorf(
+			"machine %s is running an older orbit-runner without bundle.v1 delivery support; please upgrade orbit-runner on %s",
+			route.MachineID, route.MachineID,
+		)
 	}
 
 	var anchorPtr *protocol.ProjectAnchorConfig

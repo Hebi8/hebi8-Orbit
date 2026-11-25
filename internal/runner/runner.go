@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"sort"
 	"strings"
@@ -56,6 +57,8 @@ type Config struct {
 	ReconnectMaxDelay       time.Duration
 	PermissionPolicy        PermissionDecisionPolicy
 	ResourceProbe           ResourceProbeFunc
+	AgentManager            *AgentManager
+	AllowedBrowseRoots      []string
 	// Test hooks for deterministic R3 crash simulation
 	OnAfterACPApprovalWrite func(approvalID string) bool
 }
@@ -64,6 +67,7 @@ type sessionSlot struct {
 	mu                   sync.Mutex
 	wbSessionID          string
 	adapter              protocol.Adapter
+	driver               AcpAdapterDriver
 	providerSessionID    acp.SessionId
 	cwd                  string
 	runtimeState         protocol.SessionRuntimeState
@@ -87,6 +91,7 @@ type attemptContext struct {
 	mu                      sync.Mutex
 	dispatch                protocol.AttemptDispatchFrame
 	slot                    *sessionSlot
+	driver                  AcpAdapterDriver
 	worktreePath            string
 	baseSHA                 string
 	state                   protocol.AttemptState
@@ -104,6 +109,7 @@ type attemptContext struct {
 	finalized               bool
 	heldResources           []string
 	reservedWorker          bool
+	reservedWorkerAdapter   protocol.Adapter
 	tracker                 *ActiveSwarmTracker
 	pendingApprovals        map[string]*pendingApprovalHandle
 	ackPendingWG            sync.WaitGroup
@@ -117,27 +123,41 @@ type attemptContext struct {
 	doneCh                  chan struct{}
 }
 
+type liveSlotMeta struct {
+	adapter    protocol.Adapter
+	live       bool
+	inFlight   bool
+	locked     bool
+	lastActive time.Time
+}
+
 // Runner is the pure-Go thin ACP runner bridging Hub (/ws/runner) and AcpAdapterDriver(s).
 type Runner struct {
-	cfg           Config
-	instanceID    string
-	outbox        *LocalOutbox
-	driver        AcpAdapterDriver
-	drivers       map[protocol.Adapter]AcpAdapterDriver
-	driverMu      sync.Mutex
-	driverStarted map[protocol.Adapter]bool
-	coalescer     *ChunkCoalescer
-	sockSrv       *localSocketServer
-	httpClient    *http.Client
-	deliverMu     sync.Mutex
+	cfg            Config
+	instanceID     string
+	outbox         *LocalOutbox
+	driver         AcpAdapterDriver
+	drivers        map[protocol.Adapter]AcpAdapterDriver
+	driverBins     map[protocol.Adapter]string
+	retiredDrivers []AcpAdapterDriver
+	driverMu       sync.Mutex
+	driverStarted  map[protocol.Adapter]bool
+	supportedAdps  []protocol.Adapter
+	agentMgr       *AgentManager
+	coalescer      *ChunkCoalescer
+	sockSrv        *localSocketServer
+	httpClient     *http.Client
+	deliverMu      sync.Mutex
 
 	mu                sync.Mutex
 	sessions          map[string]*sessionSlot
+	slotMeta          map[string]liveSlotMeta
 	attempts          map[string]*attemptContext
 	sessionOwner      map[acp.SessionId]string
 	resourceLocks     map[string]string // resourceName -> attemptID
 	cancelledAttempts map[string]bool   // B10: attemptID cancelled before/during dispatch
-	reservedWorkers   int               // S1: atomic hard-cap reservation for MaxLiveWorkers
+	reservedWorkers   int               // S1: atomic hard-cap reservation for global MaxLiveWorkers
+	reservedByAdapter map[protocol.Adapter]int
 
 	connMu   sync.Mutex
 	wsConn   *websocket.Conn
@@ -171,7 +191,7 @@ func New(ctx context.Context, cfg Config) (*Runner, error) {
 			drivers[defaultAdp] = cfg.Driver
 		}
 	}
-	if len(drivers) == 0 {
+	if len(drivers) == 0 && cfg.AgentManager == nil {
 		return nil, errors.New("at least one acp driver is required")
 	}
 	primaryDriver := cfg.Driver
@@ -249,13 +269,18 @@ func New(ctx context.Context, cfg Config) (*Runner, error) {
 		outbox:            outbox,
 		driver:            primaryDriver,
 		drivers:           drivers,
+		driverBins:        map[protocol.Adapter]string{},
 		driverStarted:     map[protocol.Adapter]bool{},
+		supportedAdps:     append([]protocol.Adapter(nil), cfg.SupportedAdapters...),
+		agentMgr:          cfg.AgentManager,
 		httpClient:        &http.Client{Timeout: 30 * time.Second},
 		sessions:          map[string]*sessionSlot{},
+		slotMeta:          map[string]liveSlotMeta{},
 		attempts:          map[string]*attemptContext{},
 		sessionOwner:      map[acp.SessionId]string{},
 		resourceLocks:     map[string]string{},
 		cancelledAttempts: map[string]bool{},
+		reservedByAdapter: map[protocol.Adapter]int{},
 		hbPeriod:          10 * time.Second,
 		outboxWakeCh:      make(chan struct{}, 1),
 	}
@@ -276,7 +301,9 @@ func deriveHubHTTPURL(wsRaw string) string {
 }
 
 func (r *Runner) supportedAdapters() []protocol.Adapter {
-	return append([]protocol.Adapter(nil), r.cfg.SupportedAdapters...)
+	r.driverMu.Lock()
+	defer r.driverMu.Unlock()
+	return append([]protocol.Adapter(nil), r.supportedAdps...)
 }
 
 // InstanceID returns this runner process's unique UUID (changes on every restart).
@@ -292,22 +319,24 @@ func (r *Runner) driverFor(adapter protocol.Adapter) (AcpAdapterDriver, error) {
 	if adapter == "" {
 		adapter = protocol.AdapterAgy
 	}
+	r.driverMu.Lock()
+	defer r.driverMu.Unlock()
 	if drv, ok := r.drivers[adapter]; ok && drv != nil {
 		return drv, nil
 	}
-	return nil, fmt.Errorf("adapter %q is not configured on runner %s", adapter, r.cfg.MachineID)
+	return nil, fmt.Errorf("adapter %q is not configured or disabled on runner %s", adapter, r.cfg.MachineID)
 }
 
 func (r *Runner) ensureDriverStarted(ctx context.Context, adapter protocol.Adapter) (AcpAdapterDriver, error) {
 	if adapter == "" {
 		adapter = protocol.AdapterAgy
 	}
-	drv, err := r.driverFor(adapter)
-	if err != nil {
-		return nil, err
-	}
 	r.driverMu.Lock()
 	defer r.driverMu.Unlock()
+	drv, ok := r.drivers[adapter]
+	if !ok || drv == nil {
+		return nil, fmt.Errorf("adapter %q is not configured or disabled on runner %s", adapter, r.cfg.MachineID)
+	}
 	if r.driverStarted[adapter] {
 		return drv, nil
 	}
@@ -322,18 +351,129 @@ func (r *Runner) ensureDriverStarted(ctx context.Context, adapter protocol.Adapt
 	return drv, nil
 }
 
-// Start boots the primary ACP driver, opens the local Unix domain socket, and connects to Hub /ws/runner.
-// Additional configured adapters (e.g. claude, codex) start lazily on first dispatch so idle memory stays minimal.
+// syncDriversFromAgentManager refreshes configured drivers and ready adapters from AgentManager probes
+// without killing live running attempts; replaced/removed drivers are retired and closed once idle.
+func (r *Runner) syncDriversFromAgentManager(probes []protocol.AgentProbe) {
+	if r.agentMgr == nil {
+		return
+	}
+	ready := make([]protocol.Adapter, 0, len(probes))
+	r.driverMu.Lock()
+	for _, p := range probes {
+		if !p.Enabled || p.State != protocol.AgentStateReady {
+			// Refuse future dispatches for disabled/unready adapters while leaving in-flight sessions undisturbed.
+			if oldDrv := r.drivers[p.Adapter]; oldDrv != nil && r.driverStarted[p.Adapter] {
+				r.retiredDrivers = append(r.retiredDrivers, oldDrv)
+			}
+			delete(r.drivers, p.Adapter)
+			delete(r.driverBins, p.Adapter)
+			delete(r.driverStarted, p.Adapter)
+			continue
+		}
+		ready = append(ready, p.Adapter)
+		if drv, sig, ok := r.agentMgr.BuildDriverFor(p.Adapter); ok {
+			if existingSig, has := r.driverBins[p.Adapter]; has && existingSig == sig && r.drivers[p.Adapter] != nil {
+				continue
+			}
+			if oldDrv := r.drivers[p.Adapter]; oldDrv != nil && r.driverStarted[p.Adapter] {
+				r.retiredDrivers = append(r.retiredDrivers, oldDrv)
+			}
+			r.drivers[p.Adapter] = drv
+			r.driverBins[p.Adapter] = sig
+			delete(r.driverStarted, p.Adapter)
+		}
+	}
+	r.supportedAdps = ready
+	r.driverMu.Unlock()
+
+	r.sweepRetiredDrivers()
+}
+
+func (r *Runner) sweepRetiredDrivers() {
+	r.driverMu.Lock()
+	hasRetired := len(r.retiredDrivers) > 0
+	r.driverMu.Unlock()
+	if !hasRetired {
+		return
+	}
+
+	// Snapshot sessions & attempts under r.mu, then inspect slot/attempt locks OUTSIDE r.mu
+	// to strictly preserve lock ordering (slot.mu / att.mu -> r.mu) and avoid ABBA deadlocks.
+	r.mu.Lock()
+	sessions := make([]*sessionSlot, 0, len(r.sessions))
+	for _, s := range r.sessions {
+		sessions = append(sessions, s)
+	}
+	attempts := make([]*attemptContext, 0, len(r.attempts))
+	for _, a := range r.attempts {
+		attempts = append(attempts, a)
+	}
+	r.mu.Unlock()
+
+	inUse := map[AcpAdapterDriver]bool{}
+	for _, s := range sessions {
+		s.mu.Lock()
+		if s.driver != nil && s.runtimeState != protocol.SessionDead && s.runtimeState != protocol.SessionIdleClosed {
+			inUse[s.driver] = true
+		}
+		s.mu.Unlock()
+	}
+	for _, a := range attempts {
+		a.mu.Lock()
+		if a.driver != nil && !a.finalized {
+			inUse[a.driver] = true
+		}
+		a.mu.Unlock()
+	}
+
+	r.driverMu.Lock()
+	var toClose []AcpAdapterDriver
+	keep := r.retiredDrivers[:0]
+	for _, drv := range r.retiredDrivers {
+		if drv == nil {
+			continue
+		}
+		if inUse[drv] {
+			keep = append(keep, drv)
+		} else {
+			toClose = append(toClose, drv)
+		}
+	}
+	r.retiredDrivers = keep
+	r.driverMu.Unlock()
+
+	for _, drv := range toClose {
+		cctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		_ = drv.Close(cctx)
+		cancel()
+	}
+}
+
+// Start boots the primary ACP driver (or probes managed adapters lazily), opens the local Unix domain socket,
+// and connects to Hub /ws/runner.
 func (r *Runner) Start(ctx context.Context) error {
 	r.runCtx, r.runCancel = context.WithCancel(ctx)
 
-	primaryAdapter := protocol.AdapterAgy
-	if _, ok := r.drivers[primaryAdapter]; !ok && len(r.cfg.SupportedAdapters) > 0 {
-		primaryAdapter = r.cfg.SupportedAdapters[0]
-	}
-	if _, ok := r.drivers[primaryAdapter]; ok {
-		if _, err := r.ensureDriverStarted(r.runCtx, primaryAdapter); err != nil {
-			return err
+	if r.agentMgr != nil {
+		// Probe all adapters upfront (capped ~10s) so runner.hello advertises accurate AgentProbes immediately,
+		// while never failing runner startup if 0 adapters are ready yet.
+		probeCtx, cancelProbe := context.WithTimeout(ctx, 15*time.Second)
+		probes := r.agentMgr.ProbeAll(probeCtx)
+		cancelProbe()
+		r.syncDriversFromAgentManager(probes)
+	} else {
+		primaryAdapter := protocol.AdapterAgy
+		r.driverMu.Lock()
+		_, hasPrimary := r.drivers[primaryAdapter]
+		if !hasPrimary && len(r.supportedAdps) > 0 {
+			primaryAdapter = r.supportedAdps[0]
+			_, hasPrimary = r.drivers[primaryAdapter]
+		}
+		r.driverMu.Unlock()
+		if hasPrimary {
+			if _, err := r.ensureDriverStarted(r.runCtx, primaryAdapter); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -376,6 +516,13 @@ func (r *Runner) closeAllDrivers(ctx context.Context) error {
 		}
 		delete(r.driverStarted, adp)
 	}
+	for _, drv := range r.retiredDrivers {
+		if drv != nil && !seen[drv] {
+			seen[drv] = true
+			toClose = append(toClose, drv)
+		}
+	}
+	r.retiredDrivers = nil
 	r.driverMu.Unlock()
 
 	var errs []error
@@ -591,7 +738,26 @@ func (r *Runner) executeAttempt(ctx context.Context, att *attemptContext) {
 	}
 
 	// 3. Prepare isolated worktree and fixed review base SHA
-	worktreePath, baseSHA, err := PrepareWorktree(ctx, dispatch, r.cfg.DataDir)
+	worktreeDispatch := dispatch
+	var inputBundleCleanup func()
+	if dispatch.InputDelivery != nil && isHubBundleMirror(dispatch.MirrorBarePath) {
+		pid := hubBundleProjectID(dispatch.MirrorBarePath, dispatch.ProjectID)
+		bPath, clean, bErr := r.downloadInputDeliveryBundle(ctx, pid, dispatch.InputDelivery.DeliveryID)
+		if bErr != nil {
+			r.finalizeAttemptDurable(att, protocol.AttemptFailed, map[string]any{
+				"state":       string(protocol.AttemptFailed),
+				"errorCode":   "WORKTREE_PREPARE_FAILED",
+				"errorDetail": bErr.Error(),
+			})
+			return
+		}
+		inputBundleCleanup = clean
+		worktreeDispatch.MirrorBarePath = bPath
+	}
+	worktreePath, baseSHA, err := PrepareWorktree(ctx, worktreeDispatch, r.cfg.DataDir)
+	if inputBundleCleanup != nil {
+		inputBundleCleanup()
+	}
 	if err != nil {
 		r.finalizeAttemptDurable(att, protocol.AttemptFailed, map[string]any{
 			"state":       string(protocol.AttemptFailed),
@@ -610,8 +776,8 @@ func (r *Runner) executeAttempt(ctx context.Context, att *attemptContext) {
 	if wbSessionID == "" {
 		wbSessionID = "ses_" + dispatch.AttemptID
 	}
-	// S1: Atomically enforce MaxLiveWorkers hard cap (evicting LRU idle sessions first; waiting if all workers busy).
-	if r.cfg.MaxLiveWorkers > 0 {
+	// S1: Atomically enforce effective MaxLiveWorkers hard cap (per-agent setting or runner config).
+	if r.effectiveMaxLiveWorkers(dispatch.Adapter) > 0 {
 		if err := r.reserveLiveWorkerSlot(ctx, att, wbSessionID); err != nil {
 			r.finalizeAttemptDurable(att, protocol.AttemptCancelled, map[string]any{
 				"state":       string(protocol.AttemptCancelled),
@@ -663,9 +829,16 @@ func (r *Runner) executeAttempt(ctx context.Context, att *attemptContext) {
 
 	r.mu.Lock()
 	r.sessionOwner[sid] = dispatch.AttemptID
+	r.slotMeta[wbSessionID] = liveSlotMeta{
+		adapter:    slot.adapter,
+		live:       true,
+		inFlight:   true,
+		locked:     slot.locked,
+		lastActive: slot.lastActivityAt,
+	}
 	r.mu.Unlock()
 	slot.mu.Unlock()
-	// Session is now live and counted under slot.runtimeState == SessionLive -> release pre-creation reservation
+	// Session is now live and counted under slotMeta -> release pre-creation reservation
 	r.releaseWorkerReservation(att)
 
 	// 5. Enter running state and send ACP session/prompt
@@ -676,7 +849,13 @@ func (r *Runner) executeAttempt(ctx context.Context, att *attemptContext) {
 		"baseSha":           baseSHA,
 	})
 
-	drv, drvErr := r.driverFor(dispatch.Adapter)
+	att.mu.Lock()
+	drv := att.driver
+	att.mu.Unlock()
+	var drvErr error
+	if drv == nil {
+		drv, drvErr = r.driverFor(dispatch.Adapter)
+	}
 	var promptResp acp.PromptResponse
 	var promptErr error
 	if drvErr != nil {
@@ -692,6 +871,7 @@ func (r *Runner) executeAttempt(ctx context.Context, att *attemptContext) {
 		slot.promptOwnerAttemptID = ""
 	}
 	slot.lastActivityAt = time.Now()
+	r.syncSlotMetaLocked(slot)
 	slot.mu.Unlock()
 
 	att.mu.Lock()
@@ -893,25 +1073,54 @@ func (r *Runner) executeAttempt(ctx context.Context, att *attemptContext) {
 	r.finalizeAttemptDurable(att, protocol.AttemptSucceeded, payload)
 }
 
+func (r *Runner) syncSlotMetaLocked(slot *sessionSlot) {
+	if slot == nil || slot.wbSessionID == "" {
+		return
+	}
+	meta := liveSlotMeta{
+		adapter:    slot.adapter,
+		live:       slot.runtimeState == protocol.SessionLive && slot.providerSessionID != "",
+		inFlight:   slot.inFlightPrompt,
+		locked:     slot.locked,
+		lastActive: slot.lastActivityAt,
+	}
+	r.mu.Lock()
+	if meta.live {
+		r.slotMeta[slot.wbSessionID] = meta
+	} else {
+		delete(r.slotMeta, slot.wbSessionID)
+	}
+	r.mu.Unlock()
+}
+
 func (r *Runner) isolateAndCloseSession(slot *sessionSlot, sid acp.SessionId) {
 	var adapter protocol.Adapter
+	var pinnedDrv AcpAdapterDriver
 	if slot != nil {
 		slot.mu.Lock()
 		slot.locked = true
 		slot.runtimeState = protocol.SessionDead
 		adapter = slot.adapter
+		pinnedDrv = slot.driver
+		slot.driver = nil
 		if sid == "" {
 			sid = slot.providerSessionID
 		}
+		r.syncSlotMetaLocked(slot)
 		slot.mu.Unlock()
 	}
 	if sid != "" {
-		if drv, err := r.driverFor(adapter); err == nil {
+		drv := pinnedDrv
+		if drv == nil {
+			drv, _ = r.driverFor(adapter)
+		}
+		if drv != nil {
 			cctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			_ = drv.CloseSession(cctx, sid)
 			cancel()
 		}
 	}
+	r.sweepRetiredDrivers()
 }
 
 func (r *Runner) releaseWorkerReservation(att *attemptContext) {
@@ -920,7 +1129,9 @@ func (r *Runner) releaseWorkerReservation(att *attemptContext) {
 	}
 	att.mu.Lock()
 	had := att.reservedWorker
+	adp := att.reservedWorkerAdapter
 	att.reservedWorker = false
+	att.reservedWorkerAdapter = ""
 	att.mu.Unlock()
 	if !had {
 		return
@@ -929,14 +1140,40 @@ func (r *Runner) releaseWorkerReservation(att *attemptContext) {
 	if r.reservedWorkers > 0 {
 		r.reservedWorkers--
 	}
+	if adp != "" && r.reservedByAdapter[adp] > 0 {
+		r.reservedByAdapter[adp]--
+	}
 	r.mu.Unlock()
 }
 
-// reserveLiveWorkerSlot atomically enforces MaxLiveWorkers as a hard cap (S1):
-// reuses an already-live slot without consuming extra capacity, evicts LRU idle sessions first,
-// and waits in waiting_resource if all live slots are currently busy with active prompts/swarms.
+func (r *Runner) effectiveMaxLiveWorkers(adapter protocol.Adapter) int {
+	globalCap, adapterCap := r.workerCaps(adapter)
+	if adapterCap > 0 && (globalCap <= 0 || adapterCap < globalCap) {
+		return adapterCap
+	}
+	return globalCap
+}
+
+func (r *Runner) workerCaps(adapter protocol.Adapter) (globalCap int, adapterCap int) {
+	if adapter == "" {
+		adapter = protocol.AdapterAgy
+	}
+	globalCap = r.cfg.MaxLiveWorkers
+	if r.agentMgr != nil {
+		adapterCap = r.agentMgr.EffectiveMaxWorkers(adapter)
+	}
+	return globalCap, adapterCap
+}
+
+// reserveLiveWorkerSlot atomically enforces BOTH per-adapter and global MaxLiveWorkers caps (S1)
+// using r.slotMeta under r.mu ONLY (zero r.mu -> slot.mu nesting, eliminating ABBA deadlocks!).
 func (r *Runner) reserveLiveWorkerSlot(ctx context.Context, att *attemptContext, wbSessionID string) error {
-	if r.cfg.MaxLiveWorkers <= 0 {
+	targetAdp := att.dispatch.Adapter
+	if targetAdp == "" {
+		targetAdp = protocol.AdapterAgy
+	}
+	globalCap, adapterCap := r.workerCaps(targetAdp)
+	if globalCap <= 0 && adapterCap <= 0 {
 		return nil
 	}
 	type cand struct {
@@ -948,38 +1185,47 @@ func (r *Runner) reserveLiveWorkerSlot(ctx context.Context, att *attemptContext,
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		r.mu.Lock()
-		if existing, ok := r.sessions[wbSessionID]; ok {
-			existing.mu.Lock()
-			alreadyLive := existing.runtimeState == protocol.SessionLive && existing.providerSessionID != "" && !existing.locked
-			existing.mu.Unlock()
-			if alreadyLive {
-				r.mu.Unlock()
-				return nil
-			}
+		globalCap, adapterCap = r.workerCaps(targetAdp)
+		if globalCap <= 0 && adapterCap <= 0 {
+			return nil
 		}
-		liveCount := 0
-		var idleCands []cand
-		for _, s := range r.sessions {
-			s.mu.Lock()
-			isLive := s.runtimeState == protocol.SessionLive && s.providerSessionID != ""
-			inFlight := s.inFlightPrompt
-			wbID := s.wbSessionID
-			lastAct := s.lastActivityAt
-			s.mu.Unlock()
-			if !isLive {
+
+		r.mu.Lock()
+		if meta, ok := r.slotMeta[wbSessionID]; ok && meta.live && !meta.locked && (meta.adapter == "" || meta.adapter == targetAdp) {
+			r.mu.Unlock()
+			return nil
+		}
+
+		totalLive := 0
+		adapterLive := 0
+		var allIdle []cand
+		var adapterIdle []cand
+		for wbID, meta := range r.slotMeta {
+			if !meta.live {
 				continue
 			}
-			liveCount++
-			if wbID != wbSessionID && !inFlight {
-				idleCands = append(idleCands, cand{wbID: wbID, lastActive: lastAct})
+			totalLive++
+			if meta.adapter == targetAdp {
+				adapterLive++
+			}
+			if wbID != wbSessionID && !meta.inFlight {
+				c := cand{wbID: wbID, lastActive: meta.lastActive}
+				allIdle = append(allIdle, c)
+				if meta.adapter == targetAdp {
+					adapterIdle = append(adapterIdle, c)
+				}
 			}
 		}
-		if liveCount+r.reservedWorkers < r.cfg.MaxLiveWorkers {
+
+		adapterOK := adapterCap <= 0 || (adapterLive+r.reservedByAdapter[targetAdp] < adapterCap)
+		globalOK := globalCap <= 0 || (totalLive+r.reservedWorkers < globalCap)
+		if adapterOK && globalOK {
 			r.reservedWorkers++
+			r.reservedByAdapter[targetAdp]++
 			r.mu.Unlock()
 			att.mu.Lock()
 			att.reservedWorker = true
+			att.reservedWorkerAdapter = targetAdp
 			att.mu.Unlock()
 			if notifiedWait {
 				r.setAttemptState(att, protocol.AttemptPreparing, map[string]any{
@@ -990,13 +1236,19 @@ func (r *Runner) reserveLiveWorkerSlot(ctx context.Context, att *attemptContext,
 		}
 		r.mu.Unlock()
 
-		// Try evicting LRU idle sessions outside r.mu (CloseSessionSafely checks ownership/swarm/approvals).
+		// Evict only matching-adapter idle slots if per-adapter cap is full; evict any idle slot if global cap is full.
+		evictPool := allIdle
+		waitCap := globalCap
+		if !adapterOK {
+			evictPool = adapterIdle
+			waitCap = adapterCap
+		}
 		evicted := false
-		if len(idleCands) > 0 {
-			sort.Slice(idleCands, func(i, j int) bool {
-				return idleCands[i].lastActive.Before(idleCands[j].lastActive)
+		if len(evictPool) > 0 {
+			sort.Slice(evictPool, func(i, j int) bool {
+				return evictPool[i].lastActive.Before(evictPool[j].lastActive)
 			})
-			for _, c := range idleCands {
+			for _, c := range evictPool {
 				if closed, _ := r.CloseSessionSafely(ctx, c.wbID); closed {
 					evicted = true
 					break
@@ -1007,12 +1259,11 @@ func (r *Runner) reserveLiveWorkerSlot(ctx context.Context, att *attemptContext,
 			continue
 		}
 
-		// All MaxLiveWorkers slots are actively busy — wait cleanly until one frees up or ctx cancels!
 		if !notifiedWait {
 			notifiedWait = true
 			r.setAttemptState(att, protocol.AttemptWaitingResource, map[string]any{
 				"state":         string(protocol.AttemptWaitingResource),
-				"waitingReason": fmt.Sprintf("等待可用 Worker 槽位（上限 %d）", r.cfg.MaxLiveWorkers),
+				"waitingReason": fmt.Sprintf("等待可用 Worker 槽位（上限 %d）", waitCap),
 			})
 		}
 		select {
@@ -1055,6 +1306,15 @@ func (r *Runner) ensureSessionReadyLocked(ctx context.Context, att *attemptConte
 		expectedSID != "" &&
 		expectedCWD != "" &&
 		filepath.Clean(expectedCWD) == filepath.Clean(worktreePath)
+
+	// If reusing a live session whose original driver is still pinned and matches current driver, keep using it.
+	if canReuse && slot.driver != nil && slot.driver == drv {
+		drv = slot.driver
+	}
+	slot.driver = drv
+	att.mu.Lock()
+	att.driver = drv
+	att.mu.Unlock()
 
 	promptText := d.Prompt
 	prependContract := false
@@ -1304,17 +1564,26 @@ func (r *Runner) CloseSessionSafely(ctx context.Context, wbSessionID string) (bo
 
 	// Mark 'closing' INSIDE the per-session lock before calling CloseSession
 	slot.runtimeState = protocol.SessionClosing
-	drv, err := r.driverFor(slot.adapter)
-	if err != nil {
-		slot.runtimeState = protocol.SessionDead
-		return false, err
+	drv := slot.driver
+	slot.driver = nil
+	if drv == nil {
+		var err error
+		drv, err = r.driverFor(slot.adapter)
+		if err != nil {
+			slot.runtimeState = protocol.SessionDead
+			return false, err
+		}
 	}
-	err = drv.CloseSession(ctx, slot.providerSessionID)
+	err := drv.CloseSession(ctx, slot.providerSessionID)
 	if err != nil {
 		slot.runtimeState = protocol.SessionDead
+		r.syncSlotMetaLocked(slot)
+		go r.sweepRetiredDrivers()
 		return false, err
 	}
 	slot.runtimeState = protocol.SessionIdleClosed
+	r.syncSlotMetaLocked(slot)
+	go r.sweepRetiredDrivers()
 	return true, nil
 }
 
@@ -1402,6 +1671,7 @@ func (r *Runner) HandleCancel(frame protocol.AttemptCancelFrame) {
 	}
 	sid := att.providerSessionID
 	slot := att.slot
+	pinnedDrv := att.driver
 	cancelFn := att.cancelFn
 	hasInFlight := att.inFlightPrompts > 0 || !att.promptReturned
 	if att.swarmIdleTimer != nil {
@@ -1415,7 +1685,16 @@ func (r *Runner) HandleCancel(frame protocol.AttemptCancelFrame) {
 	att.mu.Unlock()
 
 	if sid != "" {
-		if drv, err := r.driverFor(att.dispatch.Adapter); err == nil {
+		drv := pinnedDrv
+		if drv == nil && slot != nil {
+			slot.mu.Lock()
+			drv = slot.driver
+			slot.mu.Unlock()
+		}
+		if drv == nil {
+			drv, _ = r.driverFor(att.dispatch.Adapter)
+		}
+		if drv != nil {
 			cctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			_ = drv.Cancel(cctx, sid)
 			cancel()
@@ -1645,9 +1924,9 @@ func (r *Runner) HandleLocalDeliver(ctx context.Context, req LocalDeliverRequest
 		return resp, fmt.Errorf("upload delivery blobs (saved locally as %s for retry): %w", pd.DeliveryID, err)
 	}
 
-	// Push delivery ref to bare mirror (protected by pre-receive hook)
+	// Push delivery ref to bare mirror (local mirror or Hub git bundle endpoint for remote_ws)
 	if !pd.Pushed {
-		if err := gitops.PushDeliveryRef(ctx, pd.RepoRoot, pd.MirrorBarePath, pd.DeliveryID, pd.HeadSHA); err != nil {
+		if err := r.pushDeliveryRefOrBundle(ctx, pd.ProjectID, pd.RepoRoot, pd.MirrorBarePath, pd.DeliveryID, pd.HeadSHA); err != nil {
 			return resp, fmt.Errorf("push delivery ref (saved locally as %s for retry): %w", pd.DeliveryID, err)
 		}
 		if err := r.outbox.MarkDeliveryPushed(ctx, pd.DeliveryID); err != nil {
@@ -2886,9 +3165,18 @@ func (r *Runner) drainBoardMessages(att *attemptContext) {
 		pctx, cancel := context.WithTimeout(r.runCtx, 2*time.Minute)
 		var resp acp.PromptResponse
 		var err error
-		if drv, drvErr := r.driverFor(att.dispatch.Adapter); drvErr != nil {
-			err = drvErr
-		} else {
+		att.mu.Lock()
+		drv := att.driver
+		att.mu.Unlock()
+		if drv == nil {
+			slot.mu.Lock()
+			drv = slot.driver
+			slot.mu.Unlock()
+		}
+		if drv == nil {
+			drv, err = r.driverFor(att.dispatch.Adapter)
+		}
+		if err == nil && drv != nil {
 			resp, err = drv.Prompt(pctx, sid, msgText)
 		}
 		cancel()
@@ -2899,6 +3187,7 @@ func (r *Runner) drainBoardMessages(att *attemptContext) {
 			slot.promptOwnerAttemptID = ""
 		}
 		slot.lastActivityAt = time.Now()
+		r.syncSlotMetaLocked(slot)
 		slot.mu.Unlock()
 
 		att.mu.Lock()
@@ -3183,6 +3472,60 @@ func (r *Runner) connectAndServeWS(ctx context.Context) error {
 	defer cancelConn()
 
 	var ioWG sync.WaitGroup
+	// Serialized config-apply & periodic re-probe worker bound to this connection's lifecycle
+	var configCh chan protocol.RunnerConfigFrame
+	if r.agentMgr != nil {
+		configCh = make(chan protocol.RunnerConfigFrame, 16)
+		if welcome.Config != nil {
+			r.agentMgr.ApplyHubConfig(*welcome.Config)
+			configCh <- protocol.RunnerConfigFrame{
+				Type:      protocol.RunnerMsgConfig,
+				ConfigRev: welcome.Config.ConfigRev,
+				Agents:    welcome.Config.Agents,
+			}
+		}
+		ioWG.Add(1)
+		go func() {
+			defer ioWG.Done()
+			ticker := time.NewTicker(10 * time.Minute)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-connCtx.Done():
+					return
+				case cfg := <-configCh:
+					// Drain any coalesced newer config frames queued behind cfg so we apply monotonically
+					latest := cfg
+					for {
+						select {
+						case next := <-configCh:
+							if next.ConfigRev >= latest.ConfigRev {
+								latest = next
+							}
+						default:
+							goto applyLatest
+						}
+					}
+				applyLatest:
+					if applied, _ := r.agentMgr.ApplyHubConfig(protocol.RunnerConfigPayload{
+						ConfigRev: latest.ConfigRev,
+						Agents:    latest.Agents,
+					}); !applied {
+						continue
+					}
+					if probes, rev, fresh := r.agentMgr.ProbeAllWithRev(connCtx); fresh {
+						r.syncDriversFromAgentManager(probes)
+						r.sendAgentsReport(probes, rev)
+					}
+				case <-ticker.C:
+					if probes, rev, fresh := r.agentMgr.ProbeAllWithRev(connCtx); fresh {
+						r.syncDriversFromAgentManager(probes)
+						r.sendAgentsReport(probes, rev)
+					}
+				}
+			}
+		}()
+	}
 	// Write pump
 	ioWG.Add(1)
 	go func() {
@@ -3272,6 +3615,37 @@ func (r *Runner) connectAndServeWS(ctx context.Context) error {
 				_ = r.outbox.AckUpTo(ctx, f.AttemptID, f.AckedOutboxSeq)
 				r.pruneFinalizedAttemptIfDrained(ctx, f.AttemptID)
 				r.wakeOutboxPump()
+			}
+		case protocol.RunnerMsgConfig:
+			var f protocol.RunnerConfigFrame
+			if json.Unmarshal(data, &f) == nil && configCh != nil {
+				// Apply Hub config revision immediately in order, then queue serialized re-probe.
+				r.agentMgr.ApplyHubConfig(protocol.RunnerConfigPayload{
+					ConfigRev: f.ConfigRev,
+					Agents:    f.Agents,
+				})
+				select {
+				case configCh <- f:
+				default:
+					// Drop stale queued item and enqueue latest
+					select {
+					case <-configCh:
+					default:
+					}
+					select {
+					case configCh <- f:
+					default:
+					}
+				}
+			}
+		case protocol.RunnerMsgRPC:
+			var f protocol.RunnerRPCFrame
+			if json.Unmarshal(data, &f) == nil {
+				ioWG.Add(1)
+				go func(req protocol.RunnerRPCFrame) {
+					defer ioWG.Done()
+					r.handleRunnerRPC(connCtx, req)
+				}(f)
 			}
 		}
 	}
@@ -3376,18 +3750,134 @@ func (r *Runner) buildRunnerHello(ctx context.Context) protocol.RunnerHelloFrame
 		resources = r.cfg.ResourceProbe(ctx)
 	}
 
+	hostname, _ := os.Hostname()
+	var agentProbes []protocol.AgentProbe
+	var configRev int64
+	caps := []string{protocol.RunnerCapFSV1, protocol.RunnerCapBundleV1}
+	if r.agentMgr != nil {
+		caps = append(caps, protocol.RunnerCapAgentsV1)
+		agentProbes = r.agentMgr.SnapshotProbes()
+		configRev = r.agentMgr.ConfigRev()
+	}
+
 	return protocol.RunnerHelloFrame{
 		Type:                     protocol.RunnerMsgHello,
 		ProtocolVersion:          1,
 		MachineID:                r.cfg.MachineID,
 		RunnerInstanceID:         r.instanceID,
 		RunnerVersion:            r.cfg.RunnerVersion,
+		OS:                       runtime.GOOS,
+		Arch:                     runtime.GOARCH,
+		Hostname:                 hostname,
+		Capabilities:             caps,
 		Adapters:                 r.supportedAdapters(),
+		AgentProbes:              agentProbes,
+		ConfigRev:                configRev,
 		LiveAttempts:             liveAttempts,
 		LivePendingApprovalIDs:   liveApprovals,
 		HandledApprovalDecisions: handled,
 		Resources:                resources,
 	}
+}
+
+func (r *Runner) sendAgentsReport(probes []protocol.AgentProbe, configRev int64) {
+	if r.agentMgr == nil {
+		return
+	}
+	_ = r.sendWSJSON(protocol.RunnerAgentsReportFrame{
+		Type:      protocol.RunnerMsgAgentsReport,
+		MachineID: r.cfg.MachineID,
+		ConfigRev: configRev,
+		Agents:    probes,
+	})
+}
+
+func (r *Runner) handleRunnerRPC(ctx context.Context, req protocol.RunnerRPCFrame) {
+	res := protocol.RunnerRPCResultFrame{
+		Type:      protocol.RunnerMsgRPCResult,
+		RequestID: req.RequestID,
+	}
+
+	switch req.Op {
+	case "probe":
+		if r.agentMgr == nil {
+			res.Error = "agent manager not enabled"
+		} else {
+			probes, rev, fresh := r.agentMgr.ProbeAllWithRev(ctx)
+			if fresh {
+				r.syncDriversFromAgentManager(probes)
+				r.sendAgentsReport(probes, rev)
+			} else {
+				probes = r.agentMgr.SnapshotProbes()
+			}
+			res.OK = true
+			res.Data = map[string]any{"agents": probes}
+		}
+
+	case "test_agent":
+		if r.agentMgr == nil {
+			res.Error = "agent manager not enabled"
+		} else {
+			adpStr, _ := req.Args["adapter"].(string)
+			probe, rev, err := r.agentMgr.TestAgent(ctx, protocol.Adapter(adpStr))
+			probes := r.agentMgr.SnapshotProbes()
+			if r.agentMgr.ConfigRev() == rev {
+				r.syncDriversFromAgentManager(probes)
+				r.sendAgentsReport(probes, rev)
+			}
+			res.Data = map[string]any{"probe": probe, "agents": probes}
+			if err != nil {
+				res.Error = err.Error()
+			} else {
+				res.OK = true
+			}
+		}
+
+	case "install_bridge":
+		if r.agentMgr == nil {
+			res.Error = "agent manager not enabled"
+		} else {
+			adpStr, _ := req.Args["adapter"].(string)
+			probe, rev, err := r.agentMgr.InstallBridge(ctx, protocol.Adapter(adpStr))
+			probes := r.agentMgr.SnapshotProbes()
+			if r.agentMgr.ConfigRev() == rev {
+				r.syncDriversFromAgentManager(probes)
+				r.sendAgentsReport(probes, rev)
+			}
+			res.Data = map[string]any{"probe": probe, "agents": probes}
+			if err != nil {
+				res.Error = err.Error()
+			} else {
+				res.OK = true
+			}
+		}
+
+	case "list_dirs":
+		pathArg, _ := req.Args["path"].(string)
+		out, err := gitops.ListSubdirs(pathArg, r.cfg.AllowedBrowseRoots, false)
+		if err != nil {
+			res.Error = err.Error()
+		} else {
+			res.OK = true
+			raw, _ := json.Marshal(out)
+			_ = json.Unmarshal(raw, &res.Data)
+		}
+
+	case "check_repo":
+		pathArg, _ := req.Args["path"].(string)
+		out := gitops.CheckGitRepo(ctx, pathArg, r.cfg.AllowedBrowseRoots)
+		raw, _ := json.Marshal(out)
+		_ = json.Unmarshal(raw, &res.Data)
+		res.OK = out.Valid
+		if !out.Valid {
+			res.Error = out.Error
+		}
+
+	default:
+		res.Error = fmt.Sprintf("unknown rpc op %q", req.Op)
+	}
+
+	_ = r.sendWSJSON(res)
 }
 
 func (r *Runner) buildHeartbeat(ctx context.Context) protocol.RunnerHeartbeatFrame {
@@ -3454,7 +3944,18 @@ func (r *Runner) retryPendingDeliveries(ctx context.Context) {
 			continue
 		}
 		if !pd.Pushed {
-			if err := gitops.PushDeliveryRef(ctx, pd.RepoRoot, pd.MirrorBarePath, pd.DeliveryID, pd.HeadSHA); err != nil {
+			if err := r.pushDeliveryRefOrBundle(ctx, pd.ProjectID, pd.RepoRoot, pd.MirrorBarePath, pd.DeliveryID, pd.HeadSHA); err != nil {
+				if isPermanentBundleErr(err) {
+					// Surface permanent size/conflict failure instead of retrying forever (#8)
+					if pd.AttemptID != "" && pd.LeaseToken != "" {
+						_, _ = r.enqueueOutbox(ctx, pd.AttemptID, pd.LeaseToken, protocol.OutboxFrameState, map[string]any{
+							"state":       string(protocol.AttemptFailed),
+							"errorCode":   "DELIVERY_BUNDLE_REJECTED",
+							"errorDetail": err.Error(),
+						})
+					}
+					_ = r.outbox.MarkDeliveryEmitted(ctx, pd.DeliveryID)
+				}
 				continue
 			}
 			_ = r.outbox.MarkDeliveryPushed(ctx, pd.DeliveryID)

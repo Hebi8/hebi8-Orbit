@@ -45,24 +45,34 @@ func main() {
 		log.Printf("orbit-client: warning loading config: %v", err)
 	}
 
+	runtimeMgr := NewRuntimeManager()
+	defer runtimeMgr.Shutdown()
+
 	var mu sync.RWMutex
 	currentHubURL := cfg.HubURL
+	currentMode := cfg.Mode
 
 	getHubURL := func() string {
 		mu.RLock()
 		defer mu.RUnlock()
 		return currentHubURL
 	}
-	setHubURL := func(u string) {
+	setHubState := func(u, mode string) {
 		mu.Lock()
 		currentHubURL = u
+		currentMode = mode
 		mu.Unlock()
 	}
 
-	// Lightweight loopback server solely for the embedded "Connect to Hub" setup page.
-	setupOrigin, closeSetupSrv, err := startSetupServer(*configDir, getHubURL, func(u string) {
-		setHubURL(u)
+	// Lightweight loopback server solely for the embedded setup screen.
+	setupOrigin, closeSetupSrv, err := startSetupServer(*configDir, runtimeMgr, getHubURL, func() string {
+		mu.RLock()
+		defer mu.RUnlock()
+		return currentMode
+	}, func(u, mode string) {
+		setHubState(u, mode)
 		cfg.HubURL = u
+		cfg.Mode = mode
 	})
 	if err != nil {
 		log.Fatalf("orbit-client: start setup server: %v", err)
@@ -71,7 +81,22 @@ func main() {
 
 	initialURL := setupOrigin + "/"
 	if !*forceSetup && cfg.HubURL != "" {
-		initialURL = cfg.HubURL + "/"
+		switch cfg.Mode {
+		case "local":
+			// Always check local Hub & local Runner independently (even if Hub is already attached).
+			if hubURL, _, _, sErr := runtimeMgr.StartOrAttachLocal(context.Background(), *configDir); sErr == nil {
+				setHubState(hubURL, "local")
+				cfg.HubURL = hubURL
+			}
+		case "remote":
+			// Restore managed remote Runner if user opted in ("让这台机器执行任务") during join.
+			if cfg.RunLocalRunner {
+				if rErr := runtimeMgr.EnsureRemoteRunner(*configDir); rErr != nil {
+					log.Printf("orbit-client: warning restoring remote runner: %v", rErr)
+				}
+			}
+		}
+		initialURL = runtimeMgr.BuildOpenURL(context.Background(), *configDir, getHubURL(), "")
 	}
 
 	mygo.App.SetName("hebi8-Orbit")
@@ -135,7 +160,7 @@ func main() {
 	}
 
 	mygo.App.WhenReady(func() {
-		mygo.App.SetMenu(buildAppMenu(getHubURL, setupOrigin, func() *mygo.Window { return mainWin }, openMainWindow))
+		mygo.App.SetMenu(buildAppMenu(*configDir, runtimeMgr, getHubURL, setupOrigin, func() *mygo.Window { return mainWin }, openMainWindow))
 		openMainWindow(initialURL)
 
 		// Best-effort global shortcut to summon Orbit straight to PA
@@ -158,7 +183,7 @@ func main() {
 		if !hasVisibleWindows {
 			hub := getHubURL()
 			if hub != "" {
-				openMainWindow(hub + "/")
+				openMainWindow(runtimeMgr.BuildOpenURL(context.Background(), *configDir, hub, ""))
 			} else {
 				openMainWindow(setupOrigin + "/")
 			}
@@ -171,6 +196,8 @@ func main() {
 }
 
 func buildAppMenu(
+	configDir string,
+	runtimeMgr *RuntimeManager,
 	getHubURL func() string,
 	setupOrigin string,
 	getWin func() *mygo.Window,
@@ -190,7 +217,7 @@ func buildAppMenu(
 			Label: "hebi8-Orbit",
 			Submenu: []*mygo.MenuItem{
 				{
-					Label: "切换 Hub 地址…",
+					Label: "切换网络或重新连接…",
 					Click: func(_ *mygo.MenuItem, _ *mygo.Window) {
 						openWin(setupOrigin + "/")
 					},
@@ -199,7 +226,10 @@ func buildAppMenu(
 					Label: "在系统浏览器中打开",
 					Click: func(_ *mygo.MenuItem, _ *mygo.Window) {
 						if hub := getHubURL(); hub != "" {
-							go func() { _ = mygo.Shell.OpenExternal(hub + "/") }()
+							go func() {
+								u := runtimeMgr.BuildOpenURL(context.Background(), configDir, hub, "")
+								_ = mygo.Shell.OpenExternal(u)
+							}()
 						}
 					},
 				},
@@ -267,11 +297,33 @@ func buildAppMenu(
 	})
 }
 
-func startSetupServer(configDir string, getHubURL func() string, onSaved func(string)) (string, func(), error) {
+func startSetupServer(
+	configDir string,
+	runtimeMgr *RuntimeManager,
+	getHubURL func() string,
+	getMode func() string,
+	onSaved func(url, mode string),
+) (string, func(), error) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return "", nil, err
 	}
+	setupOrigin := "http://" + ln.Addr().String()
+	checkSetupOrigin := func(w http.ResponseWriter, r *http.Request) bool {
+		if r.Header.Get("X-Orbit-Setup") != "1" {
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "missing X-Orbit-Setup header"})
+			return false
+		}
+		origin := strings.TrimSpace(r.Header.Get("Origin"))
+		if !strings.EqualFold(origin, setupOrigin) {
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "forbidden origin"})
+			return false
+		}
+		return true
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -279,10 +331,67 @@ func startSetupServer(configDir string, getHubURL func() string, onSaved func(st
 	})
 	mux.HandleFunc("GET /api/current", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]string{"hubUrl": getHubURL()})
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"hubUrl": getHubURL(),
+			"mode":   getMode(),
+		})
+	})
+	mux.HandleFunc("POST /api/local-start", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if !checkSetupOrigin(w, r) {
+			return
+		}
+		hubURL, machineID, attached, err := runtimeMgr.StartOrAttachLocal(r.Context(), configDir)
+		if err != nil {
+			w.WriteHeader(http.StatusBadGateway)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		onSaved(hubURL, "local")
+		openURL := runtimeMgr.BuildOpenURL(r.Context(), configDir, hubURL, "")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"hubUrl":    hubURL,
+			"openUrl":   openURL,
+			"machineId": machineID,
+			"attached":  attached,
+		})
+	})
+	mux.HandleFunc("POST /api/join", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if !checkSetupOrigin(w, r) {
+			return
+		}
+		var body struct {
+			Input    string `json:"input"`
+			AsRunner bool   `json:"asRunner"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "无效的请求格式"})
+			return
+		}
+		res, err := runtimeMgr.JoinRemote(r.Context(), configDir, body.Input, body.AsRunner)
+		if err != nil {
+			w.WriteHeader(http.StatusBadGateway)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		onSaved(res.HubURL, "remote")
+		openURL := runtimeMgr.BuildOpenURL(r.Context(), configDir, res.HubURL, "")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"hubUrl":          res.HubURL,
+			"openUrl":         openURL,
+			"machineId":       res.MachineID,
+			"clientConnected": res.ClientConnected,
+			"runnerStarted":   res.RunnerStarted,
+			"runnerError":     res.RunnerError,
+		})
 	})
 	mux.HandleFunc("POST /api/connect", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		if !checkSetupOrigin(w, r) {
+			return
+		}
 		var body struct {
 			HubURL string `json:"hubUrl"`
 		}
@@ -291,32 +400,15 @@ func startSetupServer(configDir string, getHubURL func() string, onSaved func(st
 			_ = json.NewEncoder(w).Encode(map[string]string{"error": "无效的请求格式"})
 			return
 		}
-		norm, err := NormalizeHubURL(body.HubURL)
+		res, err := runtimeMgr.JoinRemote(r.Context(), configDir, body.HubURL, false)
 		if err != nil {
-			w.WriteHeader(http.StatusBadRequest)
+			w.WriteHeader(http.StatusBadGateway)
 			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 			return
 		}
-		hc := &http.Client{Timeout: 6 * time.Second}
-		resp, err := hc.Get(norm + "/api/health")
-		if err != nil {
-			w.WriteHeader(http.StatusBadGateway)
-			_ = json.NewEncoder(w).Encode(map[string]string{"error": fmt.Sprintf("无法连接到 %s: %v", norm, err)})
-			return
-		}
-		_ = resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			w.WriteHeader(http.StatusBadGateway)
-			_ = json.NewEncoder(w).Encode(map[string]string{"error": fmt.Sprintf("Hub 健康检查返回 HTTP %d", resp.StatusCode)})
-			return
-		}
-		if err := SaveClientConfig(configDir, ClientConfig{HubURL: norm, PAShortcut: "CmdOrCtrl+Shift+O"}); err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			_ = json.NewEncoder(w).Encode(map[string]string{"error": fmt.Sprintf("保存配置失败: %v", err)})
-			return
-		}
-		onSaved(norm)
-		_ = json.NewEncoder(w).Encode(map[string]string{"hubUrl": norm})
+		onSaved(res.HubURL, "remote")
+		openURL := runtimeMgr.BuildOpenURL(r.Context(), configDir, res.HubURL, "")
+		_ = json.NewEncoder(w).Encode(map[string]string{"hubUrl": res.HubURL, "openUrl": openURL})
 	})
 
 	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}

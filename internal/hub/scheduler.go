@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"path/filepath"
 	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -29,10 +30,19 @@ func (s *Server) resolveExecutionRoute(
 	proj protocol.ProjectView,
 	reqCap string,
 	reqAdapter protocol.Adapter,
+	reqMachineID ...string,
 ) (resolvedRoute, error) {
 	s.mu.RLock()
-	machines := s.machines.Machines
+	machines := make(map[string]protocol.MachineConfig, len(s.machines.Machines))
+	for k, v := range s.machines.Machines {
+		machines[k] = v
+	}
 	s.mu.RUnlock()
+
+	explicitMachine := ""
+	if len(reqMachineID) > 0 {
+		explicitMachine = strings.TrimSpace(reqMachineID[0])
+	}
 
 	capName := strings.TrimSpace(reqCap)
 	if capName == "" {
@@ -46,18 +56,86 @@ func (s *Server) resolveExecutionRoute(
 
 	machineID := ""
 	var mCfg protocol.MachineConfig
-	if hasAnchor && anchor.Machine != "" {
+
+	if explicitMachine != "" {
+		cfg, ok := machines[explicitMachine]
+		if !ok {
+			return resolvedRoute{}, fmt.Errorf("unknown machine %q", explicitMachine)
+		}
+		machineID = explicitMachine
+		mCfg = cfg
+		if proj.ProjectID != protocol.ScratchProjectID && len(proj.Anchors) > 0 {
+			if strings.TrimSpace(reqCap) != "" {
+				a, ok := proj.Anchors[capName]
+				if !ok || a.Machine != explicitMachine {
+					return resolvedRoute{}, fmt.Errorf("project %q has no anchor for capability %q on machine %q", proj.ProjectID, capName, explicitMachine)
+				}
+				anchor = a
+				hasAnchor = true
+			} else if hasAnchor && anchor.Machine == explicitMachine {
+				// Default capability already targets explicitMachine; keep it.
+			} else {
+				// Deterministic search across sorted capability names for an anchor on explicitMachine
+				capNames := make([]string, 0, len(proj.Anchors))
+				for cName := range proj.Anchors {
+					capNames = append(capNames, cName)
+				}
+				sort.Strings(capNames)
+				matched := false
+				for _, cName := range capNames {
+					a := proj.Anchors[cName]
+					if a.Machine == explicitMachine {
+						capName = cName
+						anchor = a
+						hasAnchor = true
+						matched = true
+						break
+					}
+				}
+				if !matched {
+					return resolvedRoute{}, fmt.Errorf("project %q is not anchored on machine %q", proj.ProjectID, explicitMachine)
+				}
+			}
+		}
+	}
+
+	if machineID == "" && hasAnchor && anchor.Machine != "" {
 		machineID = anchor.Machine
 		if cfg, ok := machines[machineID]; ok {
 			mCfg = cfg
 		}
 	}
 
+	sortedIDs := make([]string, 0, len(machines))
+	for id := range machines {
+		sortedIDs = append(sortedIDs, id)
+	}
+	sort.Strings(sortedIDs)
+
+	// Prefer connected online machines supporting the requested adapter when routing dynamically.
+	if machineID == "" && reqAdapter != "" {
+		for _, id := range sortedIDs {
+			m := machines[id]
+			if m.Transport == protocol.TransportSSHOutbound || !s.runners.IsConnected(id) {
+				continue
+			}
+			if slices.Contains(s.runners.ReportedAdapters(id), reqAdapter) {
+				machineID = id
+				mCfg = m
+				break
+			}
+		}
+	}
+
 	if machineID == "" {
-		// Find first machine advertising capName, or fallback to local_ws
-		for id, m := range machines {
-			for _, c := range m.Capabilities {
-				if c == capName {
+		// Find first machine advertising capName (prefer online)
+		for _, onlyOnline := range []bool{true, false} {
+			for _, id := range sortedIDs {
+				m := machines[id]
+				if onlyOnline && !s.runners.IsConnected(id) {
+					continue
+				}
+				if slices.Contains(m.Capabilities, capName) {
 					machineID = id
 					mCfg = m
 					break
@@ -69,7 +147,8 @@ func (s *Server) resolveExecutionRoute(
 		}
 	}
 	if machineID == "" {
-		for id, m := range machines {
+		for _, id := range sortedIDs {
+			m := machines[id]
 			if m.Transport == protocol.TransportLocalWS {
 				machineID = id
 				mCfg = m
@@ -78,11 +157,18 @@ func (s *Server) resolveExecutionRoute(
 		}
 	}
 	if machineID == "" {
-		for id, m := range machines {
-			machineID = id
-			mCfg = m
-			break
+		for _, id := range sortedIDs {
+			m := machines[id]
+			if m.Transport != protocol.TransportSSHOutbound {
+				machineID = id
+				mCfg = m
+				break
+			}
 		}
+	}
+	if machineID == "" && len(sortedIDs) > 0 {
+		machineID = sortedIDs[0]
+		mCfg = machines[machineID]
 	}
 	if machineID == "" {
 		machineID = "hub-node"
@@ -96,6 +182,8 @@ func (s *Server) resolveExecutionRoute(
 			adapter = protocol.AdapterSSHDeploy
 		} else if proj.DefaultAdapter != "" {
 			adapter = proj.DefaultAdapter
+		} else if reported := s.runners.ReportedAdapters(machineID); len(reported) > 0 {
+			adapter = reported[0]
 		} else {
 			adapter = protocol.AdapterAgy
 		}
@@ -136,8 +224,15 @@ func (s *Server) validateAdapterSupport(route resolvedRoute) (int, string, error
 			"adapter %q is not implemented in Phase 1 (supported session adapters: agy)", route.Adapter,
 		)
 	}
-	if reported := s.runners.ReportedAdapters(route.MachineID); len(reported) > 0 {
+	reported := s.runners.ReportedAdapters(route.MachineID)
+	if len(reported) > 0 || s.runners.HasExplicitAdapterReport(route.MachineID) {
 		if !slices.Contains(reported, route.Adapter) {
+			if len(reported) == 0 {
+				return http.StatusBadRequest, "ERR_ADAPTER_UNSUPPORTED", fmt.Errorf(
+					"machine %s currently has no ready agents; configure or enable an agent first",
+					route.MachineID,
+				)
+			}
 			return http.StatusBadRequest, "ERR_ADAPTER_UNSUPPORTED", fmt.Errorf(
 				"connected runner on machine %s does not advertise adapter %q (advertised: %v)",
 				route.MachineID, route.Adapter, reported,
@@ -229,13 +324,42 @@ func (s *Server) buildAttemptDispatchFrame(
 		effAnchor = *att.Anchor
 	}
 
-	worktreeRoot := s.resolveWorktreeRoot(proj, effAnchor)
-	worktreePath := att.WorktreePath
-	if worktreePath == "" {
-		if provSID != "" && expectedCWD != "" {
+	s.mu.RLock()
+	targetMachineCfg := s.machines.Machines[att.MachineID]
+	s.mu.RUnlock()
+	isRemoteMachine := targetMachineCfg.Transport != "" && targetMachineCfg.Transport != protocol.TransportLocalWS
+
+	var worktreeRoot, worktreePath string
+	if isRemoteMachine {
+		// Remote runners compute their own OS-native worktree directory under their local dataDir
+		// unless an explicit anchor WorktreeRoot was configured for that machine.
+		worktreeRoot = strings.TrimSpace(effAnchor.WorktreeRoot)
+		worktreePath = att.WorktreePath
+		if worktreePath == "" && provSID != "" && expectedCWD != "" {
 			worktreePath = expectedCWD
-		} else {
-			worktreePath = filepath.Join(worktreeRoot, att.TaskID, att.AttemptID)
+		}
+	} else {
+		worktreeRoot = s.resolveWorktreeRoot(proj, effAnchor)
+		worktreePath = att.WorktreePath
+		if worktreePath == "" {
+			if provSID != "" && expectedCWD != "" {
+				worktreePath = expectedCWD
+			} else {
+				worktreePath = filepath.Join(worktreeRoot, att.TaskID, att.AttemptID)
+			}
+		}
+	}
+
+	repoPath := strings.TrimSpace(effAnchor.RepoPath)
+	if !isRemoteMachine {
+		repoPath = protocol.ExpandPath(repoPath)
+	}
+	mirrorBarePath := proj.MirrorBarePath
+	if isRemoteMachine && proj.ProjectID != protocol.ScratchProjectID && strings.TrimSpace(proj.MirrorBarePath) != "" {
+		// Only switch to Hub HTTP bundle transport when the connected Runner negotiates bundle.v1,
+		// so older Runners with pre-configured remote mirror paths continue working cleanly.
+		if s.runners.HasCapability(att.MachineID, protocol.RunnerCapBundleV1) {
+			mirrorBarePath = "orbit-hub://" + proj.ProjectID
 		}
 	}
 
@@ -249,11 +373,11 @@ func (s *Server) buildAttemptDispatchFrame(
 		WBSessionID:        att.WBSessionID,
 		ProviderSessionID:  provSID,
 		ExpectedSessionCWD: expectedCWD,
-		RepoPath:           protocol.ExpandPath(effAnchor.RepoPath),
+		RepoPath:           repoPath,
 		RepoIdentity:       proj.RepoIdentity,
 		WorktreeRoot:       worktreeRoot,
 		WorktreePath:       worktreePath,
-		MirrorBarePath:     proj.MirrorBarePath,
+		MirrorBarePath:     mirrorBarePath,
 		BaseSHA:            att.BaseSHA,
 		DefaultBranch:      proj.DefaultBranch,
 		DesiredConfig:      att.DesiredConfig,

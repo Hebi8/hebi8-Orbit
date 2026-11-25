@@ -435,3 +435,85 @@ CREATE TABLE IF NOT EXISTS pa_action_receipts (
 );
 `
 }
+
+// BuildMigrationV5DDL constructs the onboarding, dynamic pairing, machine credentials,
+// client tokens, per-machine agent overrides, and hub settings tables.
+func BuildMigrationV5DDL() string {
+	return fmt.Sprintf(`
+CREATE TABLE IF NOT EXISTS hub_settings (
+  key        TEXT PRIMARY KEY,
+  value_json TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS registry_machines (
+  machine_id        TEXT PRIMARY KEY,
+  display_name      TEXT NOT NULL,
+  transport_mode    TEXT NOT NULL CHECK (transport_mode IN (%s)),
+  capabilities_json TEXT NOT NULL DEFAULT '[]',
+  tailscale_host    TEXT NOT NULL DEFAULT '',
+  ssh_alias         TEXT NOT NULL DEFAULT '',
+  created_at        INTEGER NOT NULL,
+  removed_at        INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS machine_credentials (
+  id           TEXT PRIMARY KEY,
+  machine_id   TEXT NOT NULL REFERENCES machines(machine_id),
+  token_hash   TEXT NOT NULL UNIQUE,
+  created_at   INTEGER NOT NULL,
+  last_used_at INTEGER,
+  revoked_at   INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_machine_credentials_machine
+  ON machine_credentials(machine_id) WHERE revoked_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS client_tokens (
+  id           TEXT PRIMARY KEY,
+  name         TEXT NOT NULL,
+  token_hash   TEXT NOT NULL UNIQUE,
+  scope        TEXT NOT NULL DEFAULT 'client',
+  machine_id   TEXT NOT NULL DEFAULT '',
+  created_at   INTEGER NOT NULL,
+  last_used_at INTEGER,
+  revoked_at   INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_client_tokens_machine
+  ON client_tokens(machine_id) WHERE revoked_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS pairing_codes (
+  id                 TEXT PRIMARY KEY,
+  code_hash          TEXT NOT NULL UNIQUE,
+  scope              TEXT NOT NULL CHECK (scope IN (%s)),
+  bind_machine_id    TEXT NOT NULL DEFAULT '',
+  created_by         TEXT NOT NULL,
+  created_at         INTEGER NOT NULL,
+  expires_at         INTEGER NOT NULL,
+  state              TEXT NOT NULL DEFAULT 'pending' CHECK (state IN (%s)),
+  claimed_at         INTEGER,
+  claimed_machine_id TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_pairing_codes_state_exp
+  ON pairing_codes(state, expires_at);
+
+CREATE TABLE IF NOT EXISTS machine_agent_settings (
+  machine_id       TEXT NOT NULL,
+  adapter          TEXT NOT NULL CHECK (adapter IN (%s)),
+  enabled          INTEGER,
+  bin              TEXT,
+  args_json        TEXT,
+  default_model    TEXT,
+  max_live_workers INTEGER,
+  updated_at       INTEGER NOT NULL,
+  PRIMARY KEY (machine_id, adapter)
+);
+`,
+		protocol.SQLInClause(protocol.AllTransportModes),
+		protocol.SQLInClause(protocol.AllPairingScopes),
+		protocol.SQLInClause(protocol.AllPairingCodeStates),
+		protocol.SQLInClause(protocol.AllSessionAdapters),
+	)
+}

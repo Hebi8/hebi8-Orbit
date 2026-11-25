@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"flag"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -40,17 +41,60 @@ func TestInitConnectAndInteractiveWizard(t *testing.T) {
 		t.Fatalf("expected resolved hubURL %q, got %q", ts.URL, hubURL)
 	}
 
-	// Interactive mode selecting [1] connect
+	// Interactive mode selecting [2] join / connect
 	cfgDir2 := t.TempDir()
 	out.Reset()
 	errBuf.Reset()
-	in := strings.NewReader("1\n" + ts.URL + "\n")
+	in := strings.NewReader("2\n" + ts.URL + "\n")
 	if err := runInit(context.Background(), []string{"--config-dir", cfgDir2}, in, &out, &errBuf); err != nil {
 		t.Fatalf("interactive init connect failed: %v", err)
 	}
 	hubURL2, _, _ := resolveHubDefaults(cfgDir2, "", "", "")
 	if hubURL2 != ts.URL {
 		t.Fatalf("expected interactive hubURL %q, got %q", ts.URL, hubURL2)
+	}
+}
+
+func TestParseJoinInput(t *testing.T) {
+	cases := []struct {
+		args     []string
+		codeFlag string
+		wantURL  string
+		wantCode string
+		wantNoR  bool
+	}{
+		{
+			args:     []string{"https://orbit.example.ts.net", "K7QM-2XPA"},
+			wantURL:  "https://orbit.example.ts.net",
+			wantCode: "K7QM-2XPA",
+		},
+		{
+			args:     []string{"orbit join https://orbit.example.ts.net K7QM-2XPA --no-runner"},
+			wantURL:  "https://orbit.example.ts.net",
+			wantCode: "K7QM-2XPA",
+			wantNoR:  true,
+		},
+		{
+			args:     []string{"https://orbit.example.ts.net/#/join/K7QM-2XPA"},
+			wantURL:  "https://orbit.example.ts.net",
+			wantCode: "K7QM-2XPA",
+		},
+		{
+			args:     []string{"https://orbit.example.ts.net"},
+			codeFlag: "ABCD-1234",
+			wantURL:  "https://orbit.example.ts.net",
+			wantCode: "ABCD-1234",
+		},
+	}
+	for _, tc := range cases {
+		u, c, noR, err := parseJoinInput(tc.args, tc.codeFlag)
+		if err != nil {
+			t.Fatalf("parseJoinInput(%v) err=%v", tc.args, err)
+		}
+		if u != tc.wantURL || c != tc.wantCode || noR != tc.wantNoR {
+			t.Fatalf("parseJoinInput(%v) = (%q, %q, %v), want (%q, %q, %v)",
+				tc.args, u, c, noR, tc.wantURL, tc.wantCode, tc.wantNoR)
+		}
 	}
 }
 
@@ -138,5 +182,45 @@ func TestInitRunnerGeneratesTokenAndSnippet(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(cfgDir, "runner.token")); err != nil {
 		t.Fatalf("expected runner.token to be created: %v", err)
+	}
+}
+
+func TestParseFlagsPermuted(t *testing.T) {
+	// Case 1: orbit join <url> <code> --service
+	fsJoin := flag.NewFlagSet("join", flag.ContinueOnError)
+	useService := fsJoin.Bool("service", false, "")
+	noRunner := fsJoin.Bool("no-runner", false, "")
+	if err := parseFlagsPermuted(fsJoin, []string{"https://orbit.example.ts.net", "ABCD-EFGH", "--service"}); err != nil {
+		t.Fatalf("parseFlagsPermuted join failed: %v", err)
+	}
+	if !*useService || *noRunner {
+		t.Fatalf("expected service=true noRunner=false, got service=%v noRunner=%v", *useService, *noRunner)
+	}
+	if got := strings.Join(fsJoin.Args(), ","); got != "https://orbit.example.ts.net,ABCD-EFGH" {
+		t.Fatalf("unexpected join positional args: %q", got)
+	}
+
+	// Case 2: orbit agents test agy --machine mini --json
+	fsAgents := flag.NewFlagSet("agents", flag.ContinueOnError)
+	machine := fsAgents.String("machine", "", "")
+	jsonOut := fsAgents.Bool("json", false, "")
+	if err := parseFlagsPermuted(fsAgents, []string{"agy", "--machine", "mini", "--json"}); err != nil {
+		t.Fatalf("parseFlagsPermuted agents failed: %v", err)
+	}
+	if *machine != "mini" || !*jsonOut {
+		t.Fatalf("expected machine=mini json=true, got machine=%q json=%v", *machine, *jsonOut)
+	}
+	if got := strings.Join(fsAgents.Args(), ","); got != "agy" {
+		t.Fatalf("unexpected agents positional args: %q", got)
+	}
+
+	// Case 3: double-dash stops flag scanning
+	fsDash := flag.NewFlagSet("dash", flag.ContinueOnError)
+	flagVal := fsDash.String("machine", "", "")
+	if err := parseFlagsPermuted(fsDash, []string{"pos1", "--", "--machine", "literal"}); err != nil {
+		t.Fatalf("parseFlagsPermuted -- failed: %v", err)
+	}
+	if *flagVal != "" || strings.Join(fsDash.Args(), ",") != "pos1,--machine,literal" {
+		t.Fatalf("unexpected -- parse: machine=%q args=%v", *flagVal, fsDash.Args())
 	}
 }

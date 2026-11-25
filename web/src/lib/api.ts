@@ -6,9 +6,16 @@ import type {
   BoardMessage,
   BootstrapResponse,
   CancelTaskResponse,
+  ClaimAuthHandoffResponse,
+  CompleteOnboardingRequest,
+  CompleteOnboardingResponse,
   CompleteReviewResponse,
   CreateAnnotationRequest,
   CreateAnnotationResponse,
+  CreatePairingCodeRequest,
+  CreatePairingCodeResponse,
+  CreateProjectRequest,
+  CreateProjectResponse,
   CreateTaskRequest,
   CreateTaskResponse,
   CreateTaskSourceInput,
@@ -23,6 +30,10 @@ import type {
   FollowupTaskResponse,
   GlobalArtifactView,
   ListArtifactsResponse,
+  ListDirsResponse,
+  ListMachinesResponse,
+  MachineAgentActionResponse,
+  NetworkSettingsView,
   PABriefRequest,
   PABriefResponse,
   PAChatRequest,
@@ -30,26 +41,61 @@ import type {
   PAStateView,
   PAThread,
   PAThreadDetailResponse,
+  PairingCodeStatusResponse,
   PendingInput,
   PostBoardMessageRequest,
   RetryTaskRequest,
   RetryTaskResponse,
   RyugiSyncResponse,
+  TailscaleEnableRequest,
+  TailscaleEnableResponse,
   TaskBoardResponse,
   TaskSource,
   TaskSummary,
   TaskTimelineResponse,
+  UpdateMachineAgentRequest,
+  UpdateMachineRequest,
+  UpdateNetworkSettingsRequest,
   WSTicketResponse,
   WorkerStreamResponse,
 } from '../generated/protocol';
 
 const DEV_TOKEN_KEY = 'orbit.devToken';
+const CLIENT_TOKEN_KEY = 'orbit.clientToken';
 
 export function getStoredDevToken(): string {
   try {
     return localStorage.getItem(DEV_TOKEN_KEY) ?? '';
   } catch {
     return '';
+  }
+}
+
+export function getStoredClientToken(): string {
+  try {
+    return localStorage.getItem(CLIENT_TOKEN_KEY) ?? '';
+  } catch {
+    return '';
+  }
+}
+
+export function setStoredDevToken(token: string) {
+  try {
+    const trimmed = token.trim();
+    if (trimmed) localStorage.setItem(DEV_TOKEN_KEY, trimmed);
+    else localStorage.removeItem(DEV_TOKEN_KEY);
+  } catch {
+    // ignore storage errors
+  }
+}
+
+export function setStoredClientToken(token: string) {
+  try {
+    const trimmed = token.trim();
+    if (trimmed) localStorage.setItem(CLIENT_TOKEN_KEY, trimmed);
+    else localStorage.removeItem(CLIENT_TOKEN_KEY);
+  } catch {
+    // ignore storage errors
   }
 }
 
@@ -86,8 +132,11 @@ async function apiFetch<T>(path: string, options: FetchOptions = {}): Promise<T>
   if (idempotencyKey) {
     headers.set('Idempotency-Key', idempotencyKey);
   }
+  const clientToken = getStoredClientToken();
   const devToken = getStoredDevToken();
-  if (devToken) {
+  if (clientToken) {
+    headers.set('Authorization', `Bearer ${clientToken}`);
+  } else if (devToken) {
     headers.set('X-Orbit-Dev-Token', devToken);
   }
 
@@ -337,6 +386,158 @@ export const api = {
     const devToken = getStoredDevToken();
     const base = `/api/blobs/${enc(sha256)}`;
     return devToken ? `${base}?token=${enc(devToken)}` : base;
+  },
+
+  async fetchBlob(sha256: string): Promise<Blob> {
+    const headers = new Headers();
+    const clientToken = getStoredClientToken();
+    const devToken = getStoredDevToken();
+    if (clientToken) {
+      headers.set('Authorization', `Bearer ${clientToken}`);
+    } else if (devToken) {
+      headers.set('X-Orbit-Dev-Token', devToken);
+    }
+    const resp = await fetch(`/api/blobs/${enc(sha256)}`, {
+      headers,
+      credentials: 'omit',
+    });
+    if (!resp.ok) {
+      throw new ApiError(resp.status, '', `读取文件失败 (HTTP ${resp.status})`);
+    }
+    return resp.blob();
+  },
+
+  async fetchBlobText(sha256: string): Promise<string> {
+    const blob = await api.fetchBlob(sha256);
+    return blob.text();
+  },
+
+  async downloadBlob(sha256: string, filename: string): Promise<void> {
+    const blob = await api.fetchBlob(sha256);
+    const objUrl = URL.createObjectURL(blob);
+    try {
+      const a = document.createElement('a');
+      a.href = objUrl;
+      a.download = filename || sha256;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    } finally {
+      window.setTimeout(() => URL.revokeObjectURL(objUrl), 10_000);
+    }
+  },
+
+  claimAuthHandoff(code: string): Promise<ClaimAuthHandoffResponse> {
+    return apiFetch<ClaimAuthHandoffResponse>('/api/auth/handoff/claim', {
+      method: 'POST',
+      json: { code },
+    });
+  },
+
+  completeOnboarding(req: CompleteOnboardingRequest = {}): Promise<CompleteOnboardingResponse> {
+    return apiFetch<CompleteOnboardingResponse>('/api/onboarding/complete', {
+      method: 'POST',
+      json: req,
+    });
+  },
+
+  createPairingCode(req: CreatePairingCodeRequest = {}): Promise<CreatePairingCodeResponse> {
+    return apiFetch<CreatePairingCodeResponse>('/api/pairing/codes', {
+      method: 'POST',
+      json: req,
+    });
+  },
+
+  getPairingCode(pairingId: string): Promise<PairingCodeStatusResponse> {
+    return apiFetch<PairingCodeStatusResponse>(`/api/pairing/codes/${enc(pairingId)}`);
+  },
+
+  revokePairingCode(pairingId: string): Promise<PairingCodeStatusResponse> {
+    return apiFetch<PairingCodeStatusResponse>(`/api/pairing/codes/${enc(pairingId)}`, {
+      method: 'DELETE',
+    });
+  },
+
+  async listMachines(): Promise<ListMachinesResponse['machines']> {
+    const res = await apiFetch<ListMachinesResponse>('/api/machines');
+    return res.machines ?? [];
+  },
+
+  updateMachine(machineId: string, req: UpdateMachineRequest): Promise<ListMachinesResponse> {
+    return apiFetch<ListMachinesResponse>(`/api/machines/${enc(machineId)}`, {
+      method: 'PATCH',
+      json: req,
+    });
+  },
+
+  deleteMachine(machineId: string): Promise<{ removed: boolean; machineId: string }> {
+    return apiFetch(`/api/machines/${enc(machineId)}`, { method: 'DELETE' });
+  },
+
+  probeMachineAgents(machineId: string): Promise<MachineAgentActionResponse> {
+    return apiFetch<MachineAgentActionResponse>(`/api/machines/${enc(machineId)}/agents/probe`, {
+      method: 'POST',
+      json: {},
+    });
+  },
+
+  testMachineAgent(machineId: string, adapter: string): Promise<MachineAgentActionResponse> {
+    return apiFetch<MachineAgentActionResponse>(
+      `/api/machines/${enc(machineId)}/agents/${enc(adapter)}/test`,
+      { method: 'POST', json: {} },
+    );
+  },
+
+  installMachineAgent(machineId: string, adapter: string): Promise<MachineAgentActionResponse> {
+    return apiFetch<MachineAgentActionResponse>(
+      `/api/machines/${enc(machineId)}/agents/${enc(adapter)}/install`,
+      { method: 'POST', json: {} },
+    );
+  },
+
+  updateMachineAgent(
+    machineId: string,
+    adapter: string,
+    req: UpdateMachineAgentRequest,
+  ): Promise<MachineAgentActionResponse> {
+    return apiFetch<MachineAgentActionResponse>(
+      `/api/machines/${enc(machineId)}/agents/${enc(adapter)}`,
+      { method: 'PATCH', json: req },
+    );
+  },
+
+  listMachineDirs(machineId: string, path?: string): Promise<ListDirsResponse> {
+    const q = path ? `?path=${enc(path)}` : '';
+    return apiFetch<ListDirsResponse>(`/api/machines/${enc(machineId)}/dirs${q}`);
+  },
+
+  createProject(req: CreateProjectRequest): Promise<CreateProjectResponse> {
+    return apiFetch<CreateProjectResponse>('/api/projects', {
+      method: 'POST',
+      json: req,
+    });
+  },
+
+  deleteProject(projectId: string): Promise<{ removed: boolean; projectId: string }> {
+    return apiFetch(`/api/projects/${enc(projectId)}`, { method: 'DELETE' });
+  },
+
+  getNetworkSettings(): Promise<NetworkSettingsView> {
+    return apiFetch<NetworkSettingsView>('/api/network/settings');
+  },
+
+  updateNetworkSettings(req: UpdateNetworkSettingsRequest): Promise<NetworkSettingsView> {
+    return apiFetch<NetworkSettingsView>('/api/network/settings', {
+      method: 'PATCH',
+      json: req,
+    });
+  },
+
+  enableTailscaleShare(req: TailscaleEnableRequest = {}): Promise<TailscaleEnableResponse> {
+    return apiFetch<TailscaleEnableResponse>('/api/network/tailscale-enable', {
+      method: 'POST',
+      json: req,
+    });
   },
 };
 

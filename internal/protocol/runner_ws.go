@@ -18,6 +18,80 @@ type HandledApprovalDecision struct {
 	Outcome    ApprovalState `json:"outcome"`
 }
 
+// AgentTestResult records the outcome of an active connectivity/auth test for one adapter.
+type AgentTestResult struct {
+	OK        bool   `json:"ok"`
+	At        int64  `json:"at"`
+	LatencyMs int64  `json:"latencyMs,omitempty"`
+	Error     string `json:"error,omitempty"`
+}
+
+// AgentProbe captures the probed runtime status and metadata of one ACP adapter on a machine.
+type AgentProbe struct {
+	Adapter        Adapter          `json:"adapter"`
+	State          AgentState       `json:"state"`
+	Enabled        bool             `json:"enabled"`
+	BridgeBin      string           `json:"bridgeBin,omitempty"`
+	BridgeVersion  string           `json:"bridgeVersion,omitempty"`
+	MainCLI        string           `json:"mainCli,omitempty"`
+	Source         string           `json:"source,omitempty"` // flag | file | settings | managed | path | none
+	HintCode       string           `json:"hintCode,omitempty"`
+	Detail         string           `json:"detail,omitempty"`
+	DefaultModel   string           `json:"defaultModel,omitempty"`
+	Models         []string         `json:"models,omitempty"`
+	MaxLiveWorkers int              `json:"maxLiveWorkers,omitempty"`
+	LockedFields   []string         `json:"lockedFields,omitempty"`
+	LastTest       *AgentTestResult `json:"lastTest,omitempty"`
+	ProbedAt       int64            `json:"probedAt,omitempty"`
+}
+
+// RunnerAgentConfig carries Hub-managed dynamic overrides for one adapter on a machine.
+type RunnerAgentConfig struct {
+	Enabled        *bool    `json:"enabled,omitempty"`
+	Bin            string   `json:"bin,omitempty"`
+	Args           []string `json:"args,omitempty"`
+	DefaultModel   string   `json:"defaultModel,omitempty"`
+	MaxLiveWorkers int      `json:"maxLiveWorkers,omitempty"`
+}
+
+// RunnerConfigPayload holds the dynamic per-machine configuration pushed from Hub to Runner.
+type RunnerConfigPayload struct {
+	ConfigRev int64                        `json:"configRev"`
+	Agents    map[string]RunnerAgentConfig `json:"agents,omitempty"`
+}
+
+// RunnerConfigFrame pushes updated dynamic agent settings to a live Runner over /ws/runner.
+type RunnerConfigFrame struct {
+	Type      RunnerWSMessageType          `json:"type"`
+	ConfigRev int64                        `json:"configRev"`
+	Agents    map[string]RunnerAgentConfig `json:"agents,omitempty"`
+}
+
+// RunnerAgentsReportFrame reports probed agent statuses from Runner to Hub.
+type RunnerAgentsReportFrame struct {
+	Type      RunnerWSMessageType `json:"type"`
+	MachineID string              `json:"machineId"`
+	ConfigRev int64               `json:"configRev"`
+	Agents    []AgentProbe        `json:"agents"`
+}
+
+// RunnerRPCFrame sends a control-plane RPC request from Hub to a live Runner.
+type RunnerRPCFrame struct {
+	Type      RunnerWSMessageType `json:"type"`
+	RequestID string              `json:"requestId"`
+	Op        string              `json:"op"` // probe | test_agent | install_bridge | list_dirs | check_repo
+	Args      map[string]any      `json:"args,omitempty"`
+}
+
+// RunnerRPCResultFrame returns the result of a RunnerRPCFrame back to Hub.
+type RunnerRPCResultFrame struct {
+	Type      RunnerWSMessageType `json:"type"`
+	RequestID string              `json:"requestId"`
+	OK        bool                `json:"ok"`
+	Data      map[string]any      `json:"data,omitempty"`
+	Error     string              `json:"error,omitempty"`
+}
+
 // RunnerHelloFrame is the first frame sent by orbit-runner on every /ws/runner connect.
 type RunnerHelloFrame struct {
 	Type                     RunnerWSMessageType       `json:"type"`
@@ -25,7 +99,13 @@ type RunnerHelloFrame struct {
 	MachineID                string                    `json:"machineId"`
 	RunnerInstanceID         string                    `json:"runnerInstanceId"`
 	RunnerVersion            string                    `json:"runnerVersion"`
+	OS                       string                    `json:"os,omitempty"`
+	Arch                     string                    `json:"arch,omitempty"`
+	Hostname                 string                    `json:"hostname,omitempty"`
+	Capabilities             []string                  `json:"capabilities,omitempty"`
 	Adapters                 []Adapter                 `json:"adapters,omitempty"`
+	AgentProbes              []AgentProbe              `json:"agentProbes,omitempty"`
+	ConfigRev                int64                     `json:"configRev,omitempty"`
 	LiveAttempts             []LiveAttemptInfo         `json:"liveAttempts"`
 	LivePendingApprovalIDs   []string                  `json:"livePendingApprovalIds"`
 	HandledApprovalDecisions []HandledApprovalDecision `json:"handledApprovalDecisions"`
@@ -54,11 +134,13 @@ type HubWelcomeReconcile struct {
 
 // HubWelcomeFrame is Hub's reconciliation response to runner.hello.
 type HubWelcomeFrame struct {
-	Type                RunnerWSMessageType `json:"type"`
-	ServerTime          int64               `json:"serverTime"`
-	HeartbeatIntervalMs int64               `json:"heartbeatIntervalMs"`
-	LeaseTtlMs          int64               `json:"leaseTtlMs"`
-	Reconcile           HubWelcomeReconcile `json:"reconcile"`
+	Type                RunnerWSMessageType  `json:"type"`
+	ServerTime          int64                `json:"serverTime"`
+	HeartbeatIntervalMs int64                `json:"heartbeatIntervalMs"`
+	LeaseTtlMs          int64                `json:"leaseTtlMs"`
+	Capabilities        []string             `json:"capabilities,omitempty"`
+	Config              *RunnerConfigPayload `json:"config,omitempty"`
+	Reconcile           HubWelcomeReconcile  `json:"reconcile"`
 }
 
 // InputDeliveryRef identifies an immutable upstream delivery used to seed a worktree.

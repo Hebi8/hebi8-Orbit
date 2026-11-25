@@ -398,9 +398,26 @@ func (s *Store) ReconcileRunnerHello(ctx context.Context, hello protocol.RunnerH
 		return res, err
 	}
 	var adaptersVal any
-	if len(hello.Adapters) > 0 {
+	if len(hello.AgentProbes) > 0 {
+		ready := deriveReadyAdaptersFromProbes(hello.AgentProbes)
+		if b, err := json.Marshal(ready); err == nil {
+			adaptersVal = string(b)
+		}
+	} else if len(hello.Adapters) > 0 {
 		if b, err := json.Marshal(hello.Adapters); err == nil {
 			adaptersVal = string(b)
+		}
+	}
+	var agentsVal any
+	if len(hello.AgentProbes) > 0 {
+		if b, err := json.Marshal(hello.AgentProbes); err == nil {
+			agentsVal = string(b)
+		}
+	}
+	var capsVal any
+	if len(hello.Capabilities) > 0 {
+		if b, err := json.Marshal(hello.Capabilities); err == nil {
+			capsVal = string(b)
 		}
 	}
 
@@ -419,10 +436,12 @@ func (s *Store) ReconcileRunnerHello(ctx context.Context, hello protocol.RunnerH
 			    runner_version = ?,
 			    resources_json = ?,
 			    adapters_json = COALESCE(?, adapters_json),
+			    agents_json = COALESCE(?, agents_json),
+			    runner_caps_json = COALESCE(?, runner_caps_json),
 			    last_seen_at = ?,
 			    updated_at = ?
 			WHERE machine_id = ?
-		`, hello.RunnerVersion, string(resJSON), adaptersVal, now, now, hello.MachineID); err != nil {
+		`, hello.RunnerVersion, string(resJSON), adaptersVal, agentsVal, capsVal, now, now, hello.MachineID); err != nil {
 			return err
 		}
 		if prevStatus != string(protocol.MachineOnline) {

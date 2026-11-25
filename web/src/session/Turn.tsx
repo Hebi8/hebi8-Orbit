@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { FileSpreadsheet, FileText, Layers, Presentation, Table } from 'lucide-react';
 import type { AttemptView, TaskTimelineResponse } from '../generated/protocol';
@@ -13,6 +13,60 @@ import { toast, useWorkbenchStore } from '../store/useWorkbenchStore';
 import { Segments } from './Segments';
 
 const CODE_KINDS = new Set(['code_diff', 'mixed', 'workspace_snapshot']);
+
+function AuthedInlineImage({ sha256, name }: { sha256: string; name: string }) {
+  const [src, setSrc] = useState<string>('');
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    let objUrl = '';
+    setFailed(false);
+    void api
+      .fetchBlob(sha256)
+      .then((blob) => {
+        if (!active) return;
+        objUrl = URL.createObjectURL(blob);
+        setSrc(objUrl);
+      })
+      .catch(() => {
+        if (active) setFailed(true);
+      });
+    return () => {
+      active = false;
+      if (objUrl) URL.revokeObjectURL(objUrl);
+    };
+  }, [sha256]);
+
+  return (
+    <figure className="inline-media-box">
+      {src ? (
+        <img src={src} alt={name} className="inline-media-img" loading="lazy" />
+      ) : (
+        <div className="muted" style={{ padding: '12px 14px', fontSize: 12 }}>
+          {failed ? '图片加载失败' : '载入图片…'}
+        </div>
+      )}
+      <figcaption className="inline-media-cap">
+        <span className="mono">{name}</span>
+        <button
+          type="button"
+          className="lk"
+          style={{ background: 'none', border: 0, padding: 0, cursor: 'pointer' }}
+          onClick={() => {
+            if (src) {
+              window.open(src, '_blank', 'noopener,noreferrer');
+            } else {
+              void api.downloadBlob(sha256, name).catch((e) => toast(errMsg(e), 'err'));
+            }
+          }}
+        >
+          原图
+        </button>
+      </figcaption>
+    </figure>
+  );
+}
 
 function ArtifactGlyph({ kind }: { kind: string }) {
   switch (kind) {
@@ -214,15 +268,7 @@ export function Turn({
       {inlineImages.length > 0 && (
         <div className="it inline-media-stack">
           {inlineImages.map((img) => (
-            <figure className="inline-media-box" key={`${img.sha256}:${img.path}`}>
-              <img src={api.blobUrl(img.sha256)} alt={basename(img.path)} className="inline-media-img" loading="lazy" />
-              <figcaption className="inline-media-cap">
-                <span className="mono">{basename(img.path)}</span>
-                <a href={api.blobUrl(img.sha256)} target="_blank" rel="noopener noreferrer" className="lk">
-                  原图
-                </a>
-              </figcaption>
-            </figure>
+            <AuthedInlineImage key={`${img.sha256}:${img.path}`} sha256={img.sha256} name={basename(img.path)} />
           ))}
         </div>
       )}

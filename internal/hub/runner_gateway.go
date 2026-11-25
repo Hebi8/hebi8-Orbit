@@ -6,11 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/oklog/ulid/v2"
 
 	"github.com/Hebi8/hebi8-Orbit/internal/protocol"
 )
@@ -25,21 +27,82 @@ type outboundFrame struct {
 type runnerConn struct {
 	machineID        string
 	runnerInstanceID string
-	adapters         []protocol.Adapter
+	metaMu            sync.RWMutex
+	adapters          []protocol.Adapter
+	hasExplicitReport bool
+	capabilities      []string
+	rpcMu            sync.Mutex
+	pendingRPC       map[string]chan protocol.RunnerRPCResultFrame
 	conn             *websocket.Conn
 	sendCh           chan outboundFrame
 	done             chan struct{}
 	closeOnce        sync.Once
 }
 
-func newRunnerConn(machineID, runnerInstanceID string, adapters []protocol.Adapter, conn *websocket.Conn) *runnerConn {
+func newRunnerConn(machineID, runnerInstanceID string, adapters []protocol.Adapter, capabilities []string, conn *websocket.Conn) *runnerConn {
 	return &runnerConn{
-		machineID:        machineID,
-		runnerInstanceID: runnerInstanceID,
-		adapters:         append([]protocol.Adapter(nil), adapters...),
-		conn:             conn,
-		sendCh:           make(chan outboundFrame, 256),
-		done:             make(chan struct{}),
+		machineID:         machineID,
+		runnerInstanceID:  runnerInstanceID,
+		adapters:          append([]protocol.Adapter(nil), adapters...),
+		hasExplicitReport: slices.Contains(capabilities, protocol.RunnerCapAgentsV1),
+		capabilities:      append([]string(nil), capabilities...),
+		pendingRPC:        map[string]chan protocol.RunnerRPCResultFrame{},
+		conn:              conn,
+		sendCh:            make(chan outboundFrame, 256),
+		done:              make(chan struct{}),
+	}
+}
+
+func (rc *runnerConn) setAdapters(adapters []protocol.Adapter) {
+	rc.metaMu.Lock()
+	rc.adapters = append([]protocol.Adapter(nil), adapters...)
+	rc.hasExplicitReport = true
+	rc.metaMu.Unlock()
+}
+
+func (rc *runnerConn) hasExplicitAdapterReport() bool {
+	rc.metaMu.RLock()
+	defer rc.metaMu.RUnlock()
+	return rc.hasExplicitReport
+}
+
+func (rc *runnerConn) getAdapters() []protocol.Adapter {
+	rc.metaMu.RLock()
+	defer rc.metaMu.RUnlock()
+	if len(rc.adapters) == 0 {
+		return nil
+	}
+	return append([]protocol.Adapter(nil), rc.adapters...)
+}
+
+func (rc *runnerConn) getCapabilities() []string {
+	rc.metaMu.RLock()
+	defer rc.metaMu.RUnlock()
+	if len(rc.capabilities) == 0 {
+		return nil
+	}
+	return append([]string(nil), rc.capabilities...)
+}
+
+func (rc *runnerConn) hasCapability(cap string) bool {
+	rc.metaMu.RLock()
+	defer rc.metaMu.RUnlock()
+	return slices.Contains(rc.capabilities, cap)
+}
+
+func (rc *runnerConn) resolveRPC(res protocol.RunnerRPCResultFrame) {
+	rc.rpcMu.Lock()
+	ch, ok := rc.pendingRPC[res.RequestID]
+	if ok {
+		delete(rc.pendingRPC, res.RequestID)
+	}
+	rc.rpcMu.Unlock()
+	if ok {
+		select {
+		case ch <- res:
+		default:
+		}
+		close(ch)
 	}
 }
 
@@ -90,6 +153,16 @@ func (rc *runnerConn) sendJSONSync(v any, onStart func() error, onFail func(erro
 func (rc *runnerConn) close(code websocket.StatusCode, reason string) {
 	rc.closeOnce.Do(func() {
 		close(rc.done)
+		rc.rpcMu.Lock()
+		for id, ch := range rc.pendingRPC {
+			select {
+			case ch <- protocol.RunnerRPCResultFrame{RequestID: id, OK: false, Error: "runner disconnected"}:
+			default:
+			}
+			close(ch)
+		}
+		rc.pendingRPC = map[string]chan protocol.RunnerRPCResultFrame{}
+		rc.rpcMu.Unlock()
 		_ = rc.conn.Close(code, reason)
 	})
 }
@@ -147,10 +220,108 @@ func (g *RunnerGateway) ActiveRunnerInstanceID(machineID string) string {
 // ReportedAdapters returns the live adapters reported by the connected runner for machineID.
 func (g *RunnerGateway) ReportedAdapters(machineID string) []protocol.Adapter {
 	rc := g.get(machineID)
-	if rc == nil || len(rc.adapters) == 0 {
+	if rc == nil {
 		return nil
 	}
-	return append([]protocol.Adapter(nil), rc.adapters...)
+	return rc.getAdapters()
+}
+
+// HasExplicitAdapterReport reports whether the connected runner explicitly reported its agent readiness
+// (so an empty ReportedAdapters slice means "0 agents ready", not "legacy runner didn't report").
+func (g *RunnerGateway) HasExplicitAdapterReport(machineID string) bool {
+	rc := g.get(machineID)
+	return rc != nil && rc.hasExplicitAdapterReport()
+}
+
+// Capabilities returns the negotiated control-plane capabilities advertised by machineID.
+func (g *RunnerGateway) Capabilities(machineID string) []string {
+	rc := g.get(machineID)
+	if rc == nil {
+		return nil
+	}
+	return rc.getCapabilities()
+}
+
+// HasCapability reports whether machineID is connected and advertises capName.
+func (g *RunnerGateway) HasCapability(machineID, capName string) bool {
+	rc := g.get(machineID)
+	return rc != nil && rc.hasCapability(capName)
+}
+
+// DisconnectMachine closes any live WebSocket link for machineID immediately (e.g. after removal/revocation).
+func (g *RunnerGateway) DisconnectMachine(machineID, reason string) {
+	if rc := g.get(machineID); rc != nil {
+		rc.close(websocket.StatusPolicyViolation, reason)
+	}
+}
+
+// SendConfig pushes a runner.config hot-update frame to machineID.
+func (g *RunnerGateway) SendConfig(machineID string, frame protocol.RunnerConfigFrame) error {
+	rc := g.get(machineID)
+	if rc == nil {
+		return fmt.Errorf("runner %s not connected", machineID)
+	}
+	frame.Type = protocol.RunnerMsgConfig
+	return rc.sendJSON(frame)
+}
+
+// CallRPC invokes a control-plane operation on machineID and waits for the correlated runner.rpc_result.
+func (g *RunnerGateway) CallRPC(
+	ctx context.Context,
+	machineID, op string,
+	args map[string]any,
+	timeout time.Duration,
+) (protocol.RunnerRPCResultFrame, error) {
+	rc := g.get(machineID)
+	if rc == nil {
+		return protocol.RunnerRPCResultFrame{}, fmt.Errorf("runner %s not connected", machineID)
+	}
+	if timeout <= 0 {
+		timeout = 15 * time.Second
+	}
+	reqID := "rpc_" + ulid.Make().String()
+	ch := make(chan protocol.RunnerRPCResultFrame, 1)
+	rc.rpcMu.Lock()
+	select {
+	case <-rc.done:
+		rc.rpcMu.Unlock()
+		return protocol.RunnerRPCResultFrame{}, fmt.Errorf("runner %s closed", machineID)
+	default:
+		rc.pendingRPC[reqID] = ch
+	}
+	rc.rpcMu.Unlock()
+
+	cleanup := func() {
+		rc.rpcMu.Lock()
+		delete(rc.pendingRPC, reqID)
+		rc.rpcMu.Unlock()
+	}
+
+	if err := rc.sendJSON(protocol.RunnerRPCFrame{
+		Type:      protocol.RunnerMsgRPC,
+		RequestID: reqID,
+		Op:        op,
+		Args:      args,
+	}); err != nil {
+		cleanup()
+		return protocol.RunnerRPCResultFrame{}, err
+	}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case res, ok := <-ch:
+		if !ok {
+			return protocol.RunnerRPCResultFrame{}, fmt.Errorf("runner %s disconnected during %s", machineID, op)
+		}
+		return res, nil
+	case <-ctx.Done():
+		cleanup()
+		return protocol.RunnerRPCResultFrame{}, ctx.Err()
+	case <-timer.C:
+		cleanup()
+		return protocol.RunnerRPCResultFrame{}, fmt.Errorf("runner rpc %s timed out after %s", op, timeout)
+	}
 }
 
 // DispatchAttempt sends an attempt.dispatch frame to machineID if connected.
@@ -323,7 +494,17 @@ func (s *Server) handleRunnerWS(w http.ResponseWriter, r *http.Request) {
 		s.broker.Broadcast(recRes.Events...)
 	}
 
-	rc := newRunnerConn(hello.MachineID, hello.RunnerInstanceID, hello.Adapters, conn)
+	initialAdapters := hello.Adapters
+	if len(hello.AgentProbes) > 0 {
+		ready := make([]protocol.Adapter, 0, len(hello.AgentProbes))
+		for _, p := range hello.AgentProbes {
+			if p.State == protocol.AgentStateReady && p.Enabled {
+				ready = append(ready, p.Adapter)
+			}
+		}
+		initialAdapters = ready
+	}
+	rc := newRunnerConn(hello.MachineID, hello.RunnerInstanceID, initialAdapters, hello.Capabilities, conn)
 	if prev := s.runners.register(rc); prev != nil && prev != rc {
 		prev.close(websocket.StatusGoingAway, "replaced by newer runner connection")
 	}
@@ -354,11 +535,20 @@ func (s *Server) handleRunnerWS(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	var cfgPayload *protocol.RunnerConfigPayload
+	if agentCfg, rev, err := s.store.GetMachineAgentSettings(r.Context(), hello.MachineID); err == nil && len(agentCfg) > 0 {
+		cfgPayload = &protocol.RunnerConfigPayload{
+			ConfigRev: rev,
+			Agents:    agentCfg,
+		}
+	}
 	welcome := protocol.HubWelcomeFrame{
 		Type:                protocol.RunnerMsgHubWelcome,
 		ServerTime:          time.Now().UnixMilli(),
 		HeartbeatIntervalMs: s.heartbeatInterval.Milliseconds(),
 		LeaseTtlMs:          s.leaseTTL.Milliseconds(),
+		Capabilities:        []string{protocol.RunnerCapAgentsV1, protocol.RunnerCapFSV1},
+		Config:              cfgPayload,
 		Reconcile:           recRes.Reconcile,
 	}
 	if err := writeRunnerRawJSON(r.Context(), conn, welcome); err != nil {
@@ -499,6 +689,33 @@ func (s *Server) handleRunnerWS(w http.ResponseWriter, r *http.Request) {
 			if ingestRes.AutoConsumeQueue && ingestRes.TaskID != "" {
 				s.consumeAndDispatchNextPendingInput(ctx, ingestRes.TaskID, ingestRes.SteerInputID)
 			}
+
+		case protocol.RunnerMsgAgentsReport:
+			var rep protocol.RunnerAgentsReportFrame
+			if err := json.Unmarshal(data, &rep); err != nil {
+				continue
+			}
+			// Reject stale agent reports produced against an older Hub config revision (#3)
+			if _, curRev, revErr := s.store.GetMachineAgentSettings(ctx, hello.MachineID); revErr == nil && curRev > 0 && rep.ConfigRev < curRev {
+				continue
+			}
+			ready := make([]protocol.Adapter, 0, len(rep.Agents))
+			for _, p := range rep.Agents {
+				if p.State == protocol.AgentStateReady && p.Enabled {
+					ready = append(ready, p.Adapter)
+				}
+			}
+			rc.setAdapters(ready)
+			if ev, err := s.store.SaveMachineAgentProbes(ctx, hello.MachineID, rep.Agents, nil); err == nil && ev != nil {
+				s.broker.Broadcast(*ev)
+			}
+
+		case protocol.RunnerMsgRPCResult:
+			var rpcRes protocol.RunnerRPCResultFrame
+			if err := json.Unmarshal(data, &rpcRes); err != nil {
+				continue
+			}
+			rc.resolveRPC(rpcRes)
 		}
 	}
 

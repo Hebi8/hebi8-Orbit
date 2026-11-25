@@ -121,6 +121,17 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      - name: Build embedded Web workbench (web/dist)
+        run: |
+          pnpm --dir web install --frozen-lockfile
+          make build-web
 
       - name: Build & package Orbit.app + DMG (darwin/arm64)
         env:
