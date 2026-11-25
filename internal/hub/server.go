@@ -278,12 +278,14 @@ func (s *Server) buildRouter() http.Handler {
 	r := chi.NewRouter()
 	r.Use(s.securityHeadersMiddleware)
 
-	// Unauthenticated lightweight health probe
+	// Unauthenticated lightweight health probe (exposes only opaque discoveryId — never projects/tasks/names)
 	r.Get("/api/health", func(w http.ResponseWriter, r *http.Request) {
+		discID, _ := s.store.EnsureDiscoveryID(r.Context())
 		writeJSON(w, http.StatusOK, map[string]any{
-			"ok":      true,
-			"service": "hebi8-orbit-hub",
-			"version": "0.2.0-phase1",
+			"ok":          true,
+			"service":     "hebi8-orbit-hub",
+			"version":     "0.3.2",
+			"discoveryId": discID,
 		})
 	})
 
@@ -347,7 +349,10 @@ func (s *Server) buildRouter() http.Handler {
 
 		api.Get("/network/settings", s.handleGetNetworkSettings)
 		api.Patch("/network/settings", s.handleUpdateNetworkSettings)
+		api.Get("/network/discover", s.handleDiscoverNetwork)
+		api.Post("/network/discover", s.handleDiscoverNetwork)
 		api.Post("/network/tailscale-enable", s.handleTailscaleEnable)
+		api.Post("/network/tailscale-disable", s.handleTailscaleDisable)
 
 		api.Get("/projects/{projectId}/tasks", s.handleListProjectTasks)
 		api.Post("/projects/{projectId}/tasks", s.handleCreateTask)

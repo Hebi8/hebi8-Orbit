@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/Hebi8/hebi8-Orbit/internal/protocol"
@@ -253,5 +254,40 @@ machines:
 	}
 	if len(artList.Artifacts) == 0 {
 		t.Fatalf("expected promoted artifact in /api/artifacts, got empty")
+	}
+
+	// Verify /api/health exposes opaque discoveryId without leaking workspace details
+	hReq := httptest.NewRequest(http.MethodGet, "/api/health", nil)
+	hRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(hRec, hReq)
+	if hRec.Code != http.StatusOK {
+		t.Fatalf("health failed: %d", hRec.Code)
+	}
+	var hDoc map[string]any
+	if err := json.Unmarshal(hRec.Body.Bytes(), &hDoc); err != nil {
+		t.Fatal(err)
+	}
+	if disc, _ := hDoc["discoveryId"].(string); !strings.HasPrefix(disc, "orb-") {
+		t.Fatalf("expected opaque discoveryId on /api/health, got %+v", hDoc)
+	}
+	if _, leaked := hDoc["workspaceName"]; leaked {
+		t.Fatalf("health endpoint must not leak workspaceName: %+v", hDoc)
+	}
+
+	// Verify loopback proxy matching helper handles localhost / 127.0.0.1 / [::1] equivalently
+	if !sameLoopbackProxyTarget("http://localhost:4310", "127.0.0.1:4310") {
+		t.Fatalf("expected localhost:4310 to match 127.0.0.1:4310")
+	}
+	if !sameLoopbackProxyTarget("http://[::1]:4310/", "127.0.0.1:4310") {
+		t.Fatalf("expected [::1]:4310 to match 127.0.0.1:4310")
+	}
+	if sameLoopbackProxyTarget("http://127.0.0.1:4311", "127.0.0.1:4310") {
+		t.Fatalf("different ports must not match")
+	}
+	if !isLoopbackOrigin("http://127.0.0.1:4310") || !isLoopbackOrigin("http://localhost:4311") {
+		t.Fatalf("expected loopback origins to be detected")
+	}
+	if isLoopbackOrigin("https://example.ts.net") {
+		t.Fatalf("tailnet origin must not be classified as loopback")
 	}
 }

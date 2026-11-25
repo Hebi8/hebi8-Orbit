@@ -21,6 +21,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/Hebi8/hebi8-Orbit/internal/discovery"
 	"github.com/Hebi8/hebi8-Orbit/internal/protocol"
 )
 
@@ -97,12 +98,42 @@ func runInit(ctx context.Context, args []string, stdin io.Reader, stdout, stderr
 
 	fmt.Fprintf(stdout, "hebi8-Orbit Init (%s)\n", Version)
 	fmt.Fprintf(stdout, "Config directory: %s\n\n", cfgDirAbs)
+
+	discoveredDefaultURL := existingClientHubURL(cfgDirAbs)
+	defaultChoice := "1"
+	if disc := discovery.Discover(ctx, discovery.Options{
+		IncludeLocal: false,
+		TotalTimeout: 2000 * time.Millisecond,
+	}); disc.TailscaleOnline {
+		var remoteHubs []protocol.DiscoveredHubView
+		for _, h := range disc.Hubs {
+			if !h.IsSelf && h.Via == "tailscale" {
+				remoteHubs = append(remoteHubs, h)
+			}
+		}
+		if len(remoteHubs) > 0 {
+			fmt.Fprintln(stdout, "检测到 Tailscale 上已存在的 Orbit 网络：")
+			for _, h := range remoteHubs {
+				idTag := ""
+				if h.DiscoveryID != "" {
+					idTag = "  [" + h.DiscoveryID + "]"
+				}
+				fmt.Fprintf(stdout, "  • %s%s  (%dms)\n", h.Origin, idTag, h.LatencyMs)
+			}
+			fmt.Fprintln(stdout)
+			if discoveredDefaultURL == "" {
+				discoveredDefaultURL = remoteHubs[0].Origin
+			}
+			defaultChoice = "2"
+		}
+	}
+
 	fmt.Fprintln(stdout, "选择配置方式：")
 	fmt.Fprintln(stdout, "  [1] 就在这台机器先用（自动初始化并启动本机 Orbit，等价 orbit up）")
 	fmt.Fprintln(stdout, "  [2] 加入已有的 Orbit 网络（粘贴配对命令或链接，等价 orbit join）")
 	fmt.Fprintln(stdout, "  [3] 添加当前 Git 仓库为项目（等价 orbit projects add）")
 
-	choice, err := promptLine(reader, stdout, "\n选择 [1-3]", "1")
+	choice, err := promptLine(reader, stdout, "\n选择 [1-3]", defaultChoice)
 	if err != nil {
 		return err
 	}
@@ -112,7 +143,7 @@ func runInit(ctx context.Context, args []string, stdin io.Reader, stdout, stderr
 		return runUp(ctx, []string{"--config-dir", cfgDirAbs, "--data-dir", dataDir}, stdout, stderr)
 
 	case "2", "join", "connect", "runner":
-		raw, err := promptLine(reader, stdout, "粘贴邀请命令、链接或 Hub 地址", existingClientHubURL(cfgDirAbs))
+		raw, err := promptLine(reader, stdout, "粘贴邀请命令、链接或 Hub 地址", discoveredDefaultURL)
 		if err != nil {
 			return err
 		}

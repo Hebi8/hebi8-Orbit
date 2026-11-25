@@ -1015,6 +1015,7 @@ export interface CreatePairingCodeResponse {
   expiresAt: number;
   joinCommand: string;
   joinLink: string;
+  loopbackOnly?: boolean;
 }
 
 export interface PairingCodeStatusResponse {
@@ -1214,11 +1215,36 @@ export interface TailscaleEnableRequest {
 export interface TailscaleEnableResponse {
   enabled: boolean;
   origin?: string;
+  targetOrigin?: string;
   needsConfirm?: boolean;
   suggestedPort?: number;
   conflictDetail?: string;
   command?: string;
   settings: NetworkSettingsView;
+}
+
+export interface TailscaleDisableResponse {
+  disabled: boolean;
+  settings: NetworkSettingsView;
+}
+
+export interface DiscoveredHubView {
+  origin: string;
+  hostName: string;
+  dnsName?: string;
+  discoveryId?: string;
+  version?: string;
+  via: string;
+  isSelf?: boolean;
+  latencyMs: number;
+}
+
+export interface NetworkDiscoverResponse {
+  tailscaleAvailable: boolean;
+  tailscaleOnline: boolean;
+  scannedPeers: number;
+  durationMs: number;
+  hubs: DiscoveredHubView[];
 }
 
 export interface CompleteOnboardingRequest {

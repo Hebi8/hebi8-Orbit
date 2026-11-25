@@ -1,12 +1,14 @@
 import { useCallback, useEffect, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import { Check, Copy, Laptop, RefreshCw, Server, ShieldCheck, X } from 'lucide-react';
+import { AlertTriangle, Check, Copy, Globe, Laptop, RefreshCw, Server, ShieldCheck, X } from 'lucide-react';
 import type {
   CreatePairingCodeResponse,
   MachineRole,
   MachineView,
   PairingCodeStatusResponse,
+  TailscaleEnableResponse,
 } from '../generated/protocol';
+import { useNetworkSettings } from '../hooks/queries';
 import { api, errMsg } from '../lib/api';
 import { toast } from '../store/useWorkbenchStore';
 import { AgentList } from './AgentList';
@@ -30,6 +32,8 @@ export function PairDialog({
   onClose: () => void;
 }) {
   const qc = useQueryClient();
+  const netQ = useNetworkSettings(open);
+  const net = netQ.data;
   const [role, setRole] = useState<MachineRole>('full');
   const [asRunner, setAsRunner] = useState(true);
   const [creating, setCreating] = useState(false);
@@ -37,6 +41,8 @@ export function PairDialog({
   const [codeResp, setCodeResp] = useState<CreatePairingCodeResponse | null>(null);
   const [status, setStatus] = useState<PairingCodeStatusResponse | null>(null);
   const [now, setNow] = useState(() => Date.now());
+  const [tsEnabling, setTsEnabling] = useState(false);
+  const [tsConfirm, setTsConfirm] = useState<TailscaleEnableResponse | null>(null);
 
   const createCode = useCallback(
     async (wantRunner: boolean, targetRole: MachineRole) => {
@@ -66,6 +72,7 @@ export function PairDialog({
       setCodeResp(null);
       setStatus(null);
       setError('');
+      setTsConfirm(null);
       return;
     }
     setRole('full');
@@ -122,6 +129,31 @@ export function PairDialog({
       void api.revokePairingCode(codeResp.id).catch(() => {});
     }
     void createCode(nextRunner, nextRole);
+  };
+
+  const isLoopbackCommand =
+    !!codeResp &&
+    (codeResp.loopbackOnly ||
+      /https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(?::|\/|\s|$)/i.test(codeResp.joinCommand));
+
+  const enableTailscaleAndRefresh = async (confirm = false, port?: number) => {
+    setTsEnabling(true);
+    try {
+      const res = await api.enableTailscaleShare({ confirm, port });
+      if (res.needsConfirm) {
+        setTsConfirm(res);
+        return;
+      }
+      setTsConfirm(null);
+      void qc.invalidateQueries({ queryKey: ['network-settings'] });
+      void qc.invalidateQueries({ queryKey: ['bootstrap'] });
+      toast(res.origin ? `已开启 Tailscale 共享：${res.origin}` : '已开启 Tailscale 共享');
+      regenerate(asRunner, role);
+    } catch (e) {
+      toast(errMsg(e), 'err');
+    } finally {
+      setTsEnabling(false);
+    }
   };
 
   const copyCommand = async () => {
@@ -231,6 +263,61 @@ export function PairDialog({
             </div>
           ) : codeResp ? (
             <>
+              {isLoopbackCommand && (
+                <div className="pair-warn-box">
+                  <div className="pair-warn-hd">
+                    <AlertTriangle size={14} strokeWidth={1.8} />
+                    <span>当前地址仅限本机访问（127.0.0.1），其他设备无法直连</span>
+                  </div>
+                  {net?.tailscaleAvailable ? (
+                    <div className="pair-warn-body">
+                      {tsConfirm ? (
+                        <>
+                          <div className="muted" style={{ fontSize: 12 }}>
+                            {tsConfirm.conflictDetail ||
+                              (tsConfirm.targetOrigin
+                                ? `将通过 Tailscale HTTPS 共享到 ${tsConfirm.targetOrigin}，开启后会自动更新上方邀请命令。`
+                                : `将通过 Tailscale 端口 ${tsConfirm.suggestedPort} 共享本机 Orbit。`)}
+                          </div>
+                          <div className="set-inline" style={{ marginTop: 6 }}>
+                            <button
+                              type="button"
+                              className="btn pri sm"
+                              disabled={tsEnabling}
+                              onClick={() => void enableTailscaleAndRefresh(true, tsConfirm.suggestedPort)}
+                            >
+                              {tsEnabling ? '开启中…' : '确认开启'}
+                            </button>
+                            <button
+                              type="button"
+                              className="btn ghost sm"
+                              disabled={tsEnabling}
+                              onClick={() => setTsConfirm(null)}
+                            >
+                              取消
+                            </button>
+                          </div>
+                        </>
+                      ) : (
+                        <button
+                          type="button"
+                          className="btn pri sm"
+                          disabled={tsEnabling}
+                          onClick={() => void enableTailscaleAndRefresh(false)}
+                        >
+                          <Globe size={12} strokeWidth={1.7} />
+                          {tsEnabling ? '检查中…' : '一键开启 Tailscale 共享'}
+                        </button>
+                      )}
+                    </div>
+                  ) : (
+                    <div className="muted" style={{ fontSize: 11.5 }}>
+                      {net?.tailscaleHint || '请先在这台机器安装并登录 Tailscale，开启外部接入后再添加其他机器。'}
+                    </div>
+                  )}
+                </div>
+              )}
+
               <div className="pair-label">在目标设备的终端运行，或粘贴到 Orbit 桌面端：</div>
               <div className="pair-cmd-box">
                 <code className="mono ell">{codeResp.joinCommand}</code>

@@ -919,6 +919,7 @@ type CreatePairingCodeResponse struct {
 	ExpiresAt     int64        `json:"expiresAt"`
 	JoinCommand   string       `json:"joinCommand"`
 	JoinLink      string       `json:"joinLink"`
+	LoopbackOnly  bool         `json:"loopbackOnly,omitempty"`
 }
 
 // PairingCodeStatusResponse reports live pairing code status for polling / WS confirmation.
@@ -1145,11 +1146,39 @@ type TailscaleEnableRequest struct {
 type TailscaleEnableResponse struct {
 	Enabled        bool                `json:"enabled"`
 	Origin         string              `json:"origin,omitempty"`
+	TargetOrigin   string              `json:"targetOrigin,omitempty"`
 	NeedsConfirm   bool                `json:"needsConfirm,omitempty"`
 	SuggestedPort  int                 `json:"suggestedPort,omitempty"`
 	ConflictDetail string              `json:"conflictDetail,omitempty"`
 	Command        string              `json:"command,omitempty"`
 	Settings       NetworkSettingsView `json:"settings"`
+}
+
+// TailscaleDisableResponse reports whether Tailscale Serve sharing for Orbit was disabled.
+type TailscaleDisableResponse struct {
+	Disabled bool                `json:"disabled"`
+	Settings NetworkSettingsView `json:"settings"`
+}
+
+// DiscoveredHubView represents one reachable Orbit Hub found on Tailscale or local loopback.
+type DiscoveredHubView struct {
+	Origin      string `json:"origin"`
+	HostName    string `json:"hostName"`
+	DNSName     string `json:"dnsName,omitempty"`
+	DiscoveryID string `json:"discoveryId,omitempty"`
+	Version     string `json:"version,omitempty"`
+	Via         string `json:"via"`
+	IsSelf      bool   `json:"isSelf,omitempty"`
+	LatencyMs   int64  `json:"latencyMs"`
+}
+
+// NetworkDiscoverResponse reports results of a manual Tailscale / local Orbit discovery scan.
+type NetworkDiscoverResponse struct {
+	TailscaleAvailable bool                `json:"tailscaleAvailable"`
+	TailscaleOnline    bool                `json:"tailscaleOnline"`
+	ScannedPeers       int                 `json:"scannedPeers"`
+	DurationMs         int64               `json:"durationMs"`
+	Hubs               []DiscoveredHubView `json:"hubs"`
 }
 
 // CompleteOnboardingRequest marks first-run onboarding completed (or skipped).

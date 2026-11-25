@@ -24,7 +24,7 @@
       -webkit-font-smoothing: antialiased;
     }
     .wrap {
-      width: min(420px, calc(100vw - 32px));
+      width: min(460px, calc(100vw - 32px));
     }
     .brand {
       display: flex; align-items: center; gap: 9px; font-weight: 600; font-size: 14px;
@@ -75,6 +75,40 @@
       font: 500 12.5px inherit; background: var(--fg); color: var(--bg);
     }
     button.pri:disabled { opacity: .45; cursor: default; }
+    button.ghost {
+      height: 26px; padding: 0 10px; border-radius: 7px; border: 1px solid var(--line);
+      background: transparent; color: var(--muted); cursor: pointer; font: 500 11.5px inherit;
+    }
+    button.ghost:hover:not(:disabled) { color: var(--fg); border-color: var(--line-on); }
+    button.ghost:disabled { opacity: .45; cursor: default; }
+    .disc-box {
+      margin-bottom: 11px; padding: 9px 10px; border-radius: 9px;
+      background: var(--raised); border: 1px solid var(--line);
+    }
+    .disc-hd {
+      display: flex; align-items: center; justify-content: space-between; gap: 8px;
+      font-size: 11.5px; color: var(--muted);
+    }
+    .disc-list { display: flex; flex-direction: column; gap: 5px; margin-top: 8px; }
+    .disc-item {
+      display: flex; align-items: center; gap: 8px; width: 100%; padding: 7px 9px;
+      border-radius: 7px; border: 1px solid var(--line); background: var(--panel);
+      color: var(--fg); text-align: left; cursor: pointer; font: inherit;
+    }
+    .disc-item:hover { border-color: var(--line-on); }
+    .disc-item.picked { border-color: var(--accent); }
+    .disc-main { min-width: 0; flex: 1; }
+    .disc-host { font-size: 12.5px; font-weight: 600; display: flex; align-items: center; gap: 6px; }
+    .disc-url {
+      font: 11px ui-monospace, Menlo, monospace; color: var(--muted);
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .disc-tag {
+      font: 10.5px ui-monospace, Menlo, monospace; color: var(--accent);
+      padding: 1px 5px; border-radius: 4px; background: rgba(163,184,255,.12); flex-shrink: 0;
+    }
+    .disc-ms { font: 11px ui-monospace, Menlo, monospace; color: var(--muted); flex-shrink: 0; }
+    .disc-hint { font-size: 11.5px; color: var(--muted); margin-top: 6px; line-height: 1.45; }
     .status {
       margin-top: 14px; min-height: 20px; font-size: 12px; color: var(--muted);
       display: flex; align-items: center; gap: 8px;
@@ -95,7 +129,7 @@
           <span class="radio"></span>
           <div>
             <div class="opt-title">就在这台机器用</div>
-            <div class="opt-sub">之后随时可以添加其他机器</div>
+            <div class="opt-sub">启动本机 Orbit，之后随时可开启 Tailscale 共享或添加其他机器</div>
           </div>
         </div>
         <div class="opt-body">
@@ -110,14 +144,23 @@
           <span class="radio"></span>
           <div>
             <div class="opt-title">连到已有的 Orbit</div>
-            <div class="opt-sub">使用另一台机器上的邀请命令、链接或地址</div>
+            <div class="opt-sub">扫描 Tailscale 网络，或粘贴另一台机器的邀请命令 / 地址</div>
           </div>
         </div>
         <div class="opt-body">
-          <input id="joinInput" type="text" placeholder="粘贴邀请命令，或输入地址" autocomplete="off" spellcheck="false" />
+          <div class="disc-box">
+            <div class="disc-hd">
+              <span id="discSummary">扫描 Tailscale 上的 Orbit 网络</span>
+              <button type="button" class="ghost" id="btnScan">重新扫描</button>
+            </div>
+            <div class="disc-list" id="discList"></div>
+          </div>
+
+          <input id="joinInput" type="text" placeholder="粘贴邀请命令（orbit join ...）或选择上方发现的地址" autocomplete="off" spellcheck="false" />
+          <div class="disc-hint" id="pickedHint" style="display:none"></div>
           <label class="chk">
             <input id="asRunner" type="checkbox" checked />
-            <span>也让这台机器执行任务</span>
+            <span>也让这台机器执行任务（需要配对码）</span>
           </label>
           <div class="foot">
             <button type="button" class="pri" id="btnJoin">连接</button>
@@ -131,16 +174,24 @@
 
   <script>
     let mode = 'local';
+    let userPickedMode = false;
     let busy = false;
+    let scanning = false;
+    let pickedOrigin = '';
     const cards = Array.from(document.querySelectorAll('.opt'));
     const joinInput = document.getElementById('joinInput');
     const asRunner = document.getElementById('asRunner');
     const btnLocal = document.getElementById('btnLocal');
     const btnJoin = document.getElementById('btnJoin');
+    const btnScan = document.getElementById('btnScan');
+    const discSummary = document.getElementById('discSummary');
+    const discList = document.getElementById('discList');
+    const pickedHint = document.getElementById('pickedHint');
     const statusEl = document.getElementById('status');
 
-    function setMode(next) {
+    function setMode(next, byUser) {
       if (busy) return;
+      if (byUser) userPickedMode = true;
       mode = next;
       cards.forEach(c => {
         const on = c.dataset.mode === next;
@@ -149,7 +200,7 @@
       });
       statusEl.className = 'status';
       statusEl.textContent = '';
-      if (next === 'remote') {
+      if (next === 'remote' && byUser) {
         setTimeout(() => joinInput.focus(), 10);
       }
     }
@@ -157,7 +208,7 @@
     cards.forEach(c => {
       c.addEventListener('click', (e) => {
         if (e.target.closest('button, input, label')) return;
-        setMode(c.dataset.mode);
+        setMode(c.dataset.mode, true);
       });
     });
 
@@ -165,12 +216,88 @@
       busy = on;
       btnLocal.disabled = on;
       btnJoin.disabled = on;
+      btnScan.disabled = on || scanning;
       joinInput.disabled = on;
       asRunner.disabled = on;
       statusEl.className = 'status' + (cls ? ' ' + cls : '');
       statusEl.innerHTML = on
         ? '<span class="dots"><span></span><span></span><span></span></span><span>' + text + '</span>'
         : text;
+    }
+
+    function escapeHtml(s) {
+      return String(s || '').replace(/[&<>"']/g, (ch) => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[ch]));
+    }
+
+    function selectDiscoveredHub(h) {
+      pickedOrigin = h.origin;
+      const cur = joinInput.value.trim();
+      const parts = cur.split(/\s+/);
+      const maybeCode = parts.length >= 2 && /^[0-9A-Za-z]{4}-?[0-9A-Za-z]{4}$/.test(parts[parts.length - 1])
+        ? parts[parts.length - 1]
+        : '';
+      joinInput.value = maybeCode ? (h.origin + ' ' + maybeCode) : h.origin;
+      pickedHint.style.display = 'block';
+      pickedHint.textContent = '已填入 ' + (h.discoveryId ? (h.hostName + ' (' + h.discoveryId + ')') : h.hostName) +
+        '：可直接点「连接」接入，或在末尾加空格与配对码同时注册本机为执行节点。';
+      Array.from(discList.querySelectorAll('.disc-item')).forEach(el => {
+        el.classList.toggle('picked', el.dataset.origin === h.origin);
+      });
+      joinInput.focus();
+    }
+
+    async function scanNetworks(autoFocusRemote) {
+      if (scanning) return;
+      scanning = true;
+      btnScan.disabled = true;
+      btnScan.textContent = '扫描中…';
+      discSummary.textContent = '正在扫描 Tailscale 在线设备…';
+      try {
+        const res = await fetch('/api/discover', {
+          method: 'POST',
+          headers: { 'X-Orbit-Setup': '1' },
+        });
+        const data = await res.json();
+        const hubs = (data.hubs || []).filter(h => h.via === 'tailscale' && !h.isSelf);
+        discList.innerHTML = '';
+        if (!data.tailscaleAvailable) {
+          discSummary.textContent = '未检测到 Tailscale，可手动粘贴地址或邀请命令';
+        } else if (!data.tailscaleOnline) {
+          discSummary.textContent = 'Tailscale 未连接，请先登录 Tailscale 后重新扫描';
+        } else if (hubs.length === 0) {
+          discSummary.textContent = '已扫描 ' + (data.scannedPeers || 0) + ' 台在线设备，未发现其他 Orbit 网络';
+        } else {
+          discSummary.textContent = '发现 ' + hubs.length + ' 个 Tailscale 上的 Orbit 网络（已扫 ' + (data.scannedPeers || 0) + ' 台）';
+          hubs.forEach(h => {
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'disc-item' + (pickedOrigin === h.origin ? ' picked' : '');
+            btn.dataset.origin = h.origin;
+            btn.innerHTML =
+              '<div class="disc-main">' +
+                '<div class="disc-host"><span>' + escapeHtml(h.hostName || h.dnsName) + '</span>' +
+                (h.discoveryId ? '<span class="disc-tag">' + escapeHtml(h.discoveryId) + '</span>' : '') +
+                '</div>' +
+                '<div class="disc-url">' + escapeHtml(h.origin) + '</div>' +
+              '</div>' +
+              '<span class="disc-ms">' + escapeHtml(h.latencyMs) + 'ms</span>';
+            btn.addEventListener('click', () => selectDiscoveredHub(h));
+            discList.appendChild(btn);
+          });
+          if (autoFocusRemote && !userPickedMode) {
+            setMode('remote', false);
+            if (!joinInput.value.trim()) {
+              selectDiscoveredHub(hubs[0]);
+            }
+          }
+        }
+      } catch (err) {
+        discSummary.textContent = '扫描失败：' + (err.message || String(err));
+      } finally {
+        scanning = false;
+        btnScan.disabled = busy;
+        btnScan.textContent = '重新扫描';
+      }
     }
 
     async function startLocal() {
@@ -215,7 +342,7 @@
           false,
           data.runnerStarted
             ? '客户端与本机执行节点已上线，正在进入…'
-            : (asRunner.checked ? '客户端已连接，执行节点正在后台连接…' : '已连接，正在进入…'),
+            : (asRunner.checked ? '客户端已连接，正在进入…' : '已连接，正在进入…'),
           'ok',
         );
         window.location.href = data.openUrl || (data.hubUrl + '/');
@@ -226,6 +353,7 @@
 
     btnLocal.addEventListener('click', startLocal);
     btnJoin.addEventListener('click', joinRemote);
+    btnScan.addEventListener('click', () => scanNetworks(false));
     document.addEventListener('keydown', (e) => {
       if (e.key === 'Enter' && !e.isComposing) {
         if (mode === 'local') {
@@ -243,6 +371,7 @@
         joinInput.value = d.hubUrl;
       }
     }).catch(() => {});
+    scanNetworks(true);
   </script>
 </body>
 </html>

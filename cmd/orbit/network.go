@@ -19,6 +19,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Hebi8/hebi8-Orbit/internal/discovery"
 	"github.com/Hebi8/hebi8-Orbit/internal/protocol"
 )
 
@@ -335,17 +336,23 @@ func runPair(ctx context.Context, args []string, stdout, stderr io.Writer) error
 
 	fmt.Fprintln(stdout, "在要加入的机器上运行：")
 	fmt.Fprintf(stdout, "  %s\n\n", resp.JoinCommand)
+	if resp.LoopbackOnly {
+		fmt.Fprintln(stdout, "提示：当前 Hub 仅监听本机地址（127.0.0.1），其他设备无法直连。")
+		fmt.Fprintln(stdout, "      请在「设置 → 网络 → 外部接入」开启 Tailscale 共享后再生成邀请命令。")
+		fmt.Fprintln(stdout)
+	}
 	if scope == protocol.PairingScopeRunner {
 		fmt.Fprintf(stdout, "（仅限执行节点，请在目标机器终端运行；配对码 %s，%d 分钟内有效。）\n", resp.Code, *ttlSec/60)
 	} else {
 		fmt.Fprintf(stdout, "或在那台机器的 Orbit 桌面端选「连到已有的」并粘贴上面这一行（配对码 %s，%d 分钟内有效）。\n", resp.Code, *ttlSec/60)
 	}
 
+	if !*noWait {
+		fmt.Fprintln(stdout, "\n等待机器连接…（按 Ctrl+C 退出等待，配对码仍然有效）")
+	}
 	if *noWait {
 		return nil
 	}
-
-	fmt.Fprintln(stdout, "\n等待机器连接…（按 Ctrl+C 退出等待，配对码仍然有效）")
 	ticker := time.NewTicker(1500 * time.Millisecond)
 	defer ticker.Stop()
 	lastState := ""
@@ -387,6 +394,48 @@ func runPair(ctx context.Context, args []string, stdout, stderr io.Writer) error
 			}
 		}
 	}
+}
+
+func runDiscover(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("discover", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	var (
+		jsonOut = fs.Bool("json", false, "output JSON")
+	)
+	if err := parseFlagsPermuted(fs, args); err != nil {
+		return err
+	}
+
+	res := discovery.Discover(ctx, discovery.Options{
+		IncludeLocal: true,
+	})
+	if *jsonOut {
+		enc, _ := json.MarshalIndent(res, "", "  ")
+		return writeRawJSON(stdout, enc)
+	}
+	if !res.TailscaleAvailable {
+		fmt.Fprintln(stdout, "未检测到 Tailscale，仅扫描了本机回环端口。")
+	} else if !res.TailscaleOnline {
+		fmt.Fprintln(stdout, "Tailscale 未连接，仅扫描了本机回环端口。")
+	} else {
+		fmt.Fprintf(stdout, "已扫描 %d 台 Tailscale 在线设备（耗时 %dms）：\n", res.ScannedPeers, res.DurationMs)
+	}
+	if len(res.Hubs) == 0 {
+		fmt.Fprintln(stdout, "  未发现可访问的 Orbit 网络。")
+		return nil
+	}
+	for _, h := range res.Hubs {
+		idPart := ""
+		if h.DiscoveryID != "" {
+			idPart = "  [" + h.DiscoveryID + "]"
+		}
+		viaPart := h.Via
+		if h.IsSelf {
+			viaPart += ", 本机"
+		}
+		fmt.Fprintf(stdout, "  • %s%s  (%s · %dms)\n", h.Origin, idPart, viaPart, h.LatencyMs)
+	}
+	return nil
 }
 
 func runJoin(ctx context.Context, args []string, stdout, stderr io.Writer) error {

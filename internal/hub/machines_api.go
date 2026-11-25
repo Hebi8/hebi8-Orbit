@@ -6,10 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/Hebi8/hebi8-Orbit/internal/discovery"
 	"github.com/Hebi8/hebi8-Orbit/internal/gitops"
 	"github.com/Hebi8/hebi8-Orbit/internal/protocol"
 	"github.com/Hebi8/hebi8-Orbit/internal/store"
@@ -815,6 +817,29 @@ func (s *Server) handleUpdateNetworkSettings(w http.ResponseWriter, r *http.Requ
 	writeJSON(w, http.StatusOK, s.buildNetworkSettingsView(r.Context()))
 }
 
+func formatTailscaleOrigin(dnsName string, port int) string {
+	dnsName = strings.TrimRight(strings.TrimSpace(dnsName), ".")
+	if dnsName == "" {
+		return ""
+	}
+	if port <= 0 || port == 443 {
+		return "https://" + dnsName
+	}
+	return fmt.Sprintf("https://%s:%d", dnsName, port)
+}
+
+func (s *Server) handleDiscoverNetwork(w http.ResponseWriter, r *http.Request) {
+	discID, _ := s.store.EnsureDiscoveryID(r.Context())
+	_, tsShared, tsOrigin, _, _ := s.probeTailscaleState(r.Context())
+	selfOrigin := s.liveEffectiveHubOrigin(tsShared, tsOrigin)
+	res := discovery.Discover(r.Context(), discovery.Options{
+		SelfDiscoveryID: discID,
+		SelfOrigin:      selfOrigin,
+		IncludeLocal:    true,
+	})
+	writeJSON(w, http.StatusOK, res)
+}
+
 func (s *Server) handleTailscaleEnable(w http.ResponseWriter, r *http.Request) {
 	if s.hubConfigSnapshot().DevOpen {
 		writeAPIError(w, http.StatusBadRequest, "ERR_DEV_OPEN_INCOMPATIBLE", "请先关闭 devOpen 模式后再开启多机共享")
@@ -844,9 +869,10 @@ func (s *Server) handleTailscaleEnable(w http.ResponseWriter, r *http.Request) {
 		// Already exposed via Tailscale Serve; ensure DB records origin + login
 		s.recordTailscaleSharing(context.WithoutCancel(r.Context()), tsState.origin, actorFromContext(r.Context()))
 		writeJSON(w, http.StatusOK, protocol.TailscaleEnableResponse{
-			Enabled:  true,
-			Origin:   tsState.origin,
-			Settings: s.buildNetworkSettingsView(r.Context()),
+			Enabled:      true,
+			Origin:       tsState.origin,
+			TargetOrigin: tsState.origin,
+			Settings:     s.buildNetworkSettingsView(r.Context()),
 		})
 		return
 	}
@@ -873,6 +899,7 @@ func (s *Server) handleTailscaleEnable(w http.ResponseWriter, r *http.Request) {
 		altCmd := fmt.Sprintf("tailscale serve --bg --https=%d %s", altPort, targetURL)
 		writeJSON(w, http.StatusOK, protocol.TailscaleEnableResponse{
 			Enabled:        false,
+			TargetOrigin:   formatTailscaleOrigin(tsState.selfDNSName, altPort),
 			NeedsConfirm:   true,
 			SuggestedPort:  altPort,
 			ConflictDetail: fmt.Sprintf("%d 端口已被其他 Tailscale 服务占用（%s），请确认改用 %d 端口以保留现有映射", targetPort, occupiedBy, altPort),
@@ -882,10 +909,12 @@ func (s *Server) handleTailscaleEnable(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	targetOrigin := formatTailscaleOrigin(tsState.selfDNSName, targetPort)
 	cmdPreview := fmt.Sprintf("tailscale serve --bg --https=%d %s", targetPort, targetURL)
 	if !req.Confirm {
 		writeJSON(w, http.StatusOK, protocol.TailscaleEnableResponse{
 			Enabled:        false,
+			TargetOrigin:   targetOrigin,
 			NeedsConfirm:   true,
 			SuggestedPort:  targetPort,
 			ConflictDetail: tsState.hint,
@@ -906,20 +935,48 @@ func (s *Server) handleTailscaleEnable(w http.ResponseWriter, r *http.Request) {
 	_, _, newOrigin, _, _ := s.probeTailscaleState(r.Context())
 	if newOrigin == "" {
 		if dnsName := queryTailscaleSelfDNSName(r.Context(), tsBin); dnsName != "" {
-			if targetPort == 443 {
-				newOrigin = "https://" + dnsName
-			} else {
-				newOrigin = fmt.Sprintf("https://%s:%d", dnsName, targetPort)
-			}
+			newOrigin = formatTailscaleOrigin(dnsName, targetPort)
+		} else {
+			newOrigin = targetOrigin
 		}
 	}
 	if newOrigin != "" {
 		s.recordTailscaleSharing(context.WithoutCancel(r.Context()), newOrigin, actorFromContext(r.Context()))
 	}
 	writeJSON(w, http.StatusOK, protocol.TailscaleEnableResponse{
-		Enabled:  true,
-		Origin:   newOrigin,
-		Command:  cmdPreview,
+		Enabled:      true,
+		Origin:       newOrigin,
+		TargetOrigin: newOrigin,
+		Command:      cmdPreview,
+		Settings:     s.buildNetworkSettingsView(r.Context()),
+	})
+}
+
+func (s *Server) handleTailscaleDisable(w http.ResponseWriter, r *http.Request) {
+	tsBin := findTailscaleBin()
+	if tsBin != "" {
+		tsState := s.inspectTailscaleServe(r.Context(), tsBin)
+		if tsState.shared && tsState.orbitPort > 0 {
+			execCtx, cancel := context.WithTimeout(r.Context(), 12*time.Second)
+			defer cancel()
+			out, err := exec.CommandContext(execCtx, tsBin, "serve", "--https="+strconv.Itoa(tsState.orbitPort), "off").CombinedOutput()
+			if err != nil {
+				writeAPIError(w, http.StatusBadGateway, "ERR_TAILSCALE_SERVE", fmt.Sprintf("关闭 Tailscale Serve 失败: %s", strings.TrimSpace(string(out))))
+				return
+			}
+		}
+	}
+	cur, _ := s.store.GetDynamicNetworkSettings(r.Context())
+	cur.TailscaleShared = false
+	cur.TailscaleOrigin = ""
+	disabled := false
+	cur.ExternalGatewayEnabled = &disabled
+	if ev, err := s.store.SaveDynamicNetworkSettings(context.WithoutCancel(r.Context()), cur, actorFromContext(r.Context())); err == nil {
+		_ = s.refreshEffectiveRegistry(context.WithoutCancel(r.Context()))
+		s.broker.Broadcast(ev)
+	}
+	writeJSON(w, http.StatusOK, protocol.TailscaleDisableResponse{
+		Disabled: true,
 		Settings: s.buildNetworkSettingsView(r.Context()),
 	})
 }
@@ -943,10 +1000,16 @@ func (s *Server) recordTailscaleSharing(ctx context.Context, origin, actorID str
 }
 
 func (s *Server) buildNetworkSettingsView(ctx context.Context) protocol.NetworkSettingsView {
+	tsAvail, tsShared, tsOrigin, conflict, conflictDetail := s.probeTailscaleState(ctx)
 	s.mu.RLock()
 	dyn := s.dynNet
 	s.mu.RUnlock()
-	tsAvail, tsShared, tsOrigin, conflict, conflictDetail := s.probeTailscaleState(ctx)
+	if tsShared && tsOrigin != "" && (!dyn.TailscaleShared || strings.TrimRight(dyn.TailscaleOrigin, "/") != strings.TrimRight(tsOrigin, "/")) {
+		s.recordTailscaleSharing(context.WithoutCancel(ctx), tsOrigin, "system")
+		s.mu.RLock()
+		dyn = s.dynNet
+		s.mu.RUnlock()
+	}
 	discID, _ := s.store.EnsureDiscoveryID(ctx)
 	dutyPriority, activeDuty := s.effectiveDutyPriority(ctx, nil)
 	gwEnabled := tsShared
@@ -966,7 +1029,7 @@ func (s *Server) buildNetworkSettingsView(ctx context.Context) protocol.NetworkS
 		ActiveDutyMachineID:    activeDuty,
 		ExternalGatewayEnabled: gwEnabled,
 		ExternalGatewayCount:   gwCount,
-		HubOrigin:              s.effectiveHubOrigin(),
+		HubOrigin:              s.liveEffectiveHubOrigin(tsShared, tsOrigin),
 		ExtraOrigins:           dyn.ExtraOrigins,
 		ExtraLogins:            dyn.ExtraLogins,
 		TailscaleAvailable:     tsAvail,
@@ -1041,22 +1104,15 @@ func decodeSingleProbeFromRPC(data map[string]any) *protocol.AgentProbe {
 }
 
 func findTailscaleBin() string {
-	if p, err := exec.LookPath("tailscale"); err == nil {
-		return p
-	}
-	if runtime.GOOS == "darwin" {
-		const macAppBin = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
-		if _, err := exec.LookPath(macAppBin); err == nil {
-			return macAppBin
-		}
-	}
-	return ""
+	return discovery.FindTailscaleBin()
 }
 
 type tailscaleServeInspection struct {
 	available     bool
 	shared        bool
+	selfDNSName   string
 	origin        string
+	orbitPort     int
 	occupiedPorts map[int]string
 	hint          string
 	statusErr     error
@@ -1074,6 +1130,25 @@ func (t tailscaleServeInspection) pickSuggestedFreePort() int {
 		}
 	}
 	return 4443
+}
+
+func sameLoopbackProxyTarget(proxyRaw, listenAddr string) bool {
+	proxyNorm := strings.TrimRight(strings.TrimSpace(proxyRaw), "/")
+	targetNorm := "http://" + strings.TrimRight(strings.TrimPrefix(strings.TrimPrefix(strings.TrimSpace(listenAddr), "http://"), "https://"), "/")
+	if strings.EqualFold(proxyNorm, targetNorm) {
+		return true
+	}
+	pu, err1 := url.Parse(proxyNorm)
+	tu, err2 := url.Parse(targetNorm)
+	if err1 != nil || err2 != nil || pu.Scheme != tu.Scheme {
+		return false
+	}
+	pHost, pPort, err1 := net.SplitHostPort(pu.Host)
+	tHost, tPort, err2 := net.SplitHostPort(tu.Host)
+	if err1 != nil || err2 != nil || pPort != tPort {
+		return false
+	}
+	return isLoopbackHost(pHost) && isLoopbackHost(tHost)
 }
 
 func (s *Server) inspectTailscaleServe(ctx context.Context, tsBin string) tailscaleServeInspection {
@@ -1094,7 +1169,7 @@ func (s *Server) inspectTailscaleServe(ctx context.Context, tsBin string) tailsc
 		res.hint = "未安装 Tailscale"
 		return res
 	}
-	pctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	pctx, cancel := context.WithTimeout(ctx, 4*time.Second)
 	defer cancel()
 	dnsName := queryTailscaleSelfDNSName(pctx, tsBin)
 	if dnsName == "" {
@@ -1102,6 +1177,7 @@ func (s *Server) inspectTailscaleServe(ctx context.Context, tsBin string) tailsc
 		return res
 	}
 	res.available = true
+	res.selfDNSName = dnsName
 
 	// Always inspect live `tailscale serve status --json` so stopping Serve externally is immediately reflected
 	// and never masked by stale DB/YAML origin settings.
@@ -1128,21 +1204,23 @@ func (s *Server) inspectTailscaleServe(ctx context.Context, tsBin string) tailsc
 		return res
 	}
 
-	targetNorm := "http://" + strings.TrimPrefix(strings.TrimPrefix(listenAddr, "http://"), "https://")
 	for hostPort, web := range statusDoc.Web {
+		portNum := 443
+		if idx := strings.LastIndex(hostPort, ":"); idx >= 0 {
+			if p, pErr := strconv.Atoi(hostPort[idx+1:]); pErr == nil && p > 0 {
+				portNum = p
+			}
+		}
 		for mountPath, h := range web.Handlers {
-			if (mountPath == "/" || mountPath == "") && strings.TrimRight(h.Proxy, "/") == strings.TrimRight(targetNorm, "/") {
+			if (mountPath == "/" || mountPath == "") && sameLoopbackProxyTarget(h.Proxy, listenAddr) {
 				res.shared = true
+				res.orbitPort = portNum
 				res.origin = "https://" + strings.TrimSuffix(hostPort, ":443")
 				return res
 			}
 		}
-		if idx := strings.LastIndex(hostPort, ":"); idx >= 0 {
-			if p, pErr := strconv.Atoi(hostPort[idx+1:]); pErr == nil && p > 0 {
-				if len(web.Handlers) > 0 {
-					res.occupiedPorts[p] = hostPort
-				}
-			}
+		if len(web.Handlers) > 0 && portNum > 0 {
+			res.occupiedPorts[portNum] = hostPort
 		}
 	}
 	if occ, busy := res.occupiedPorts[443]; busy {

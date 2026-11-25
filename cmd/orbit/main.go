@@ -79,6 +79,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return runPair(ctx, args[1:], stdout, stderr)
 	case "join":
 		return runJoin(ctx, args[1:], stdout, stderr)
+	case "discover", "scan":
+		return runDiscover(ctx, args[1:], stdout, stderr)
 	case "agents", "agent":
 		return runAgents(ctx, args[1:], stdout, stderr)
 	case "machines", "machine":
@@ -121,6 +123,7 @@ func printUsage(w io.Writer) {
   orbit up [--no-runner] [--service] [--json]               Start or attach to local Orbit on this machine
   orbit pair [--runner|--client|--both] [--machine <id>]    Generate a one-time pairing code & wait for node
   orbit join <hub-url> <pair-code> [--no-runner] [--service] Join an existing Orbit network
+  orbit discover [--json]                                   Scan Tailscale & local ports for Orbit Hubs
   orbit agents [list|check|test|install|enable|disable] ... Inspect and configure machine Agents
   orbit machines [ls|rename|rm] ...                         Manage connected machines
   orbit projects [ls|add|rm] ...                            Manage registered projects

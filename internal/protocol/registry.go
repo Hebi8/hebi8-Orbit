@@ -187,6 +187,9 @@ func ExportedDTOTypes() []reflect.Type {
 		reflect.TypeOf(UpdateNetworkSettingsRequest{}),
 		reflect.TypeOf(TailscaleEnableRequest{}),
 		reflect.TypeOf(TailscaleEnableResponse{}),
+		reflect.TypeOf(TailscaleDisableResponse{}),
+		reflect.TypeOf(DiscoveredHubView{}),
+		reflect.TypeOf(NetworkDiscoverResponse{}),
 		reflect.TypeOf(CompleteOnboardingRequest{}),
 		reflect.TypeOf(CompleteOnboardingResponse{}),
 		// Runner WS frames

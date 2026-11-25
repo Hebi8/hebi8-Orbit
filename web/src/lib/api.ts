@@ -36,6 +36,7 @@ import type {
   ListDirsResponse,
   ListMachinesResponse,
   MachineAgentActionResponse,
+  NetworkDiscoverResponse,
   NetworkSettingsView,
   PABriefRequest,
   PABriefResponse,
@@ -55,6 +56,7 @@ import type {
   RetryTaskRequest,
   RetryTaskResponse,
   RyugiSyncResponse,
+  TailscaleDisableResponse,
   TailscaleEnableRequest,
   TailscaleEnableResponse,
   TaskBoardResponse,
@@ -654,6 +656,20 @@ export const api = {
     return apiFetch<TailscaleEnableResponse>('/api/network/tailscale-enable', {
       method: 'POST',
       json: req,
+    });
+  },
+
+  disableTailscaleShare(): Promise<TailscaleDisableResponse> {
+    return apiFetch<TailscaleDisableResponse>('/api/network/tailscale-disable', {
+      method: 'POST',
+      json: {},
+    });
+  },
+
+  discoverNetworks(): Promise<NetworkDiscoverResponse> {
+    return apiFetch<NetworkDiscoverResponse>('/api/network/discover', {
+      method: 'POST',
+      json: {},
     });
   },
 };

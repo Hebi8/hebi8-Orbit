@@ -9,6 +9,7 @@ import (
 	"io"
 	"math/big"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -131,17 +132,24 @@ func normalizePairingCode(raw string) string {
 	return out
 }
 
-func (s *Server) effectiveHubOrigin() string {
+func isLoopbackOrigin(raw string) bool {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Host == "" {
+		return false
+	}
+	return isLoopbackHost(u.Host)
+}
+
+func (s *Server) liveEffectiveHubOrigin(tsShared bool, tsOrigin string) string {
+	tsOrigin = strings.TrimRight(strings.TrimSpace(tsOrigin), "/")
+	if tsShared && tsOrigin != "" {
+		return tsOrigin
+	}
 	s.mu.RLock()
-	tsOrigin := strings.TrimRight(strings.TrimSpace(s.dynNet.TailscaleOrigin), "/")
-	tsShared := s.dynNet.TailscaleShared
 	hubOrigin := strings.TrimRight(strings.TrimSpace(s.hubCfg.HubOrigin), "/")
 	listenAddr := strings.TrimSpace(s.hubCfg.ListenAddr)
 	s.mu.RUnlock()
 
-	if tsShared && tsOrigin != "" {
-		return tsOrigin
-	}
 	if hubOrigin != "" {
 		return hubOrigin
 	}
@@ -152,6 +160,14 @@ func (s *Server) effectiveHubOrigin() string {
 		listenAddr = "127.0.0.1:4310"
 	}
 	return "http://" + listenAddr
+}
+
+func (s *Server) effectiveHubOrigin() string {
+	s.mu.RLock()
+	tsOrigin := strings.TrimRight(strings.TrimSpace(s.dynNet.TailscaleOrigin), "/")
+	tsShared := s.dynNet.TailscaleShared
+	s.mu.RUnlock()
+	return s.liveEffectiveHubOrigin(tsShared, tsOrigin)
 }
 
 func hubOriginToRunnerWS(origin string) string {
@@ -232,7 +248,16 @@ func (s *Server) handleCreatePairingCode(w http.ResponseWriter, r *http.Request)
 
 	discID, _ := s.store.EnsureDiscoveryID(r.Context())
 	fp := derivePairingFingerprint(normalized, discID)
-	origin := s.effectiveHubOrigin()
+	_, tsShared, tsOrigin, _, _ := s.probeTailscaleState(r.Context())
+	if tsShared && tsOrigin != "" {
+		s.mu.RLock()
+		needsSync := !s.dynNet.TailscaleShared || strings.TrimRight(s.dynNet.TailscaleOrigin, "/") != strings.TrimRight(tsOrigin, "/")
+		s.mu.RUnlock()
+		if needsSync {
+			s.recordTailscaleSharing(context.WithoutCancel(r.Context()), tsOrigin, actorFromContext(r.Context()))
+		}
+	}
+	origin := s.liveEffectiveHubOrigin(tsShared, tsOrigin)
 	joinCmd := fmt.Sprintf("orbit join %s %s", origin, formatted)
 	joinLink := fmt.Sprintf("%s/#/join/%s", origin, formatted)
 	switch scope {
@@ -258,6 +283,7 @@ func (s *Server) handleCreatePairingCode(w http.ResponseWriter, r *http.Request)
 		ExpiresAt:     rec.ExpiresAt,
 		JoinCommand:   joinCmd,
 		JoinLink:      joinLink,
+		LoopbackOnly:  isLoopbackOrigin(origin),
 	})
 }
 

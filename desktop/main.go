@@ -82,14 +82,26 @@ func main() {
 	initialURL := setupOrigin + "/"
 	if !*forceSetup {
 		if cfg.HubURL == "" {
-			// Zero-fork first launch: start or attach local Hub + Runner directly without blocking setup fork.
-			if hubURL, _, _, sErr := runtimeMgr.StartOrAttachLocal(context.Background(), *configDir); sErr == nil && hubURL != "" {
-				setHubState(hubURL, "local")
-				cfg.HubURL = hubURL
-				cfg.Mode = "local"
-				initialURL = runtimeMgr.BuildOpenURL(context.Background(), *configDir, getHubURL(), "")
-			} else if sErr != nil {
-				log.Printf("orbit-client: auto-start local hub unavailable (%v); showing setup screen", sErr)
+			// Fresh machine: quickly check if an Orbit network already exists on Tailscale.
+			// If a remote Orbit Hub is found, open the setup screen so the user can join it directly
+			// (avoiding accidental split-brain standalone Hubs); otherwise launch zero-fork locally.
+			disc := DiscoverNetworks(context.Background(), false, 1800*time.Millisecond)
+			hasRemote := false
+			for _, h := range disc.Hubs {
+				if !h.IsSelf && h.Via == "tailscale" {
+					hasRemote = true
+					break
+				}
+			}
+			if !hasRemote {
+				if hubURL, _, _, sErr := runtimeMgr.StartOrAttachLocal(context.Background(), *configDir); sErr == nil && hubURL != "" {
+					setHubState(hubURL, "local")
+					cfg.HubURL = hubURL
+					cfg.Mode = "local"
+					initialURL = runtimeMgr.BuildOpenURL(context.Background(), *configDir, getHubURL(), "")
+				} else if sErr != nil {
+					log.Printf("orbit-client: auto-start local hub unavailable (%v); showing setup screen", sErr)
+				}
 			}
 		} else {
 			switch cfg.Mode {
@@ -140,6 +152,11 @@ func main() {
 		// Hand off IDE deep-links (cursor://, vscode://, zed://, antigravity://) and cross-origin URLs
 		// (e.g. Ryugi :8443 canvases) natively via OS shell with zero browser prompt friction.
 		page.OnWillNavigate(func(e *mygo.NavigateEvent) {
+			if strings.HasPrefix(e.URL, "orbit-desktop://setup") {
+				e.PreventDefault()
+				_ = page.LoadURL(setupOrigin + "/")
+				return
+			}
 			if ShouldOpenExternally(e.URL, getHubURL(), setupOrigin) {
 				e.PreventDefault()
 				go func(target string) {
@@ -347,6 +364,19 @@ func startSetupServer(
 			"hubUrl": getHubURL(),
 			"mode":   getMode(),
 		})
+	})
+	mux.HandleFunc("GET /api/discover", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		res := DiscoverNetworks(r.Context(), true, 4000*time.Millisecond)
+		_ = json.NewEncoder(w).Encode(res)
+	})
+	mux.HandleFunc("POST /api/discover", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if !checkSetupOrigin(w, r) {
+			return
+		}
+		res := DiscoverNetworks(r.Context(), true, 4000*time.Millisecond)
+		_ = json.NewEncoder(w).Encode(res)
 	})
 	mux.HandleFunc("POST /api/local-start", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
