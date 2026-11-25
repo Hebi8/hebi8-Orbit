@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/Hebi8/hebi8-Orbit/internal/protocol"
@@ -359,7 +358,7 @@ func (d *AgyAcpDriver) Start(ctx context.Context, onUpdate SessionUpdateHandler,
 		rawStdout = d.customStdout
 	} else {
 		cmd = exec.Command(d.cfg.Bin, d.cfg.Args...)
-		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		setProcessGroup(cmd)
 		cmd.Env = d.buildEnv()
 		cmd.Stderr = &d.stderrBuf
 
@@ -737,20 +736,6 @@ func (b *acpClientBridge) ReleaseTerminal(ctx context.Context, params acp.Releas
 
 func (b *acpClientBridge) WaitForTerminalExit(ctx context.Context, params acp.WaitForTerminalExitRequest) (acp.WaitForTerminalExitResponse, error) {
 	return acp.WaitForTerminalExitResponse{}, errors.New("client terminal not enabled")
-}
-
-func killProcessGroup(cmd *exec.Cmd) {
-	if cmd == nil || cmd.Process == nil {
-		return
-	}
-	pgid, err := syscall.Getpgid(cmd.Process.Pid)
-	if err == nil && pgid > 0 {
-		_ = syscall.Kill(-pgid, syscall.SIGTERM)
-		time.Sleep(150 * time.Millisecond)
-		_ = syscall.Kill(-pgid, syscall.SIGKILL)
-		return
-	}
-	_ = cmd.Process.Kill()
 }
 
 func setEnvVar(env []string, key, val string) []string {
