@@ -73,6 +73,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	}
 
 	switch args[0] {
+	case "init":
+		return runInit(ctx, args[1:], os.Stdin, stdout, stderr)
 	case "version", "--version", "-v":
 		fmt.Fprintf(stdout, "orbit %s (commit=%s built=%s)\n", Version, Commit, BuildDate)
 		return nil
@@ -102,6 +104,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 
 func printUsage(w io.Writer) {
 	fmt.Fprintln(w, `Usage:
+  orbit init [--connect <url> | --hub | --runner --hub-url <url> | --project [dir]]
   orbit status [--hub <url>] [--json]
   orbit tasks [list|new|show|followup|cancel|retry] ...
   orbit approvals [list|allow|reject] ...

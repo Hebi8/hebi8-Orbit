@@ -6,7 +6,7 @@ Single-user, multi-machine agent project delivery and review workbench built wit
 
 - **Hub (`orbit-hub`)**: Single-writer SQLite WAL (`ncruces/go-sqlite3`), static YAML project/machine registries, Git Smart HTTP mirror with `pre-receive` immutability guard, Ryugi sidecar bridge, PA runtime, and embedded React SPA.
 - **ACP Runner (`orbit-runner`)**: Thin pure-Go ACP runner supporting **`agy`**, **`claude` (`claude-agent-acp`)**, and **`codex` (`codex-acp`)** via standard ACP (`github.com/coder/acp-go-sdk`), with dynamic cross-adapter `configOptions` mapping, per-session serialization, persistent SQLite Outbox, and zero-pollution Git checkpoints.
-- **CLI (`orbit`)**: Fast terminal interface for daily workflows — `status`, `tasks` (`list`/`new`/`show`/`followup`/`cancel`/`retry`), `approvals` (`list`/`allow`/`reject`), `pa`, `artifacts`, `brief`, `deliver`, `doctor`, `open`, `version`.
+- **CLI (`orbit`)**: Fast terminal interface for daily workflows — `init`, `status`, `tasks` (`list`/`new`/`show`/`followup`/`cancel`/`retry`), `approvals` (`list`/`allow`/`reject`), `pa`, `artifacts`, `brief`, `deliver`, `doctor`, `open`, `version`.
 - **Desktop Client (`desktop/` -> `orbit-client`)**: Thin pure-Go (`CGO_ENABLED=0`) desktop shell using `github.com/egoist/mygo` (`WKWebView` / `WebKitGTK` / `WebView2`) with native IDE deep-link handoff (`cursor://`, `vscode://`, `zed://`, `antigravity://`), cross-origin external link routing (Ryugi canvases), global PA shortcut (`CmdOrCtrl+Shift+O`), and built-in Hub setup screen.
 
 ## Configuration Paths
@@ -41,6 +41,13 @@ make check-privacy
 ## CLI Quick Start
 
 ```bash
+# Guided first-time setup (connect to Hub, scaffold a new Hub, join as Runner, or register a Git repo)
+orbit init
+orbit init --connect https://orbit.example.ts.net
+orbit init --hub
+orbit init --runner --hub-url https://orbit.example.ts.net --machine mac-node
+orbit init --project .
+
 orbit doctor
 orbit status
 orbit tasks list
@@ -58,3 +65,7 @@ orbit open
 
 - `.github/workflows/ci.yml`: Privacy hygiene check, protocol typegen verification, web build, Go race tests, and cross-OS builds (core + CLI + `mygo` desktop client).
 - `.github/workflows/release.yml`: Triggered on `v*` tags (or manual dispatch) to publish versioned CLI/Hub/Runner archives (`linux/amd64`, `linux/arm64`, `darwin/arm64`, `darwin/amd64`, `windows/amd64`), Desktop Client (`Orbit.app` + `.dmg` + `.zip` on macOS, `.tar.gz` on Linux, `.zip` on Windows), and `SHA256SUMS.txt` to GitHub Releases.
+
+## License
+
+Apache-2.0 — see [LICENSE](LICENSE).
