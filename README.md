@@ -66,6 +66,10 @@ orbit open
 - `.github/workflows/ci.yml`: Privacy hygiene check, protocol typegen verification, web build, Go race tests, and cross-OS builds (core + CLI + `mygo` desktop client).
 - `.github/workflows/release.yml`: Triggered on `v*` tags (or manual dispatch) to publish versioned CLI/Hub/Runner archives (`linux/amd64`, `linux/arm64`, `darwin/arm64`, `darwin/amd64`, `windows/amd64`), Desktop Client (`Orbit.app` + `.dmg` + `.zip` on macOS, `.tar.gz` on Linux, `.zip` on Windows), and `SHA256SUMS.txt` to GitHub Releases.
 
+## Documentation
+
+Architecture specifications, communication contracts, UI/UX guidelines, and historical design records live in [docs/README.md](docs/README.md). See [AGENTS.md](AGENTS.md) for engineering constraints, verification commands, and design-sync rules.
+
 ## License
 
 Apache-2.0 — see [LICENSE](LICENSE).
