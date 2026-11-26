@@ -13,9 +13,23 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/oklog/ulid/v2"
 )
+
+var (
+	beforeSnapshotRenameMu   sync.Mutex
+	beforeSnapshotRenameHook func(deliveryID, stagingDir, targetDir string)
+)
+
+// SetBeforeSnapshotRenameHook installs an optional hook invoked in ExportFrozenSnapshot
+// after stagingDir is prepared and right before os.Rename into targetDir (for tests).
+func SetBeforeSnapshotRenameHook(fn func(deliveryID, stagingDir, targetDir string)) {
+	beforeSnapshotRenameMu.Lock()
+	beforeSnapshotRenameHook = fn
+	beforeSnapshotRenameMu.Unlock()
+}
 
 const base62Alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 
@@ -110,6 +124,13 @@ func ExportFrozenSnapshot(ctx context.Context, mirrorPath, headSHA, deliveryID, 
 	exported, err := freezeRyugiArtifactsDir(artifactsRoot, absTarget, deliveryID)
 	if err != nil {
 		return nil, err
+	}
+
+	beforeSnapshotRenameMu.Lock()
+	renameHook := beforeSnapshotRenameHook
+	beforeSnapshotRenameMu.Unlock()
+	if renameHook != nil {
+		renameHook(deliveryID, stagingDir, absTarget)
 	}
 
 	if err := os.Rename(stagingDir, absTarget); err != nil {

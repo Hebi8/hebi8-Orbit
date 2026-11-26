@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -191,15 +192,19 @@ func (s *Store) CreateTask(ctx context.Context, p CreateTaskParams) (CreateTaskR
 			}
 		}
 
-		// Verify parent task exists if provided
+		// Verify parent task exists and is NOT archived if provided
 		var parentVal any
 		if p.ParentTaskID != "" {
 			var pid string
-			if err := tx.QueryRowContext(ctx, `SELECT project_id FROM tasks WHERE task_id = ?`, p.ParentTaskID).Scan(&pid); err != nil {
+			var parentArchived sql.NullInt64
+			if err := tx.QueryRowContext(ctx, `SELECT project_id, archived_at FROM tasks WHERE task_id = ?`, p.ParentTaskID).Scan(&pid, &parentArchived); err != nil {
 				if errors.Is(err, sql.ErrNoRows) {
 					return fmt.Errorf("%w: parent task %s", ErrNotFound, p.ParentTaskID)
 				}
 				return err
+			}
+			if parentArchived.Valid {
+				return fmt.Errorf("%w: parent task %s is archived", ErrTaskArchived, p.ParentTaskID)
 			}
 			parentVal = p.ParentTaskID
 		}
@@ -562,16 +567,20 @@ func (s *Store) CreateNextAttempt(ctx context.Context, p CreateNextAttemptParams
 	err := s.WithWriteTx(ctx, func(tx *sql.Tx) error {
 		var projectID, taskGoal string
 		var activeAttID, latestDlvID, desiredCfgJSON, reqResJSON sql.NullString
+		var archivedAt sql.NullInt64
 		var prefAdapter string
 		err := tx.QueryRowContext(ctx, `
-			SELECT project_id, goal, active_attempt_id, latest_delivery_id, preferred_adapter, desired_config_json, required_resources
+			SELECT project_id, goal, active_attempt_id, latest_delivery_id, preferred_adapter, desired_config_json, required_resources, archived_at
 			FROM tasks WHERE task_id = ?
-		`, p.TaskID).Scan(&projectID, &taskGoal, &activeAttID, &latestDlvID, &prefAdapter, &desiredCfgJSON, &reqResJSON)
+		`, p.TaskID).Scan(&projectID, &taskGoal, &activeAttID, &latestDlvID, &prefAdapter, &desiredCfgJSON, &reqResJSON, &archivedAt)
 		if errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("%w: task %s", ErrNotFound, p.TaskID)
 		}
 		if err != nil {
 			return err
+		}
+		if archivedAt.Valid {
+			return fmt.Errorf("%w: task %s", ErrTaskArchived, p.TaskID)
 		}
 		if activeAttID.Valid && activeAttID.String != "" {
 			return fmt.Errorf("%w: task %s already has active attempt %s", ErrConflict, p.TaskID, activeAttID.String)
@@ -765,6 +774,38 @@ func createAttemptInTx(ctx context.Context, tx *sql.Tx, p createAttemptTxParams)
 	var nextAttemptNo int
 	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(attempt_no), 0) + 1 FROM attempts WHERE task_id = ?`, p.TaskID).Scan(&nextAttemptNo); err != nil {
 		return AttemptRecord{}, protocol.EventRecord{}, err
+	}
+
+	// Atomically consult Hebi8 Fold-Rollover generation state inside this SAME BEGIN IMMEDIATE tx:
+	// ensures no concurrent follow-up/retry/queue-drain can ever reuse a pre-fold session or miss the opening!
+	if p.ProjectID == protocol.PAProjectID {
+		if isMain, mErr := isHebi8MainTaskTx(ctx, tx, p.TaskID); mErr != nil {
+			return AttemptRecord{}, protocol.EventRecord{}, mErr
+		} else if isMain {
+			st, stErr := loadHebi8RolloverStateTx(ctx, tx)
+			if stErr != nil {
+				return AttemptRecord{}, protocol.EventRecord{}, stErr
+			}
+			if st.Generation > 0 && st.PendingOpeningGen == st.Generation && nextAttemptNo > st.LastFoldedAttemptNo {
+				var succeededAfter int
+				if err := tx.QueryRowContext(ctx, `
+					SELECT COUNT(*) FROM attempts
+					WHERE task_id = ? AND attempt_no > ? AND state = 'succeeded'
+				`, p.TaskID, st.LastFoldedAttemptNo).Scan(&succeededAfter); err != nil {
+					return AttemptRecord{}, protocol.EventRecord{}, err
+				}
+				if succeededAfter > 0 {
+					st.PendingOpeningGen = 0
+					if err := saveHebi8RolloverStateTx(ctx, tx, st, p.Now); err != nil {
+						return AttemptRecord{}, protocol.EventRecord{}, err
+					}
+				} else {
+					p.ForceNewSession = true
+					p.TriggerPayload["hebi8OpeningGeneration"] = st.Generation
+					p.TriggerPayload["hebi8LastFoldedAttemptNo"] = st.LastFoldedAttemptNo
+				}
+			}
+		}
 	}
 
 	cfgBytes, err := json.Marshal(p.DesiredConfig)
@@ -1273,6 +1314,98 @@ func (s *Store) CancelTaskActiveAttempt(ctx context.Context, taskID, actorID, re
 	return s.CancelTaskActiveAttemptWithIdempotency(ctx, taskID, actorID, reason, forceImmediate, nil)
 }
 
+// FailUndispatchedAttempt atomically marks a never-dispatched leased attempt as failed and
+// clears tasks.active_attempt_id so prompt/opening preparation errors never leave a zombie
+// leased attempt blocking subsequent turns.
+func (s *Store) FailUndispatchedAttempt(ctx context.Context, attemptID, errorCode, errorDetail string) ([]protocol.EventRecord, error) {
+	var events []protocol.EventRecord
+	now := time.Now().UnixMilli()
+	if strings.TrimSpace(errorCode) == "" {
+		errorCode = "ERR_DISPATCH_PREPARE"
+	}
+	err := s.WithWriteTx(ctx, func(tx *sql.Tx) error {
+		att, err := loadAttemptRecordTx(ctx, tx, attemptID)
+		if errors.Is(err, ErrNotFound) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		// Only transition leased attempts that were never dispatched to a runner.
+		if att.State != protocol.AttemptLeased || att.RunnerInstanceID != "" {
+			return nil
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE attempts
+			SET state = 'failed', error_code = ?, error_detail = ?, finished_at = ?
+			WHERE attempt_id = ? AND state = 'leased'
+		`, errorCode, errorDetail, now, att.AttemptID); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE tasks
+			SET state = 'failed', active_attempt_id = NULL, waiting_reason = NULL,
+			    pending_queue_drain = 0, pending_steer_input_id = NULL,
+			    version = version + 1, updated_at = ?
+			WHERE task_id = ? AND active_attempt_id = ?
+		`, now, att.TaskID, att.AttemptID); err != nil {
+			return err
+		}
+		revertedDeliveryIDs, _ := lookupQueuedAnnotationDeliveryIDsTx(ctx, tx, att.AttemptID)
+		if err := releaseQueuedAnnotationsTx(ctx, tx, att.AttemptID); err != nil {
+			return err
+		}
+		if err := expirePendingApprovalsForAttemptTx(ctx, tx, att.AttemptID, now); err != nil {
+			return err
+		}
+		ev1Payload := map[string]any{
+			"state":       protocol.AttemptFailed,
+			"errorCode":   errorCode,
+			"errorDetail": errorDetail,
+		}
+		if len(revertedDeliveryIDs) > 0 {
+			ev1Payload["revertedDeliveryIds"] = revertedDeliveryIDs
+			ev1Payload["deliveryIds"] = revertedDeliveryIDs
+		}
+		ev1, err := insertEventTx(ctx, tx, eventInsert{
+			StreamID:   "task:" + att.TaskID,
+			ProjectID:  att.ProjectID,
+			TaskID:     att.TaskID,
+			AttemptID:  att.AttemptID,
+			ActorKind:  protocol.ActorSystem,
+			ActorID:    "hub",
+			Kind:       protocol.EventAttemptFinished,
+			Visibility: protocol.VisibilityTimeline,
+			Payload:    ev1Payload,
+			CreatedAt:  now,
+		})
+		if err != nil {
+			return err
+		}
+		ev2, err := insertEventTx(ctx, tx, eventInsert{
+			StreamID:   "task:" + att.TaskID,
+			ProjectID:  att.ProjectID,
+			TaskID:     att.TaskID,
+			AttemptID:  att.AttemptID,
+			ActorKind:  protocol.ActorSystem,
+			ActorID:    "hub",
+			Kind:       protocol.EventTaskStateChanged,
+			Visibility: protocol.VisibilityTimeline,
+			Payload: map[string]any{
+				"state":     protocol.TaskStateFailed,
+				"errorCode": errorCode,
+			},
+			CreatedAt: now,
+		})
+		if err != nil {
+			return err
+		}
+		events = append(events, ev1, ev2)
+		return nil
+	})
+	return events, err
+}
+
 // CancelTaskActiveAttemptWithIdempotency performs cancel + PA idempotency receipt verification/storage
 // inside a single BEGIN IMMEDIATE transaction (NEW-3).
 func (s *Store) CancelTaskActiveAttemptWithIdempotency(ctx context.Context, taskID, actorID, reason string, forceImmediate bool, idemp *PAActionIdempotencySpec) (CancelTaskResult, error) {
@@ -1745,4 +1878,619 @@ func upsertBlockedInboxTx(ctx context.Context, tx *sql.Tx, projectID, taskID, at
 			resolved_at = NULL
 	`, inboxID, projectID, taskID, attemptID, title, summary, priority, now, now)
 	return err
+}
+
+func collectTaskTreeIDsTx(ctx context.Context, tx *sql.Tx, rootTaskID string) ([]string, error) {
+	seen := map[string]bool{rootTaskID: true}
+	order := []string{rootTaskID}
+	for i := 0; i < len(order); i++ {
+		cur := order[i]
+		rows, err := tx.QueryContext(ctx, `SELECT task_id FROM tasks WHERE parent_task_id = ?`, cur)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var cid string
+			if err := rows.Scan(&cid); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			if !seen[cid] {
+				seen[cid] = true
+				order = append(order, cid)
+			}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		rows.Close()
+	}
+	return order, nil
+}
+
+func sqlPlaceholders(n int) string {
+	if n <= 0 {
+		return ""
+	}
+	return strings.Repeat("?,", n-1) + "?"
+}
+
+func toAnySlice(ss []string) []any {
+	out := make([]any, len(ss))
+	for i, s := range ss {
+		out[i] = s
+	}
+	return out
+}
+
+func isHebi8MainTaskInTreeTx(ctx context.Context, tx *sql.Tx, allIDs []string) (bool, error) {
+	var rawSetting string
+	err := tx.QueryRowContext(ctx, `SELECT value_json FROM hub_settings WHERE key = ?`, hebi8MainTaskSettingKey).Scan(&rawSetting)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	var doc struct {
+		TaskID string `json:"taskId"`
+	}
+	if json.Unmarshal([]byte(rawSetting), &doc) != nil {
+		return false, nil
+	}
+	mainID := strings.TrimSpace(doc.TaskID)
+	if mainID == "" {
+		return false, nil
+	}
+	for _, id := range allIDs {
+		if id == mainID {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// ErrProtectedTask aliases ErrForbidden for protected task guard checks (e.g. Hebi8 main task).
+var ErrProtectedTask = ErrForbidden
+
+func checkTaskTreeProtectedTx(ctx context.Context, tx *sql.Tx, taskID, projectID string) error {
+	allIDs, err := collectTaskTreeIDsTx(ctx, tx, taskID)
+	if err != nil {
+		return err
+	}
+	if isMain, mErr := isHebi8MainTaskInTreeTx(ctx, tx, allIDs); mErr != nil {
+		return mErr
+	} else if isMain {
+		return fmt.Errorf("%w: cannot archive the Hebi8 main conversation", ErrProtectedTask)
+	}
+	if projectID == protocol.PAProjectID {
+		ph := sqlPlaceholders(len(allIDs))
+		idArgs := toAnySlice(allIDs)
+		var otherActivePA int
+		if err := tx.QueryRowContext(ctx,
+			fmt.Sprintf(`SELECT COUNT(*) FROM tasks WHERE project_id = ? AND archived_at IS NULL AND task_id NOT IN (%s)`, ph),
+			append([]any{protocol.PAProjectID}, idArgs...)...,
+		).Scan(&otherActivePA); err != nil {
+			return err
+		}
+		if otherActivePA == 0 {
+			return fmt.Errorf("%w: cannot archive the only active Hebi8 conversation", ErrProtectedTask)
+		}
+	}
+	return nil
+}
+
+// CheckTaskTreeProtected verifies whether taskID (or any subtask in its tree) is a protected
+// Hebi8 main conversation or the sole active _pa conversation.
+func (s *Store) CheckTaskTreeProtected(ctx context.Context, taskID string) error {
+	return s.WithReadTx(ctx, func(tx *sql.Tx) error {
+		var projectID string
+		if err := tx.QueryRowContext(ctx, `SELECT project_id FROM tasks WHERE task_id = ?`, taskID).Scan(&projectID); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("%w: task %s", ErrNotFound, taskID)
+			}
+			return err
+		}
+		return checkTaskTreeProtectedTx(ctx, tx, taskID, projectID)
+	})
+}
+
+// CancelActiveAttemptIfArchivable atomically checks task-tree protection (e.g. Hebi8 main task)
+// and cancels/requests cancel on the task's active attempt inside ONE BEGIN IMMEDIATE write tx,
+// eliminating TOCTOU races between main-task selection and archive-with-cancel.
+func (s *Store) CancelActiveAttemptIfArchivable(ctx context.Context, taskID, actorID, reason string) (CancelTaskResult, error) {
+	var res CancelTaskResult
+	now := time.Now().UnixMilli()
+	if actorID == "" {
+		actorID = "human"
+	}
+
+	err := s.WithWriteTx(ctx, func(tx *sql.Tx) error {
+		var projectID string
+		var activeAttID sql.NullString
+		err := tx.QueryRowContext(ctx, `SELECT project_id, active_attempt_id FROM tasks WHERE task_id = ?`, taskID).Scan(&projectID, &activeAttID)
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("%w: task %s", ErrNotFound, taskID)
+		}
+		if err != nil {
+			return err
+		}
+		if err := checkTaskTreeProtectedTx(ctx, tx, taskID, projectID); err != nil {
+			return err
+		}
+		if !activeAttID.Valid || activeAttID.String == "" {
+			return fmt.Errorf("%w: task %s has no active attempt", ErrConflict, taskID)
+		}
+
+		att, err := loadAttemptRecordTx(ctx, tx, activeAttID.String)
+		if err != nil {
+			return err
+		}
+		res.Attempt = att
+
+		// Only cancel immediately without runner confirmation when the leased attempt
+		// has NEVER been dispatched to any runner_instance_id.
+		neverDispatched := att.State == protocol.AttemptLeased && att.RunnerInstanceID == ""
+		if !neverDispatched {
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE attempts
+				SET cancel_requested = 1,
+				    cancel_reason_kind = 'human',
+				    steer_input_id = NULL
+				WHERE attempt_id = ?
+			`, att.AttemptID); err != nil {
+				return err
+			}
+			res.Attempt.CancelRequested = true
+			res.Attempt.CancelReasonKind = "human"
+			res.Attempt.SteerInputID = ""
+			res.NeedsRunnerSend = true
+		} else {
+			if err := cancelAttemptTx(ctx, tx, att, actorID, reason, now, &res.Events); err != nil {
+				return err
+			}
+			res.CancelledNow = true
+			res.NeedsRunnerSend = false
+		}
+		return nil
+	})
+	return res, err
+}
+
+// ArchiveTask archives a task and its direct/descendant subtasks in one transaction,
+// dismissing open inbox items, deactivating ryugi_bindings, and emitting task.archived.
+// Returns ErrTaskActive if the task or any subtask currently has an active attempt.
+func (s *Store) ArchiveTask(ctx context.Context, taskID, actorID string) (protocol.TaskSummary, *protocol.EventRecord, error) {
+	var out protocol.TaskSummary
+	var emitted *protocol.EventRecord
+	now := time.Now().UnixMilli()
+	if actorID == "" {
+		actorID = "human"
+	}
+
+	err := s.WithWriteTx(ctx, func(tx *sql.Tx) error {
+		var projectID string
+		var activeAtt sql.NullString
+		err := tx.QueryRowContext(ctx, `SELECT project_id, active_attempt_id FROM tasks WHERE task_id = ?`, taskID).Scan(&projectID, &activeAtt)
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("%w: task %s", ErrNotFound, taskID)
+		}
+		if err != nil {
+			return err
+		}
+
+		allIDs, err := collectTaskTreeIDsTx(ctx, tx, taskID)
+		if err != nil {
+			return err
+		}
+		ph := sqlPlaceholders(len(allIDs))
+		idArgs := toAnySlice(allIDs)
+
+		// Reject if target task or any subtask has an active attempt.
+		var activeCount int
+		if err := tx.QueryRowContext(ctx,
+			fmt.Sprintf(`SELECT COUNT(*) FROM tasks WHERE task_id IN (%s) AND active_attempt_id IS NOT NULL AND active_attempt_id != ''`, ph),
+			idArgs...,
+		).Scan(&activeCount); err != nil {
+			return err
+		}
+		if activeCount > 0 {
+			return fmt.Errorf("%w: task %s has an active attempt", ErrTaskActive, taskID)
+		}
+
+		// Protect the unique Hebi8 main conversation (hebi8_main_task_id) and sole active _pa conversation from accidental archive.
+		if isMain, mErr := isHebi8MainTaskInTreeTx(ctx, tx, allIDs); mErr != nil {
+			return mErr
+		} else if isMain {
+			return fmt.Errorf("%w: cannot archive the Hebi8 main conversation", ErrForbidden)
+		}
+		if projectID == protocol.PAProjectID {
+			var otherActivePA int
+			if err := tx.QueryRowContext(ctx,
+				fmt.Sprintf(`SELECT COUNT(*) FROM tasks WHERE project_id = ? AND archived_at IS NULL AND task_id NOT IN (%s)`, ph),
+				append([]any{protocol.PAProjectID}, idArgs...)...,
+			).Scan(&otherActivePA); err != nil {
+				return err
+			}
+			if otherActivePA == 0 {
+				return fmt.Errorf("%w: cannot archive the only active Hebi8 conversation", ErrForbidden)
+			}
+		}
+
+		if _, err := tx.ExecContext(ctx,
+			fmt.Sprintf(`UPDATE tasks SET archived_at = COALESCE(archived_at, ?), updated_at = ?, version = version + 1 WHERE task_id IN (%s)`, ph),
+			append([]any{now, now}, idArgs...)...,
+		); err != nil {
+			return fmt.Errorf("archive tasks: %w", err)
+		}
+
+		if _, err := tx.ExecContext(ctx,
+			fmt.Sprintf(`UPDATE inbox_items SET state = 'dismissed', resolved_at = ?, updated_at = ? WHERE task_id IN (%s) AND state = 'open'`, ph),
+			append([]any{now, now}, idArgs...)...,
+		); err != nil {
+			return fmt.Errorf("dismiss task inbox_items: %w", err)
+		}
+
+		if _, err := tx.ExecContext(ctx,
+			fmt.Sprintf(`UPDATE ryugi_bindings SET active = 0, updated_at = ? WHERE task_id IN (%s) AND active = 1`, ph),
+			append([]any{now}, idArgs...)...,
+		); err != nil {
+			return fmt.Errorf("deactivate ryugi_bindings: %w", err)
+		}
+
+		ev, err := insertEventTx(ctx, tx, eventInsert{
+			StreamID:   "task:" + taskID,
+			ProjectID:  projectID,
+			TaskID:     taskID,
+			ActorKind:  protocol.ActorHuman,
+			ActorID:    actorID,
+			Kind:       protocol.EventTaskArchived,
+			Visibility: protocol.VisibilityTimeline,
+			Payload: map[string]any{
+				"taskId":     taskID,
+				"projectId":  projectID,
+				"archivedAt": now,
+			},
+			CreatedAt: now,
+		})
+		if err != nil {
+			return err
+		}
+		emitted = &ev
+
+		task, err := loadTaskSummaryTx(ctx, tx, taskID)
+		if err != nil {
+			return err
+		}
+		out = task
+		return nil
+	})
+	return out, emitted, err
+}
+
+// UnarchiveTask restores an archived task and its subtasks, reactivating ryugi_bindings
+// whose frozen_project_dir still exists on disk, and emits task.unarchived.
+func (s *Store) UnarchiveTask(ctx context.Context, taskID, actorID string) (protocol.TaskSummary, *protocol.EventRecord, error) {
+	var out protocol.TaskSummary
+	var emitted *protocol.EventRecord
+	now := time.Now().UnixMilli()
+	if actorID == "" {
+		actorID = "human"
+	}
+
+	err := s.WithWriteTx(ctx, func(tx *sql.Tx) error {
+		var projectID string
+		if err := tx.QueryRowContext(ctx, `SELECT project_id FROM tasks WHERE task_id = ?`, taskID).Scan(&projectID); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("%w: task %s", ErrNotFound, taskID)
+			}
+			return err
+		}
+
+		allIDs, err := collectTaskTreeIDsTx(ctx, tx, taskID)
+		if err != nil {
+			return err
+		}
+		ph := sqlPlaceholders(len(allIDs))
+		idArgs := toAnySlice(allIDs)
+
+		if _, err := tx.ExecContext(ctx,
+			fmt.Sprintf(`UPDATE tasks SET archived_at = NULL, updated_at = ?, version = version + 1 WHERE task_id IN (%s)`, ph),
+			append([]any{now}, idArgs...)...,
+		); err != nil {
+			return fmt.Errorf("unarchive tasks: %w", err)
+		}
+
+		// Reactivate ryugi_bindings whose frozen directory still exists on disk.
+		bRows, err := tx.QueryContext(ctx,
+			fmt.Sprintf(`SELECT binding_id, frozen_project_dir FROM ryugi_bindings WHERE task_id IN (%s) AND active = 0`, ph),
+			idArgs...,
+		)
+		if err != nil {
+			return fmt.Errorf("query ryugi_bindings for unarchive: %w", err)
+		}
+		var reactivateIDs []string
+		for bRows.Next() {
+			var bid, dir string
+			if err := bRows.Scan(&bid, &dir); err != nil {
+				bRows.Close()
+				return err
+			}
+			if strings.TrimSpace(dir) != "" {
+				if info, sErr := os.Stat(dir); sErr == nil && info.IsDir() {
+					reactivateIDs = append(reactivateIDs, bid)
+				}
+			}
+		}
+		if err := bRows.Err(); err != nil {
+			bRows.Close()
+			return err
+		}
+		bRows.Close()
+
+		for _, bid := range reactivateIDs {
+			if _, err := tx.ExecContext(ctx, `UPDATE ryugi_bindings SET active = 1, updated_at = ? WHERE binding_id = ?`, now, bid); err != nil {
+				return fmt.Errorf("reactivate ryugi_binding %s: %w", bid, err)
+			}
+		}
+
+		ev, err := insertEventTx(ctx, tx, eventInsert{
+			StreamID:   "task:" + taskID,
+			ProjectID:  projectID,
+			TaskID:     taskID,
+			ActorKind:  protocol.ActorHuman,
+			ActorID:    actorID,
+			Kind:       protocol.EventTaskUnarchived,
+			Visibility: protocol.VisibilityTimeline,
+			Payload: map[string]any{
+				"taskId":    taskID,
+				"projectId": projectID,
+			},
+			CreatedAt: now,
+		})
+		if err != nil {
+			return err
+		}
+		emitted = &ev
+
+		task, err := loadTaskSummaryTx(ctx, tx, taskID)
+		if err != nil {
+			return err
+		}
+		out = task
+		return nil
+	})
+	return out, emitted, err
+}
+
+// DeleteTask permanently deletes a task and all its subtasks across all 12 dependent child tables
+// in strict reverse FK order inside a single write transaction. Returns the owning projectID,
+// a deduplicated list of deleted deliveryIDs (so Hub cleans up only under its own dataDir/deliveries/),
+// and the emitted task.deleted event. Symmetrically decrements delivery_blobs.ref_count for removed deliveries.
+func (s *Store) DeleteTask(ctx context.Context, taskID, actorID string) (string, []string, *protocol.EventRecord, error) {
+	var projectID string
+	var deliveryIDs []string
+	var emitted *protocol.EventRecord
+	now := time.Now().UnixMilli()
+	if actorID == "" {
+		actorID = "human"
+	}
+
+	err := s.WithWriteTx(ctx, func(tx *sql.Tx) error {
+		if err := tx.QueryRowContext(ctx, `SELECT project_id FROM tasks WHERE task_id = ?`, taskID).Scan(&projectID); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("%w: task %s", ErrNotFound, taskID)
+			}
+			return err
+		}
+
+		allIDs, err := collectTaskTreeIDsTx(ctx, tx, taskID)
+		if err != nil {
+			return err
+		}
+		ph := sqlPlaceholders(len(allIDs))
+		idArgs := toAnySlice(allIDs)
+
+		// Reject if any task in the tree has an active attempt.
+		var activeCount int
+		if err := tx.QueryRowContext(ctx,
+			fmt.Sprintf(`SELECT COUNT(*) FROM tasks WHERE task_id IN (%s) AND active_attempt_id IS NOT NULL AND active_attempt_id != ''`, ph),
+			idArgs...,
+		).Scan(&activeCount); err != nil {
+			return err
+		}
+		if activeCount > 0 {
+			return fmt.Errorf("%w: task %s has an active attempt", ErrTaskActive, taskID)
+		}
+		var activeAttRows int
+		if err := tx.QueryRowContext(ctx,
+			fmt.Sprintf(`SELECT COUNT(*) FROM attempts WHERE task_id IN (%s) AND state IN (%s)`, ph, protocol.SQLInClause(protocol.ActiveAttemptStates)),
+			idArgs...,
+		).Scan(&activeAttRows); err != nil {
+			return err
+		}
+		if activeAttRows > 0 {
+			return fmt.Errorf("%w: task %s has an active attempt", ErrTaskActive, taskID)
+		}
+
+		// Protect the unique Hebi8 main conversation (hebi8_main_task_id) and sole _pa conversation from deletion.
+		if isMain, mErr := isHebi8MainTaskInTreeTx(ctx, tx, allIDs); mErr != nil {
+			return mErr
+		} else if isMain {
+			return fmt.Errorf("%w: cannot delete the Hebi8 main conversation", ErrForbidden)
+		}
+		if projectID == protocol.PAProjectID {
+			var otherPA int
+			if err := tx.QueryRowContext(ctx,
+				fmt.Sprintf(`SELECT COUNT(*) FROM tasks WHERE project_id = ? AND task_id NOT IN (%s)`, ph),
+				append([]any{protocol.PAProjectID}, idArgs...)...,
+			).Scan(&otherPA); err != nil {
+				return err
+			}
+			if otherPA == 0 {
+				return fmt.Errorf("%w: cannot delete the only Hebi8 conversation", ErrForbidden)
+			}
+		}
+
+		// Collect deleted delivery IDs (for safe Hub-side dataDir/deliveries/<deliveryId> cleanup)
+		// and symmetrically decrement delivery_blobs.ref_count once per distinct sha256 per delivery.
+		seenDlvs := map[string]bool{}
+		blobDecCounts := map[string]int{}
+		dlvRows, err := tx.QueryContext(ctx, fmt.Sprintf(`SELECT delivery_id, manifest_json FROM deliveries WHERE task_id IN (%s)`, ph), idArgs...)
+		if err != nil {
+			return fmt.Errorf("query deliveries for delete: %w", err)
+		}
+		for dlvRows.Next() {
+			var dlvID, manifestJSON string
+			if err := dlvRows.Scan(&dlvID, &manifestJSON); err != nil {
+				dlvRows.Close()
+				return err
+			}
+			dlvID = strings.TrimSpace(dlvID)
+			if dlvID != "" && !seenDlvs[dlvID] {
+				seenDlvs[dlvID] = true
+				deliveryIDs = append(deliveryIDs, dlvID)
+			}
+			if strings.TrimSpace(manifestJSON) != "" {
+				var man protocol.DeliveryManifest
+				if json.Unmarshal([]byte(manifestJSON), &man) == nil && len(man.Blobs) > 0 {
+					seenInDlv := map[string]bool{}
+					for _, b := range man.Blobs {
+						sha := strings.ToLower(strings.TrimSpace(b.SHA256))
+						if sha != "" && !seenInDlv[sha] {
+							seenInDlv[sha] = true
+							blobDecCounts[sha]++
+						}
+					}
+				}
+			}
+		}
+		if err := dlvRows.Err(); err != nil {
+			dlvRows.Close()
+			return err
+		}
+		dlvRows.Close()
+
+		for sha, dec := range blobDecCounts {
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE delivery_blobs SET ref_count = MAX(0, ref_count - ?) WHERE sha256 = ?
+			`, dec, sha); err != nil {
+				return fmt.Errorf("decrement delivery_blobs ref_count for %s: %w", sha, err)
+			}
+		}
+
+		// Reverse FK cascade cleanup across all 12 child tables + subtasks -> target task.
+		// 1. annotations (clear any cross-task references to these deliveries/attempts first)
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`
+			UPDATE annotations SET resolution_delivery_id = NULL
+			WHERE resolution_delivery_id IN (SELECT delivery_id FROM deliveries WHERE task_id IN (%s))
+		`, ph), idArgs...); err != nil {
+			return fmt.Errorf("clear annotation resolution_delivery_id: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`
+			UPDATE annotations SET triggered_attempt_id = NULL
+			WHERE triggered_attempt_id IN (SELECT attempt_id FROM attempts WHERE task_id IN (%s))
+		`, ph), idArgs...); err != nil {
+			return fmt.Errorf("clear annotation triggered_attempt_id: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`DELETE FROM annotations WHERE task_id IN (%s)`, ph), idArgs...); err != nil {
+			return fmt.Errorf("delete annotations: %w", err)
+		}
+
+		// 2. ryugi_bindings
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`DELETE FROM ryugi_bindings WHERE task_id IN (%s)`, ph), idArgs...); err != nil {
+			return fmt.Errorf("delete ryugi_bindings: %w", err)
+		}
+
+		// 3. deliveries + atomically enqueue deleted deliveryIDs into pending_delivery_cleanups in the same tx
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`DELETE FROM deliveries WHERE task_id IN (%s)`, ph), idArgs...); err != nil {
+			return fmt.Errorf("delete deliveries: %w", err)
+		}
+		for _, dlvID := range deliveryIDs {
+			if _, err := tx.ExecContext(ctx, `
+				INSERT OR REPLACE INTO pending_delivery_cleanups (delivery_id, created_at)
+				VALUES (?, ?)
+			`, dlvID, now); err != nil {
+				return fmt.Errorf("record pending_delivery_cleanups for %s: %w", dlvID, err)
+			}
+		}
+
+		// 4. approvals
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`DELETE FROM approvals WHERE task_id IN (%s)`, ph), idArgs...); err != nil {
+			return fmt.Errorf("delete approvals: %w", err)
+		}
+
+		// 5. task_pending_inputs
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`DELETE FROM task_pending_inputs WHERE task_id IN (%s)`, ph), idArgs...); err != nil {
+			return fmt.Errorf("delete task_pending_inputs: %w", err)
+		}
+
+		// 6. inbox_items
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`DELETE FROM inbox_items WHERE task_id IN (%s)`, ph), idArgs...); err != nil {
+			return fmt.Errorf("delete inbox_items: %w", err)
+		}
+
+		// 7. task_sources
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`DELETE FROM task_sources WHERE task_id IN (%s)`, ph), idArgs...); err != nil {
+			return fmt.Errorf("delete task_sources: %w", err)
+		}
+
+		// 8. board_messages
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`DELETE FROM board_messages WHERE task_id IN (%s)`, ph), idArgs...); err != nil {
+			return fmt.Errorf("delete board_messages: %w", err)
+		}
+
+		// 9. board_members (clear references to worker_task_id from any parent board first)
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`UPDATE board_members SET worker_task_id = NULL WHERE worker_task_id IN (%s)`, ph), idArgs...); err != nil {
+			return fmt.Errorf("clear board_members.worker_task_id: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`DELETE FROM board_members WHERE task_id IN (%s)`, ph), idArgs...); err != nil {
+			return fmt.Errorf("delete board_members: %w", err)
+		}
+
+		// 10. attempts
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`DELETE FROM attempts WHERE task_id IN (%s)`, ph), idArgs...); err != nil {
+			return fmt.Errorf("delete attempts: %w", err)
+		}
+
+		// 11. agent_sessions
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`DELETE FROM agent_sessions WHERE task_id IN (%s)`, ph), idArgs...); err != nil {
+			return fmt.Errorf("delete agent_sessions: %w", err)
+		}
+
+		// 12. events
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`DELETE FROM events WHERE task_id IN (%s)`, ph), idArgs...); err != nil {
+			return fmt.Errorf("delete events: %w", err)
+		}
+
+		// 13. subtasks (deepest first) -> target task
+		for i := len(allIDs) - 1; i >= 0; i-- {
+			if _, err := tx.ExecContext(ctx, `DELETE FROM tasks WHERE task_id = ?`, allIDs[i]); err != nil {
+				return fmt.Errorf("delete task %s: %w", allIDs[i], err)
+			}
+		}
+
+		ev, err := insertEventTx(ctx, tx, eventInsert{
+			StreamID:   "project:" + projectID,
+			ProjectID:  projectID,
+			TaskID:     taskID,
+			ActorKind:  protocol.ActorHuman,
+			ActorID:    actorID,
+			Kind:       protocol.EventTaskDeleted,
+			Visibility: protocol.VisibilityTimeline,
+			Payload: map[string]any{
+				"taskId":       taskID,
+				"projectId":    projectID,
+				"deletedCount": len(allIDs),
+			},
+			CreatedAt: now,
+		})
+		if err != nil {
+			return err
+		}
+		emitted = &ev
+		return nil
+	})
+	return projectID, deliveryIDs, emitted, err
 }

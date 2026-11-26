@@ -482,20 +482,36 @@ const taskSummarySelectSQL = `
 		       (SELECT COUNT(*) FROM board_members bm WHERE bm.task_id = t.task_id AND bm.state IN ('working', 'waiting'))
 		       + (SELECT COUNT(*) FROM tasks ct WHERE ct.parent_task_id = t.task_id AND ct.archived_at IS NULL AND ct.state NOT IN ('done', 'cancelled')
 		          AND NOT EXISTS (SELECT 1 FROM board_members bm2 WHERE bm2.task_id = t.task_id AND bm2.worker_task_id = ct.task_id)) AS worker_count,
-		       t.created_by, t.created_at, t.updated_at
+		       t.created_by, t.created_at, t.updated_at, t.archived_at
 		FROM tasks t
 		LEFT JOIN attempts a ON a.attempt_id = t.active_attempt_id
 		LEFT JOIN deliveries d ON d.delivery_id = t.latest_delivery_id
 `
 
+func archivedFilterSQL(filter string) string {
+	switch strings.ToLower(strings.TrimSpace(filter)) {
+	case "only":
+		return "t.archived_at IS NOT NULL"
+	case "all":
+		return "1 = 1"
+	default:
+		return "t.archived_at IS NULL"
+	}
+}
+
 // ListProjectTasks returns tasks for a project ordered by recent updates.
-func (s *Store) ListProjectTasks(ctx context.Context, projectID string) ([]protocol.TaskSummary, error) {
+// Optional archivedFilter supports "active" (default), "only", or "all".
+func (s *Store) ListProjectTasks(ctx context.Context, projectID string, archivedFilter ...string) ([]protocol.TaskSummary, error) {
 	if _, err := s.GetProject(ctx, projectID); err != nil {
 		return nil, err
 	}
+	filter := "active"
+	if len(archivedFilter) > 0 && strings.TrimSpace(archivedFilter[0]) != "" {
+		filter = archivedFilter[0]
+	}
 	tasks := []protocol.TaskSummary{}
 	rows, err := s.ro.QueryContext(ctx, taskSummarySelectSQL+`
-		WHERE t.project_id = ? AND t.archived_at IS NULL
+		WHERE t.project_id = ? AND `+archivedFilterSQL(filter)+`
 		ORDER BY t.updated_at DESC
 	`, projectID)
 	if err != nil {
@@ -516,6 +532,7 @@ func (s *Store) ListProjectTasks(ctx context.Context, projectID string) ([]proto
 func scanTaskSummary(scanner interface{ Scan(...any) error }) (protocol.TaskSummary, error) {
 	var ts protocol.TaskSummary
 	var parentID, waitingReason, activeAttID, activeAttState, latestDlvID, latestHead sql.NullString
+	var archivedAt sql.NullInt64
 	var adapter, state, createdBy string
 	if err := scanner.Scan(
 		&ts.TaskID, &ts.ProjectID, &parentID, &ts.Title, &ts.Goal,
@@ -523,7 +540,7 @@ func scanTaskSummary(scanner interface{ Scan(...any) error }) (protocol.TaskSumm
 		&activeAttID, &activeAttState, &latestDlvID, &latestHead,
 		&ts.OpenAnnotationCount, &ts.DeliveryCount,
 		&ts.QueuedInputCount, &ts.WorkerCount,
-		&createdBy, &ts.CreatedAt, &ts.UpdatedAt,
+		&createdBy, &ts.CreatedAt, &ts.UpdatedAt, &archivedAt,
 	); err != nil {
 		return ts, err
 	}
@@ -548,6 +565,10 @@ func scanTaskSummary(scanner interface{ Scan(...any) error }) (protocol.TaskSumm
 	}
 	if latestHead.Valid {
 		ts.LatestDeliveryHead = latestHead.String
+	}
+	if archivedAt.Valid {
+		v := archivedAt.Int64
+		ts.ArchivedAt = &v
 	}
 	return ts, nil
 }
@@ -837,12 +858,13 @@ func extractReferencedTasks(triggerPayloadJSON string) []protocol.ReferencedTask
 
 // ListRecentTasks returns recent non-archived tasks across all projects ordered by recency.
 func (s *Store) ListRecentTasks(ctx context.Context, limit int) ([]protocol.TaskSummary, error) {
-	return s.ListRecentTasksFiltered(ctx, limit, "", "")
+	return s.ListRecentTasksFiltered(ctx, limit, "", "", "", "active")
 }
 
-// ListRecentTasksFiltered returns recent non-archived tasks filtered by optional search keyword
-// (matching title, goal, project_id, or project display_name) and optional excluded project ID.
-func (s *Store) ListRecentTasksFiltered(ctx context.Context, limit int, query, excludeProject string) ([]protocol.TaskSummary, error) {
+// ListRecentTasksFiltered returns recent tasks filtered by optional search keyword
+// (matching title, goal, project_id, or project display_name), optional excluded project ID,
+// optional included projectId, and archivedFilter ("active" | "only" | "all", default "active").
+func (s *Store) ListRecentTasksFiltered(ctx context.Context, limit int, query, excludeProject, projectID, archivedFilter string) ([]protocol.TaskSummary, error) {
 	if limit <= 0 {
 		limit = 80
 	}
@@ -851,14 +873,19 @@ func (s *Store) ListRecentTasksFiltered(ctx context.Context, limit int, query, e
 	}
 	q := strings.ToLower(strings.TrimSpace(query))
 	excludeProject = strings.TrimSpace(excludeProject)
+	projectID = strings.TrimSpace(projectID)
 
 	out := []protocol.TaskSummary{}
 	err := s.WithReadTx(ctx, func(tx *sql.Tx) error {
 		var sb strings.Builder
 		sb.WriteString(taskSummarySelectSQL)
 		sb.WriteString(` LEFT JOIN projects p ON p.project_id = t.project_id`)
-		sb.WriteString(` WHERE t.archived_at IS NULL`)
+		sb.WriteString(` WHERE ` + archivedFilterSQL(archivedFilter))
 		args := []any{}
+		if projectID != "" {
+			sb.WriteString(` AND t.project_id = ?`)
+			args = append(args, projectID)
+		}
 		if excludeProject != "" {
 			sb.WriteString(` AND t.project_id != ?`)
 			args = append(args, excludeProject)
@@ -869,7 +896,11 @@ func (s *Store) ListRecentTasksFiltered(ctx context.Context, limit int, query, e
 			sb.WriteString(` AND (LOWER(t.title) LIKE ? ESCAPE '\' OR LOWER(t.goal) LIKE ? ESCAPE '\' OR LOWER(t.project_id) LIKE ? ESCAPE '\' OR LOWER(COALESCE(p.display_name, '')) LIKE ? ESCAPE '\')`)
 			args = append(args, like, like, like, like)
 		}
-		sb.WriteString(` ORDER BY t.updated_at DESC LIMIT ?`)
+		if strings.EqualFold(strings.TrimSpace(archivedFilter), "only") {
+			sb.WriteString(` ORDER BY COALESCE(t.archived_at, t.updated_at) DESC, t.updated_at DESC LIMIT ?`)
+		} else {
+			sb.WriteString(` ORDER BY t.updated_at DESC LIMIT ?`)
+		}
 		args = append(args, limit)
 
 		rows, err := tx.QueryContext(ctx, sb.String(), args...)
@@ -1134,6 +1165,11 @@ func (s *Store) CreateManualImportDelivery(ctx context.Context, p ManualImportPa
 			res.Created = false
 			return loadManualImportExisting(ctx, tx, existingTaskID, existingAttemptID, p.DeliveryID, &res)
 		} else if !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+
+		// Atomically reject reusing a delivery_id whose previous frozen snapshot still awaits cleanup.
+		if err := checkDeliveryCleanupPendingTx(ctx, tx, p.DeliveryID); err != nil {
 			return err
 		}
 
@@ -1707,21 +1743,55 @@ type RyugiBindingRecord struct {
 	LastStateHashes map[string]StateHashEntry
 }
 
+// DeliveryOwnerExpectation identifies the exact delivery instance whose snapshot was exported.
+type DeliveryOwnerExpectation struct {
+	ProjectID string
+	TaskID    string
+	HeadSHA   string
+}
+
 // SaveRyugiBindings updates frozen_snapshot_dir, ryugi_sync_state, upserts ryugi_bindings,
 // and atomically emits a delivery.ryugi_updated event in the same write transaction.
 func (s *Store) SaveRyugiBindings(ctx context.Context, deliveryID, frozenDir string, syncState protocol.RyugiSyncState, bindings []protocol.RyugiBindingView) ([]protocol.RyugiBindingView, *protocol.EventRecord, error) {
+	return s.SaveRyugiBindingsForOwner(ctx, deliveryID, nil, frozenDir, syncState, bindings)
+}
+
+// SaveRyugiBindingsForOwner atomically verifies inside the SQLite write transaction that deliveryID
+// still exists, is NOT in pending_delivery_cleanups, and (when expected != nil) still belongs to
+// the exact same (project_id, task_id, head_sha) before writing any ryugi_bindings.
+func (s *Store) SaveRyugiBindingsForOwner(ctx context.Context, deliveryID string, expected *DeliveryOwnerExpectation, frozenDir string, syncState protocol.RyugiSyncState, bindings []protocol.RyugiBindingView) ([]protocol.RyugiBindingView, *protocol.EventRecord, error) {
 	now := time.Now().UnixMilli()
 	var saved []protocol.RyugiBindingView
 	var emitted *protocol.EventRecord
 
 	err := s.WithWriteTx(ctx, func(tx *sql.Tx) error {
-		var projectID, taskID string
-		err := tx.QueryRowContext(ctx, `SELECT project_id, task_id FROM deliveries WHERE delivery_id = ?`, deliveryID).Scan(&projectID, &taskID)
+		if err := checkDeliveryCleanupPendingTx(ctx, tx, deliveryID); err != nil {
+			return err
+		}
+
+		var projectID, taskID, headSHA string
+		var archivedAt sql.NullInt64
+		err := tx.QueryRowContext(ctx, `
+			SELECT d.project_id, d.task_id, d.head_sha, t.archived_at
+			FROM deliveries d
+			JOIN tasks t ON t.task_id = d.task_id
+			WHERE d.delivery_id = ?
+		`, deliveryID).Scan(&projectID, &taskID, &headSHA, &archivedAt)
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrNotFound
 		}
 		if err != nil {
 			return err
+		}
+		if expected != nil {
+			if projectID != expected.ProjectID || taskID != expected.TaskID || headSHA != expected.HeadSHA {
+				return fmt.Errorf("%w: delivery %s identity changed during registration", ErrOwnershipMismatch, deliveryID)
+			}
+		}
+
+		activeInt := 1
+		if archivedAt.Valid {
+			activeInt = 0
 		}
 
 		var frozenVal any
@@ -1745,15 +1815,15 @@ func (s *Store) SaveRyugiBindings(ctx context.Context, deliveryID, frozenDir str
 				INSERT INTO ryugi_bindings (
 					binding_id, delivery_id, project_id, task_id, frozen_project_dir,
 					artifact_locator, derived_artifact_id, open_url, active, created_at, updated_at
-				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 				ON CONFLICT(delivery_id, artifact_locator) DO UPDATE SET
 					frozen_project_dir = excluded.frozen_project_dir,
 					derived_artifact_id = excluded.derived_artifact_id,
 					open_url = excluded.open_url,
-					active = 1,
+					active = excluded.active,
 					updated_at = excluded.updated_at
 			`, bid, deliveryID, projectID, taskID, b.FrozenProjectDir,
-				b.ArtifactLocator, b.DerivedArtifactID, b.OpenURL, now, now)
+				b.ArtifactLocator, b.DerivedArtifactID, b.OpenURL, activeInt, now, now)
 			if err != nil {
 				return fmt.Errorf("upsert ryugi binding %s: %w", b.ArtifactLocator, err)
 			}
@@ -1807,27 +1877,29 @@ func (s *Store) SaveRyugiBindings(ctx context.Context, deliveryID, frozenDir str
 }
 
 // ListRyugiBindings lists either all active bindings (deliveryID == "") or bindings for one delivery.
+// When activeOnly is true, archived tasks are always excluded so background polling never resumes for archived work.
 func (s *Store) ListRyugiBindings(ctx context.Context, deliveryID string, activeOnly bool) ([]RyugiBindingRecord, error) {
 	query := `
-		SELECT binding_id, delivery_id, project_id, task_id, frozen_project_dir,
-		       artifact_locator, derived_artifact_id, open_url,
-		       last_thread_receipt, last_changes_receipt, last_state_hashes,
-		       active, created_at, updated_at
-		FROM ryugi_bindings
+		SELECT rb.binding_id, rb.delivery_id, rb.project_id, rb.task_id, rb.frozen_project_dir,
+		       rb.artifact_locator, rb.derived_artifact_id, rb.open_url,
+		       rb.last_thread_receipt, rb.last_changes_receipt, rb.last_state_hashes,
+		       rb.active, rb.created_at, rb.updated_at
+		FROM ryugi_bindings rb
+		JOIN tasks t ON t.task_id = rb.task_id
 	`
 	var clauses []string
 	var args []any
 	if deliveryID != "" {
-		clauses = append(clauses, "delivery_id = ?")
+		clauses = append(clauses, "rb.delivery_id = ?")
 		args = append(args, deliveryID)
 	}
 	if activeOnly {
-		clauses = append(clauses, "active = 1")
+		clauses = append(clauses, "rb.active = 1", "t.archived_at IS NULL")
 	}
 	if len(clauses) > 0 {
 		query += " WHERE " + strings.Join(clauses, " AND ")
 	}
-	query += " ORDER BY updated_at DESC"
+	query += " ORDER BY rb.updated_at DESC"
 
 	rows, err := s.ro.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -1886,6 +1958,25 @@ func (s *Store) ApplyRyugiSyncBatch(
 	var emitted []protocol.EventRecord
 
 	err := s.WithWriteTx(ctx, func(tx *sql.Tx) error {
+		// Re-verify inside the write transaction that the binding is still active and its task
+		// is not archived so concurrent archive/delete never receives late annotations or loses receipts.
+		var bindingActive int
+		var taskArchived sql.NullInt64
+		if err := tx.QueryRowContext(ctx, `
+			SELECT rb.active, t.archived_at
+			FROM ryugi_bindings rb
+			JOIN tasks t ON t.task_id = rb.task_id
+			WHERE rb.binding_id = ?
+		`, binding.BindingID).Scan(&bindingActive, &taskArchived); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("%w: ryugi binding %s", ErrNotFound, binding.BindingID)
+			}
+			return err
+		}
+		if bindingActive == 0 || taskArchived.Valid {
+			return fmt.Errorf("%w: ryugi binding %s is inactive or task is archived", ErrTaskArchived, binding.BindingID)
+		}
+
 		for _, item := range incoming {
 			annID := newID("ann")
 			anchorBytes, err := json.Marshal(item.Anchor)
@@ -1969,6 +2060,85 @@ func (s *Store) ApplyRyugiSyncBatch(
 		return err
 	})
 	return insertedCount, emitted, err
+}
+
+// ListPendingDeliveryCleanups returns all delivery IDs waiting for frozen directory cleanup.
+func (s *Store) ListPendingDeliveryCleanups(ctx context.Context) ([]string, error) {
+	var out []string
+	err := s.WithReadTx(ctx, func(tx *sql.Tx) error {
+		rows, err := tx.QueryContext(ctx, `SELECT delivery_id FROM pending_delivery_cleanups ORDER BY created_at ASC`)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				return err
+			}
+			id = strings.TrimSpace(id)
+			if id != "" {
+				out = append(out, id)
+			}
+		}
+		return rows.Err()
+	})
+	return out, err
+}
+
+// HasPendingDeliveryCleanup reports whether deliveryID currently has an unfinished cleanup record.
+func (s *Store) HasPendingDeliveryCleanup(ctx context.Context, deliveryID string) (bool, error) {
+	var exists int
+	err := s.WithReadTx(ctx, func(tx *sql.Tx) error {
+		return tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM pending_delivery_cleanups WHERE delivery_id = ?`, deliveryID).Scan(&exists)
+	})
+	return exists > 0, err
+}
+
+// ShouldCleanupDeliveryDir verifies inside a single transaction that deliveryID is still in
+// pending_delivery_cleanups AND has no active row in deliveries (preventing stale cleanup from
+// ever deleting a re-imported delivery snapshot).
+func (s *Store) ShouldCleanupDeliveryDir(ctx context.Context, deliveryID string) (bool, error) {
+	var pendingCount, activeDlvCount int
+	err := s.WithReadTx(ctx, func(tx *sql.Tx) error {
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM pending_delivery_cleanups WHERE delivery_id = ?`, deliveryID).Scan(&pendingCount); err != nil {
+			return err
+		}
+		if pendingCount == 0 {
+			return nil
+		}
+		return tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM deliveries WHERE delivery_id = ?`, deliveryID).Scan(&activeDlvCount)
+	})
+	if err != nil {
+		return false, err
+	}
+	return pendingCount > 0 && activeDlvCount == 0, nil
+}
+
+// ClearPendingDeliveryCleanup removes deliveryID from pending_delivery_cleanups after its frozen dir is gone.
+func (s *Store) ClearPendingDeliveryCleanup(ctx context.Context, deliveryID string) error {
+	return s.WithWriteTx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `DELETE FROM pending_delivery_cleanups WHERE delivery_id = ?`, deliveryID)
+		return err
+	})
+}
+
+// checkDeliveryCleanupPendingTx MUST be called inside the same BEGIN IMMEDIATE write transaction
+// before any INSERT INTO deliveries so no manual import, runner outbox, or folder promotion can
+// reuse a delivery_id whose previous frozen snapshot directory has not yet been cleaned up.
+func checkDeliveryCleanupPendingTx(ctx context.Context, tx *sql.Tx, deliveryID string) error {
+	deliveryID = strings.TrimSpace(deliveryID)
+	if deliveryID == "" {
+		return nil
+	}
+	var count int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM pending_delivery_cleanups WHERE delivery_id = ?`, deliveryID).Scan(&count); err != nil {
+		return err
+	}
+	if count > 0 {
+		return fmt.Errorf("%w: delivery %s still has pending snapshot cleanup", ErrDeliveryCleanupPending, deliveryID)
+	}
+	return nil
 }
 
 // CompleteDeliveryReview atomically resolves the delivery_review inbox card for deliveryID

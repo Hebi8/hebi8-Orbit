@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -46,6 +47,17 @@ func newHubClient(configDir, dataDir, hubURLFlag, tokenFlag string) *hubClient {
 	}
 }
 
+type httpStatusError struct {
+	Method     string
+	Path       string
+	StatusCode int
+	Body       string
+}
+
+func (e *httpStatusError) Error() string {
+	return fmt.Sprintf("%s %s failed (%d): %s", e.Method, e.Path, e.StatusCode, e.Body)
+}
+
 func (c *hubClient) doJSON(ctx context.Context, method, path string, reqBody any) ([]byte, error) {
 	var bodyReader io.Reader
 	if reqBody != nil {
@@ -80,7 +92,12 @@ func (c *hubClient) doJSON(ctx context.Context, method, path string, reqBody any
 		return nil, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("%s %s failed (%d): %s", method, path, resp.StatusCode, strings.TrimSpace(string(raw)))
+		return nil, &httpStatusError{
+			Method:     method,
+			Path:       path,
+			StatusCode: resp.StatusCode,
+			Body:       strings.TrimSpace(string(raw)),
+		}
 	}
 	return raw, nil
 }
@@ -615,16 +632,228 @@ func isTerminalAttemptState(st protocol.AttemptState) bool {
 	}
 }
 
+func runHebi8(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	if len(args) > 0 {
+		switch args[0] {
+		case "fold":
+			return runHebi8Fold(ctx, args[1:], stdout, stderr)
+		case "expand":
+			return runHebi8Expand(ctx, args[1:], stdout, stderr)
+		case "pin":
+			return runHebi8Pin(ctx, args[1:], stdout, stderr)
+		case "line", "tree", "list", "ls":
+			return runHebi8Line(ctx, args[1:], stdout, stderr)
+		case "-h", "--help", "help":
+			fmt.Fprintln(stdout, `Usage:
+  orbit hebi8 [--ref <taskId>] [--adapter <adp>] [--model <m>] [--no-wait] [--json] "<message>"
+  orbit hebi8 fold [--title "..."] [--summary "..."] [--tags "a,b"] [--json]
+  orbit hebi8 line [--json]
+  orbit hebi8 expand <nodeId> [--offset 0] [--limit 20] [--json]
+  orbit hebi8 pin <nodeId> [--unpin] [--json]
+  orbit hebi8 --brief [--json]`)
+			return nil
+		}
+	}
+	return runPA(ctx, args, stdout, stderr)
+}
+
+func runHebi8Fold(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("hebi8 fold", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	var (
+		titleFlag   = fs.String("title", "", "optional segment title (<=60 chars)")
+		summaryFlag = fs.String("summary", "", "optional first-person summary body")
+		tagsFlag    = fs.String("tags", "", "optional comma-separated tags")
+		hubURLFlag  = fs.String("hub", "", "orbit-hub base URL")
+		tokenFlag   = fs.String("token", "", "optional auth token")
+		configDir   = fs.String("config-dir", "", "orbit config directory")
+		dataDirFlg  = fs.String("data-dir", "", "orbit data directory")
+		jsonOut     = fs.Bool("json", false, "output JSON")
+	)
+	if err := parseFlagsPermuted(fs, args); err != nil {
+		return err
+	}
+	req := protocol.Hebi8FoldRequest{
+		Title:   strings.TrimSpace(*titleFlag),
+		Summary: strings.TrimSpace(*summaryFlag),
+	}
+	if rawTags := strings.TrimSpace(*tagsFlag); rawTags != "" {
+		for _, p := range strings.Split(rawTags, ",") {
+			if t := strings.TrimSpace(p); t != "" {
+				req.Tags = append(req.Tags, t)
+			}
+		}
+	}
+	c := newHubClient(*configDir, *dataDirFlg, *hubURLFlag, *tokenFlag)
+	raw, err := c.doJSON(ctx, http.MethodPost, "/api/hebi8/fold", req)
+	if err != nil {
+		return err
+	}
+	if *jsonOut {
+		return writeRawJSON(stdout, raw)
+	}
+	var resp protocol.Hebi8FoldResponse
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return err
+	}
+	turns := 0
+	if resp.Segment.AttemptRange != nil {
+		turns = resp.Segment.AttemptRange.TurnCount
+	}
+	fmt.Fprintf(stdout, "Folded segment %s (%d turns) · %s\n", resp.Segment.ID, turns, resp.Segment.Title)
+	if resp.Fold != nil {
+		fmt.Fprintf(stdout, "  Higher fold: %s (L%d, covers %d nodes) · %s\n", resp.Fold.ID, resp.Fold.Level, len(resp.Fold.Covers), resp.Fold.Title)
+	}
+	return nil
+}
+
+func runHebi8Line(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("hebi8 line", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	var (
+		hubURLFlag = fs.String("hub", "", "orbit-hub base URL")
+		tokenFlag  = fs.String("token", "", "optional auth token")
+		configDir  = fs.String("config-dir", "", "orbit config directory")
+		dataDirFlg = fs.String("data-dir", "", "orbit data directory")
+		jsonOut    = fs.Bool("json", false, "output JSON")
+	)
+	if err := parseFlagsPermuted(fs, args); err != nil {
+		return err
+	}
+	c := newHubClient(*configDir, *dataDirFlg, *hubURLFlag, *tokenFlag)
+	raw, err := c.doJSON(ctx, http.MethodGet, "/api/hebi8/line", nil)
+	if err != nil {
+		return err
+	}
+	if *jsonOut {
+		return writeRawJSON(stdout, raw)
+	}
+	var resp protocol.Hebi8LineResponse
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return err
+	}
+	if len(resp.Nodes) == 0 {
+		fmt.Fprintln(stdout, "(no hebi8-line nodes yet)")
+		return nil
+	}
+	for _, n := range resp.Nodes {
+		pinMark := ""
+		if n.Pinned {
+			pinMark = " [PINNED]"
+		}
+		foldedMark := ""
+		if n.FoldedInto != "" {
+			foldedMark = " -> " + n.FoldedInto
+		}
+		fmt.Fprintf(stdout, "%-14s L%d  %-7s  %s%s%s\n", n.ID, n.Level, n.Kind, n.Title, pinMark, foldedMark)
+	}
+	return nil
+}
+
+func runHebi8Expand(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("hebi8 expand", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	var (
+		offsetFlag = fs.Int("offset", 0, "turn pagination offset for segment nodes")
+		limitFlag  = fs.Int("limit", 20, "turn pagination limit for segment nodes")
+		hubURLFlag = fs.String("hub", "", "orbit-hub base URL")
+		tokenFlag  = fs.String("token", "", "optional auth token")
+		configDir  = fs.String("config-dir", "", "orbit config directory")
+		dataDirFlg = fs.String("data-dir", "", "orbit data directory")
+		jsonOut    = fs.Bool("json", false, "output JSON")
+	)
+	if err := parseFlagsPermuted(fs, args); err != nil {
+		return err
+	}
+	if fs.NArg() < 1 {
+		return fmt.Errorf("usage: orbit hebi8 expand <nodeId> [--offset 0] [--limit 20] [--json]")
+	}
+	nodeID := strings.TrimSpace(fs.Arg(0))
+	c := newHubClient(*configDir, *dataDirFlg, *hubURLFlag, *tokenFlag)
+	path := fmt.Sprintf("/api/hebi8/line/%s/expand?offset=%d&limit=%d", url.PathEscape(nodeID), *offsetFlag, *limitFlag)
+	raw, err := c.doJSON(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return err
+	}
+	if *jsonOut {
+		return writeRawJSON(stdout, raw)
+	}
+	var resp protocol.Hebi8ExpandResponse
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return err
+	}
+	fmt.Fprintf(stdout, "%s [%s L%d] %s\n", resp.Node.ID, resp.Node.Kind, resp.Node.Level, resp.Node.Title)
+	if resp.Node.CoversFrom != "" {
+		fmt.Fprintf(stdout, "Range: %s ~ %s\n", resp.Node.CoversFrom, resp.Node.CoversTo)
+	}
+	if strings.TrimSpace(resp.Summary) != "" {
+		fmt.Fprintf(stdout, "\n%s\n", strings.TrimSpace(resp.Summary))
+	}
+	if len(resp.Children) > 0 {
+		fmt.Fprintf(stdout, "\nCovered children (%d):\n", len(resp.Children))
+		for _, ch := range resp.Children {
+			fmt.Fprintf(stdout, "\n--- %s (L%d) %s ---\n%s\n", ch.ID, ch.Level, ch.Title, strings.TrimSpace(ch.Summary))
+		}
+	}
+	if len(resp.Turns) > 0 {
+		fmt.Fprintf(stdout, "\nRaw turns (%d/%d, offset=%d):\n", len(resp.Turns), resp.TotalTurns, resp.Offset)
+		for _, t := range resp.Turns {
+			fmt.Fprintf(stdout, "\n[Turn #%d %s]\nUser: %s\nHebi8: %s\n", t.AttemptNo, t.AttemptID, strings.TrimSpace(t.UserPrompt), strings.TrimSpace(t.AssistantReply))
+		}
+	}
+	return nil
+}
+
+func runHebi8Pin(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("hebi8 pin", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	var (
+		unpinFlag  = fs.Bool("unpin", false, "unpin the specified node")
+		hubURLFlag = fs.String("hub", "", "orbit-hub base URL")
+		tokenFlag  = fs.String("token", "", "optional auth token")
+		configDir  = fs.String("config-dir", "", "orbit config directory")
+		dataDirFlg = fs.String("data-dir", "", "orbit data directory")
+		jsonOut    = fs.Bool("json", false, "output JSON")
+	)
+	if err := parseFlagsPermuted(fs, args); err != nil {
+		return err
+	}
+	if fs.NArg() < 1 {
+		return fmt.Errorf("usage: orbit hebi8 pin <nodeId> [--unpin] [--json]")
+	}
+	nodeID := strings.TrimSpace(fs.Arg(0))
+	c := newHubClient(*configDir, *dataDirFlg, *hubURLFlag, *tokenFlag)
+	raw, err := c.doJSON(ctx, http.MethodPost, "/api/hebi8/line/"+url.PathEscape(nodeID)+"/pin", protocol.Hebi8PinRequest{
+		Pinned: !*unpinFlag,
+	})
+	if err != nil {
+		return err
+	}
+	if *jsonOut {
+		return writeRawJSON(stdout, raw)
+	}
+	var resp protocol.Hebi8PinResponse
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return err
+	}
+	if resp.Pinned {
+		fmt.Fprintf(stdout, "Pinned %s (total pins: %d)\n", resp.NodeID, len(resp.Pins))
+	} else {
+		fmt.Fprintf(stdout, "Unpinned %s (total pins: %d)\n", resp.NodeID, len(resp.Pins))
+	}
+	return nil
+}
+
 func runPA(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if len(args) > 0 && args[0] == "chat" {
 		args = args[1:]
 	}
-	fs := flag.NewFlagSet("pa", flag.ContinueOnError)
+	fs := flag.NewFlagSet("hebi8", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	var (
-		taskIDFlag  = fs.String("task", "", "existing _pa task ID to continue")
+		taskIDFlag  = fs.String("task", "", "explicit _pa task ID override (defaults to the single Hebi8 main conversation)")
 		threadID    = fs.String("thread", "", "legacy PA thread ID (uses /api/pa/chat)")
-		newThread   = fs.Bool("new", false, "start a fresh PA conversation")
+		newThread   = fs.Bool("new", false, "ignored for single-line Hebi8 (retained for flag compatibility)")
 		briefFlag   = fs.Bool("brief", false, "fetch structured workspace brief (/api/pa/brief)")
 		adapterFlag = fs.String("adapter", "", "optional agent adapter override (agy|claude|codex)")
 		machineFlag = fs.String("machine", "", "optional target machine ID")
@@ -670,7 +899,7 @@ func runPA(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 
 	msg := strings.TrimSpace(strings.Join(fs.Args(), " "))
 	if msg == "" {
-		return fmt.Errorf("usage: orbit pa [--task <taskId>] [--ref <taskId>] [--adapter <adp>] [--brief] \"<message>\"")
+		return fmt.Errorf("usage: orbit hebi8 [--ref <taskId>] [--adapter <adp>] [--brief] \"<message>\"")
 	}
 
 	// Legacy /api/pa/chat path ONLY if caller explicitly passed --thread
@@ -692,7 +921,7 @@ func runPA(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		fmt.Fprintln(stdout, resp.AssistantMessage.Content)
 		return nil
 	}
-	_ = newThread // new _pa task is created by default when --task is empty
+	_ = newThread
 
 	cfg := map[string]string{}
 	if v := strings.TrimSpace(*modelFlag); v != "" {
@@ -709,7 +938,33 @@ func runPA(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	var attemptID string
 	var pendingInputID string
 
+	// Default: attach directly to the single workspace Hebi8 main conversation via GET /api/hebi8/main.
+	// Only fall back to legacy POST /api/projects/_pa/tasks when the Hub explicitly returns 404
+	// (older Hub version without /api/hebi8/main). Any 5xx/timeout/JSON error is surfaced directly
+	// so we never accidentally spawn a second _pa thread.
+	legacyFallback := false
 	if taskID == "" {
+		mainRaw, mainErr := c.doJSON(ctx, http.MethodGet, "/api/hebi8/main", nil)
+		if mainErr != nil {
+			var statusErr *httpStatusError
+			if errors.As(mainErr, &statusErr) && statusErr.StatusCode == http.StatusNotFound {
+				legacyFallback = true
+			} else {
+				return mainErr
+			}
+		} else {
+			var mainResp protocol.Hebi8MainResponse
+			if err := json.Unmarshal(mainRaw, &mainResp); err != nil {
+				return fmt.Errorf("decode /api/hebi8/main response: %w", err)
+			}
+			taskID = strings.TrimSpace(mainResp.Task.TaskID)
+			if taskID == "" {
+				return fmt.Errorf("/api/hebi8/main returned empty taskId")
+			}
+		}
+	}
+
+	if taskID == "" && legacyFallback {
 		createReq := protocol.CreateTaskRequest{
 			Goal:              msg,
 			MachineID:         strings.TrimSpace(*machineFlag),
@@ -737,13 +992,14 @@ func runPA(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 			if *jsonOut {
 				return writeRawJSON(stdout, raw)
 			}
-			fmt.Fprintf(stdout, "PA task %s dispatched (attempt=%s)\n", taskID, attemptID)
+			fmt.Fprintf(stdout, "Hebi8 task %s dispatched (attempt=%s)\n", taskID, attemptID)
 			return nil
 		}
 	} else {
 		fReq := protocol.FollowupTaskRequest{
 			Message:           msg,
 			Mode:              protocol.FollowupModeQueue,
+			MachineID:         strings.TrimSpace(*machineFlag),
 			ReferencedTaskIDs: []string(refFlags),
 		}
 		if adp := strings.TrimSpace(*adapterFlag); adp != "" {
@@ -771,9 +1027,9 @@ func runPA(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 				return writeRawJSON(stdout, raw)
 			}
 			if attemptID != "" {
-				fmt.Fprintf(stdout, "PA follow-up dispatched on %s (attempt=%s)\n", taskID, attemptID)
+				fmt.Fprintf(stdout, "Hebi8 turn dispatched on %s (attempt=%s)\n", taskID, attemptID)
 			} else {
-				fmt.Fprintf(stdout, "PA follow-up queued on %s (input=%s)\n", taskID, pendingInputID)
+				fmt.Fprintf(stdout, "Hebi8 turn queued on %s (input=%s)\n", taskID, pendingInputID)
 			}
 			return nil
 		}

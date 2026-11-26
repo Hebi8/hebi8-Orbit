@@ -23,6 +23,7 @@ import (
 
 	"github.com/Hebi8/hebi8-Orbit/internal/gitops"
 	"github.com/Hebi8/hebi8-Orbit/internal/protocol"
+	"github.com/Hebi8/hebi8-Orbit/internal/sshcfg"
 	"github.com/Hebi8/hebi8-Orbit/internal/store"
 )
 
@@ -49,6 +50,7 @@ type Server struct {
 	projects     protocol.ProjectsConfig
 	machines     protocol.MachinesConfig
 	dynNet       store.DynamicNetworkSettings
+	sshCfgOpts   sshcfg.MatchOptions
 
 	gcPaused    bool
 	gcReason    string
@@ -58,8 +60,14 @@ type Server struct {
 	leaseTTL            time.Duration
 	maintenanceInterval time.Duration
 
-	paMu               sync.Mutex
-	paBeforeCommitHook func(fromSeq, highSeq int64)
+	paMu                         sync.Mutex
+	paBeforeCommitHook           func(fromSeq, highSeq int64)
+	hebi8Mu                      sync.Mutex
+	hebi8BeforeCommitHook        func() error
+	deliveryLocks                *deliveryLocker
+	testHookMu                   sync.Mutex
+	removeFrozenDirFn            func(string) error
+	manualImportBeforeInsertHook func()
 
 	wsTicketsMu sync.Mutex
 	wsTickets   map[string]wsTicketEntry
@@ -109,6 +117,17 @@ func NewServer(ctx context.Context, opts ServerOptions) (*Server, error) {
 	if err := os.MkdirAll(filepath.Join(cfg.DataDir, "deliveries"), 0o755); err != nil {
 		return nil, fmt.Errorf("mkdir data deliveries dir: %w", err)
 	}
+	hebi8BaseDir := filepath.Join(cfg.DataDir, "hebi8-line")
+	hebi8NodesDir := filepath.Join(hebi8BaseDir, "nodes")
+	if err := os.MkdirAll(hebi8NodesDir, 0o700); err != nil {
+		return nil, fmt.Errorf("mkdir data hebi8-line dir: %w", err)
+	}
+	if err := os.Chmod(hebi8BaseDir, 0o700); err != nil {
+		return nil, fmt.Errorf("chmod data hebi8-line dir: %w", err)
+	}
+	if err := os.Chmod(hebi8NodesDir, 0o700); err != nil {
+		return nil, fmt.Errorf("chmod data hebi8-line nodes dir: %w", err)
+	}
 
 	broker := NewEventBroker()
 	runner := opts.RyugiRunner
@@ -143,22 +162,24 @@ func NewServer(ctx context.Context, opts ServerOptions) (*Server, error) {
 		maintenanceInterval: maintInterval,
 		handoffCodes:        map[string]authHandoffEntry{},
 		pairLimiter:         newPairingRateLimiter(),
+		deliveryLocks:       newDeliveryLocker(),
 		store:               opts.Store,
 		broker:              broker,
 		runners:             NewRunnerGateway(),
 		webFS:               opts.WebFS,
 	}
 	s.ryugi = NewRyugiBridge(RyugiBridgeConfig{
-		Store:        opts.Store,
-		Broker:       broker,
-		Runner:       runner,
-		DataDir:      cfg.DataDir,
-		Host:         cfg.RyugiHost,
-		URLHost:      cfg.RyugiURLHost,
-		Port:         cfg.RyugiPort,
-		PublicOrigin: cfg.RyugiPublicOrigin,
-		PollInterval: time.Duration(cfg.RyugiPollIntervalSeconds) * time.Second,
-		IsPaused:     s.IsGCPaused,
+		Store:         opts.Store,
+		Broker:        broker,
+		Runner:        runner,
+		DataDir:       cfg.DataDir,
+		Host:          cfg.RyugiHost,
+		URLHost:       cfg.RyugiURLHost,
+		Port:          cfg.RyugiPort,
+		PublicOrigin:  cfg.RyugiPublicOrigin,
+		PollInterval:  time.Duration(cfg.RyugiPollIntervalSeconds) * time.Second,
+		IsPaused:      s.IsGCPaused,
+		DeliveryLocks: s.deliveryLocks,
 	})
 
 	// Best-effort initial config load if projects.yaml / machines.yaml exist in configDir
@@ -178,7 +199,25 @@ func NewServer(ctx context.Context, opts ServerOptions) (*Server, error) {
 	}
 
 	s.router = s.buildRouter()
+	// Retry any pending frozen delivery directory cleanups recorded in SQLite from prior runs.
+	s.retryPendingDeliveryCleanups(ctx)
+
 	return s, nil
+}
+
+// SetRemoveFrozenDirHook overrides the frozen directory removal function (for tests).
+func (s *Server) SetRemoveFrozenDirHook(fn func(string) error) {
+	s.testHookMu.Lock()
+	s.removeFrozenDirFn = fn
+	s.testHookMu.Unlock()
+}
+
+// SetManualImportBeforeInsertHook installs a test hook invoked in handleManualImport right after
+// the pending-cleanup pre-check and right before CreateManualImportDelivery's write transaction.
+func (s *Server) SetManualImportBeforeInsertHook(fn func()) {
+	s.testHookMu.Lock()
+	s.manualImportBeforeInsertHook = fn
+	s.testHookMu.Unlock()
 }
 
 // Handler returns the root HTTP handler for mounting in net/http.Server or httptest.Server.
@@ -198,6 +237,19 @@ func (s *Server) SetPABeforeCommitHook(fn func(fromSeq, highSeq int64)) {
 	s.paMu.Lock()
 	s.paBeforeCommitHook = fn
 	s.paMu.Unlock()
+}
+
+// SetHebi8BeforeCommitHook registers a test hook invoked inside CommitHebi8Fold right before SQLite commit.
+func (s *Server) SetHebi8BeforeCommitHook(fn func() error) {
+	s.mu.Lock()
+	s.hebi8BeforeCommitHook = fn
+	s.mu.Unlock()
+}
+
+func (s *Server) getHebi8BeforeCommitHook() func() error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.hebi8BeforeCommitHook
 }
 
 // Shutdown closes active runner/client WebSocket connections and waits for background tasks.
@@ -348,6 +400,7 @@ func (s *Server) buildRouter() http.Handler {
 		api.Post("/machines/{machineId}/agents/{adapter}/install", s.handleInstallMachineAgent)
 		api.Patch("/machines/{machineId}/agents/{adapter}", s.handleUpdateMachineAgent)
 		api.Get("/machines/{machineId}/dirs", s.handleListMachineDirs)
+		api.Get("/machines/{machineId}/ssh-candidates", s.handleGetMachineSSHCandidates)
 
 		api.Post("/projects", s.handleCreateProject)
 		api.Patch("/projects/{projectId}", s.handleUpdateProjectSettings)
@@ -377,6 +430,9 @@ func (s *Server) buildRouter() http.Handler {
 		api.Post("/tasks/{taskId}/followup", s.handleFollowupTask)
 		api.Post("/tasks/{taskId}/cancel", s.handleCancelTask)
 		api.Post("/tasks/{taskId}/retry", s.handleRetryTask)
+		api.Post("/tasks/{taskId}/archive", s.handleArchiveTask)
+		api.Post("/tasks/{taskId}/unarchive", s.handleUnarchiveTask)
+		api.Delete("/tasks/{taskId}", s.handleDeleteTask)
 		api.Get("/tasks/{taskId}/folder-file", s.handleDownloadTaskFolderFile)
 		api.Post("/tasks/{taskId}/folder-changes/promote", s.handlePromoteFolderChanges)
 
@@ -410,6 +466,12 @@ func (s *Server) buildRouter() http.Handler {
 		api.Post("/pa/chat", s.handlePAChat)
 		api.Post("/pa/reset-session", s.handlePAResetSession)
 
+		api.Get("/hebi8/main", s.handleHebi8Main)
+		api.Post("/hebi8/fold", s.handleHebi8Fold)
+		api.Get("/hebi8/line", s.handleHebi8Line)
+		api.Get("/hebi8/line/{nodeId}/expand", s.handleHebi8Expand)
+		api.Post("/hebi8/line/{nodeId}/pin", s.handleHebi8Pin)
+
 		api.Post("/deliveries/manual-import", s.handleManualImport)
 		api.Get("/artifacts", s.handleListGlobalArtifacts)
 		api.Delete("/annotations/{annotationId}", s.handleDeleteAnnotation)
@@ -417,6 +479,8 @@ func (s *Server) buildRouter() http.Handler {
 		api.Get("/deliveries/{deliveryId}/diff", s.handleGetDeliveryDiff)
 		api.Post("/deliveries/{deliveryId}/annotations", s.handleCreateAnnotation)
 		api.Post("/deliveries/{deliveryId}/ryugi/sync", s.handleSyncDeliveryRyugi)
+		api.Post("/deliveries/{deliveryId}/ryugi/open", s.handleOpenDeliveryRyugi)
+		api.Get("/deliveries/{deliveryId}/ryugi/{bindingId}/content", s.handleGetDeliveryRyugiContent)
 		api.Post("/deliveries/{deliveryId}/complete-review", s.handleCompleteDeliveryReview)
 
 		api.Post("/admin/reload-config", s.handleReloadConfig)
@@ -484,8 +548,10 @@ func (s *Server) handleListAllTasks(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	excludeProj := strings.TrimSpace(r.URL.Query().Get("excludeProject"))
+	projectID := strings.TrimSpace(r.URL.Query().Get("projectId"))
 	searchQuery := strings.TrimSpace(r.URL.Query().Get("q"))
-	tasks, err := s.store.ListRecentTasksFiltered(r.Context(), limit, searchQuery, excludeProj)
+	archivedFilter := strings.TrimSpace(r.URL.Query().Get("archived"))
+	tasks, err := s.store.ListRecentTasksFiltered(r.Context(), limit, searchQuery, excludeProj, projectID, archivedFilter)
 	if err != nil {
 		writeAPIError(w, http.StatusInternalServerError, "ERR_LIST_TASKS_FAILED", err.Error())
 		return
@@ -495,7 +561,8 @@ func (s *Server) handleListAllTasks(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleListProjectTasks(w http.ResponseWriter, r *http.Request) {
 	projectID := chi.URLParam(r, "projectId")
-	tasks, err := s.store.ListProjectTasks(r.Context(), projectID)
+	archivedFilter := strings.TrimSpace(r.URL.Query().Get("archived"))
+	tasks, err := s.store.ListProjectTasks(r.Context(), projectID, archivedFilter)
 	if errors.Is(err, store.ErrNotFound) {
 		writeAPIError(w, http.StatusNotFound, "ERR_PROJECT_NOT_FOUND", "project not found")
 		return
@@ -633,6 +700,29 @@ func (s *Server) handleManualImport(w http.ResponseWriter, r *http.Request) {
 		idempKey = strings.TrimSpace(r.Header.Get("Idempotency-Key"))
 	}
 
+	// Serialize same-deliveryID re-import against pending frozen directory cleanups and in-flight
+	// Ryugi registrations using the shared per-deliveryID lifecycle lock.
+	// Release the lock BEFORE invoking s.ryugi.RegisterDelivery below (no re-entrant locking).
+	unlockDelivery := s.deliveryLocks.Lock(strings.TrimSpace(req.DeliveryID))
+	if hasPending, pErr := s.store.HasPendingDeliveryCleanup(r.Context(), req.DeliveryID); pErr != nil {
+		unlockDelivery()
+		writeAPIError(w, http.StatusInternalServerError, "ERR_DELIVERY_CLEANUP_CHECK", pErr.Error())
+		return
+	} else if hasPending {
+		if clErr := s.cleanupPendingDeliveryDirLocked(r.Context(), req.DeliveryID); clErr != nil {
+			unlockDelivery()
+			writeAPIError(w, http.StatusConflict, "ERR_DELIVERY_CLEANUP_PENDING", fmt.Sprintf("previous delivery %s snapshot cleanup failed: %v", req.DeliveryID, clErr))
+			return
+		}
+	}
+
+	s.testHookMu.Lock()
+	preInsertHook := s.manualImportBeforeInsertHook
+	s.testHookMu.Unlock()
+	if preInsertHook != nil {
+		preInsertHook()
+	}
+
 	res, err := s.store.CreateManualImportDelivery(r.Context(), store.ManualImportParams{
 		DeliveryID:      req.DeliveryID,
 		ProjectID:       req.ProjectID,
@@ -650,6 +740,11 @@ func (s *Server) handleManualImport(w http.ResponseWriter, r *http.Request) {
 		IdempotencyKey:  idempKey,
 		ActorID:         actorFromContext(r.Context()),
 	})
+	unlockDelivery()
+	if errors.Is(err, store.ErrDeliveryCleanupPending) {
+		writeAPIError(w, http.StatusConflict, "ERR_DELIVERY_CLEANUP_PENDING", err.Error())
+		return
+	}
 	if errors.Is(err, store.ErrNotFound) {
 		writeAPIError(w, http.StatusNotFound, "ERR_TASK_NOT_FOUND", err.Error())
 		return
@@ -847,6 +942,65 @@ func (s *Server) handleSyncDeliveryRyugi(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) handleOpenDeliveryRyugi(w http.ResponseWriter, r *http.Request) {
+	deliveryID := chi.URLParam(r, "deliveryId")
+	bindingID := strings.TrimSpace(r.URL.Query().Get("bindingId"))
+
+	bindings, err := s.ryugi.EnsureDeliveryRegistered(r.Context(), deliveryID)
+	if errors.Is(err, store.ErrNotFound) {
+		writeAPIError(w, http.StatusNotFound, "ERR_DELIVERY_NOT_FOUND", "delivery not found")
+		return
+	}
+	if err != nil {
+		writeAPIError(w, http.StatusBadGateway, "ERR_RYUGI_OPEN", err.Error())
+		return
+	}
+	if bindings == nil {
+		bindings = []protocol.RyugiBindingView{}
+	}
+	openURL := ""
+	if bindingID != "" {
+		for _, b := range bindings {
+			if b.BindingID == bindingID {
+				openURL = b.OpenURL
+				break
+			}
+		}
+	}
+	if openURL == "" && len(bindings) > 0 {
+		openURL = bindings[0].OpenURL
+	}
+	writeJSON(w, http.StatusOK, protocol.RyugiOpenResponse{
+		DeliveryID:    deliveryID,
+		OpenURL:       openURL,
+		RyugiBindings: bindings,
+	})
+}
+
+func (s *Server) handleGetDeliveryRyugiContent(w http.ResponseWriter, r *http.Request) {
+	deliveryID := chi.URLParam(r, "deliveryId")
+	bindingID := chi.URLParam(r, "bindingId")
+
+	content, err := s.ryugi.ReadBindingContent(r.Context(), deliveryID, bindingID)
+	if errors.Is(err, store.ErrNotFound) {
+		writeAPIError(w, http.StatusNotFound, "ERR_RYUGI_NOT_FOUND", err.Error())
+		return
+	}
+	if errors.Is(err, ErrInvalidArtifactPath) {
+		writeAPIError(w, http.StatusBadRequest, "ERR_INVALID_ARTIFACT_PATH", err.Error())
+		return
+	}
+	if errors.Is(err, ErrArtifactTooLarge) {
+		writeAPIError(w, http.StatusRequestEntityTooLarge, "ERR_ARTIFACT_TOO_LARGE", err.Error())
+		return
+	}
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, "ERR_RYUGI_CONTENT", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, content)
 }
 
 func (s *Server) handleCompleteDeliveryReview(w http.ResponseWriter, r *http.Request) {

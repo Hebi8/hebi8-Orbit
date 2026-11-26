@@ -307,6 +307,18 @@ CREATE TABLE IF NOT EXISTS delivery_blobs (
   ref_count           INTEGER NOT NULL DEFAULT 1,
   created_at          INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS pending_delivery_cleanups (
+  delivery_id         TEXT PRIMARY KEY,
+  created_at          INTEGER NOT NULL
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_deliveries_block_pending_cleanup
+BEFORE INSERT ON deliveries
+WHEN EXISTS (SELECT 1 FROM pending_delivery_cleanups WHERE delivery_id = NEW.delivery_id)
+BEGIN
+  SELECT RAISE(ABORT, 'ERR_DELIVERY_CLEANUP_PENDING');
+END;
 `,
 		protocol.SQLInClause(protocol.AllTransportModes),
 		protocol.SQLInClause(protocol.AllMachineStatuses),

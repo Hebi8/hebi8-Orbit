@@ -1,7 +1,9 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { ArrowUpRight, FolderGit2, Layers, LayoutGrid, MessageSquare, Plus, SunMoon, Zap } from 'lucide-react';
-import type { BootstrapResponse, PABriefResponse, PAChatResponse } from '../generated/protocol';
+import type { BootstrapResponse, PABriefResponse } from '../generated/protocol';
 import { useManyProjectTasks } from '../hooks/queries';
+import { api, errMsg } from '../lib/api';
 import {
   PA_PROJECT_ID,
   SCRATCH_PROJECT_ID,
@@ -13,10 +15,9 @@ import {
   taskTitle,
 } from '../lib/format';
 import { navigate, paths } from '../lib/router';
-import { useWorkbenchStore } from '../store/useWorkbenchStore';
+import { toast, useWorkbenchStore } from '../store/useWorkbenchStore';
 import { PAIcon } from './Icons';
-import { Md } from './Md';
-import { ActionCards, BriefView, usePABrief, usePAChat } from './PAViews';
+import { BriefView, usePABrief } from './PAViews';
 import { StatusMark } from './StatusMark';
 
 interface Item {
@@ -28,9 +29,10 @@ interface Item {
   run: () => void;
 }
 
-type Out = { kind: 'chat'; res: PAChatResponse } | { kind: 'brief'; res: PABriefResponse } | null;
+type Out = { kind: 'brief'; res: PABriefResponse } | null;
 
 export function CommandPalette({ boot }: { boot: BootstrapResponse }) {
+  const qc = useQueryClient();
   const setOpen = useWorkbenchStore((s) => s.setCmdkOpen);
   const toggleTheme = useWorkbenchStore((s) => s.toggleTheme);
   const [q, setQ] = useState('');
@@ -38,7 +40,25 @@ export function CommandPalette({ boot }: { boot: BootstrapResponse }) {
   const [out, setOut] = useState<Out>(null);
   const inputRef = useRef<HTMLInputElement | null>(null);
   const tasksBy = useManyProjectTasks(boot.projects);
-  const chat = usePAChat((res) => setOut({ kind: 'chat', res }));
+  const askHebi8 = useMutation({
+    mutationFn: async (message: string) => {
+      const main = await api.getHebi8Main();
+      await api.followup(main.task.taskId, {
+        message,
+        mode: 'queue',
+      });
+      return main.task.taskId;
+    },
+    onSuccess: (taskId) => {
+      void qc.invalidateQueries({ queryKey: ['task-timeline', taskId] });
+      void qc.invalidateQueries({ queryKey: ['hebi8-main'] });
+      void qc.invalidateQueries({ queryKey: ['project-tasks', PA_PROJECT_ID] });
+      void qc.invalidateQueries({ queryKey: ['bootstrap'] });
+      setOpen(false);
+      navigate(paths.hebi8());
+    },
+    onError: (e) => toast(errMsg(e), 'err'),
+  });
   const brief = usePABrief((res) => setOut({ kind: 'brief', res }));
   const inboxByTask = useMemo(() => indexInboxByTask(boot.openInboxItems), [boot.openInboxItems]);
 
@@ -57,11 +77,15 @@ export function CommandPalette({ boot }: { boot: BootstrapResponse }) {
     if (k) {
       list.push({
         key: 'ask',
-        group: 'PA',
+        group: 'Hebi8',
         icon: <PAIcon />,
-        label: `问 PA：${q.trim()}`,
+        label: `问 Hebi8：${q.trim()}`,
         trail: <span className="d">↵</span>,
-        run: () => chat.mutate({ message: q.trim(), threadId: boot.paState.activePaThreadId || undefined }),
+        run: () => {
+          if (!askHebi8.isPending) {
+            askHebi8.mutate(q.trim());
+          }
+        },
       });
     }
 
@@ -79,7 +103,7 @@ export function CommandPalette({ boot }: { boot: BootstrapResponse }) {
         t.projectId === SCRATCH_PROJECT_ID
           ? '自由 Chat'
           : t.projectId === PA_PROJECT_ID
-            ? 'PA'
+            ? 'Hebi8'
             : boot.projects.find((p) => p.projectId === t.projectId)?.displayName ?? t.projectId;
       list.push({
         key: `t:${t.taskId}`,
@@ -106,7 +130,7 @@ export function CommandPalette({ boot }: { boot: BootstrapResponse }) {
       { key: 'brief', group: '动作', icon: <Zap size={14} strokeWidth={1.6} />, label: '今日摘要', run: () => brief.mutate() },
       { key: 'new', group: '动作', icon: <Plus size={14} strokeWidth={1.6} />, label: '新建线程', trail: <span className="d">⌘N</span>, run: () => go(paths.newThread()) },
       { key: 'home', group: '动作', icon: <LayoutGrid size={14} strokeWidth={1.6} />, label: '总览', run: () => go(paths.home()) },
-      { key: 'pa', group: '动作', icon: <PAIcon />, label: 'PA', run: () => go(paths.pa()) },
+      { key: 'pa', group: '动作', icon: <PAIcon />, label: 'Hebi8', run: () => go(paths.hebi8()) },
       { key: 'artifacts', group: '动作', icon: <Layers size={14} strokeWidth={1.6} />, label: 'Artifacts', run: () => go(paths.artifacts()) },
       { key: 'theme', group: '动作', icon: <SunMoon size={14} strokeWidth={1.6} />, label: '切换深 / 浅色', run: () => toggleTheme() },
     ];
@@ -120,7 +144,6 @@ export function CommandPalette({ boot }: { boot: BootstrapResponse }) {
   useEffect(() => setAct(0), [q]);
   const groups: string[] = [];
   for (const it of items) if (!groups.includes(it.group)) groups.push(it.group);
-  const threadIdForPA = out?.kind === 'chat' ? out.res.thread.paThreadId : boot.paState.activePaThreadId;
 
   return (
     <>
@@ -131,7 +154,7 @@ export function CommandPalette({ boot }: { boot: BootstrapResponse }) {
           <input
             ref={inputRef}
             value={q}
-            placeholder="跳线程、搜项目，或问 PA…"
+            placeholder="跳线程、搜项目，或问 Hebi8…"
             onChange={(e) => setQ(e.target.value)}
             onKeyDown={(e) => {
               if (e.nativeEvent.isComposing) return;
@@ -150,25 +173,20 @@ export function CommandPalette({ boot }: { boot: BootstrapResponse }) {
           />
           <span className="kbd">esc</span>
         </div>
-        {(out || chat.isPending || brief.isPending) && (
+        {(out || askHebi8.isPending || brief.isPending) && (
           <div className="ck-out">
-            {chat.isPending || brief.isPending ? (
+            {askHebi8.isPending || brief.isPending ? (
               <div className="running">
                 <span className="spin" />
-                <span className="shim">{brief.isPending ? '汇总中…' : '思考中…'}</span>
+                <span className="shim">{brief.isPending ? '汇总中…' : '正在发送给 Hebi8…'}</span>
               </div>
-            ) : out?.kind === 'chat' ? (
-              <>
-                <Md text={out.res.assistantMessage.content} />
-                <ActionCards actions={out.res.actions ?? out.res.assistantMessage.actions} />
-              </>
             ) : out?.kind === 'brief' ? (
               <BriefView brief={out.res} projects={boot.projects} />
             ) : null}
             {out && (
               <div style={{ marginTop: 10 }}>
-                <button type="button" className="btn" onClick={() => go(paths.pa(threadIdForPA || undefined))}>
-                  在 PA 页继续 <ArrowUpRight size={12} strokeWidth={1.6} />
+                <button type="button" className="btn" onClick={() => go(paths.hebi8())}>
+                  在 Hebi8 页继续 <ArrowUpRight size={12} strokeWidth={1.6} />
                 </button>
               </div>
             )}

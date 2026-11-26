@@ -21,9 +21,9 @@ export function MobileTabs({ route, hasUrgent }: { route: Route; hasUrgent: bool
         总览
         {hasUrgent && <span className="mdot" aria-label="有待处理会话" />}
       </button>
-      <button type="button" className={tab === 'pa' ? 'on' : ''} onClick={() => navigate(paths.pa())}>
+      <button type="button" className={tab === 'pa' ? 'on' : ''} onClick={() => navigate(paths.hebi8())}>
         <PAIcon size={17} />
-        PA
+        Hebi8
       </button>
       <button type="button" className={tab === 'artifacts' ? 'on' : ''} onClick={() => navigate(paths.artifacts())}>
         <Layers size={17} strokeWidth={1.6} />

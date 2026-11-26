@@ -245,7 +245,7 @@ export function sourceLabel(s: PendingInputSource): string {
     human: '你',
     diff_drawer: '批注',
     ryugi: '批注',
-    pa: 'PA',
+    pa: 'Hebi8',
     system: '系统',
   };
   return m[s] ?? s;

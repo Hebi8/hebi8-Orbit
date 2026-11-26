@@ -20,8 +20,8 @@ ryugiBin: "ryugi"
 ryugiServerHome: "~/.local/share/hebi8-orbit/ryugi-home"
 ryugiHost: "127.0.0.1"
 ryugiUrlHost: ""
-ryugiPort: 27319
-ryugiPublicOrigin: "https://orbit.example.ts.net:8443"
+ryugiPort: 27329
+ryugiPublicOrigin: "https://orbit.example.ts.net:8444"
 ryugiPollIntervalSeconds: 6
 
 # Local development overrides (loopback only; keep false in production).

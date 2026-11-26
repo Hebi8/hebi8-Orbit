@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"slices"
 	"strings"
@@ -653,6 +654,7 @@ func (s *Server) handleRunnerWS(w http.ResponseWriter, r *http.Request) {
 			}
 			ingestRes, err := s.store.IngestOutboxBatch(ctx, hello.MachineID, hello.RunnerInstanceID, batch)
 			if err != nil {
+				log.Printf("hub: ingest outbox batch for attempt %s (%s) rejected: %v", batch.AttemptID, hello.MachineID, err)
 				continue
 			}
 			if len(ingestRes.Events) > 0 {

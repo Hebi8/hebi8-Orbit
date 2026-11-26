@@ -329,6 +329,7 @@ type TaskSummary struct {
 	CreatedBy           TaskCreatedBy `json:"createdBy"`
 	CreatedAt           int64         `json:"createdAt"`
 	UpdatedAt           int64         `json:"updatedAt"`
+	ArchivedAt          *int64        `json:"archivedAt,omitempty"`
 }
 
 // EventRecord is a single row from the unified append-only events log.
@@ -754,16 +755,17 @@ type BindScratchTaskResponse struct {
 
 // FollowupTaskRequest appends an instruction or switches capability/session for a task.
 type FollowupTaskRequest struct {
-	Message            string            `json:"message"`
-	Mode               FollowupMode      `json:"mode,omitempty"`
-	ReferencedTaskIDs  []string          `json:"referencedTaskIds,omitempty"`
-	RequiredCapability string            `json:"requiredCapability,omitempty"`
-	RequiredResources  []string          `json:"requiredResources,omitempty"`
+	Message                string            `json:"message"`
+	Mode                   FollowupMode      `json:"mode,omitempty"`
+	MachineID              string            `json:"machineId,omitempty"`
+	ReferencedTaskIDs      []string          `json:"referencedTaskIds,omitempty"`
+	RequiredCapability     string            `json:"requiredCapability,omitempty"`
+	RequiredResources      []string          `json:"requiredResources,omitempty"`
 	Adapter                Adapter           `json:"adapter,omitempty"`
 	Config                 map[string]string `json:"config,omitempty"`
 	ExplicitFullPermission bool              `json:"explicitFullPermission,omitempty"`
 	VerifiedSite           bool              `json:"verifiedSite,omitempty"`
-	VerifiedAttemptID  string            `json:"verifiedAttemptId,omitempty"`
+	VerifiedAttemptID      string            `json:"verifiedAttemptId,omitempty"`
 }
 
 // FollowupTaskResponse reports whether the follow-up was queued, steered, dispatched, or forked.
@@ -1246,4 +1248,174 @@ type CompleteOnboardingRequest struct {
 type CompleteOnboardingResponse struct {
 	Completed bool            `json:"completed"`
 	Setup     SetupStatusView `json:"setup"`
+}
+
+// Hebi8AttemptRange records the inclusive SQLite attempt range sealed by a segment node.
+type Hebi8AttemptRange struct {
+	StartAttemptID string `json:"startAttemptId"`
+	EndAttemptID   string `json:"endAttemptId"`
+	StartAttemptNo int    `json:"startAttemptNo"`
+	EndAttemptNo   int    `json:"endAttemptNo"`
+	TurnCount      int    `json:"turnCount"`
+}
+
+// Hebi8LineNode is the immutable metadata record for one segment or fold node under <dataDir>/hebi8-line/nodes/.
+type Hebi8LineNode struct {
+	V              int                 `json:"v"`
+	ID             string              `json:"id"`
+	Kind           Hebi8NodeKind       `json:"kind"`
+	Seq            int                 `json:"seq"`
+	CoversFrom     string              `json:"coversFrom"`
+	CoversTo       string              `json:"coversTo"`
+	CoversFromMs   int64               `json:"coversFromMs,omitempty"`
+	CoversToMs     int64               `json:"coversToMs,omitempty"`
+	AttemptRange   *Hebi8AttemptRange  `json:"attemptRange,omitempty"`
+	Covers         []string            `json:"covers,omitempty"`
+	Level          int                 `json:"level"`
+	Title          string              `json:"title"`
+	Tags           []string            `json:"tags,omitempty"`
+	Adapter        Adapter             `json:"adapter,omitempty"`
+	Model          string              `json:"model,omitempty"`
+	SummaryQuality Hebi8SummaryQuality `json:"summaryQuality"`
+	CreatedAt      string              `json:"createdAt"`
+	CreatedAtMs    int64               `json:"createdAtMs,omitempty"`
+	// Computed view fields populated by API responses (never written into immutable node JSON).
+	Pinned     bool   `json:"pinned,omitempty"`
+	FoldedInto string `json:"foldedInto,omitempty"`
+	Summary    string `json:"summary,omitempty"`
+}
+
+// Hebi8LineSummary summarizes the current Fold-Rollover context tree state.
+type Hebi8LineSummary struct {
+	TotalNodes          int    `json:"totalNodes"`
+	SegmentCount        int    `json:"segmentCount"`
+	FoldCount           int    `json:"foldCount"`
+	PinnedCount         int    `json:"pinnedCount"`
+	MaxLevel            int    `json:"maxLevel"`
+	LastFoldedAt        string `json:"lastFoldedAt,omitempty"`
+	LastFoldedAttemptNo int    `json:"lastFoldedAttemptNo,omitempty"`
+	ShouldSuggestFold   bool   `json:"shouldSuggestFold,omitempty"`
+}
+
+// Hebi8MainResponse is returned by GET /api/hebi8/main.
+type Hebi8MainResponse struct {
+	Task                      TaskSummary      `json:"task"`
+	LineSummary               Hebi8LineSummary `json:"lineSummary"`
+	Nodes                     []Hebi8LineNode  `json:"nodes"`
+	Pins                      []string         `json:"pins"`
+	PendingTurnsSinceLastFold int              `json:"pendingTurnsSinceLastFold"`
+	PendingCharsSinceLastFold int              `json:"pendingCharsSinceLastFold"`
+}
+
+// Hebi8FoldRequest optionally supplies a model- or user-authored summary/title/tags when folding.
+type Hebi8FoldRequest struct {
+	Title   string   `json:"title,omitempty"`
+	Summary string   `json:"summary,omitempty"`
+	Tags    []string `json:"tags,omitempty"`
+}
+
+// Hebi8FoldResponse is returned by POST /api/hebi8/fold.
+type Hebi8FoldResponse struct {
+	TaskID      string           `json:"taskId"`
+	Segment     Hebi8LineNode    `json:"segment"`
+	Fold        *Hebi8LineNode   `json:"fold,omitempty"`
+	Folds       []Hebi8LineNode  `json:"folds,omitempty"`
+	Nodes       []Hebi8LineNode  `json:"nodes"`
+	Pins        []string         `json:"pins"`
+	LineSummary Hebi8LineSummary `json:"lineSummary"`
+}
+
+// Hebi8LineResponse is returned by GET /api/hebi8/line.
+type Hebi8LineResponse struct {
+	TaskID      string           `json:"taskId"`
+	Nodes       []Hebi8LineNode  `json:"nodes"`
+	Pins        []string         `json:"pins"`
+	LineSummary Hebi8LineSummary `json:"lineSummary"`
+}
+
+// Hebi8RawTurn is one raw user/assistant turn reconstructed from SQLite for segment expansion or opening.
+type Hebi8RawTurn struct {
+	AttemptID      string       `json:"attemptId"`
+	AttemptNo      int          `json:"attemptNo"`
+	State          AttemptState `json:"state"`
+	UserPrompt     string       `json:"userPrompt"`
+	AssistantReply string       `json:"assistantReply"`
+	StartedAt      int64        `json:"startedAt"`
+	FinishedAt     *int64       `json:"finishedAt,omitempty"`
+}
+
+// Hebi8ExpandResponse is returned by GET /api/hebi8/line/{nodeId}/expand.
+type Hebi8ExpandResponse struct {
+	Node       Hebi8LineNode   `json:"node"`
+	Summary    string          `json:"summary"`
+	Children   []Hebi8LineNode `json:"children,omitempty"`
+	Turns      []Hebi8RawTurn  `json:"turns,omitempty"`
+	TotalTurns int             `json:"totalTurns,omitempty"`
+	Offset     int             `json:"offset,omitempty"`
+	Limit      int             `json:"limit,omitempty"`
+}
+
+// Hebi8PinRequest pins or unpins a node in hebi8-line.
+type Hebi8PinRequest struct {
+	Pinned bool `json:"pinned"`
+}
+
+// Hebi8PinResponse returns the updated pin list after POST /api/hebi8/line/{nodeId}/pin.
+type Hebi8PinResponse struct {
+	NodeID string   `json:"nodeId"`
+	Pinned bool     `json:"pinned"`
+	Pins   []string `json:"pins"`
+}
+
+// SSHCandidate describes one matched entry from the client's local ~/.ssh/config.
+type SSHCandidate struct {
+	Alias       string `json:"alias"`
+	HostName    string `json:"hostName,omitempty"`
+	User        string `json:"user,omitempty"`
+	Port        int    `json:"port,omitempty"`
+	ProxyJump   string `json:"proxyJump,omitempty"`
+	Score       int    `json:"score"`
+	MatchReason string `json:"matchReason,omitempty"`
+	Reachable   *bool  `json:"reachable,omitempty"`
+	LatencyMs   int64  `json:"latencyMs,omitempty"`
+}
+
+// SSHCandidatesResponse returns SSH alias candidates resolved from a local ~/.ssh/config.
+type SSHCandidatesResponse struct {
+	LocalConfigAvailable bool           `json:"localConfigAvailable"`
+	Recommended          string         `json:"recommended,omitempty"`
+	Candidates           []SSHCandidate `json:"candidates"`
+	AllHosts             []string       `json:"allHosts"`
+}
+
+// ArchiveTaskRequest configures archiving a task (optionally cancelling an active attempt first).
+type ArchiveTaskRequest struct {
+	CancelActive bool `json:"cancelActive,omitempty"`
+}
+
+// ArchiveTaskResponse returns the updated task summary after archive/unarchive.
+type ArchiveTaskResponse struct {
+	Task TaskSummary `json:"task"`
+}
+
+// DeleteTaskResponse confirms permanent deletion of a task and its cascaded records.
+type DeleteTaskResponse struct {
+	TaskID    string `json:"taskId"`
+	ProjectID string `json:"projectId"`
+	Deleted   bool   `json:"deleted"`
+}
+
+// RyugiOpenResponse returns freshly ensured Ryugi bindings and target openUrl.
+type RyugiOpenResponse struct {
+	DeliveryID    string             `json:"deliveryId"`
+	OpenURL       string             `json:"openUrl,omitempty"`
+	RyugiBindings []RyugiBindingView `json:"ryugiBindings"`
+}
+
+// RyugiArtifactContentResponse returns the read-only primary source content of a frozen Ryugi artifact.
+type RyugiArtifactContentResponse struct {
+	ContentType string `json:"contentType"`
+	Filename    string `json:"filename"`
+	Locator     string `json:"locator"`
+	Text        string `json:"text"`
 }

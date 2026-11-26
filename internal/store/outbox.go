@@ -194,6 +194,10 @@ func applyLateHistoryItemTx(
 			} else if !errors.Is(err, sql.ErrNoRows) {
 				return err
 			}
+			// Reject reusing a delivery_id whose previous frozen snapshot still awaits cleanup.
+			if err := checkDeliveryCleanupPendingTx(ctx, tx, deliveryID); err != nil {
+				return err
+			}
 		}
 
 		// Verify ref/mirror/blobs before inserting into deliveries (reject corrupt late records into audit only)
@@ -1014,6 +1018,11 @@ func applyDeliveryPublishedFrameTx(
 		} else if !errors.Is(err, sql.ErrNoRows) {
 			return err
 		}
+	}
+
+	// Atomically reject reusing a delivery_id whose previous frozen snapshot still awaits cleanup.
+	if err := checkDeliveryCleanupPendingTx(ctx, tx, deliveryID); err != nil {
+		return err
 	}
 
 	// B12: Verify mirror ref / headSha / baseSha / blobs before admitting delivery.

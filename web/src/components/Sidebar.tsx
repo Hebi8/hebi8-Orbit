@@ -1,8 +1,10 @@
-import { useMemo } from 'react';
-import { Layers, LayoutGrid, PanelLeftClose, Plus, Search, Settings } from 'lucide-react';
+import { useMemo, useState } from 'react';
+import { useQueryClient } from '@tanstack/react-query';
+import { Archive, Layers, LayoutGrid, MoreHorizontal, PanelLeftClose, Plus, Search, Settings, Trash2 } from 'lucide-react';
 import type { BootstrapResponse, MachineView, ProjectView, TaskSummary } from '../generated/protocol';
 import { useManyProjectTasks } from '../hooks/queries';
 import { useHubLatency } from '../hooks/useHubLatency';
+import { api, errMsg } from '../lib/api';
 import {
   SCRATCH_PROJECT_ID,
   indexInboxByTask,
@@ -11,9 +13,10 @@ import {
   sessionMark,
   sessionMarkHint,
   taskTitle,
+  type SessionMark,
 } from '../lib/format';
 import { navigate, paths, type Route } from '../lib/router';
-import { useWorkbenchStore } from '../store/useWorkbenchStore';
+import { toast, useWorkbenchStore } from '../store/useWorkbenchStore';
 import { CaretIcon, MoonIcon, PAIcon, SunIcon } from './Icons';
 import { StatusMark } from './StatusMark';
 
@@ -21,6 +24,111 @@ const MAX_THREADS = 8;
 
 function mainThreads(tasks: TaskSummary[]): TaskSummary[] {
   return tasks.filter((t) => !t.parentTaskId).sort((a, b) => b.updatedAt - a.updatedAt);
+}
+
+function SidebarThreadItem({
+  task,
+  mark,
+  active,
+  flat,
+  menuOpen,
+  onToggleMenu,
+  onCloseMenu,
+  onArchive,
+  onDelete,
+}: {
+  task: TaskSummary;
+  mark: SessionMark;
+  active: boolean;
+  flat?: boolean;
+  menuOpen: boolean;
+  onToggleMenu: () => void;
+  onCloseMenu: () => void;
+  onArchive: () => void;
+  onDelete: () => void;
+}) {
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const hint = sessionMarkHint(mark);
+
+  return (
+    <div className={`th-wrap ${menuOpen ? 'menu-open' : ''}`}>
+      <button
+        type="button"
+        className={`th ${flat ? 'flat' : ''} ${active ? 'on' : ''} ${!mark ? 'resting' : ''}`}
+        onClick={() => navigate(paths.session(task.taskId))}
+        title={hint ? `${taskTitle(task)} · ${hint}` : taskTitle(task)}
+      >
+        <span className="tt">{taskTitle(task)}</span>
+        <StatusMark mark={mark} />
+      </button>
+      <button
+        type="button"
+        className="th-more-btn"
+        title="会话操作"
+        aria-label="会话操作"
+        aria-expanded={menuOpen}
+        onClick={(e) => {
+          e.stopPropagation();
+          setConfirmDelete(false);
+          onToggleMenu();
+        }}
+      >
+        <MoreHorizontal size={13} strokeWidth={1.7} />
+      </button>
+      {menuOpen && (
+        <>
+          <div
+            className="scrim"
+            style={{ background: 'transparent', backdropFilter: 'none', zIndex: 49 }}
+            onClick={() => {
+              setConfirmDelete(false);
+              onCloseMenu();
+            }}
+          />
+          <div className="th-menu" role="menu">
+            <button
+              type="button"
+              role="menuitem"
+              className="th-menu-item"
+              onClick={() => {
+                setConfirmDelete(false);
+                onCloseMenu();
+                onArchive();
+              }}
+            >
+              <Archive size={12.5} strokeWidth={1.6} />
+              <span>归档会话</span>
+            </button>
+            {confirmDelete ? (
+              <button
+                type="button"
+                role="menuitem"
+                className="th-menu-item danger"
+                onClick={() => {
+                  setConfirmDelete(false);
+                  onCloseMenu();
+                  onDelete();
+                }}
+              >
+                <Trash2 size={12.5} strokeWidth={1.7} />
+                <span>确认永久删除</span>
+              </button>
+            ) : (
+              <button
+                type="button"
+                role="menuitem"
+                className="th-menu-item danger"
+                onClick={() => setConfirmDelete(true)}
+              >
+                <Trash2 size={12.5} strokeWidth={1.6} />
+                <span>永久删除</span>
+              </button>
+            )}
+          </div>
+        </>
+      )}
+    </div>
+  );
 }
 
 function WorkspaceFooterButton({
@@ -76,6 +184,8 @@ export function Sidebar({
   route: Route;
   onAddProject?: () => void;
 }) {
+  const qc = useQueryClient();
+  const [openMenuTaskId, setOpenMenuTaskId] = useState<string | null>(null);
   const expanded = useWorkbenchStore((s) => s.expandedProjects);
   const setExpanded = useWorkbenchStore((s) => s.setProjectExpanded);
   const toggleSidebar = useWorkbenchStore((s) => s.toggleSidebar);
@@ -100,6 +210,51 @@ export function Sidebar({
   const inboxByTask = useMemo(() => indexInboxByTask(boot.openInboxItems), [boot.openInboxItems]);
   const activeTaskId = route.name === 'session' ? route.taskId : '';
 
+  const invalidateTasks = (projectId: string) => {
+    void qc.invalidateQueries({ queryKey: ['project-tasks', projectId] });
+    void qc.invalidateQueries({ queryKey: ['all-tasks'] });
+    void qc.invalidateQueries({ queryKey: ['archived-tasks'] });
+    void qc.invalidateQueries({ queryKey: ['global-artifacts'] });
+    void qc.invalidateQueries({ queryKey: ['bootstrap'] });
+  };
+
+  const handleArchiveTask = async (t: TaskSummary) => {
+    try {
+      await api.archiveTask(t.taskId);
+      invalidateTasks(t.projectId);
+      if (activeTaskId === t.taskId) {
+        navigate(isVirtualProject(t.projectId) ? paths.home() : paths.project(t.projectId));
+      }
+      toast(`已归档「${taskTitle(t)}」`, 'info', {
+        label: '撤销',
+        onClick: () => {
+          void api
+            .unarchiveTask(t.taskId)
+            .then(() => {
+              invalidateTasks(t.projectId);
+              toast(`已恢复「${taskTitle(t)}」`);
+            })
+            .catch((e) => toast(errMsg(e), 'err'));
+        },
+      });
+    } catch (e) {
+      toast(errMsg(e), 'err');
+    }
+  };
+
+  const handleDeleteTask = async (t: TaskSummary) => {
+    try {
+      await api.deleteTask(t.taskId);
+      invalidateTasks(t.projectId);
+      if (activeTaskId === t.taskId) {
+        navigate(isVirtualProject(t.projectId) ? paths.home() : paths.project(t.projectId));
+      }
+      toast(`已永久删除「${taskTitle(t)}」`);
+    } catch (e) {
+      toast(errMsg(e), 'err');
+    }
+  };
+
   return (
     <aside className="side">
       <div className="side-in">
@@ -120,13 +275,17 @@ export function Sidebar({
             <LayoutGrid size={14} strokeWidth={1.6} />
             总览
           </button>
-          <button type="button" className={`qi ${route.name === 'pa' ? 'on' : ''}`} onClick={() => navigate(paths.pa())}>
+          <button type="button" className={`qi ${route.name === 'pa' ? 'on' : ''}`} onClick={() => navigate(paths.hebi8())}>
             <PAIcon />
-            PA
+            Hebi8
           </button>
           <button type="button" className={`qi ${route.name === 'artifacts' ? 'on' : ''}`} onClick={() => navigate(paths.artifacts())}>
             <Layers size={14} strokeWidth={1.6} />
             Artifacts
+          </button>
+          <button type="button" className={`qi ${route.name === 'archived' ? 'on' : ''}`} onClick={() => navigate(paths.archived())}>
+            <Archive size={14} strokeWidth={1.6} />
+            已归档
           </button>
           <button type="button" className={`qi ${route.name === 'new' ? 'on' : ''}`} onClick={() => navigate(paths.newThread())}>
             <Plus size={14} strokeWidth={1.6} />
@@ -176,18 +335,18 @@ export function Sidebar({
                 {open &&
                   threads.slice(0, MAX_THREADS).map((t) => {
                     const mark = rootSessionMark(t, allProjTasks, inboxByTask);
-                    const hint = sessionMarkHint(mark);
                     return (
-                      <button
-                        type="button"
+                      <SidebarThreadItem
                         key={t.taskId}
-                        className={`th ${activeTaskId === t.taskId ? 'on' : ''} ${!mark ? 'resting' : ''}`}
-                        onClick={() => navigate(paths.session(t.taskId))}
-                        title={hint ? `${taskTitle(t)} · ${hint}` : taskTitle(t)}
-                      >
-                        <span className="tt">{taskTitle(t)}</span>
-                        <StatusMark mark={mark} />
-                      </button>
+                        task={t}
+                        mark={mark}
+                        active={activeTaskId === t.taskId}
+                        menuOpen={openMenuTaskId === t.taskId}
+                        onToggleMenu={() => setOpenMenuTaskId((cur) => (cur === t.taskId ? null : t.taskId))}
+                        onCloseMenu={() => setOpenMenuTaskId(null)}
+                        onArchive={() => void handleArchiveTask(t)}
+                        onDelete={() => void handleDeleteTask(t)}
+                      />
                     );
                   })}
                 {open && threads.length > MAX_THREADS && (
@@ -205,18 +364,19 @@ export function Sidebar({
               </div>
               {scratchThreads.slice(0, MAX_THREADS).map((t) => {
                 const mark = sessionMark(t, inboxByTask.get(t.taskId));
-                const hint = sessionMarkHint(mark);
                 return (
-                  <button
-                    type="button"
+                  <SidebarThreadItem
                     key={t.taskId}
-                    className={`th flat ${activeTaskId === t.taskId ? 'on' : ''} ${!mark ? 'resting' : ''}`}
-                    onClick={() => navigate(paths.session(t.taskId))}
-                    title={hint ? `${taskTitle(t)} · ${hint}` : taskTitle(t)}
-                  >
-                    <span className="tt">{taskTitle(t)}</span>
-                    <StatusMark mark={mark} />
-                  </button>
+                    task={t}
+                    mark={mark}
+                    active={activeTaskId === t.taskId}
+                    flat
+                    menuOpen={openMenuTaskId === t.taskId}
+                    onToggleMenu={() => setOpenMenuTaskId((cur) => (cur === t.taskId ? null : t.taskId))}
+                    onCloseMenu={() => setOpenMenuTaskId(null)}
+                    onArchive={() => void handleArchiveTask(t)}
+                    onDelete={() => void handleDeleteTask(t)}
+                  />
                 );
               })}
             </>

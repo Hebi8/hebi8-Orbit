@@ -1,12 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { ArrowLeft, Check, Layers, MessageSquare } from 'lucide-react';
+import { useQueryClient } from '@tanstack/react-query';
+import { Archive, ArchiveRestore, ArrowLeft, Check, Layers, MessageSquare, MoreHorizontal, Trash2 } from 'lucide-react';
 import type { BootstrapResponse } from '../generated/protocol';
 import { CardIcon, DiffIcon } from '../components/Icons';
 import { IdeOpenButton } from '../components/IdeOpenButton';
 import { PageHeader } from '../components/PageHeader';
 import { StatusMark } from '../components/StatusMark';
 import { useBoard, useTimeline } from '../hooks/queries';
-import { errMsg } from '../lib/api';
+import { ApiError, api, errMsg } from '../lib/api';
 import { collectSessionArtifacts } from '../lib/artifacts';
 import {
   PA_PROJECT_ID,
@@ -15,13 +16,14 @@ import {
   indexInboxByTask,
   isVirtualProject,
   memberStateLabel,
+  relTime,
   sessionMark,
   shortSha,
   taskTitle,
 } from '../lib/format';
 import { resolveMachineSshAlias } from '../lib/ide';
 import { navigate, paths } from '../lib/router';
-import { useWorkbenchStore } from '../store/useWorkbenchStore';
+import { toast, useWorkbenchStore } from '../store/useWorkbenchStore';
 import { BoardPanel } from './BoardPanel';
 import { RightCard } from './RightCard';
 import { SessionConversation } from './SessionConversation';
@@ -29,6 +31,7 @@ import { SessionConversation } from './SessionConversation';
 const CODE_KINDS = new Set(['code_diff', 'mixed', 'workspace_snapshot']);
 
 export function SessionPage({ boot, taskId, worker }: { boot: BootstrapResponse; taskId: string; worker?: string }) {
+  const qc = useQueryClient();
   const tlq = useTimeline(taskId);
   const tl = tlq.data;
   const task = tl?.task;
@@ -48,7 +51,12 @@ export function SessionPage({ boot, taskId, worker }: { boot: BootstrapResponse;
   const openReview = useWorkbenchStore((s) => s.openReview);
   const [manualCardOpen, setManualCardOpen] = useState(false);
   const [artMenuOpen, setArtMenuOpen] = useState(false);
+  const [moreMenuOpen, setMoreMenuOpen] = useState(false);
+  const [confirmDeleteMenu, setConfirmDeleteMenu] = useState(false);
+  const [confirmDeleteBanner, setConfirmDeleteBanner] = useState(false);
+  const [actionBusy, setActionBusy] = useState(false);
   const artMenuRef = useRef<HTMLDivElement | null>(null);
+  const moreMenuRef = useRef<HTMLDivElement | null>(null);
 
   const members = tl?.boardMembers ?? [];
   const hasSwarm = members.length > 0 || (task?.workerCount ?? 0) > 0;
@@ -60,6 +68,9 @@ export function SessionPage({ boot, taskId, worker }: { boot: BootstrapResponse;
     setMobileDock(false);
     setManualCardOpen(false);
     setArtMenuOpen(false);
+    setMoreMenuOpen(false);
+    setConfirmDeleteMenu(false);
+    setConfirmDeleteBanner(false);
   }, [taskId, setMobileDock]);
 
   useEffect(() => {
@@ -71,15 +82,33 @@ export function SessionPage({ boot, taskId, worker }: { boot: BootstrapResponse;
   }, [task, isVirtual, expandedProjects, setProjectExpanded]);
 
   useEffect(() => {
-    if (!artMenuOpen) return;
+    if (!artMenuOpen && !moreMenuOpen) return;
     const onDown = (e: MouseEvent) => {
-      if (artMenuRef.current && !artMenuRef.current.contains(e.target as Node)) {
+      const target = e.target as Node;
+      if (artMenuOpen && artMenuRef.current && !artMenuRef.current.contains(target)) {
         setArtMenuOpen(false);
+      }
+      if (moreMenuOpen && moreMenuRef.current && !moreMenuRef.current.contains(target)) {
+        setMoreMenuOpen(false);
+        setConfirmDeleteMenu(false);
       }
     };
     window.addEventListener('mousedown', onDown);
     return () => window.removeEventListener('mousedown', onDown);
-  }, [artMenuOpen]);
+  }, [artMenuOpen, moreMenuOpen]);
+
+  const invalidateAfterTaskMut = (pid?: string) => {
+    void qc.invalidateQueries({ queryKey: ['task-timeline', taskId] });
+    void qc.invalidateQueries({ queryKey: ['all-tasks'] });
+    void qc.invalidateQueries({ queryKey: ['archived-tasks'] });
+    void qc.invalidateQueries({ queryKey: ['global-artifacts'] });
+    void qc.invalidateQueries({ queryKey: ['bootstrap'] });
+    if (pid) {
+      void qc.invalidateQueries({ queryKey: ['project-tasks', pid] });
+    } else {
+      void qc.invalidateQueries({ queryKey: ['project-tasks'] });
+    }
+  };
 
   if (tlq.isError) {
     return (
@@ -100,6 +129,79 @@ export function SessionPage({ boot, taskId, worker }: { boot: BootstrapResponse;
       </main>
     );
   }
+
+  const isArchived = !!task.archivedAt;
+  const fallbackReturnHash = project && !isVirtual ? paths.project(project.projectId) : paths.home();
+
+  const handleArchive = async (cancelActive = false) => {
+    if (actionBusy) return;
+    setActionBusy(true);
+    try {
+      await api.archiveTask(task.taskId, cancelActive);
+      setMoreMenuOpen(false);
+      invalidateAfterTaskMut(task.projectId);
+      const label = taskTitle(task);
+      navigate(fallbackReturnHash);
+      toast(`已归档「${label}」`, 'info', {
+        label: '撤销',
+        onClick: () => {
+          void api
+            .unarchiveTask(task.taskId)
+            .then(() => {
+              invalidateAfterTaskMut(task.projectId);
+              navigate(paths.session(task.taskId));
+              toast(`已恢复「${label}」`);
+            })
+            .catch((e) => toast(errMsg(e), 'err'));
+        },
+      });
+    } catch (e) {
+      if (e instanceof ApiError && e.code === 'ERR_TASK_ACTIVE' && !cancelActive) {
+        toast('会话正在运行中，可点击重试并自动取消后归档', 'err', {
+          label: '取消并归档',
+          onClick: () => void handleArchive(true),
+        });
+      } else {
+        toast(errMsg(e), 'err');
+      }
+    } finally {
+      setActionBusy(false);
+    }
+  };
+
+  const handleUnarchive = async () => {
+    if (actionBusy) return;
+    setActionBusy(true);
+    try {
+      await api.unarchiveTask(task.taskId);
+      setMoreMenuOpen(false);
+      invalidateAfterTaskMut(task.projectId);
+      toast(`已恢复「${taskTitle(task)}」`);
+    } catch (e) {
+      toast(errMsg(e), 'err');
+    } finally {
+      setActionBusy(false);
+    }
+  };
+
+  const handleDelete = async () => {
+    if (actionBusy) return;
+    setActionBusy(true);
+    try {
+      const label = taskTitle(task);
+      await api.deleteTask(task.taskId);
+      setMoreMenuOpen(false);
+      setConfirmDeleteMenu(false);
+      setConfirmDeleteBanner(false);
+      invalidateAfterTaskMut(task.projectId);
+      navigate(fallbackReturnHash);
+      toast(`已永久删除「${label}」`);
+    } catch (e) {
+      toast(errMsg(e), 'err');
+    } finally {
+      setActionBusy(false);
+    }
+  };
 
   const formalDeliveries = tl.deliveries.filter((d) => !d.lateArrival);
   const codeDeliveries = tl.deliveries.filter((d) => CODE_KINDS.has(d.kind));
@@ -202,6 +304,73 @@ export function SessionPage({ boot, taskId, worker }: { boot: BootstrapResponse;
             >
               <CardIcon />
             </button>
+            {!worker && (
+              <div className="relpos" ref={moreMenuRef}>
+                <button
+                  type="button"
+                  className={`ib ${moreMenuOpen ? 'on' : ''}`}
+                  title="更多操作"
+                  aria-label="更多操作"
+                  aria-expanded={moreMenuOpen}
+                  onClick={() => {
+                    setConfirmDeleteMenu(false);
+                    setMoreMenuOpen((v) => !v);
+                  }}
+                >
+                  <MoreHorizontal size={15} strokeWidth={1.7} />
+                </button>
+                {moreMenuOpen && (
+                  <div className="sess-more-menu" role="menu">
+                    {isArchived ? (
+                      <button
+                        type="button"
+                        role="menuitem"
+                        className="th-menu-item"
+                        disabled={actionBusy}
+                        onClick={() => void handleUnarchive()}
+                      >
+                        <ArchiveRestore size={13} strokeWidth={1.6} />
+                        <span>取消归档</span>
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        role="menuitem"
+                        className="th-menu-item"
+                        disabled={actionBusy}
+                        onClick={() => void handleArchive(false)}
+                      >
+                        <Archive size={13} strokeWidth={1.6} />
+                        <span>归档会话</span>
+                      </button>
+                    )}
+                    {confirmDeleteMenu ? (
+                      <button
+                        type="button"
+                        role="menuitem"
+                        className="th-menu-item danger"
+                        disabled={actionBusy}
+                        onClick={() => void handleDelete()}
+                      >
+                        <Trash2 size={13} strokeWidth={1.7} />
+                        <span>确认永久删除</span>
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        role="menuitem"
+                        className="th-menu-item danger"
+                        disabled={actionBusy}
+                        onClick={() => setConfirmDeleteMenu(true)}
+                      >
+                        <Trash2 size={13} strokeWidth={1.6} />
+                        <span>永久删除</span>
+                      </button>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
           </>
         }
       >
@@ -275,8 +444,8 @@ export function SessionPage({ boot, taskId, worker }: { boot: BootstrapResponse;
               {isScratch ? (
                 <span>自由对话</span>
               ) : isPA ? (
-                <button type="button" onClick={() => navigate(paths.pa(taskId))}>
-                  PA 助手
+                <button type="button" onClick={() => navigate(paths.hebi8())}>
+                  Hebi8
                 </button>
               ) : (
                 <>
@@ -312,6 +481,51 @@ export function SessionPage({ boot, taskId, worker }: { boot: BootstrapResponse;
           </div>
         )}
       </PageHeader>
+
+      {isArchived && !worker && (
+        <div className="sess-archived-bar">
+          <Archive size={13} strokeWidth={1.6} className="muted" />
+          <span>已归档会话{task.archivedAt ? ` · ${relTime(task.archivedAt)}` : ''}</span>
+          <div className="sess-archived-acts">
+            <button
+              type="button"
+              className="btn ghost sm"
+              disabled={actionBusy}
+              onClick={() => void handleUnarchive()}
+            >
+              <ArchiveRestore size={12} strokeWidth={1.6} /> 恢复
+            </button>
+            {confirmDeleteBanner ? (
+              <>
+                <button
+                  type="button"
+                  className="btn ghost sm bad-t"
+                  disabled={actionBusy}
+                  onClick={() => void handleDelete()}
+                >
+                  确认永久删除
+                </button>
+                <button
+                  type="button"
+                  className="btn ghost sm"
+                  onClick={() => setConfirmDeleteBanner(false)}
+                >
+                  取消
+                </button>
+              </>
+            ) : (
+              <button
+                type="button"
+                className="btn ghost sm bad-t"
+                disabled={actionBusy}
+                onClick={() => setConfirmDeleteBanner(true)}
+              >
+                <Trash2 size={12} strokeWidth={1.6} /> 永久删除
+              </button>
+            )}
+          </div>
+        </div>
+      )}
 
       <div className="sess">
         <SessionConversation

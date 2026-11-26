@@ -559,6 +559,9 @@ const (
 	EventTaskCreated             EventKind = "task.created"
 	EventTaskStateChanged        EventKind = "task.state_changed"
 	EventTaskCancelled           EventKind = "task.cancelled"
+	EventTaskArchived            EventKind = "task.archived"
+	EventTaskUnarchived          EventKind = "task.unarchived"
+	EventTaskDeleted             EventKind = "task.deleted"
 	EventAttemptStarted          EventKind = "attempt.started"
 	EventAttemptStateChanged     EventKind = "attempt.state_changed"
 	EventAttemptFinished         EventKind = "attempt.finished"
@@ -596,12 +599,16 @@ const (
 	EventMachineAgentsUpdated    EventKind = "machine.agents_updated"
 	EventProjectChanged          EventKind = "project.changed"
 	EventNetworkSettingsChanged  EventKind = "network.settings_changed"
+	EventHebi8Folded             EventKind = "hebi8.folded"
 )
 
 var AllEventKinds = []EventKind{
 	EventTaskCreated,
 	EventTaskStateChanged,
 	EventTaskCancelled,
+	EventTaskArchived,
+	EventTaskUnarchived,
+	EventTaskDeleted,
 	EventAttemptStarted,
 	EventAttemptStateChanged,
 	EventAttemptFinished,
@@ -639,6 +646,7 @@ var AllEventKinds = []EventKind{
 	EventMachineAgentsUpdated,
 	EventProjectChanged,
 	EventNetworkSettingsChanged,
+	EventHebi8Folded,
 }
 
 // IDEScheme defines supported URI schemes for one-click IDE jump.
@@ -684,9 +692,39 @@ const (
 	ScratchProjectRepoIdentity = "scratch:local"
 
 	PAProjectID           = "_pa"
-	PAProjectDisplayName  = "PA 助手"
+	PAProjectDisplayName  = "Hebi8"
 	PAProjectRepoIdentity = "pa:local"
 )
+
+// Hebi8NodeKind distinguishes raw segment nodes from higher-level folded nodes in hebi8-line.
+type Hebi8NodeKind string
+
+const (
+	Hebi8NodeSegment Hebi8NodeKind = "segment"
+	Hebi8NodeFold    Hebi8NodeKind = "fold"
+)
+
+var AllHebi8NodeKinds = []Hebi8NodeKind{
+	Hebi8NodeSegment,
+	Hebi8NodeFold,
+}
+
+func (v Hebi8NodeKind) IsValid() bool { return slices.Contains(AllHebi8NodeKinds, v) }
+
+// Hebi8SummaryQuality records whether a node summary was model/user written or deterministically synthesized.
+type Hebi8SummaryQuality string
+
+const (
+	Hebi8SummaryWritten  Hebi8SummaryQuality = "written"
+	Hebi8SummaryFallback Hebi8SummaryQuality = "fallback"
+)
+
+var AllHebi8SummaryQualities = []Hebi8SummaryQuality{
+	Hebi8SummaryWritten,
+	Hebi8SummaryFallback,
+}
+
+func (v Hebi8SummaryQuality) IsValid() bool { return slices.Contains(AllHebi8SummaryQualities, v) }
 
 // IsVirtualProjectID reports whether projectID is a built-in non-repository virtual project (_scratch or _pa).
 func IsVirtualProjectID(projectID string) bool {

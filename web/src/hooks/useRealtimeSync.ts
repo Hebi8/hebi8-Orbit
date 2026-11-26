@@ -38,9 +38,13 @@ export function collectInvalidations(events: EventRecord[]): unknown[][] {
 
     if (kind.startsWith('task.')) {
       add('task-timeline', tid);
+      if (pid === '_pa') add('hebi8-main');
       if (kind === 'task.source_added' || kind === 'task.source_removed') continue;
       add('bootstrap');
       add('project-tasks', pid);
+      add('all-tasks');
+      add('archived-tasks');
+      add('global-artifacts');
       if (kind === 'task.project_bound') {
         add('project-tasks', strField(p, 'fromProjectId'));
         add('project-tasks', strField(p, 'toProjectId'));
@@ -51,6 +55,7 @@ export function collectInvalidations(events: EventRecord[]): unknown[][] {
       add('task-timeline', tid);
       add('attempt-raw', aid);
       add('project-tasks', pid);
+      if (pid === '_pa') add('hebi8-main');
       add('bootstrap');
       for (const did of strListField(p, 'deliveryIds')) add('delivery', did);
       for (const did of strListField(p, 'revertedDeliveryIds')) add('delivery', did);
@@ -133,6 +138,13 @@ export function collectInvalidations(events: EventRecord[]): unknown[][] {
     if (kind === 'pa.turn' || kind === 'pa.thread_created' || kind === 'pa.action_executed') {
       add('pa-threads');
       add('pa-thread');
+      add('bootstrap');
+      continue;
+    }
+    if (kind === 'hebi8.folded') {
+      add('task-timeline', tid);
+      add('hebi8-main');
+      add('hebi8-line');
       add('bootstrap');
       continue;
     }

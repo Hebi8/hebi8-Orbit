@@ -18,6 +18,7 @@ import {
 } from './lib/api';
 import { hasUrgentSession } from './lib/format';
 import { navigate, parseHash, paths, replaceHash, useRoute } from './lib/router';
+import { ArchivedPage } from './pages/ArchivedPage';
 import { ArtifactsPage } from './pages/ArtifactsPage';
 import { HomePage } from './pages/HomePage';
 import { NewThreadPage } from './pages/NewThreadPage';
@@ -32,10 +33,23 @@ import { ReviewOverlay } from './windows/ReviewOverlay';
 
 function Toast() {
   const t = useWorkbenchStore((s) => s.toast);
+  const clearToast = useWorkbenchStore((s) => s.clearToast);
   if (!t) return null;
   return (
     <div className={`toast ${t.tone === 'err' ? 'err' : ''}`} role="status" key={t.id}>
-      {t.text}
+      <span>{t.text}</span>
+      {t.action && (
+        <button
+          type="button"
+          className="toast-act"
+          onClick={() => {
+            t.action?.onClick();
+            clearToast(t.id);
+          }}
+        >
+          {t.action.label}
+        </button>
+      )}
     </div>
   );
 }
@@ -382,6 +396,9 @@ export function App() {
       break;
     case 'artifacts':
       page = <ArtifactsPage />;
+      break;
+    case 'archived':
+      page = <ArchivedPage boot={boot} />;
       break;
     case 'new':
       page = (

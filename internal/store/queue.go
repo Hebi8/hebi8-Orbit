@@ -294,11 +294,15 @@ func (s *Store) EnqueuePendingInput(
 
 	err := s.WithWriteTx(ctx, func(tx *sql.Tx) error {
 		var projectID string
-		if err := tx.QueryRowContext(ctx, `SELECT project_id FROM tasks WHERE task_id = ?`, taskID).Scan(&projectID); err != nil {
+		var archivedAt sql.NullInt64
+		if err := tx.QueryRowContext(ctx, `SELECT project_id, archived_at FROM tasks WHERE task_id = ?`, taskID).Scan(&projectID, &archivedAt); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return fmt.Errorf("%w: task %s", ErrNotFound, taskID)
 			}
 			return err
+		}
+		if archivedAt.Valid {
+			return fmt.Errorf("%w: task %s", ErrTaskArchived, taskID)
 		}
 
 		var nextPos int
@@ -533,11 +537,15 @@ func (s *Store) ReorderPendingInputs(ctx context.Context, taskID string, ordered
 
 	err := s.WithWriteTx(ctx, func(tx *sql.Tx) error {
 		var projectID string
-		if err := tx.QueryRowContext(ctx, `SELECT project_id FROM tasks WHERE task_id = ?`, taskID).Scan(&projectID); err != nil {
+		var archivedAt sql.NullInt64
+		if err := tx.QueryRowContext(ctx, `SELECT project_id, archived_at FROM tasks WHERE task_id = ?`, taskID).Scan(&projectID, &archivedAt); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return fmt.Errorf("%w: task %s", ErrNotFound, taskID)
 			}
 			return err
+		}
+		if archivedAt.Valid {
+			return fmt.Errorf("%w: task %s", ErrTaskArchived, taskID)
 		}
 
 		// Load current queued IDs
@@ -706,15 +714,19 @@ func (s *Store) SubmitFollowupAtomic(ctx context.Context, p SubmitFollowupParams
 
 		var projectID, prefAdapter, desiredCfgJSON, reqResJSON string
 		var activeAtt, latestDlv sql.NullString
+		var archivedAt sql.NullInt64
 		err := tx.QueryRowContext(ctx, `
-			SELECT project_id, active_attempt_id, latest_delivery_id, preferred_adapter, desired_config_json, required_resources
+			SELECT project_id, active_attempt_id, latest_delivery_id, preferred_adapter, desired_config_json, required_resources, archived_at
 			FROM tasks WHERE task_id = ?
-		`, p.TaskID).Scan(&projectID, &activeAtt, &latestDlv, &prefAdapter, &desiredCfgJSON, &reqResJSON)
+		`, p.TaskID).Scan(&projectID, &activeAtt, &latestDlv, &prefAdapter, &desiredCfgJSON, &reqResJSON, &archivedAt)
 		if errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("%w: task %s", ErrNotFound, p.TaskID)
 		}
 		if err != nil {
 			return err
+		}
+		if archivedAt.Valid {
+			return fmt.Errorf("%w: task %s", ErrTaskArchived, p.TaskID)
 		}
 
 		adapter := p.Adapter
@@ -1057,11 +1069,15 @@ func (s *Store) SteerPendingInput(ctx context.Context, taskID, inputID, actorID 
 	err := s.WithWriteTx(ctx, func(tx *sql.Tx) error {
 		var projectID string
 		var activeAtt sql.NullString
-		if err := tx.QueryRowContext(ctx, `SELECT project_id, active_attempt_id FROM tasks WHERE task_id = ?`, taskID).Scan(&projectID, &activeAtt); err != nil {
+		var archivedAt sql.NullInt64
+		if err := tx.QueryRowContext(ctx, `SELECT project_id, active_attempt_id, archived_at FROM tasks WHERE task_id = ?`, taskID).Scan(&projectID, &activeAtt, &archivedAt); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return fmt.Errorf("%w: task %s", ErrNotFound, taskID)
 			}
 			return err
+		}
+		if archivedAt.Valid {
+			return fmt.Errorf("%w: task %s", ErrTaskArchived, taskID)
 		}
 
 		rows, err := tx.QueryContext(ctx, `
@@ -1212,16 +1228,20 @@ func (s *Store) DispatchAnnotations(ctx context.Context, p DispatchAnnotationsPa
 	err := s.WithWriteTx(ctx, func(tx *sql.Tx) error {
 		var projectID string
 		var activeAtt, latestDlv sql.NullString
+		var archivedAt sql.NullInt64
 		var prefAdapter, desiredCfgJSON, reqResJSON string
 		err := tx.QueryRowContext(ctx, `
-			SELECT project_id, active_attempt_id, latest_delivery_id, preferred_adapter, desired_config_json, required_resources
+			SELECT project_id, active_attempt_id, latest_delivery_id, preferred_adapter, desired_config_json, required_resources, archived_at
 			FROM tasks WHERE task_id = ?
-		`, p.TaskID).Scan(&projectID, &activeAtt, &latestDlv, &prefAdapter, &desiredCfgJSON, &reqResJSON)
+		`, p.TaskID).Scan(&projectID, &activeAtt, &latestDlv, &prefAdapter, &desiredCfgJSON, &reqResJSON, &archivedAt)
 		if errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("%w: task %s", ErrNotFound, p.TaskID)
 		}
 		if err != nil {
 			return err
+		}
+		if archivedAt.Valid {
+			return fmt.Errorf("%w: task %s", ErrTaskArchived, p.TaskID)
 		}
 
 		// B11: If task is idle, enforce needs_verification gate BEFORE transitioning annotations!
@@ -1528,15 +1548,20 @@ func (s *Store) ConsumeNextPendingInput(ctx context.Context, p ConsumeNextPendin
 	err := s.WithWriteTx(ctx, func(tx *sql.Tx) error {
 		var projectID, prefAdapter, desiredCfgJSON, reqResJSON string
 		var activeAtt, latestDlv sql.NullString
+		var archivedAt sql.NullInt64
 		err := tx.QueryRowContext(ctx, `
-			SELECT project_id, active_attempt_id, latest_delivery_id, preferred_adapter, desired_config_json, required_resources
+			SELECT project_id, active_attempt_id, latest_delivery_id, preferred_adapter, desired_config_json, required_resources, archived_at
 			FROM tasks WHERE task_id = ?
-		`, p.TaskID).Scan(&projectID, &activeAtt, &latestDlv, &prefAdapter, &desiredCfgJSON, &reqResJSON)
+		`, p.TaskID).Scan(&projectID, &activeAtt, &latestDlv, &prefAdapter, &desiredCfgJSON, &reqResJSON, &archivedAt)
 		if errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("%w: task %s", ErrNotFound, p.TaskID)
 		}
 		if err != nil {
 			return err
+		}
+		if archivedAt.Valid {
+			_, _ = tx.ExecContext(ctx, `UPDATE tasks SET pending_queue_drain = 0, pending_steer_input_id = NULL WHERE task_id = ?`, p.TaskID)
+			return nil
 		}
 		if activeAtt.Valid && activeAtt.String != "" {
 			return nil

@@ -205,7 +205,7 @@ func main() {
 				hub := getHubURL()
 				target := setupOrigin + "/"
 				if hub != "" {
-					target = hub + "/#/pa"
+					target = hub + "/#/hebi8"
 				}
 				mygo.App.Focus()
 				openMainWindow(target)
@@ -294,9 +294,9 @@ func buildAppMenu(
 					Click:       func(_ *mygo.MenuItem, _ *mygo.Window) { navigateHash("#/") },
 				},
 				{
-					Label:       "PA 助手",
+					Label:       "Hebi8",
 					Accelerator: "CmdOrCtrl+2",
-					Click:       func(_ *mygo.MenuItem, _ *mygo.Window) { navigateHash("#/pa") },
+					Click:       func(_ *mygo.MenuItem, _ *mygo.Window) { navigateHash("#/hebi8") },
 				},
 				{
 					Label:       "Artifacts",
@@ -345,6 +345,9 @@ func startSetupServer(
 		return "", nil, err
 	}
 	setupOrigin := "http://" + ln.Addr().String()
+	if tcpAddr, ok := ln.Addr().(*net.TCPAddr); ok && tcpAddr.Port > 0 && runtimeMgr != nil {
+		runtimeMgr.SetDesktopHelperPort(tcpAddr.Port)
+	}
 	checkSetupOrigin := func(w http.ResponseWriter, r *http.Request) bool {
 		if r.Header.Get("X-Orbit-Setup") != "1" {
 			w.WriteHeader(http.StatusForbidden)
@@ -411,6 +414,9 @@ func startSetupServer(
 			"agents": ProbeLocalAgentsSummary(),
 		})
 	})
+	localSSHHandler := newLocalSSHCandidatesHandler(getHubURL, setupOrigin, SSHMatchOptions{})
+	mux.HandleFunc("GET /api/local-ssh-candidates", localSSHHandler)
+	mux.HandleFunc("OPTIONS /api/local-ssh-candidates", localSSHHandler)
 	mux.HandleFunc("POST /api/switch", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if !checkSetupOrigin(w, r) {
@@ -561,4 +567,42 @@ func startSetupServer(
 		_ = srv.Shutdown(ctx)
 	}
 	return "http://" + ln.Addr().String(), cleanup, nil
+}
+
+// newLocalSSHCandidatesHandler serves local ~/.ssh/config matching ONLY to the currently
+// connected Orbit Hub origin (or the embedded setupOrigin) via strict Origin + CORS checks,
+// preventing arbitrary websites from probing the user's local SSH config.
+func newLocalSSHCandidatesHandler(getHubURL func() string, setupOrigin string, opts SSHMatchOptions) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		origin := strings.TrimSpace(r.Header.Get("Origin"))
+		hubURL := ""
+		if getHubURL != nil {
+			hubURL = strings.TrimSpace(getHubURL())
+		}
+		allowed := origin != "" && ((hubURL != "" && sameOriginStrings(origin, hubURL)) || (setupOrigin != "" && sameOriginStrings(origin, setupOrigin)))
+		if !allowed {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "forbidden origin"})
+			return
+		}
+		w.Header().Set("Access-Control-Allow-Origin", origin)
+		w.Header().Set("Vary", "Origin")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		q := r.URL.Query()
+		target := SSHTarget{
+			MachineID:     strings.TrimSpace(q.Get("machineId")),
+			DisplayName:   strings.TrimSpace(q.Get("name")),
+			TailscaleHost: strings.TrimSpace(q.Get("host")),
+			SSHAlias:      strings.TrimSpace(q.Get("sshAlias")),
+		}
+		res := MatchLocalSSHConfig(r.Context(), target, opts)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(res)
+	}
 }

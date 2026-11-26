@@ -104,8 +104,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return runTasks(ctx, args[1:], stdout, stderr)
 	case "approvals", "approval":
 		return runApprovals(ctx, args[1:], stdout, stderr)
-	case "pa":
-		return runPA(ctx, args[1:], stdout, stderr)
+	case "hebi8", "pa":
+		return runHebi8(ctx, args[1:], stdout, stderr)
 	case "artifacts", "artifact":
 		return runArtifacts(ctx, args[1:], stdout, stderr)
 	case "doctor":
@@ -132,7 +132,8 @@ func printUsage(w io.Writer) {
   orbit status [--hub <url>] [--json]
   orbit tasks [list|new|show|followup|cancel|retry] ...
   orbit approvals [list|allow|reject] ...
-  orbit pa [--thread <id>] [--new] [--json] "<message>"
+  orbit hebi8 "<message>"                                   Send a turn to the single Hebi8 main conversation (alias: orbit pa)
+  orbit hebi8 [fold|line|expand <nodeId>|pin <nodeId>]      Manage Hebi8 Fold-Rollover context tree
   orbit artifacts [--project <id>] [--kind <type>] [--json]
   orbit brief [--since-hours 24] [--project <id>] [--json]
   orbit deliver --summary "..." [--final] [--attach <file>...]                               (inside runner worktree via ORBIT_RUNNER_SOCK)

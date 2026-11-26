@@ -8,9 +8,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log"
 	"net/url"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -25,6 +28,14 @@ import (
 
 // ErrSyncPaused is returned when Ryugi syncing/acking is paused during a maintenance/backup window.
 var ErrSyncPaused = errors.New("ryugi sync is paused during maintenance window")
+
+// ErrInvalidArtifactPath indicates a malformed or out-of-bounds Ryugi artifact path.
+var ErrInvalidArtifactPath = errors.New("invalid ryugi artifact path")
+
+// ErrArtifactTooLarge indicates a frozen artifact source file exceeds the inline preview cap.
+var ErrArtifactTooLarge = errors.New("ryugi artifact source file exceeds 4 MiB limit")
+
+const maxRyugiContentBytes = 4 << 20 // 4 MiB
 
 // RyugiRunner executes ryugi CLI commands (replaceable in unit tests).
 type RyugiRunner interface {
@@ -93,9 +104,19 @@ type RyugiBridge struct {
 	pollInterval time.Duration
 	isPausedFn   func() bool
 
-	mu       sync.Mutex
-	inFlight map[string]*singleFlightEntry
-	syncOpMu sync.RWMutex // held for read during SyncBinding (fetch->commit->ack); DrainInFlight acquires write lock
+	mu          sync.Mutex
+	inFlight    map[string]*singleFlightEntry
+	ensureMu    sync.Mutex   // serializes ryugi start / self-heal re-registration to avoid spawn storms
+	syncOpMu      sync.RWMutex // held for read during SyncBinding (fetch->commit->ack); DrainInFlight acquires write lock
+	regFlightMu   sync.Mutex
+	regFlight     map[string]*ryugiRegFlight
+	deliveryLocks *deliveryLocker
+}
+
+type ryugiRegFlight struct {
+	done     chan struct{}
+	bindings []protocol.RyugiBindingView
+	err      error
 }
 
 type singleFlightEntry struct {
@@ -104,16 +125,17 @@ type singleFlightEntry struct {
 
 // RyugiBridgeConfig configures a RyugiBridge instance.
 type RyugiBridgeConfig struct {
-	Store        *store.Store
-	Broker       *EventBroker
-	Runner       RyugiRunner
-	DataDir      string
-	Host         string
-	URLHost      string
-	Port         int
-	PublicOrigin string
-	PollInterval time.Duration
-	IsPaused     func() bool
+	Store         *store.Store
+	Broker        *EventBroker
+	Runner        RyugiRunner
+	DataDir       string
+	Host          string
+	URLHost       string
+	Port          int
+	PublicOrigin  string
+	PollInterval  time.Duration
+	IsPaused      func() bool
+	DeliveryLocks *deliveryLocker
 }
 
 func NewRyugiBridge(cfg RyugiBridgeConfig) *RyugiBridge {
@@ -121,18 +143,24 @@ func NewRyugiBridge(cfg RyugiBridgeConfig) *RyugiBridge {
 	if interval <= 0 {
 		interval = 6 * time.Second
 	}
+	dl := cfg.DeliveryLocks
+	if dl == nil {
+		dl = newDeliveryLocker()
+	}
 	return &RyugiBridge{
-		store:        cfg.Store,
-		broker:       cfg.Broker,
-		runner:       cfg.Runner,
-		dataDir:      cfg.DataDir,
-		host:         strings.TrimSpace(cfg.Host),
-		urlHost:      strings.TrimSpace(cfg.URLHost),
-		port:         cfg.Port,
-		publicOrigin: cfg.PublicOrigin,
-		pollInterval: interval,
-		isPausedFn:   cfg.IsPaused,
-		inFlight:     map[string]*singleFlightEntry{},
+		store:         cfg.Store,
+		broker:        cfg.Broker,
+		runner:        cfg.Runner,
+		dataDir:       cfg.DataDir,
+		host:          strings.TrimSpace(cfg.Host),
+		urlHost:       strings.TrimSpace(cfg.URLHost),
+		port:          cfg.Port,
+		publicOrigin:  cfg.PublicOrigin,
+		pollInterval:  interval,
+		isPausedFn:    cfg.IsPaused,
+		inFlight:      map[string]*singleFlightEntry{},
+		regFlight:     map[string]*ryugiRegFlight{},
+		deliveryLocks: dl,
 	}
 }
 
@@ -157,14 +185,22 @@ func (b *RyugiBridge) CalibrateActiveBindings(ctx context.Context) error {
 	seen := map[string]struct{}{}
 	var errs []string
 	for _, rec := range records {
-		key := rec.DeliveryID + "\x00" + rec.FrozenProjectDir
-		if _, dup := seen[key]; dup {
+		trustedDir, ok := safeDeliveryFrozenDir(b.dataDir, rec.DeliveryID)
+		if !ok {
 			continue
 		}
-		seen[key] = struct{}{}
-		if _, err := gitops.CalibrateFrozenSnapshot(rec.FrozenProjectDir, rec.DeliveryID); err != nil {
-			errs = append(errs, fmt.Sprintf("%s (%s): %v", rec.DeliveryID, rec.FrozenProjectDir, err))
+		if _, dup := seen[trustedDir]; dup {
+			continue
 		}
+		seen[trustedDir] = struct{}{}
+		unlock := b.deliveryLocks.Lock(rec.DeliveryID)
+		hasPending, _ := b.store.HasPendingDeliveryCleanup(ctx, rec.DeliveryID)
+		if !hasPending {
+			if _, err := gitops.CalibrateFrozenSnapshot(trustedDir, rec.DeliveryID); err != nil {
+				errs = append(errs, fmt.Sprintf("%s (%s): %v", rec.DeliveryID, trustedDir, err))
+			}
+		}
+		unlock()
 	}
 	if len(errs) > 0 {
 		return fmt.Errorf("calibrate active ryugi bindings: %s", strings.Join(errs, "; "))
@@ -278,12 +314,70 @@ type ryugiChangesData struct {
 }
 
 // RegisterDelivery exports a frozen snapshot for deliveryID and registers each
-// .ryugi/artifacts/<type>/<slug> with the Ryugi sidecar. Emits delivery.ryugi_updated
-// in the same DB transaction and broadcasts a WS notification so clients refresh URLs live.
+// .ryugi/artifacts/<type>/<slug> with the Ryugi sidecar. Coalesces concurrent registrations
+// for the same deliveryID (singleflight) so concurrent open/self-heal requests share one start pass.
 func (b *RyugiBridge) RegisterDelivery(ctx context.Context, deliveryID string) ([]protocol.RyugiBindingView, error) {
+	b.regFlightMu.Lock()
+	if existing, ok := b.regFlight[deliveryID]; ok {
+		b.regFlightMu.Unlock()
+		select {
+		case <-existing.done:
+			if existing.bindings == nil {
+				return nil, existing.err
+			}
+			copied := make([]protocol.RyugiBindingView, len(existing.bindings))
+			copy(copied, existing.bindings)
+			return copied, existing.err
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	flight := &ryugiRegFlight{done: make(chan struct{})}
+	b.regFlight[deliveryID] = flight
+	b.regFlightMu.Unlock()
+
+	defer func() {
+		b.regFlightMu.Lock()
+		delete(b.regFlight, deliveryID)
+		b.regFlightMu.Unlock()
+		close(flight.done)
+	}()
+
+	// Decouple execution from a single caller's cancellation when coalescing? Keep caller ctx
+	// so single caller timeouts still abort cleanly while concurrent callers share the outcome.
+	bindings, err := b.registerDeliveryInner(ctx, deliveryID)
+	flight.bindings = bindings
+	flight.err = err
+	if bindings == nil {
+		return nil, err
+	}
+	copied := make([]protocol.RyugiBindingView, len(bindings))
+	copy(copied, bindings)
+	return copied, err
+}
+
+func (b *RyugiBridge) registerDeliveryInner(ctx context.Context, deliveryID string) ([]protocol.RyugiBindingView, error) {
+	// Hold the shared per-deliveryID lifecycle mutex across the ENTIRE registration pipeline:
+	// reading delivery owner -> pending cleanup check -> ExportFrozenSnapshot (staging + Rename)
+	// -> ryugi start -> SaveRyugiBindingsForOwner. Any concurrent DeleteTask cleanup or same-ID
+	// re-import MUST wait until this registration completes and releases the lock.
+	unlock := b.deliveryLocks.Lock(strings.TrimSpace(deliveryID))
+	defer unlock()
+
+	if hasPending, err := b.store.HasPendingDeliveryCleanup(ctx, deliveryID); err != nil {
+		return nil, err
+	} else if hasPending {
+		return nil, fmt.Errorf("%w: delivery %s awaits snapshot cleanup", store.ErrDeliveryCleanupPending, deliveryID)
+	}
+
 	dlv, _, _, proj, err := b.store.GetDeliveryDetail(ctx, deliveryID)
 	if err != nil {
 		return nil, err
+	}
+	expectedOwner := &store.DeliveryOwnerExpectation{
+		ProjectID: dlv.ProjectID,
+		TaskID:    dlv.TaskID,
+		HeadSHA:   dlv.HeadSHA,
 	}
 
 	locators := dlv.Manifest.RyugiArtifacts
@@ -298,10 +392,13 @@ func (b *RyugiBridge) RegisterDelivery(ctx context.Context, deliveryID string) (
 		return nil, nil
 	}
 
-	frozenDir := filepath.Join(b.dataDir, "deliveries", deliveryID)
+	frozenDir, ok := safeDeliveryFrozenDir(b.dataDir, deliveryID)
+	if !ok {
+		return nil, fmt.Errorf("%w: unsafe deliveryId %q", ErrInvalidArtifactPath, deliveryID)
+	}
 	exported, err := gitops.ExportFrozenSnapshot(ctx, proj.MirrorBarePath, dlv.HeadSHA, deliveryID, frozenDir)
 	if err != nil {
-		_, ev, _ := b.store.SaveRyugiBindings(ctx, deliveryID, frozenDir, protocol.RyugiSyncFailed, nil)
+		_, ev, _ := b.store.SaveRyugiBindingsForOwner(ctx, deliveryID, expectedOwner, frozenDir, protocol.RyugiSyncFailed, nil)
 		if ev != nil && b.broker != nil {
 			b.broker.Broadcast(*ev)
 		}
@@ -310,6 +407,9 @@ func (b *RyugiBridge) RegisterDelivery(ctx context.Context, deliveryID string) (
 	if len(exported) == 0 {
 		return nil, nil
 	}
+
+	b.ensureMu.Lock()
+	defer b.ensureMu.Unlock()
 
 	var bindings []protocol.RyugiBindingView
 	var regErrors []string
@@ -370,7 +470,7 @@ func (b *RyugiBridge) RegisterDelivery(ctx context.Context, deliveryID string) (
 	}
 
 	if len(regErrors) > 0 && len(bindings) == 0 {
-		_, ev, _ := b.store.SaveRyugiBindings(ctx, deliveryID, frozenDir, protocol.RyugiSyncFailed, nil)
+		_, ev, _ := b.store.SaveRyugiBindingsForOwner(ctx, deliveryID, expectedOwner, frozenDir, protocol.RyugiSyncFailed, nil)
 		if ev != nil && b.broker != nil {
 			b.broker.Broadcast(*ev)
 		}
@@ -381,7 +481,7 @@ func (b *RyugiBridge) RegisterDelivery(ctx context.Context, deliveryID string) (
 	if len(regErrors) > 0 {
 		syncState = protocol.RyugiSyncFailed
 	}
-	saved, ev, err := b.store.SaveRyugiBindings(ctx, deliveryID, frozenDir, syncState, bindings)
+	saved, ev, err := b.store.SaveRyugiBindingsForOwner(ctx, deliveryID, expectedOwner, frozenDir, syncState, bindings)
 	if err != nil {
 		return nil, err
 	}
@@ -427,6 +527,13 @@ func (b *RyugiBridge) SyncDelivery(ctx context.Context, deliveryID string) (prot
 	records, err := b.store.ListRyugiBindings(ctx, deliveryID, false)
 	if err != nil {
 		return resp, err
+	}
+	if len(records) == 0 && len(dlv.Manifest.RyugiArtifacts) > 0 {
+		if _, regErr := b.RegisterDelivery(ctx, deliveryID); regErr != nil {
+			resp.Errors = append(resp.Errors, regErr.Error())
+		} else if refreshed, rErr := b.store.ListRyugiBindings(ctx, deliveryID, false); rErr == nil {
+			records = refreshed
+		}
 	}
 
 	for _, rec := range records {
@@ -487,8 +594,20 @@ func (b *RyugiBridge) SyncBinding(ctx context.Context, bindingID string) (Bindin
 		return BindingSyncResult{}, store.ErrNotFound
 	}
 
-	// 1. Fetch comment list (--sections all --detail) + paginate all pages collecting every page receipt
+	// 1. Fetch comment list (--sections all --detail) + paginate all pages collecting every page receipt.
+	// If the managed Ryugi server is down (E_SERVER_NOT_RUNNING / E_SERVER_UNREACHABLE / connection refused),
+	// self-heal once by re-registering the delivery (which restarts the dedicated server and refreshes openUrl).
+	healed := false
 	sections, err := b.fetchAllCommentSections(ctx, rec.FrozenProjectDir, rec.ArtifactLocator)
+	if err != nil && isRyugiServerNotRunningErr(err) {
+		if _, regErr := b.RegisterDelivery(ctx, rec.DeliveryID); regErr == nil {
+			healed = true
+			if refreshed, rErr := b.findBindingRecord(ctx, bindingID); rErr == nil && refreshed != nil {
+				rec = refreshed
+			}
+			sections, err = b.fetchAllCommentSections(ctx, rec.FrozenProjectDir, rec.ArtifactLocator)
+		}
+	}
 	if err != nil {
 		return BindingSyncResult{}, err
 	}
@@ -617,6 +736,12 @@ func (b *RyugiBridge) SyncBinding(ctx context.Context, bindingID string) (Bindin
 	var changesReceipts []string
 	if isDocumentLikeArtifact(rec.ArtifactLocator) {
 		diffText, chReceipts, chErr := b.fetchDocumentChanges(ctx, rec.FrozenProjectDir, rec.ArtifactLocator)
+		if chErr != nil && !healed && isRyugiServerNotRunningErr(chErr) {
+			if _, regErr := b.RegisterDelivery(ctx, rec.DeliveryID); regErr == nil {
+				healed = true
+				diffText, chReceipts, chErr = b.fetchDocumentChanges(ctx, rec.FrozenProjectDir, rec.ArtifactLocator)
+			}
+		}
 		if chErr != nil {
 			result.Errors = append(result.Errors, fmt.Sprintf("changes sync failed: %v", chErr))
 		} else {
@@ -647,6 +772,10 @@ func (b *RyugiBridge) SyncBinding(ctx context.Context, bindingID string) (Bindin
 		lastChangesRcpt,
 	)
 	if err != nil {
+		// If the binding became inactive or its task was archived concurrently, skip writes and preserve receipts!
+		if errors.Is(err, store.ErrTaskArchived) {
+			return BindingSyncResult{}, nil
+		}
 		// NEVER ack any receipt if SQLite commit failed!
 		return BindingSyncResult{}, fmt.Errorf("commit ryugi sync batch: %w", err)
 	}
@@ -1037,4 +1166,317 @@ func SortedKeys[V any](m map[string]V) []string {
 	}
 	sort.Strings(keys)
 	return keys
+}
+
+func isRyugiServerNotRunningErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	low := strings.ToLower(err.Error())
+	for _, needle := range []string{
+		"e_server_not_running",
+		"e_server_unreachable",
+		"server not running",
+		"connection refused",
+		"econnrefused",
+	} {
+		if strings.Contains(low, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+func (b *RyugiBridge) findBindingRecord(ctx context.Context, bindingID string) (*store.RyugiBindingRecord, error) {
+	records, err := b.store.ListRyugiBindings(ctx, "", false)
+	if err != nil {
+		return nil, err
+	}
+	for i := range records {
+		if records[i].BindingID == bindingID {
+			rec := records[i]
+			return &rec, nil
+		}
+	}
+	return nil, store.ErrNotFound
+}
+
+// EnsureDeliveryRegistered ensures the managed Ryugi server is running and the frozen snapshot
+// for deliveryID is registered with fresh openUrls (containing latest ?key=).
+func (b *RyugiBridge) EnsureDeliveryRegistered(ctx context.Context, deliveryID string) ([]protocol.RyugiBindingView, error) {
+	bindings, err := b.RegisterDelivery(ctx, deliveryID)
+	if err != nil {
+		return bindings, err
+	}
+	if len(bindings) == 0 {
+		_, existing, _, _, dErr := b.store.GetDeliveryDetail(ctx, deliveryID)
+		if dErr != nil {
+			return nil, dErr
+		}
+		return existing, nil
+	}
+	return bindings, nil
+}
+
+// EnsureActiveBindingsRegistered runs asynchronously on Hub startup to re-register all active=1
+// bindings whose frozen snapshot directories still exist, healing stale ports or missing ?key= URLs.
+func (b *RyugiBridge) EnsureActiveBindingsRegistered(ctx context.Context) {
+	records, err := b.store.ListRyugiBindings(ctx, "", true)
+	if err != nil {
+		log.Printf("ryugi startup re-register: list bindings: %v", err)
+		return
+	}
+	seenDeliveries := map[string]bool{}
+	for _, rec := range records {
+		if ctx.Err() != nil {
+			return
+		}
+		if seenDeliveries[rec.DeliveryID] {
+			continue
+		}
+		trustedDir, ok := safeDeliveryFrozenDir(b.dataDir, rec.DeliveryID)
+		if !ok {
+			continue
+		}
+		if info, sErr := os.Stat(trustedDir); sErr != nil || !info.IsDir() {
+			continue
+		}
+		seenDeliveries[rec.DeliveryID] = true
+		if _, rErr := b.RegisterDelivery(ctx, rec.DeliveryID); rErr != nil {
+			log.Printf("ryugi startup re-register delivery %s: %v", rec.DeliveryID, rErr)
+		}
+	}
+}
+
+// ReadBindingContent safely reads the primary source file of a frozen Ryugi artifact for read-only
+// inline preview in Orbit. Uses os.OpenRoot anchored strictly to <dataDir>/deliveries/<deliveryID>
+// and stats the already-open *os.File to eliminate path-validation TOCTOU races and symlink escapes.
+func (b *RyugiBridge) ReadBindingContent(ctx context.Context, deliveryID, bindingID string) (protocol.RyugiArtifactContentResponse, error) {
+	unlock := b.deliveryLocks.Lock(strings.TrimSpace(deliveryID))
+	defer unlock()
+
+	_, bindings, _, _, err := b.store.GetDeliveryDetail(ctx, deliveryID)
+	if err != nil {
+		return protocol.RyugiArtifactContentResponse{}, err
+	}
+	var target *protocol.RyugiBindingView
+	for i := range bindings {
+		if bindings[i].BindingID == bindingID {
+			target = &bindings[i]
+			break
+		}
+	}
+	if target == nil {
+		return protocol.RyugiArtifactContentResponse{}, fmt.Errorf("%w: binding %s", store.ErrNotFound, bindingID)
+	}
+
+	trustedFrozenDir, ok := safeDeliveryFrozenDir(b.dataDir, deliveryID)
+	if !ok {
+		return protocol.RyugiArtifactContentResponse{}, fmt.Errorf("%w: unsafe deliveryId %q", ErrInvalidArtifactPath, deliveryID)
+	}
+
+	locator := strings.TrimSpace(target.ArtifactLocator)
+	if !isSafeArtifactLocator(locator) {
+		return protocol.RyugiArtifactContentResponse{}, fmt.Errorf("%w: unsafe locator %q", ErrInvalidArtifactPath, locator)
+	}
+
+	deliveryRoot, err := os.OpenRoot(trustedFrozenDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return protocol.RyugiArtifactContentResponse{}, fmt.Errorf("%w: frozen snapshot dir not found", store.ErrNotFound)
+		}
+		return protocol.RyugiArtifactContentResponse{}, err
+	}
+	defer deliveryRoot.Close()
+
+	// Two-layer os.Root isolation: lock reads strictly inside <frozenDir>/.ryugi/artifacts/<locator>
+	// so symlinks pointing to other files in the SAME frozen snapshot (or sibling artifacts) are rejected!
+	artRelDir := path.Join(".ryugi", "artifacts", locator)
+	artifactRoot, err := deliveryRoot.OpenRoot(artRelDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return protocol.RyugiArtifactContentResponse{}, fmt.Errorf("%w: artifact dir not found", store.ErrNotFound)
+		}
+		if isRootEscapeError(err) {
+			return protocol.RyugiArtifactContentResponse{}, fmt.Errorf("%w: %v", ErrInvalidArtifactPath, err)
+		}
+		return protocol.RyugiArtifactContentResponse{}, err
+	}
+	defer artifactRoot.Close()
+
+	filename, err := pickPrimaryRyugiFileInArtifactRoot(artifactRoot, locator)
+	if err != nil {
+		return protocol.RyugiArtifactContentResponse{}, err
+	}
+
+	f, err := artifactRoot.Open(filename)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return protocol.RyugiArtifactContentResponse{}, fmt.Errorf("%w: artifact file not found", store.ErrNotFound)
+		}
+		if isRootEscapeError(err) {
+			return protocol.RyugiArtifactContentResponse{}, fmt.Errorf("%w: %v", ErrInvalidArtifactPath, err)
+		}
+		return protocol.RyugiArtifactContentResponse{}, err
+	}
+	defer f.Close()
+
+	fi, err := f.Stat()
+	if err != nil {
+		return protocol.RyugiArtifactContentResponse{}, err
+	}
+	if fi.IsDir() || !fi.Mode().IsRegular() {
+		return protocol.RyugiArtifactContentResponse{}, fmt.Errorf("%w: not a regular file", ErrInvalidArtifactPath)
+	}
+	if fi.Size() > maxRyugiContentBytes {
+		return protocol.RyugiArtifactContentResponse{}, ErrArtifactTooLarge
+	}
+
+	raw, err := io.ReadAll(io.LimitReader(f, maxRyugiContentBytes+1))
+	if err != nil {
+		return protocol.RyugiArtifactContentResponse{}, err
+	}
+	if len(raw) > maxRyugiContentBytes {
+		return protocol.RyugiArtifactContentResponse{}, ErrArtifactTooLarge
+	}
+
+	return protocol.RyugiArtifactContentResponse{
+		ContentType: inferRyugiContentType(filename),
+		Filename:    filename,
+		Locator:     locator,
+		Text:        string(raw),
+	}, nil
+}
+
+func isRootEscapeError(err error) bool {
+	if err == nil {
+		return false
+	}
+	low := strings.ToLower(err.Error())
+	return strings.Contains(low, "escapes from parent") ||
+		strings.Contains(low, "outside root") ||
+		strings.Contains(low, "invalid argument") ||
+		strings.Contains(low, "path is not local")
+}
+
+func pickPrimaryRyugiFileInArtifactRoot(artifactRoot *os.Root, locator string) (string, error) {
+	kind := strings.ToLower(strings.SplitN(locator, "/", 2)[0])
+	var preferred []string
+	var preferredExts []string
+	switch kind {
+	case "html":
+		preferred = []string{"index.html", "index.htm"}
+		preferredExts = []string{".html", ".htm"}
+	case "document":
+		preferred = []string{"doc.xml", "document.xml", "doc.md", "index.md"}
+		preferredExts = []string{".xml", ".md", ".markdown"}
+	case "whiteboard":
+		preferred = []string{"scene.excalidraw", "canvas.excalidraw", "board.excalidraw", "canvas.json", "scene.json"}
+		preferredExts = []string{".excalidraw", ".json", ".svg"}
+	case "artboard":
+		preferred = []string{"index.html", "canvas.json", "scene.excalidraw", "artboard.json", "board.svg"}
+		preferredExts = []string{".html", ".svg", ".excalidraw", ".json"}
+	case "slides":
+		preferred = []string{"slides.xml", "doc.xml", "index.html", "slides.md"}
+		preferredExts = []string{".xml", ".html", ".md"}
+	default:
+		preferred = []string{"index.html", "doc.xml", "scene.excalidraw", "canvas.json"}
+		preferredExts = []string{".html", ".xml", ".excalidraw", ".json", ".md", ".svg", ".txt"}
+	}
+
+	dirFile, err := artifactRoot.Open(".")
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "", fmt.Errorf("%w: artifact dir not found", store.ErrNotFound)
+		}
+		if isRootEscapeError(err) {
+			return "", fmt.Errorf("%w: %v", ErrInvalidArtifactPath, err)
+		}
+		return "", err
+	}
+	defer dirFile.Close()
+
+	entries, err := dirFile.ReadDir(-1)
+	if err != nil {
+		return "", err
+	}
+	entryByName := make(map[string]os.DirEntry, len(entries))
+	var names []string
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		n := e.Name()
+		if strings.HasPrefix(n, ".") || n == "comments.json" {
+			continue
+		}
+		entryByName[n] = e
+		names = append(names, n)
+	}
+
+	for _, name := range preferred {
+		if _, ok := entryByName[name]; ok {
+			return name, nil
+		}
+	}
+
+	sort.Strings(names)
+	for _, ext := range preferredExts {
+		for _, n := range names {
+			if strings.EqualFold(filepath.Ext(n), ext) {
+				return n, nil
+			}
+		}
+	}
+	if len(names) > 0 {
+		return names[0], nil
+	}
+	return "", fmt.Errorf("%w: no previewable source file in %s", store.ErrNotFound, locator)
+}
+
+func isSafeArtifactLocator(locator string) bool {
+	if locator == "" || strings.ContainsRune(locator, 0) || strings.Contains(locator, `\`) {
+		return false
+	}
+	if strings.HasPrefix(locator, "/") {
+		return false
+	}
+	parts := strings.Split(locator, "/")
+	if len(parts) < 2 {
+		return false
+	}
+	for _, seg := range parts {
+		if seg == "" || seg == "." || seg == ".." || strings.HasPrefix(seg, ".") {
+			return false
+		}
+	}
+	return true
+}
+
+func isSubPath(base, target string) bool {
+	rel, err := filepath.Rel(base, target)
+	if err != nil {
+		return false
+	}
+	if rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return false
+	}
+	return true
+}
+
+func inferRyugiContentType(filename string) string {
+	switch strings.ToLower(filepath.Ext(filename)) {
+	case ".html", ".htm":
+		return "text/html"
+	case ".xml":
+		return "application/xml"
+	case ".json", ".excalidraw":
+		return "application/json"
+	case ".svg":
+		return "image/svg+xml"
+	case ".md", ".markdown":
+		return "text/markdown"
+	default:
+		return "text/plain"
+	}
 }

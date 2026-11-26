@@ -39,7 +39,7 @@ func DefaultHubConfig() HubConfig {
 		ConfigDir:                "~/.config/hebi8-orbit",
 		HubOrigin:                "http://127.0.0.1:4310",
 		RyugiBin:                 "ryugi",
-		RyugiPort:                27319,
+		RyugiPort:                27329,
 		RyugiPollIntervalSeconds: 6,
 	}
 }

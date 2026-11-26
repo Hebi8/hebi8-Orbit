@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/Hebi8/hebi8-Orbit/internal/protocol"
+	"github.com/Hebi8/hebi8-Orbit/internal/store"
 )
 
 const (
@@ -25,7 +26,7 @@ func (s *Server) resolveReferencedTaskMetas(ctx context.Context, taskIDs []strin
 	}
 	projNameCache := map[string]string{
 		protocol.ScratchProjectID: "Chat",
-		protocol.PAProjectID:      "PA",
+		protocol.PAProjectID:      "Hebi8",
 	}
 	var out []protocol.ReferencedTaskMeta
 	for _, raw := range taskIDs {
@@ -85,6 +86,42 @@ func (s *Server) decorateAttemptPrompt(
 	return strings.Join(parts, "\n\n")
 }
 
+// decorateAttemptPromptForAttempt decorates the prompt for an attempt, injecting:
+// - The deterministic 6-section Hebi8 Fold-Rollover opening on the first fresh-session turn after a fold;
+// - Otherwise the standard workspace snapshot on the very first Hebi8 turn (attemptNo == 1);
+// - Plus any explicitly referenced conversations.
+func (s *Server) decorateAttemptPromptForAttempt(
+	ctx context.Context,
+	att store.AttemptRecord,
+	rawPrompt string,
+	refs []protocol.ReferencedTaskMeta,
+) (string, error) {
+	var parts []string
+	if att.ProjectID == protocol.PAProjectID {
+		opening, ok, err := s.buildHebi8FoldOpeningForAttempt(ctx, att)
+		if err != nil {
+			return "", err
+		}
+		if ok && opening != "" {
+			parts = append(parts, opening)
+		} else if att.AttemptNo == 1 {
+			if ws := s.buildPAWorkspaceSnapshot(ctx); ws != "" {
+				parts = append(parts, ws)
+			}
+		}
+	}
+	if len(refs) > 0 {
+		if refBlock := s.buildReferencedConversationsBlock(ctx, refs); refBlock != "" {
+			parts = append(parts, refBlock)
+		}
+	}
+	if len(parts) == 0 {
+		return rawPrompt, nil
+	}
+	parts = append(parts, rawPrompt)
+	return strings.Join(parts, "\n\n"), nil
+}
+
 func (s *Server) buildPAWorkspaceSnapshot(ctx context.Context) string {
 	s.mu.RLock()
 	yamlMach := s.yamlMachines.Machines
@@ -122,7 +159,7 @@ func (s *Server) buildPAWorkspaceSnapshot(ctx context.Context) string {
 	}
 	projNames := map[string]string{
 		protocol.ScratchProjectID: "Chat",
-		protocol.PAProjectID:      "PA",
+		protocol.PAProjectID:      "Hebi8",
 	}
 	for _, p := range boot.Projects {
 		projNames[p.ProjectID] = p.DisplayName

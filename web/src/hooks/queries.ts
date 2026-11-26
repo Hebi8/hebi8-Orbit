@@ -1,5 +1,5 @@
 import { useQueries, useQuery, useQueryClient } from '@tanstack/react-query';
-import type { EventRecord, ProjectView, TaskSummary } from '../generated/protocol';
+import type { EventRecord, MachineView, ProjectView, TaskSummary } from '../generated/protocol';
 import { api } from '../lib/api';
 
 export function useBootstrap(enabled = true) {
@@ -24,15 +24,41 @@ export function useClientDevices(enabled = true) {
   });
 }
 
-export function useAllTasks(opts?: { limit?: number; excludeProject?: string; q?: string; enabled?: boolean }) {
+export function useAllTasks(opts?: {
+  limit?: number;
+  excludeProject?: string;
+  projectId?: string;
+  q?: string;
+  archived?: 'active' | 'only' | 'all';
+  enabled?: boolean;
+}) {
   const trimmedQ = opts?.q?.trim() ?? '';
+  const archived = opts?.archived ?? 'active';
   return useQuery({
-    queryKey: ['all-tasks', opts?.excludeProject ?? '', opts?.limit ?? 80, trimmedQ],
+    queryKey: ['all-tasks', opts?.excludeProject ?? '', opts?.projectId ?? '', archived, opts?.limit ?? 80, trimmedQ],
     queryFn: () =>
       api.listAllTasks({
         limit: opts?.limit,
         excludeProject: opts?.excludeProject,
+        projectId: opts?.projectId,
         q: trimmedQ || undefined,
+        archived,
+      }),
+    enabled: opts?.enabled ?? true,
+    staleTime: 10_000,
+  });
+}
+
+export function useArchivedTasks(opts?: { projectId?: string; q?: string; limit?: number; enabled?: boolean }) {
+  const trimmedQ = opts?.q?.trim() ?? '';
+  return useQuery({
+    queryKey: ['archived-tasks', opts?.projectId ?? '', opts?.limit ?? 150, trimmedQ],
+    queryFn: () =>
+      api.listAllTasks({
+        limit: opts?.limit ?? 150,
+        projectId: opts?.projectId || undefined,
+        q: trimmedQ || undefined,
+        archived: 'only',
       }),
     enabled: opts?.enabled ?? true,
     staleTime: 10_000,
@@ -48,11 +74,45 @@ export function useGlobalArtifacts(enabled = true) {
   });
 }
 
-export function useProjectTasks(projectId: string | undefined, enabled = true) {
+export function useProjectTasks(
+  projectId: string | undefined,
+  enabled = true,
+  archived: 'active' | 'only' | 'all' = 'active',
+) {
   return useQuery({
-    queryKey: ['project-tasks', projectId],
-    queryFn: () => api.listProjectTasks(projectId!),
+    queryKey: ['project-tasks', projectId, archived],
+    queryFn: () => api.listProjectTasks(projectId!, archived),
     enabled: !!projectId && enabled,
+  });
+}
+
+export function useMachineSSHCandidates(machine?: MachineView | null, enabled = true) {
+  return useQuery({
+    queryKey: [
+      'ssh-candidates',
+      machine?.machineId ?? '',
+      machine?.tailscaleHost ?? '',
+      machine?.sshAlias ?? '',
+      machine?.displayAlias || machine?.displayName || '',
+    ],
+    queryFn: () => api.getMachineSSHCandidates(machine!),
+    enabled: !!machine && enabled,
+    staleTime: 60_000,
+    retry: false,
+  });
+}
+
+export function useRyugiArtifactContent(
+  deliveryId: string | undefined,
+  bindingId: string | undefined,
+  enabled = true,
+) {
+  return useQuery({
+    queryKey: ['ryugi-content', deliveryId, bindingId],
+    queryFn: () => api.getRyugiArtifactContent(deliveryId!, bindingId!),
+    enabled: !!deliveryId && !!bindingId && enabled,
+    staleTime: 60_000,
+    retry: false,
   });
 }
 
@@ -133,6 +193,35 @@ export function usePAThread(threadId: string | undefined) {
     queryKey: ['pa-thread', threadId],
     queryFn: () => api.getPAThread(threadId!),
     enabled: !!threadId,
+  });
+}
+
+export function useHebi8Main(enabled = true) {
+  return useQuery({
+    queryKey: ['hebi8-main'],
+    queryFn: api.getHebi8Main,
+    enabled,
+    staleTime: 5_000,
+  });
+}
+
+export function useHebi8Line(enabled = true) {
+  return useQuery({
+    queryKey: ['hebi8-line'],
+    queryFn: api.getHebi8Line,
+    enabled,
+    staleTime: 10_000,
+  });
+}
+
+export function useHebi8Expand(nodeId: string | undefined, opts?: { offset?: number; limit?: number; enabled?: boolean }) {
+  const offset = opts?.offset ?? 0;
+  const limit = opts?.limit ?? 20;
+  return useQuery({
+    queryKey: ['hebi8-expand', nodeId, offset, limit],
+    queryFn: () => api.expandHebi8Node(nodeId!, { offset, limit }),
+    enabled: !!nodeId && (opts?.enabled ?? true),
+    staleTime: 30_000,
   });
 }
 

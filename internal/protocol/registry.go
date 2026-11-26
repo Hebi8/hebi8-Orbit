@@ -66,6 +66,8 @@ func ExportedEnums() []EnumDef {
 		{Name: "MachineRole", Values: toStrings(AllMachineRoles)},
 		{Name: "ProjectPartKind", Values: toStrings(AllProjectPartKinds)},
 		{Name: "LocationIsolation", Values: toStrings(AllLocationIsolations)},
+		{Name: "Hebi8NodeKind", Values: toStrings(AllHebi8NodeKinds)},
+		{Name: "Hebi8SummaryQuality", Values: toStrings(AllHebi8SummaryQualities)},
 	}
 }
 
@@ -200,6 +202,26 @@ func ExportedDTOTypes() []reflect.Type {
 		reflect.TypeOf(NetworkDiscoverResponse{}),
 		reflect.TypeOf(CompleteOnboardingRequest{}),
 		reflect.TypeOf(CompleteOnboardingResponse{}),
+		// Hebi8 single-line Fold-Rollover DTOs
+		reflect.TypeOf(Hebi8AttemptRange{}),
+		reflect.TypeOf(Hebi8LineNode{}),
+		reflect.TypeOf(Hebi8LineSummary{}),
+		reflect.TypeOf(Hebi8MainResponse{}),
+		reflect.TypeOf(Hebi8FoldRequest{}),
+		reflect.TypeOf(Hebi8FoldResponse{}),
+		reflect.TypeOf(Hebi8LineResponse{}),
+		reflect.TypeOf(Hebi8RawTurn{}),
+		reflect.TypeOf(Hebi8ExpandResponse{}),
+		reflect.TypeOf(Hebi8PinRequest{}),
+		reflect.TypeOf(Hebi8PinResponse{}),
+		// SSH config, archive/delete & Ryugi preview DTOs
+		reflect.TypeOf(SSHCandidate{}),
+		reflect.TypeOf(SSHCandidatesResponse{}),
+		reflect.TypeOf(ArchiveTaskRequest{}),
+		reflect.TypeOf(ArchiveTaskResponse{}),
+		reflect.TypeOf(DeleteTaskResponse{}),
+		reflect.TypeOf(RyugiOpenResponse{}),
+		reflect.TypeOf(RyugiArtifactContentResponse{}),
 		// Runner WS frames
 		reflect.TypeOf(LiveAttemptInfo{}),
 		reflect.TypeOf(HandledApprovalDecision{}),

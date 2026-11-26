@@ -7,6 +7,7 @@ export type Route =
   | { name: 'home' }
   | { name: 'pa'; threadId?: string }
   | { name: 'artifacts' }
+  | { name: 'archived' }
   | { name: 'new'; mode?: NewMode; projectId?: string; machineId?: string; adapter?: string }
   | { name: 'project'; projectId: string; tab: ProjectTab }
   | { name: 'session'; taskId: string; worker?: string }
@@ -42,9 +43,12 @@ export function parseHash(hash: string): Route {
     case 'settings':
       return { name: 'settings' };
     case 'pa':
+    case 'hebi8':
       return { name: 'pa', threadId: segs[1] };
     case 'artifacts':
       return { name: 'artifacts' };
+    case 'archived':
+      return { name: 'archived' };
     case 'new': {
       const m = q.get('mode');
       const mode: NewMode | undefined = m === 'pa' || m === 'chat' || m === 'project' ? m : undefined;
@@ -82,8 +86,10 @@ export const paths = {
   home: () => '#/',
   onboarding: () => '#/onboarding',
   settings: () => '#/settings',
-  pa: (threadId?: string) => (threadId ? `#/pa/${e(threadId)}` : '#/pa'),
+  hebi8: () => '#/hebi8',
+  pa: (threadId?: string) => (threadId ? `#/pa/${e(threadId)}` : '#/hebi8'),
   artifacts: () => '#/artifacts',
+  archived: () => '#/archived',
   newThread: (mode?: NewMode, projectId?: string, opts?: { machineId?: string; adapter?: string }) => {
     const q = new URLSearchParams();
     if (mode) q.set('mode', mode);

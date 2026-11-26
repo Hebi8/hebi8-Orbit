@@ -20,7 +20,7 @@ import { navigate, paths } from '../lib/router';
 
 export function projectName(projects: ProjectView[], pid: string): string {
   if (pid === SCRATCH_PROJECT_ID) return '对话';
-  if (pid === PA_PROJECT_ID) return 'PA';
+  if (pid === PA_PROJECT_ID) return 'Hebi8';
   return projects.find((p) => p.projectId === pid)?.displayName ?? pid;
 }
 
@@ -163,8 +163,8 @@ export function HomePage({ boot }: { boot: BootstrapResponse }) {
           <div className="home-hd">
             <h1 className="home-title">总览</h1>
             <div className="home-acts">
-              <button type="button" className="btn ghost" onClick={() => navigate(paths.pa())}>
-                <PAIcon size={13} /> 问 PA
+              <button type="button" className="btn ghost" onClick={() => navigate(paths.hebi8())}>
+                <PAIcon size={13} /> Hebi8
               </button>
               <button type="button" className="btn pri" onClick={() => navigate(paths.newThread())}>
                 <Plus size={13} strokeWidth={1.8} /> 新建线程

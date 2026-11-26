@@ -13,10 +13,16 @@ export interface ReviewState {
   artifactId?: string;
 }
 
+export interface ToastAction {
+  label: string;
+  onClick: () => void;
+}
+
 export interface ToastState {
   id: number;
   text: string;
   tone: 'info' | 'err';
+  action?: ToastAction;
 }
 
 function readLS(key: string, fallback: string): string {
@@ -75,6 +81,7 @@ interface WorkbenchState {
   lastSeq: number;
   localMachineId: string;
   preferredIDE: IDEScheme;
+  sshAliasRev: number;
   workspaceNameOverride: string;
   expandedProjects: Record<string, boolean>;
   promptCache: Record<string, string>;
@@ -98,12 +105,13 @@ interface WorkbenchState {
   setLastSeq: (seq: number) => void;
   setLocalMachineId: (machineId: string) => void;
   setPreferredIDE: (scheme: IDEScheme) => void;
+  bumpSshAliasRev: () => void;
   setWorkspaceNameOverride: (name: string) => void;
   setProjectExpanded: (projectId: string, open: boolean) => void;
   rememberPrompt: (key: string, body: string) => void;
   toggleAnnotationSelected: (taskId: string, annotationId: string, selected: boolean) => void;
   clearDeselectedAnnotations: (taskId: string) => void;
-  showToast: (text: string, tone?: 'info' | 'err') => void;
+  showToast: (text: string, tone?: 'info' | 'err', action?: ToastAction) => void;
   clearToast: (id: number) => void;
 }
 
@@ -127,6 +135,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
   lastSeq: 0,
   localMachineId: readLS('orbit.localMachineId', ''),
   preferredIDE: (readLS('orbit.preferredIDE', 'cursor') as IDEScheme) || 'cursor',
+  sshAliasRev: 0,
   workspaceNameOverride: readLS('orbit.workspaceName', ''),
   expandedProjects: readJSON<Record<string, boolean>>('orbit.expandedProjects', {}),
   promptCache: readJSON<Record<string, string>>(PROMPT_CACHE_KEY, {}),
@@ -179,6 +188,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
     writeLS('orbit.preferredIDE', scheme);
     set({ preferredIDE: scheme });
   },
+  bumpSshAliasRev: () => set((s) => ({ sshAliasRev: s.sshAliasRev + 1 })),
   setWorkspaceNameOverride: (name) => {
     const trimmed = name.trim();
     writeLS('orbit.workspaceName', trimmed);
@@ -215,15 +225,16 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
       delete next[taskId];
       return { deselectedAnnotations: next };
     }),
-  showToast: (text, tone = 'info') => {
+  showToast: (text, tone = 'info', action) => {
     toastSeq += 1;
     const id = toastSeq;
-    set({ toast: { id, text, tone } });
-    window.setTimeout(() => get().clearToast(id), tone === 'err' ? 4200 : 2400);
+    set({ toast: { id, text, tone, action } });
+    const ms = action ? 5500 : tone === 'err' ? 4200 : 2400;
+    window.setTimeout(() => get().clearToast(id), ms);
   },
   clearToast: (id) => set((s) => (s.toast?.id === id ? { toast: null } : s)),
 }));
 
-export function toast(text: string, tone: 'info' | 'err' = 'info') {
-  useWorkbenchStore.getState().showToast(text, tone);
+export function toast(text: string, tone: 'info' | 'err' = 'info', action?: ToastAction) {
+  useWorkbenchStore.getState().showToast(text, tone, action);
 }

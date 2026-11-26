@@ -6,7 +6,7 @@ import { PA_PROJECT_ID, SCRATCH_PROJECT_ID, relTime, taskTitle } from '../lib/fo
 
 export function projectLabelForTask(task: Pick<TaskSummary, 'projectId'>, projects?: readonly ProjectView[]): string {
   if (task.projectId === SCRATCH_PROJECT_ID) return '对话';
-  if (task.projectId === PA_PROJECT_ID) return 'PA';
+  if (task.projectId === PA_PROJECT_ID) return 'Hebi8';
   return projects?.find((p) => p.projectId === task.projectId)?.displayName || task.projectId;
 }
 

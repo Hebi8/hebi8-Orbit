@@ -23,20 +23,6 @@ const (
 	gitZeroOID             = "0000000000000000000000000000000000000000"
 )
 
-func isSafeDeliveryToken(s string) bool {
-	if s == "" || len(s) > 128 {
-		return false
-	}
-	for _, r := range s {
-		switch {
-		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
-		default:
-			return false
-		}
-	}
-	return true
-}
-
 func randomBundleNonce() string {
 	var b [8]byte
 	_, _ = rand.Read(b[:])
@@ -80,7 +66,7 @@ func (s *Server) handleGetRunnerMirrorHeads(w http.ResponseWriter, r *http.Reque
 func (s *Server) handlePutRunnerDeliveryBundle(w http.ResponseWriter, r *http.Request) {
 	projectID := chi.URLParam(r, "projectId")
 	deliveryID := chi.URLParam(r, "deliveryId")
-	if !isSafeDeliveryToken(deliveryID) {
+	if !isSafeDeliveryID(deliveryID) {
 		writeAPIError(w, http.StatusBadRequest, "ERR_INVALID_DELIVERY_ID", "invalid deliveryId")
 		return
 	}
@@ -176,7 +162,7 @@ func (s *Server) handlePutRunnerDeliveryBundle(w http.ResponseWriter, r *http.Re
 func (s *Server) handleGetRunnerDeliveryBundle(w http.ResponseWriter, r *http.Request) {
 	projectID := chi.URLParam(r, "projectId")
 	deliveryID := chi.URLParam(r, "deliveryId")
-	if !isSafeDeliveryToken(deliveryID) {
+	if !isSafeDeliveryID(deliveryID) {
 		writeAPIError(w, http.StatusBadRequest, "ERR_INVALID_DELIVERY_ID", "invalid deliveryId")
 		return
 	}

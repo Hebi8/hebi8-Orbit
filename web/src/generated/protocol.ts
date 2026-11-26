@@ -84,7 +84,7 @@ export type InboxCategory = (typeof InboxCategoryValues)[number];
 export const InboxStateValues = ["open", "resolved", "dismissed"] as const;
 export type InboxState = (typeof InboxStateValues)[number];
 
-export const EventKindValues = ["task.created", "task.state_changed", "task.cancelled", "attempt.started", "attempt.state_changed", "attempt.finished", "resource.waiting", "resource.acquired", "delivery.published", "delivery.verified", "delivery.ryugi_updated", "delivery.review_completed", "annotation.created", "annotation.addressed", "approval.requested", "approval.decided", "approval.expired", "approval.consumed", "deploy.started", "deploy.verified", "deploy.failed", "acp.message_batch", "acp.thought_batch", "acp.tool_call", "acp.unsolicited_update", "acp.usage", "pa.turn", "pa.action_executed", "pa.thread_created", "board.message_posted", "board.member_updated", "queue.updated", "task.project_bound", "task.source_added", "task.source_removed", "machine.state_changed", "pairing.updated", "machine.agents_updated", "project.changed", "network.settings_changed"] as const;
+export const EventKindValues = ["task.created", "task.state_changed", "task.cancelled", "task.archived", "task.unarchived", "task.deleted", "attempt.started", "attempt.state_changed", "attempt.finished", "resource.waiting", "resource.acquired", "delivery.published", "delivery.verified", "delivery.ryugi_updated", "delivery.review_completed", "annotation.created", "annotation.addressed", "approval.requested", "approval.decided", "approval.expired", "approval.consumed", "deploy.started", "deploy.verified", "deploy.failed", "acp.message_batch", "acp.thought_batch", "acp.tool_call", "acp.unsolicited_update", "acp.usage", "pa.turn", "pa.action_executed", "pa.thread_created", "board.message_posted", "board.member_updated", "queue.updated", "task.project_bound", "task.source_added", "task.source_removed", "machine.state_changed", "pairing.updated", "machine.agents_updated", "project.changed", "network.settings_changed", "hebi8.folded"] as const;
 export type EventKind = (typeof EventKindValues)[number];
 
 export const IDESchemeValues = ["cursor", "vscode", "zed", "antigravity"] as const;
@@ -140,6 +140,12 @@ export type ProjectPartKind = (typeof ProjectPartKindValues)[number];
 
 export const LocationIsolationValues = ["worktree", "in_place"] as const;
 export type LocationIsolation = (typeof LocationIsolationValues)[number];
+
+export const Hebi8NodeKindValues = ["segment", "fold"] as const;
+export type Hebi8NodeKind = (typeof Hebi8NodeKindValues)[number];
+
+export const Hebi8SummaryQualityValues = ["written", "fallback"] as const;
+export type Hebi8SummaryQuality = (typeof Hebi8SummaryQualityValues)[number];
 
 export interface APIError {
   code: string;
@@ -541,6 +547,7 @@ export interface TaskSummary {
   createdBy: TaskCreatedBy;
   createdAt: number;
   updatedAt: number;
+  archivedAt?: number | null;
 }
 
 export interface EventRecord {
@@ -884,6 +891,7 @@ export interface BindScratchTaskResponse {
 export interface FollowupTaskRequest {
   message: string;
   mode?: FollowupMode;
+  machineId?: string;
   referencedTaskIds?: string[];
   requiredCapability?: string;
   requiredResources?: string[];
@@ -1315,6 +1323,157 @@ export interface CompleteOnboardingRequest {
 export interface CompleteOnboardingResponse {
   completed: boolean;
   setup: SetupStatusView;
+}
+
+export interface Hebi8AttemptRange {
+  startAttemptId: string;
+  endAttemptId: string;
+  startAttemptNo: number;
+  endAttemptNo: number;
+  turnCount: number;
+}
+
+export interface Hebi8LineNode {
+  v: number;
+  id: string;
+  kind: Hebi8NodeKind;
+  seq: number;
+  coversFrom: string;
+  coversTo: string;
+  coversFromMs?: number;
+  coversToMs?: number;
+  attemptRange?: Hebi8AttemptRange | null;
+  covers?: string[];
+  level: number;
+  title: string;
+  tags?: string[];
+  adapter?: Adapter;
+  model?: string;
+  summaryQuality: Hebi8SummaryQuality;
+  createdAt: string;
+  createdAtMs?: number;
+  pinned?: boolean;
+  foldedInto?: string;
+  summary?: string;
+}
+
+export interface Hebi8LineSummary {
+  totalNodes: number;
+  segmentCount: number;
+  foldCount: number;
+  pinnedCount: number;
+  maxLevel: number;
+  lastFoldedAt?: string;
+  lastFoldedAttemptNo?: number;
+  shouldSuggestFold?: boolean;
+}
+
+export interface Hebi8MainResponse {
+  task: TaskSummary;
+  lineSummary: Hebi8LineSummary;
+  nodes: Hebi8LineNode[];
+  pins: string[];
+  pendingTurnsSinceLastFold: number;
+  pendingCharsSinceLastFold: number;
+}
+
+export interface Hebi8FoldRequest {
+  title?: string;
+  summary?: string;
+  tags?: string[];
+}
+
+export interface Hebi8FoldResponse {
+  taskId: string;
+  segment: Hebi8LineNode;
+  fold?: Hebi8LineNode | null;
+  folds?: Hebi8LineNode[];
+  nodes: Hebi8LineNode[];
+  pins: string[];
+  lineSummary: Hebi8LineSummary;
+}
+
+export interface Hebi8LineResponse {
+  taskId: string;
+  nodes: Hebi8LineNode[];
+  pins: string[];
+  lineSummary: Hebi8LineSummary;
+}
+
+export interface Hebi8RawTurn {
+  attemptId: string;
+  attemptNo: number;
+  state: AttemptState;
+  userPrompt: string;
+  assistantReply: string;
+  startedAt: number;
+  finishedAt?: number | null;
+}
+
+export interface Hebi8ExpandResponse {
+  node: Hebi8LineNode;
+  summary: string;
+  children?: Hebi8LineNode[];
+  turns?: Hebi8RawTurn[];
+  totalTurns?: number;
+  offset?: number;
+  limit?: number;
+}
+
+export interface Hebi8PinRequest {
+  pinned: boolean;
+}
+
+export interface Hebi8PinResponse {
+  nodeId: string;
+  pinned: boolean;
+  pins: string[];
+}
+
+export interface SSHCandidate {
+  alias: string;
+  hostName?: string;
+  user?: string;
+  port?: number;
+  proxyJump?: string;
+  score: number;
+  matchReason?: string;
+  reachable?: boolean | null;
+  latencyMs?: number;
+}
+
+export interface SSHCandidatesResponse {
+  localConfigAvailable: boolean;
+  recommended?: string;
+  candidates: SSHCandidate[];
+  allHosts: string[];
+}
+
+export interface ArchiveTaskRequest {
+  cancelActive?: boolean;
+}
+
+export interface ArchiveTaskResponse {
+  task: TaskSummary;
+}
+
+export interface DeleteTaskResponse {
+  taskId: string;
+  projectId: string;
+  deleted: boolean;
+}
+
+export interface RyugiOpenResponse {
+  deliveryId: string;
+  openUrl?: string;
+  ryugiBindings: RyugiBindingView[];
+}
+
+export interface RyugiArtifactContentResponse {
+  contentType: string;
+  filename: string;
+  locator: string;
+  text: string;
 }
 
 export interface LiveAttemptInfo {

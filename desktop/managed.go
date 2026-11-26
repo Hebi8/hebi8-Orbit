@@ -34,13 +34,29 @@ type managedProc struct {
 // RuntimeManager manages optional local orbit-hub / orbit-runner child processes
 // for the desktop shell, always preferring to attach to an already-running service.
 type RuntimeManager struct {
-	mu       sync.Mutex
-	switchMu sync.Mutex
-	procs    []*managedProc
+	mu                sync.Mutex
+	switchMu          sync.Mutex
+	procs             []*managedProc
+	desktopHelperPort int
 }
 
 func NewRuntimeManager() *RuntimeManager {
 	return &RuntimeManager{}
+}
+
+// SetDesktopHelperPort records the local loopback setup/helper server port so BuildDesktopOpenURL
+// can pass ?desktopHelper=<port> to the embedded WebView for local ~/.ssh/config matching.
+func (m *RuntimeManager) SetDesktopHelperPort(port int) {
+	m.mu.Lock()
+	m.desktopHelperPort = port
+	m.mu.Unlock()
+}
+
+// DesktopHelperPort returns the recorded local loopback helper server port (0 if unset).
+func (m *RuntimeManager) DesktopHelperPort() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.desktopHelperPort
 }
 
 // Shutdown terminates all desktop-managed child processes cleanly (never touching external services).
@@ -718,6 +734,9 @@ func (m *RuntimeManager) buildOpenURL(ctx context.Context, configDir, hubURL, fa
 	querySuffix := ""
 	if forDesktop {
 		querySuffix = "?orbitDesktop=1"
+		if helperPort := m.DesktopHelperPort(); helperPort > 0 {
+			querySuffix += "&desktopHelper=" + strconv.Itoa(helperPort)
+		}
 	}
 	fallbackURL := hubURL + "/" + querySuffix + fallbackHash
 
@@ -1007,7 +1026,7 @@ func bootstrapLocalConfig(cfgDir, dataDir, machineID, listenAddr string) (string
 		"hubOrigin":                origin,
 		"devToken":                 devToken,
 		"ryugiBin":                 "ryugi",
-		"ryugiPort":                27319,
+		"ryugiPort":                27329,
 		"ryugiPollIntervalSeconds": 6,
 	}
 	rawHub, _ := yaml.Marshal(hubDoc)

@@ -1271,6 +1271,9 @@ func (s *Store) PromoteAttemptFolderDelivery(
 	}
 
 	err = s.WithWriteTx(ctx, func(tx *sql.Tx) error {
+		if err := checkDeliveryCleanupPendingTx(ctx, tx, dlvID); err != nil {
+			return err
+		}
 		seen := map[string]bool{}
 		for _, b := range blobs {
 			if seen[b.SHA256] {

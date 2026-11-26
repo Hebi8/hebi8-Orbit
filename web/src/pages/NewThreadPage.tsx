@@ -73,10 +73,10 @@ const MODE_COPY: Record<NewMode, ModeCopy> = {
     ],
   },
   pa: {
-    tab: '问 PA',
-    heading: '问 PA 私人助手',
-    hint: '直连真实 Agent，支持引用历史对话与项目线程上下文展开讨论、总结进展或拆解下一步计划。',
-    placeholder: '问问今天的优先级、卡住的线程，或引用几个对话让 PA 帮你梳理…',
+    tab: 'Hebi8',
+    heading: 'Hebi8 主对话',
+    hint: '直连工作区唯一的 Hebi8 持续主对话，支持引用任意历史对话与项目线程上下文展开讨论、总结进展或拆解下一步计划。',
+    placeholder: '问问今天的优先级、卡住的线程，或引用几个对话让 Hebi8 帮你梳理…',
     starters: [
       '帮我看看现在哪些线程需要我处理，按紧急程度排一下',
       '结合我引用的对话，帮我总结关键结论和待决事项',
@@ -374,8 +374,17 @@ export function NewThreadPage({
       }
 
       if (m === 'pa') {
-        const res = await api.createTask(PA_PROJECT_ID, req);
-        return { kind: 'pa' as const, id: res.task.taskId, pid: PA_PROJECT_ID };
+        const main = await api.getHebi8Main();
+        await api.followup(main.task.taskId, {
+          message: goal,
+          mode: 'queue',
+          machineId: selectedMachine?.machineId,
+          adapter: effectiveAdapter,
+          config: Object.keys(cfg).length > 0 ? cfg : undefined,
+          explicitFullPermission: req.explicitFullPermission,
+          referencedTaskIds: refIds.length > 0 ? refIds : undefined,
+        });
+        return { kind: 'pa' as const, id: main.task.taskId, pid: PA_PROJECT_ID };
       }
 
       if (m === 'chat') {
@@ -410,7 +419,9 @@ export function NewThreadPage({
       void qc.invalidateQueries({ queryKey: ['all-tasks'] });
       void qc.invalidateQueries({ queryKey: ['project-tasks', r.pid] });
       if (r.kind === 'pa') {
-        navigate(paths.pa(r.id));
+        void qc.invalidateQueries({ queryKey: ['hebi8-main'] });
+        void qc.invalidateQueries({ queryKey: ['task-timeline', r.id] });
+        navigate(paths.hebi8());
       } else {
         navigate(paths.session(r.id));
       }
@@ -609,7 +620,7 @@ export function NewThreadPage({
                   )}
 
                   {m === 'pa' && (
-                    <span className="muted" style={{ fontSize: 12 }}>PA 私人助手 · 支持跨对话引用</span>
+                    <span className="muted" style={{ fontSize: 12 }}>Hebi8 主对话 · 支持跨对话引用</span>
                   )}
 
                   {/* Secondary de-emphasized machine picker — only shown quietly when multiple execution hosts exist */}

@@ -5,11 +5,19 @@ import type {
   ProjectView,
 } from '../generated/protocol';
 
+export type SSHHostSource = 'custom' | 'ssh_config' | 'machine' | 'tailscale' | 'fallback';
+
+export interface ResolvedSshHost {
+  host: string;
+  source: SSHHostSource;
+}
+
 export interface IDEJumpResult {
   uri: string;
   mode: 'local' | 'ssh';
   targetMachine: string;
   sshHost?: string;
+  sshSource?: SSHHostSource;
   targetLabel: '只读快照' | '工作目录';
   resolvedPath: string;
   line?: number;
@@ -22,8 +30,53 @@ export const IDE_OPTIONS: { id: IDEScheme; label: string }[] = [
   { id: 'zed', label: 'Zed' },
 ];
 
+const SSH_ALIAS_STORAGE_PREFIX = 'orbit.sshAlias.';
+
 export function ideLabel(scheme: IDEScheme): string {
   return IDE_OPTIONS.find((x) => x.id === scheme)?.label ?? scheme;
+}
+
+export function getCustomSshAlias(machineId: string): string {
+  if (!machineId) return '';
+  try {
+    return (localStorage.getItem(`${SSH_ALIAS_STORAGE_PREFIX}${machineId}`) ?? '').trim();
+  } catch {
+    return '';
+  }
+}
+
+export function setCustomSshAlias(machineId: string, alias: string) {
+  if (!machineId) return;
+  try {
+    const trimmed = alias.trim();
+    const key = `${SSH_ALIAS_STORAGE_PREFIX}${machineId}`;
+    if (trimmed) localStorage.setItem(key, trimmed);
+    else localStorage.removeItem(key);
+  } catch {
+    // ignore storage errors
+  }
+}
+
+/**
+ * Formats the VS Code / Cursor / Antigravity Remote-SSH authority segment.
+ * Per VS Code Remote-SSH URI protocol, when target contains uppercase letters, colons (ports / IPv6),
+ * user@ prefixes, or other non-plain-lowercase characters, hex-encode the JSON object `{"hostName": target}`
+ * so VS Code's URI authority lowercasing never corrupts the SSH Host alias.
+ */
+export function formatVsCodeRemoteAuthority(target: string): string {
+  const cleaned = target.trim();
+  if (!cleaned) return 'ssh-remote+';
+  const needsHex = /[A-Z:@\s]/.test(cleaned) || !/^[a-z0-9._-]+$/.test(cleaned);
+  if (!needsHex) {
+    return `ssh-remote+${cleaned}`;
+  }
+  const json = JSON.stringify({ hostName: cleaned });
+  const bytes = new TextEncoder().encode(json);
+  let hex = '';
+  for (let i = 0; i < bytes.length; i++) {
+    hex += bytes[i].toString(16).padStart(2, '0');
+  }
+  return `ssh-remote+${hex}`;
 }
 
 /**
@@ -42,9 +95,38 @@ export function resolveEffectiveLocalMachineId(machines: MachineView[], storedLo
   return '';
 }
 
+/**
+ * Resolves the effective SSH target host and its provenance according to priority:
+ * localStorage custom alias > local ~/.ssh/config recommended > machine.sshAlias > machine.tailscaleHost > machine.machineId.
+ */
+export function resolveEffectiveSshHost(params: {
+  machine?: MachineView | null;
+  fallbackId?: string;
+  recommendedSshHost?: string;
+  customSshHost?: string;
+}): ResolvedSshHost {
+  const { machine, fallbackId = '', recommendedSshHost, customSshHost } = params;
+  const machineId = machine?.machineId || fallbackId;
+  const custom = (customSshHost !== undefined ? customSshHost : getCustomSshAlias(machineId)).trim();
+  if (custom) {
+    return { host: custom, source: 'custom' };
+  }
+  const rec = (recommendedSshHost ?? '').trim();
+  if (rec) {
+    return { host: rec, source: 'ssh_config' };
+  }
+  if (machine?.sshAlias?.trim()) {
+    return { host: machine.sshAlias.trim(), source: 'machine' };
+  }
+  if (machine?.tailscaleHost?.trim()) {
+    return { host: machine.tailscaleHost.trim(), source: 'tailscale' };
+  }
+  return { host: machineId || fallbackId, source: 'fallback' };
+}
+
 export function resolveMachineSshAlias(machine?: MachineView | null, fallbackId = ''): string {
   if (!machine) return fallbackId;
-  return machine.sshAlias || machine.machineId || machine.tailscaleHost || fallbackId;
+  return getCustomSshAlias(machine.machineId) || machine.sshAlias || machine.machineId || machine.tailscaleHost || fallbackId;
 }
 
 /**
@@ -57,6 +139,13 @@ export function encodeURIPathSegments(rawPath: string): string {
     .split('/')
     .map((seg, idx) => (idx === 0 ? '' : encodeURIComponent(seg)))
     .join('/');
+}
+
+function buildRemoteUri(proto: IDEScheme, sshHost: string, encodedPath: string, lineSuffix: string): string {
+  if (proto === 'zed') {
+    return `zed://ssh/${encodeURIComponent(sshHost)}${encodedPath}${lineSuffix}`;
+  }
+  return `${proto}://vscode-remote/${formatVsCodeRemoteAuthority(sshHost)}${encodedPath}${lineSuffix}`;
 }
 
 /**
@@ -72,8 +161,21 @@ export function buildIDEJump(params: {
   file?: string;
   line?: number;
   preferSnapshot?: boolean;
+  recommendedSshHost?: string;
+  customSshHost?: string;
 }): IDEJumpResult | null {
-  const { scheme, localMachineId, delivery, project, machines, file, line, preferSnapshot } = params;
+  const {
+    scheme,
+    localMachineId,
+    delivery,
+    project,
+    machines,
+    file,
+    line,
+    preferSnapshot,
+    recommendedSshHost,
+    customSshHost,
+  } = params;
 
   let basePath = '';
   let targetMachine = delivery.sourceMachineId;
@@ -130,25 +232,19 @@ export function buildIDEJump(params: {
   }
 
   const machineObj = machines.find((m) => m.machineId === targetMachine);
-  const sshHost = machineObj?.sshAlias || machineObj?.tailscaleHost || targetMachine;
-
-  if (proto === 'zed') {
-    return {
-      uri: `zed://ssh/${encodeURIComponent(sshHost)}${encodedPath}${lineSuffix}`,
-      mode: 'ssh',
-      targetMachine,
-      sshHost,
-      targetLabel,
-      resolvedPath: fullPath,
-      line: file && line && line > 0 ? line : undefined,
-    };
-  }
+  const resolved = resolveEffectiveSshHost({
+    machine: machineObj,
+    fallbackId: targetMachine,
+    recommendedSshHost,
+    customSshHost,
+  });
 
   return {
-    uri: `${proto}://vscode-remote/ssh-remote+${encodeURIComponent(sshHost)}${encodedPath}${lineSuffix}`,
+    uri: buildRemoteUri(proto, resolved.host, encodedPath, lineSuffix),
     mode: 'ssh',
     targetMachine,
-    sshHost,
+    sshHost: resolved.host,
+    sshSource: resolved.source,
     targetLabel,
     resolvedPath: fullPath,
     line: file && line && line > 0 ? line : undefined,
@@ -163,8 +259,19 @@ export function buildProjectIDEJump(params: {
   scheme?: IDEScheme;
   worktreePath?: string;
   worktreeMachineId?: string;
+  recommendedSshHost?: string;
+  customSshHost?: string;
 }): IDEJumpResult | null {
-  const { project, machines, localMachineId, scheme, worktreePath, worktreeMachineId } = params;
+  const {
+    project,
+    machines,
+    localMachineId,
+    scheme,
+    worktreePath,
+    worktreeMachineId,
+    recommendedSshHost,
+    customSshHost,
+  } = params;
   let basePath = '';
   let targetMachine = '';
   if (worktreePath && worktreeMachineId) {
@@ -184,12 +291,21 @@ export function buildProjectIDEJump(params: {
     return { uri: `${proto}://file${encodedPath}`, mode: 'local', targetMachine, targetLabel: '工作目录', resolvedPath: fullPath };
   }
   const machineObj = machines.find((m) => m.machineId === targetMachine);
-  const sshHost = machineObj?.sshAlias || machineObj?.tailscaleHost || targetMachine;
-  const uri =
-    proto === 'zed'
-      ? `zed://ssh/${encodeURIComponent(sshHost)}${encodedPath}`
-      : `${proto}://vscode-remote/ssh-remote+${encodeURIComponent(sshHost)}${encodedPath}`;
-  return { uri, mode: 'ssh', targetMachine, sshHost, targetLabel: '工作目录', resolvedPath: fullPath };
+  const resolved = resolveEffectiveSshHost({
+    machine: machineObj,
+    fallbackId: targetMachine,
+    recommendedSshHost,
+    customSshHost,
+  });
+  return {
+    uri: buildRemoteUri(proto, resolved.host, encodedPath, ''),
+    mode: 'ssh',
+    targetMachine,
+    sshHost: resolved.host,
+    sshSource: resolved.source,
+    targetLabel: '工作目录',
+    resolvedPath: fullPath,
+  };
 }
 
 /** Hands a custom-scheme IDE URI to the OS without leaving the SPA. */

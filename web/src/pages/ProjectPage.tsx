@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useQueries, useQueryClient } from '@tanstack/react-query';
 import {
+  ArchiveRestore,
   ArrowUpRight,
   Eye,
   EyeOff,
@@ -540,14 +541,22 @@ function ProjectSettingsTab({
 }
 
 export function ProjectPage({ boot, projectId, tab }: { boot: BootstrapResponse; projectId: string; tab: ProjectTab }) {
+  const qc = useQueryClient();
   const project = boot.projects.find((p) => p.projectId === projectId);
-  const tasksQ = useProjectTasks(projectId);
+  const [threadScope, setThreadScope] = useState<'active' | 'archived'>('active');
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  const tasksQ = useProjectTasks(projectId, true, 'active');
+  const archivedTasksQ = useProjectTasks(projectId, tab === 'threads' && threadScope === 'archived', 'only');
   const [q, setQ] = useState('');
   const openReview = useWorkbenchStore((s) => s.openReview);
   const localMachineId = useWorkbenchStore((s) => s.localMachineId);
 
   const allTasks = useMemo(() => tasksQ.data ?? [], [tasksQ.data]);
   const threads = useMemo(() => allTasks.filter((t) => !t.parentTaskId), [allTasks]);
+  const archivedThreads = useMemo(
+    () => (archivedTasksQ.data ?? []).filter((t) => !t.parentTaskId),
+    [archivedTasksQ.data],
+  );
   const inboxByTask = useMemo(() => indexInboxByTask(boot.openInboxItems), [boot.openInboxItems]);
 
   const ranked = useMemo(() => {
@@ -557,6 +566,42 @@ export function ProjectPage({ boot, projectId, tab }: { boot: BootstrapResponse;
       .map((t) => ({ t, mark: rootSessionMark(t, allTasks, inboxByTask) }))
       .sort((a, b) => displayMarkRank(a.mark) - displayMarkRank(b.mark) || b.t.updatedAt - a.t.updatedAt);
   }, [threads, allTasks, inboxByTask, q]);
+
+  const filteredArchived = useMemo(() => {
+    const k = q.trim().toLowerCase();
+    return k
+      ? archivedThreads.filter((t) => `${t.title} ${t.goal}`.toLowerCase().includes(k))
+      : archivedThreads;
+  }, [archivedThreads, q]);
+
+  const invalidateProjectTasks = () => {
+    void qc.invalidateQueries({ queryKey: ['project-tasks', projectId] });
+    void qc.invalidateQueries({ queryKey: ['all-tasks'] });
+    void qc.invalidateQueries({ queryKey: ['archived-tasks'] });
+    void qc.invalidateQueries({ queryKey: ['global-artifacts'] });
+    void qc.invalidateQueries({ queryKey: ['bootstrap'] });
+  };
+
+  const handleRestoreArchived = async (t: TaskSummary) => {
+    try {
+      await api.unarchiveTask(t.taskId);
+      invalidateProjectTasks();
+      toast(`已恢复「${taskTitle(t)}」`);
+    } catch (e) {
+      toast(errMsg(e), 'err');
+    }
+  };
+
+  const handleDeleteArchived = async (t: TaskSummary) => {
+    try {
+      await api.deleteTask(t.taskId);
+      setConfirmDeleteId(null);
+      invalidateProjectTasks();
+      toast(`已永久删除「${taskTitle(t)}」`);
+    } catch (e) {
+      toast(errMsg(e), 'err');
+    }
+  };
 
   const markedRows = ranked.filter((r) => r.mark !== null);
   const restingRows = ranked.filter((r) => r.mark === null);
@@ -672,22 +717,111 @@ export function ProjectPage({ boot, projectId, tab }: { boot: BootstrapResponse;
             )}
           </div>
 
-          {tab === 'threads' &&
-            (tasksQ.isLoading ? (
-              <div className="quiet">载入会话…</div>
-            ) : ranked.length === 0 ? (
-              <div className="quiet">{q ? '没有匹配的会话' : '这个项目还没有会话'}</div>
-            ) : (
-              <>
-                {markedRows.map(({ t, mark }) => (
-                  <ThreadRow key={t.taskId} t={t} mark={mark} />
-                ))}
-                {markedRows.length > 0 && restingRows.length > 0 && <div className="home-sep" role="separator" />}
-                {restingRows.map(({ t, mark }) => (
-                  <ThreadRow key={t.taskId} t={t} mark={mark} />
-                ))}
-              </>
-            ))}
+          {tab === 'threads' && (
+            <>
+              <div className="proj-scope-bar">
+                <div className="proj-scope-seg" role="tablist" aria-label="会话状态筛选">
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={threadScope === 'active'}
+                    className={threadScope === 'active' ? 'on' : ''}
+                    onClick={() => setThreadScope('active')}
+                  >
+                    活跃{threads.length > 0 ? ` (${threads.length})` : ''}
+                  </button>
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={threadScope === 'archived'}
+                    className={threadScope === 'archived' ? 'on' : ''}
+                    onClick={() => setThreadScope('archived')}
+                  >
+                    已归档{archivedThreads.length > 0 ? ` (${archivedThreads.length})` : ''}
+                  </button>
+                </div>
+              </div>
+
+              {threadScope === 'active' ? (
+                tasksQ.isLoading ? (
+                  <div className="quiet">载入会话…</div>
+                ) : ranked.length === 0 ? (
+                  <div className="quiet">{q ? '没有匹配的会话' : '这个项目还没有会话'}</div>
+                ) : (
+                  <>
+                    {markedRows.map(({ t, mark }) => (
+                      <ThreadRow key={t.taskId} t={t} mark={mark} />
+                    ))}
+                    {markedRows.length > 0 && restingRows.length > 0 && <div className="home-sep" role="separator" />}
+                    {restingRows.map(({ t, mark }) => (
+                      <ThreadRow key={t.taskId} t={t} mark={mark} />
+                    ))}
+                  </>
+                )
+              ) : archivedTasksQ.isLoading ? (
+                <div className="quiet">载入已归档会话…</div>
+              ) : filteredArchived.length === 0 ? (
+                <div className="quiet">{q ? '没有匹配的已归档会话' : '该项目还没有已归档会话'}</div>
+              ) : (
+                <div className="arch-list">
+                  {filteredArchived.map((t) => {
+                    const confirming = confirmDeleteId === t.taskId;
+                    return (
+                      <div className="arch-row" key={t.taskId}>
+                        <button
+                          type="button"
+                          className="arch-row-main"
+                          onClick={() => navigate(paths.session(t.taskId))}
+                        >
+                          <span className="arch-row-title ell">{taskTitle(t)}</span>
+                          <span className="arch-row-time faint">
+                            归档于 {relTime(t.archivedAt ?? t.updatedAt)}
+                          </span>
+                        </button>
+                        <div className="arch-row-acts">
+                          <button
+                            type="button"
+                            className="btn ghost sm"
+                            onClick={() => void handleRestoreArchived(t)}
+                          >
+                            <ArchiveRestore size={12.5} strokeWidth={1.6} /> 恢复
+                          </button>
+                          {confirming ? (
+                            <>
+                              <button
+                                type="button"
+                                className="btn ghost sm bad-t"
+                                onClick={() => void handleDeleteArchived(t)}
+                              >
+                                确认删除
+                              </button>
+                              <button
+                                type="button"
+                                className="btn ghost sm"
+                                onClick={() => setConfirmDeleteId(null)}
+                              >
+                                取消
+                              </button>
+                            </>
+                          ) : (
+                            <button
+                              type="button"
+                              className="ib bad-t"
+                              title="永久删除"
+                              aria-label="永久删除"
+                              onClick={() => setConfirmDeleteId(t.taskId)}
+                            >
+                              <Trash2 size={13} strokeWidth={1.6} />
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </>
+          )}
 
           {tab === 'deliveries' &&
             (withDeliveries.length === 0 ? (

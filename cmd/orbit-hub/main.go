@@ -143,6 +143,11 @@ func main() {
 
 	var pollerWG sync.WaitGroup
 	pollerCtx, cancelPoller := context.WithCancel(ctx)
+	pollerWG.Add(1)
+	go func() {
+		defer pollerWG.Done()
+		srv.RyugiBridge().EnsureActiveBindingsRegistered(pollerCtx)
+	}()
 	if cfg.RyugiPollIntervalSeconds > 0 {
 		srv.RyugiBridge().StartPoller(pollerCtx, &pollerWG)
 	}

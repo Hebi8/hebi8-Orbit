@@ -26,6 +26,9 @@ var (
 	ErrForbidden            = errors.New("forbidden")
 	ErrVerificationRequired = errors.New("verification required")
 	ErrInvalidInput         = errors.New("invalid input")
+	ErrTaskActive             = errors.New("task has an active attempt")
+	ErrTaskArchived           = errors.New("task is archived")
+	ErrDeliveryCleanupPending = errors.New("delivery snapshot cleanup pending")
 )
 
 // Store manages the single-writer SQLite WAL pool and a separate read-only query pool.
@@ -409,6 +412,22 @@ func applySchema(ctx context.Context, db *sql.DB) error {
 		`, now); err != nil {
 			return err
 		}
+	}
+
+	// Idempotently ensure pending_delivery_cleanups and its BEFORE INSERT guard trigger exist on both fresh and existing DBs.
+	if _, err := tx.ExecContext(ctx, `
+		CREATE TABLE IF NOT EXISTS pending_delivery_cleanups (
+			delivery_id TEXT PRIMARY KEY,
+			created_at  INTEGER NOT NULL
+		);
+		CREATE TRIGGER IF NOT EXISTS trg_deliveries_block_pending_cleanup
+		BEFORE INSERT ON deliveries
+		WHEN EXISTS (SELECT 1 FROM pending_delivery_cleanups WHERE delivery_id = NEW.delivery_id)
+		BEGIN
+			SELECT RAISE(ABORT, 'ERR_DELIVERY_CLEANUP_PENDING');
+		END;
+	`); err != nil {
+		return fmt.Errorf("ensure pending_delivery_cleanups table/trigger: %w", err)
 	}
 
 	// Idempotently ensure the built-in virtual _scratch project exists on every startup.

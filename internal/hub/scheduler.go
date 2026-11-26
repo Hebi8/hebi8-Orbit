@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"path/filepath"
 	"slices"
@@ -523,10 +524,10 @@ func buildOrbitSystemPromptAppend(taskID, projectID, attemptID string, isPlainFo
 		)
 	case projectID == protocol.PAProjectID:
 		base = fmt.Sprintf(
-			"hebi8-Orbit Personal Assistant (PA): task=%s attempt=%s. "+
-				"You are the user's Personal Assistant inside Orbit. "+
-				"When referenced conversations (<referenced_conversations>) or workspace context (<orbit_workspace>) are provided, "+
-				"read and synthesize them faithfully, cite specific facts/decisions/files, and answer in the user's language.",
+			"hebi8-Orbit Hebi8 Main Assistant: task=%s attempt=%s. "+
+				"You are Hebi8, the user's single continuous assistant inside Orbit. "+
+				"When a Fold-Rollover opening (<hebi8_fold_opening>), referenced conversations (<referenced_conversations>), or workspace context (<orbit_workspace>) are provided, "+
+				"treat summaries as cache and original transcripts as evidence, synthesize them faithfully, cite specific facts/decisions/files, and answer in the user's language.",
 			taskID, attemptID,
 		)
 	case isPlainFolder:
@@ -557,7 +558,7 @@ func (s *Server) buildAttemptDispatchFrame(
 	anchor protocol.ProjectAnchorConfig,
 	promptOverride string,
 	swarmIdleTimeoutMs int64,
-) protocol.AttemptDispatchFrame {
+) (protocol.AttemptDispatchFrame, error) {
 	prompt := strings.TrimSpace(promptOverride)
 	usedOverride := prompt != ""
 	explicitFullPermission := false
@@ -585,7 +586,11 @@ func (s *Server) buildAttemptDispatchFrame(
 		}
 	}
 	if !usedOverride && (len(att.RefTasks) > 0 || proj.ProjectID == protocol.PAProjectID) {
-		prompt = s.decorateAttemptPrompt(ctx, proj.ProjectID, prompt, att.RefTasks, proj.ProjectID == protocol.PAProjectID && att.AttemptNo == 1)
+		decorated, decErr := s.decorateAttemptPromptForAttempt(ctx, att, prompt, att.RefTasks)
+		if decErr != nil {
+			return protocol.AttemptDispatchFrame{}, decErr
+		}
+		prompt = decorated
 	}
 
 	var inputDlv *protocol.InputDeliveryRef
@@ -713,7 +718,7 @@ func (s *Server) buildAttemptDispatchFrame(
 		Prompt:             prompt,
 		RequiredResources:  att.RequiredResources,
 		SwarmIdleTimeoutMs: swarmIdleTimeoutMs,
-	}
+	}, nil
 }
 
 func (s *Server) dispatchAttemptRecord(ctx context.Context, att store.AttemptRecord, promptOverride string, swarmIdleTimeoutMs int64) bool {
@@ -746,7 +751,14 @@ func (s *Server) dispatchAttemptRecord(ctx context.Context, att store.AttemptRec
 		}
 		anchor = route.Anchor
 	}
-	frame := s.buildAttemptDispatchFrame(ctx, att, proj, anchor, promptOverride, swarmIdleTimeoutMs)
+	frame, err := s.buildAttemptDispatchFrame(ctx, att, proj, anchor, promptOverride, swarmIdleTimeoutMs)
+	if err != nil {
+		log.Printf("hub scheduler: aborting dispatch for attempt %s due to prompt/opening build error: %v", att.AttemptID, err)
+		if failErr := s.failUndispatchedAttemptDetached(ctx, att.AttemptID, "ERR_HEBI8_OPENING", err.Error()); failErr != nil {
+			log.Printf("hub scheduler: failed to mark undispatched attempt %s failed: %v", att.AttemptID, failErr)
+		}
+		return false
+	}
 	// B10: Atomically bind runner_instance_id INSIDE the serialized runner write pump right before
 	// writing attempt.dispatch (only if still leased & !cancel_requested), so any concurrent cancel
 	// either aborts dispatch before it ever touches the wire, or is strictly ordered AFTER dispatch.

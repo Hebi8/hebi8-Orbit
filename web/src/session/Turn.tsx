@@ -235,7 +235,7 @@ export function Turn({
               >
                 <Link2 size={11} strokeWidth={1.7} />
                 <span className="turn-ref-proj">
-                  {ref.projectName || (ref.projectId === SCRATCH_PROJECT_ID ? '对话' : ref.projectId === PA_PROJECT_ID ? 'PA' : ref.projectId)}
+                  {ref.projectName || (ref.projectId === SCRATCH_PROJECT_ID ? '对话' : ref.projectId === PA_PROJECT_ID ? 'Hebi8' : ref.projectId)}
                 </span>
                 <span className="ell">{ref.title || ref.taskId}</span>
               </button>

@@ -6,9 +6,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
+	"os"
+	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/oklog/ulid/v2"
@@ -17,6 +23,145 @@ import (
 	"github.com/Hebi8/hebi8-Orbit/internal/protocol"
 	"github.com/Hebi8/hebi8-Orbit/internal/store"
 )
+
+var safeDeliveryIDRegex = regexp.MustCompile(`^[A-Za-z0-9_-][A-Za-z0-9._-]{0,127}$`)
+
+func isSafeDeliveryID(id string) bool {
+	id = strings.TrimSpace(id)
+	if !safeDeliveryIDRegex.MatchString(id) {
+		return false
+	}
+	return !strings.Contains(id, "..")
+}
+
+type deliveryLockEntry struct {
+	mu   sync.Mutex
+	refs int
+}
+
+// deliveryLocker provides ref-counted per-deliveryID exclusive locks shared across Hub
+// (cleanup / manual-import) and RyugiBridge (snapshot export / registration / content read).
+// Lock hierarchy: syncOpMu -> bindingGate -> regFlight wait -> deliveryLocks.Lock(id) -> ensureMu -> SQLite tx.
+type deliveryLocker struct {
+	mu      sync.Mutex
+	entries map[string]*deliveryLockEntry
+}
+
+func newDeliveryLocker() *deliveryLocker {
+	return &deliveryLocker{entries: map[string]*deliveryLockEntry{}}
+}
+
+func (l *deliveryLocker) Lock(deliveryID string) func() {
+	if l == nil {
+		return func() {}
+	}
+	l.mu.Lock()
+	e, ok := l.entries[deliveryID]
+	if !ok {
+		e = &deliveryLockEntry{}
+		l.entries[deliveryID] = e
+	}
+	e.refs++
+	l.mu.Unlock()
+
+	e.mu.Lock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			e.mu.Unlock()
+			l.mu.Lock()
+			e.refs--
+			if e.refs == 0 {
+				delete(l.entries, deliveryID)
+			}
+			l.mu.Unlock()
+		})
+	}
+}
+
+func (s *Server) removeFrozenDir(dir string) error {
+	s.testHookMu.Lock()
+	fn := s.removeFrozenDirFn
+	s.testHookMu.Unlock()
+	if fn != nil {
+		return fn(dir)
+	}
+	return gitops.RemoveFrozenDir(dir)
+}
+
+func (s *Server) cleanupPendingDeliveryDir(ctx context.Context, deliveryID string) error {
+	unlock := s.deliveryLocks.Lock(strings.TrimSpace(deliveryID))
+	defer unlock()
+	return s.cleanupPendingDeliveryDirLocked(ctx, deliveryID)
+}
+
+func (s *Server) cleanupPendingDeliveryDirLocked(ctx context.Context, deliveryID string) error {
+	deliveryID = strings.TrimSpace(deliveryID)
+	dataDir := s.hubConfigSnapshot().DataDir
+	dir, ok := safeDeliveryFrozenDir(dataDir, deliveryID)
+	if !ok {
+		log.Printf("warn: skipping unsafe deliveryId %q during pending cleanup", deliveryID)
+		return nil
+	}
+	shouldClean, err := s.store.ShouldCleanupDeliveryDir(ctx, deliveryID)
+	if err != nil {
+		return err
+	}
+	if !shouldClean {
+		// Either already cleared or a new delivery row with this ID now exists: never delete its directory.
+		return nil
+	}
+	if rmErr := s.removeFrozenDir(dir); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+		log.Printf("warn: failed to remove frozen snapshot dir %s for delivery %s: %v", dir, deliveryID, rmErr)
+		return rmErr
+	}
+	if clErr := s.store.ClearPendingDeliveryCleanup(ctx, deliveryID); clErr != nil {
+		log.Printf("warn: failed to clear pending_delivery_cleanups for %s: %v", deliveryID, clErr)
+		return clErr
+	}
+	return nil
+}
+
+func (s *Server) retryPendingDeliveryCleanups(ctx context.Context) {
+	ids, err := s.store.ListPendingDeliveryCleanups(ctx)
+	if err != nil {
+		log.Printf("warn: list pending_delivery_cleanups failed: %v", err)
+		return
+	}
+	for _, id := range ids {
+		_ = s.cleanupPendingDeliveryDir(ctx, id)
+	}
+}
+
+func (s *Server) failUndispatchedAttemptDetached(reqCtx context.Context, attemptID, errorCode, errorDetail string) error {
+	failCtx, cancel := context.WithTimeout(context.WithoutCancel(reqCtx), 5*time.Second)
+	defer cancel()
+	failEvents, err := s.store.FailUndispatchedAttempt(failCtx, attemptID, errorCode, errorDetail)
+	if err != nil {
+		log.Printf("error: FailUndispatchedAttempt(%s, %s) failed: %v", attemptID, errorCode, err)
+		return err
+	}
+	if len(failEvents) > 0 {
+		s.broker.Broadcast(failEvents...)
+	}
+	return nil
+}
+
+func safeDeliveryFrozenDir(dataDir, deliveryID string) (string, bool) {
+	deliveryID = strings.TrimSpace(deliveryID)
+	if !isSafeDeliveryID(deliveryID) || strings.TrimSpace(dataDir) == "" {
+		return "", false
+	}
+	base := filepath.Join(filepath.Clean(dataDir), "deliveries")
+	target := filepath.Join(base, deliveryID)
+	if !isSubPath(base, target) {
+		return "", false
+	}
+	if fi, err := os.Lstat(target); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+		return "", false
+	}
+	return target, true
+}
 
 func (s *Server) createTaskInternal(
 	ctx context.Context,
@@ -204,6 +349,9 @@ func (s *Server) createTaskInternalWithPA(
 	if errors.Is(err, store.ErrNotFound) {
 		return resp, nil, http.StatusNotFound, "ERR_NOT_FOUND", err
 	}
+	if errors.Is(err, store.ErrTaskArchived) {
+		return resp, nil, http.StatusConflict, "ERR_TASK_ARCHIVED", err
+	}
 	if errors.Is(err, store.ErrConflict) {
 		return resp, nil, http.StatusConflict, "ERR_CONFLICT", err
 	}
@@ -223,7 +371,14 @@ func (s *Server) createTaskInternalWithPA(
 
 	dispatched := false
 	if res.Created && res.Attempt != nil {
-		effectivePrompt := s.decorateAttemptPrompt(ctx, projectID, req.Goal, refMetas, projectID == protocol.PAProjectID)
+		effectivePrompt, decErr := s.decorateAttemptPromptForAttempt(ctx, *res.Attempt, req.Goal, refMetas)
+		if decErr != nil {
+			log.Printf("hub: failed to build prompt opening for attempt %s: %v", res.Attempt.AttemptID, decErr)
+			if failErr := s.failUndispatchedAttemptDetached(ctx, res.Attempt.AttemptID, "ERR_HEBI8_OPENING", decErr.Error()); failErr != nil {
+				return resp, nil, http.StatusInternalServerError, "ERR_HEBI8_OPENING", fmt.Errorf("%w (cleanup failed: %v)", decErr, failErr)
+			}
+			return resp, nil, http.StatusInternalServerError, "ERR_HEBI8_OPENING", decErr
+		}
 		dispatched = s.dispatchAttemptRecord(ctx, *res.Attempt, effectivePrompt, req.SwarmIdleTimeoutMs)
 	}
 
@@ -389,6 +544,9 @@ func (s *Server) followupTaskInternalWithPA(
 	if err != nil {
 		return resp, nil, http.StatusInternalServerError, "ERR_TASK_LOOKUP", err
 	}
+	if task.ArchivedAt != nil {
+		return resp, nil, http.StatusConflict, "ERR_TASK_ARCHIVED", errors.New("该会话已归档，请先恢复后再继续执行")
+	}
 
 	proj, err := s.store.GetProject(ctx, task.ProjectID)
 	if err != nil {
@@ -406,7 +564,8 @@ func (s *Server) followupTaskInternalWithPA(
 		effPayloadExtra = cloned
 	}
 
-	// Preserve existing task machine/location/isolation pinning across follow-ups when caller didn't switch capability.
+	// Preserve existing task machine/location/isolation pinning across follow-ups when caller didn't switch capability or machine.
+	explicitMachine := strings.TrimSpace(req.MachineID)
 	prevMachineID := ""
 	prevPartID := ""
 	prevLocID := ""
@@ -420,6 +579,15 @@ func (s *Server) followupTaskInternalWithPA(
 			prevIsolation = last.Isolation
 		}
 	}
+	targetMachineID := prevMachineID
+	if explicitMachine != "" {
+		if explicitMachine != prevMachineID {
+			prevPartID = ""
+			prevLocID = ""
+			prevIsolation = ""
+		}
+		targetMachineID = explicitMachine
+	}
 
 	reqCap := strings.TrimSpace(req.RequiredCapability)
 	if reqCap == "" {
@@ -429,11 +597,19 @@ func (s *Server) followupTaskInternalWithPA(
 	if reqAdapter == "" {
 		reqAdapter = task.PreferredAdapter
 	}
-	route, err := s.resolveExecutionRouteWithLocation(proj, reqCap, reqAdapter, prevMachineID, prevPartID, prevLocID)
+	route, err := s.resolveExecutionRouteWithLocation(proj, reqCap, reqAdapter, targetMachineID, prevPartID, prevLocID)
 	if err != nil {
+		if explicitMachine != "" {
+			return resp, nil, http.StatusBadRequest, "ERR_ROUTE_FAILED", err
+		}
 		route, err = s.resolveExecutionRoute(proj, reqCap, reqAdapter)
 		if err != nil {
 			return resp, nil, http.StatusBadRequest, "ERR_ROUTE_FAILED", err
+		}
+	}
+	if explicitMachine != "" && route.Adapter != protocol.AdapterManual && route.Adapter != protocol.AdapterSSHDeploy {
+		if !s.runners.IsConnected(route.MachineID) {
+			return resp, nil, http.StatusBadRequest, "ERR_MACHINE_OFFLINE", fmt.Errorf("machine %s is offline", route.MachineID)
 		}
 	}
 	if err := enforcePostRouteGuard(actorKind, route); err != nil {
@@ -458,7 +634,7 @@ func (s *Server) followupTaskInternalWithPA(
 		)
 	}
 
-	routeExplicit := strings.TrimSpace(req.RequiredCapability) != ""
+	routeExplicit := strings.TrimSpace(req.RequiredCapability) != "" || explicitMachine != ""
 	var anchorPtr *protocol.ProjectAnchorConfig
 	if route.HasAnchor {
 		a := route.Anchor
@@ -595,6 +771,9 @@ func (s *Server) followupTaskInternalWithPA(
 	if errors.Is(err, store.ErrNotFound) {
 		return resp, nil, http.StatusNotFound, "ERR_TASK_NOT_FOUND", err
 	}
+	if errors.Is(err, store.ErrTaskArchived) {
+		return resp, nil, http.StatusConflict, "ERR_TASK_ARCHIVED", errors.New("该会话已归档，请先恢复后再继续执行")
+	}
 	if errors.Is(err, store.ErrVerificationRequired) {
 		return resp, nil, http.StatusConflict, "ERR_VERIFICATION_REQUIRED", err
 	}
@@ -642,7 +821,14 @@ func (s *Server) followupTaskInternalWithPA(
 	dispatched := false
 	var attView *protocol.AttemptView
 	if subRes.Attempt != nil {
-		effectivePrompt := s.decorateAttemptPrompt(ctx, task.ProjectID, req.Message, refMetas, false)
+		effectivePrompt, decErr := s.decorateAttemptPromptForAttempt(ctx, *subRes.Attempt, req.Message, refMetas)
+		if decErr != nil {
+			log.Printf("hub: failed to build fold opening for attempt %s: %v", subRes.Attempt.AttemptID, decErr)
+			if failErr := s.failUndispatchedAttemptDetached(ctx, subRes.Attempt.AttemptID, "ERR_HEBI8_OPENING", decErr.Error()); failErr != nil {
+				return resp, nil, http.StatusInternalServerError, "ERR_HEBI8_OPENING", fmt.Errorf("%w (cleanup failed: %v)", decErr, failErr)
+			}
+			return resp, nil, http.StatusInternalServerError, "ERR_HEBI8_OPENING", decErr
+		}
 		dispatched = s.dispatchAttemptRecord(ctx, *subRes.Attempt, effectivePrompt, 0)
 		v := subRes.Attempt.AttemptView
 		attView = &v
@@ -792,6 +978,10 @@ func (s *Server) handleRetryTask(w http.ResponseWriter, r *http.Request) {
 		ActorKind:         actorKindFromContext(r.Context()),
 		ActorID:           actorFromContext(r.Context()),
 	})
+	if errors.Is(err, store.ErrTaskArchived) {
+		writeAPIError(w, http.StatusConflict, "ERR_TASK_ARCHIVED", "该会话已归档，请先恢复后再继续执行")
+		return
+	}
 	if errors.Is(err, store.ErrVerificationRequired) {
 		writeAPIError(w, http.StatusConflict, "ERR_VERIFICATION_REQUIRED", err.Error())
 		return
@@ -859,6 +1049,10 @@ func (s *Server) handleEnqueueInput(w http.ResponseWriter, r *http.Request) {
 	pi, ev, err := s.store.EnqueuePendingInput(r.Context(), taskID, req.Kind, req.Source, req.Body, req.Payload, actorFromContext(r.Context()))
 	if errors.Is(err, store.ErrNotFound) {
 		writeAPIError(w, http.StatusNotFound, "ERR_TASK_NOT_FOUND", err.Error())
+		return
+	}
+	if errors.Is(err, store.ErrTaskArchived) {
+		writeAPIError(w, http.StatusConflict, "ERR_TASK_ARCHIVED", "该会话已归档，请先恢复后再继续执行")
 		return
 	}
 	if errors.Is(err, store.ErrInvalidInput) {
@@ -932,6 +1126,10 @@ func (s *Server) handleSteerQueueInput(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusNotFound, "ERR_NOT_FOUND", err.Error())
 		return
 	}
+	if errors.Is(err, store.ErrTaskArchived) {
+		writeAPIError(w, http.StatusConflict, "ERR_TASK_ARCHIVED", "该会话已归档，请先恢复后再继续执行")
+		return
+	}
 	if err != nil {
 		writeAPIError(w, http.StatusInternalServerError, "ERR_QUEUE_STEER", err.Error())
 		return
@@ -962,6 +1160,10 @@ func (s *Server) handleReorderQueue(w http.ResponseWriter, r *http.Request) {
 	items, ev, err := s.store.ReorderPendingInputs(r.Context(), taskID, req.InputIDs, actorFromContext(r.Context()))
 	if errors.Is(err, store.ErrNotFound) {
 		writeAPIError(w, http.StatusNotFound, "ERR_TASK_NOT_FOUND", err.Error())
+		return
+	}
+	if errors.Is(err, store.ErrTaskArchived) {
+		writeAPIError(w, http.StatusConflict, "ERR_TASK_ARCHIVED", "该会话已归档，请先恢复后再继续执行")
 		return
 	}
 	if errors.Is(err, store.ErrInvalidInput) {
@@ -1036,6 +1238,10 @@ func (s *Server) handleDispatchAnnotations(w http.ResponseWriter, r *http.Reques
 	})
 	if errors.Is(err, store.ErrNotFound) {
 		writeAPIError(w, http.StatusNotFound, "ERR_TASK_NOT_FOUND", err.Error())
+		return
+	}
+	if errors.Is(err, store.ErrTaskArchived) {
+		writeAPIError(w, http.StatusConflict, "ERR_TASK_ARCHIVED", "该会话已归档，请先恢复后再继续执行")
 		return
 	}
 	if errors.Is(err, store.ErrInvalidInput) {
@@ -1126,6 +1332,10 @@ func (s *Server) handlePostBoardMessage(w http.ResponseWriter, r *http.Request) 
 	msg, ev, err := s.store.PostBoardMessage(r.Context(), taskID, author, req.TargetMention, req.Body, extKey)
 	if errors.Is(err, store.ErrNotFound) {
 		writeAPIError(w, http.StatusNotFound, "ERR_TASK_NOT_FOUND", err.Error())
+		return
+	}
+	if errors.Is(err, store.ErrTaskArchived) {
+		writeAPIError(w, http.StatusConflict, "ERR_TASK_ARCHIVED", "该会话已归档，请先恢复后再继续执行")
 		return
 	}
 	if errors.Is(err, store.ErrInvalidInput) {
@@ -1250,6 +1460,10 @@ func (s *Server) handleAddTaskSource(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusNotFound, "ERR_TASK_NOT_FOUND", err.Error())
 		return
 	}
+	if errors.Is(err, store.ErrTaskArchived) {
+		writeAPIError(w, http.StatusConflict, "ERR_TASK_ARCHIVED", "该会话已归档，请先恢复后再继续执行")
+		return
+	}
 	if errors.Is(err, store.ErrInvalidInput) {
 		writeAPIError(w, http.StatusBadRequest, "ERR_INVALID_INPUT", err.Error())
 		return
@@ -1280,4 +1494,125 @@ func (s *Server) handleDeleteTaskSource(w http.ResponseWriter, r *http.Request) 
 		s.broker.Broadcast(*ev)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"deleted": true, "sourceId": sourceID})
+}
+
+func (s *Server) handleArchiveTask(w http.ResponseWriter, r *http.Request) {
+	taskID := chi.URLParam(r, "taskId")
+	var req protocol.ArchiveTaskRequest
+	if r.Body != nil {
+		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<16)).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+			writeAPIError(w, http.StatusBadRequest, "ERR_INVALID_JSON", "invalid request body")
+			return
+		}
+	}
+	actorID := actorFromContext(r.Context())
+
+	cancelRequestedPending := false
+	if req.CancelActive {
+		// Atomically verify task-tree protection (e.g. Hebi8 main conversation) and cancel/request cancel
+		// inside ONE BEGIN IMMEDIATE SQLite write transaction to eliminate TOCTOU races.
+		cancelRes, cErr := s.store.CancelActiveAttemptIfArchivable(r.Context(), taskID, actorID, "归档前自动取消")
+		if cErr == nil {
+			if len(cancelRes.Events) > 0 {
+				s.broker.Broadcast(cancelRes.Events...)
+			}
+			if cancelRes.NeedsRunnerSend && cancelRes.Attempt.MachineID != "" && s.runners.IsConnected(cancelRes.Attempt.MachineID) {
+				_ = s.runners.CancelAttempt(cancelRes.Attempt.MachineID, protocol.AttemptCancelFrame{
+					AttemptID:  cancelRes.Attempt.AttemptID,
+					LeaseToken: cancelRes.Attempt.LeaseToken,
+				})
+			}
+			if !cancelRes.CancelledNow {
+				cancelRequestedPending = true
+			}
+		} else if errors.Is(cErr, store.ErrNotFound) {
+			writeAPIError(w, http.StatusNotFound, "ERR_TASK_NOT_FOUND", cErr.Error())
+			return
+		} else if errors.Is(cErr, store.ErrProtectedTask) || errors.Is(cErr, store.ErrForbidden) {
+			writeAPIError(w, http.StatusConflict, "ERR_FORBIDDEN", cErr.Error())
+			return
+		} else if !errors.Is(cErr, store.ErrConflict) {
+			writeAPIError(w, http.StatusInternalServerError, "ERR_CANCEL_TASK", cErr.Error())
+			return
+		}
+	}
+
+	task, ev, err := s.store.ArchiveTask(r.Context(), taskID, actorID)
+	if errors.Is(err, store.ErrNotFound) {
+		writeAPIError(w, http.StatusNotFound, "ERR_TASK_NOT_FOUND", err.Error())
+		return
+	}
+	if errors.Is(err, store.ErrTaskActive) {
+		msg := "会话正在运行中，请先停止或勾选取消后再归档"
+		if cancelRequestedPending {
+			msg = "已发送停止请求，请等待当前运行确认停止后再归档"
+		}
+		writeAPIError(w, http.StatusConflict, "ERR_TASK_ACTIVE", msg)
+		return
+	}
+	if errors.Is(err, store.ErrForbidden) {
+		writeAPIError(w, http.StatusConflict, "ERR_FORBIDDEN", err.Error())
+		return
+	}
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, "ERR_ARCHIVE_TASK", err.Error())
+		return
+	}
+	if ev != nil {
+		s.broker.Broadcast(*ev)
+	}
+	writeJSON(w, http.StatusOK, protocol.ArchiveTaskResponse{Task: task})
+}
+
+func (s *Server) handleUnarchiveTask(w http.ResponseWriter, r *http.Request) {
+	taskID := chi.URLParam(r, "taskId")
+	task, ev, err := s.store.UnarchiveTask(r.Context(), taskID, actorFromContext(r.Context()))
+	if errors.Is(err, store.ErrNotFound) {
+		writeAPIError(w, http.StatusNotFound, "ERR_TASK_NOT_FOUND", err.Error())
+		return
+	}
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, "ERR_UNARCHIVE_TASK", err.Error())
+		return
+	}
+	if ev != nil {
+		s.broker.Broadcast(*ev)
+	}
+	writeJSON(w, http.StatusOK, protocol.ArchiveTaskResponse{Task: task})
+}
+
+func (s *Server) handleDeleteTask(w http.ResponseWriter, r *http.Request) {
+	taskID := chi.URLParam(r, "taskId")
+	projectID, deliveryIDs, ev, err := s.store.DeleteTask(r.Context(), taskID, actorFromContext(r.Context()))
+	if errors.Is(err, store.ErrNotFound) {
+		writeAPIError(w, http.StatusNotFound, "ERR_TASK_NOT_FOUND", err.Error())
+		return
+	}
+	if errors.Is(err, store.ErrTaskActive) {
+		writeAPIError(w, http.StatusConflict, "ERR_TASK_ACTIVE", "会话正在运行中，请先停止后再永久删除")
+		return
+	}
+	if errors.Is(err, store.ErrForbidden) {
+		writeAPIError(w, http.StatusConflict, "ERR_FORBIDDEN", err.Error())
+		return
+	}
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, "ERR_DELETE_TASK", err.Error())
+		return
+	}
+	// Safely remove frozen delivery snapshot directories ONLY under this Hub instance's dataDir/deliveries/<deliveryId>.
+	// DeleteTask already recorded every deleted deliveryID into SQLite pending_delivery_cleanups inside its write tx;
+	// use a detached 30s timeout context so cleanup waits for any in-flight registration lock even if the HTTP client disconnects.
+	cleanCtx, cleanCancel := context.WithTimeout(context.WithoutCancel(r.Context()), 30*time.Second)
+	defer cleanCancel()
+	s.retryPendingDeliveryCleanups(cleanCtx)
+	_ = deliveryIDs
+	if ev != nil {
+		s.broker.Broadcast(*ev)
+	}
+	writeJSON(w, http.StatusOK, protocol.DeleteTaskResponse{
+		TaskID:    taskID,
+		ProjectID: projectID,
+		Deleted:   true,
+	})
 }

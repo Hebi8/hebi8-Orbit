@@ -1,6 +1,7 @@
 import type {
   ApprovalState,
   ApprovalView,
+  ArchiveTaskResponse,
   AttemptRawEventsResponse,
   BindScratchTaskResponse,
   BoardMessage,
@@ -25,6 +26,7 @@ import type {
   DecideApprovalRequest,
   DecideApprovalResponse,
   DeleteAnnotationResponse,
+  DeleteTaskResponse,
   DeliveryDetailResponse,
   DeliveryDiffResponse,
   DismissSuggestionRequest,
@@ -33,12 +35,19 @@ import type {
   FollowupTaskRequest,
   FollowupTaskResponse,
   GlobalArtifactView,
+  Hebi8ExpandResponse,
+  Hebi8FoldRequest,
+  Hebi8FoldResponse,
+  Hebi8LineResponse,
+  Hebi8MainResponse,
+  Hebi8PinResponse,
   ListArtifactsResponse,
   ListClientsResponse,
   ListDirsResponse,
   ListMachinesResponse,
   LogoutClientResponse,
   MachineAgentActionResponse,
+  MachineView,
   NetworkDiscoverResponse,
   NetworkSettingsView,
   PABriefRequest,
@@ -60,7 +69,10 @@ import type {
   RetryTaskRequest,
   RetryTaskResponse,
   RevokeClientResponse,
+  RyugiArtifactContentResponse,
+  RyugiOpenResponse,
   RyugiSyncResponse,
+  SSHCandidatesResponse,
   TailscaleDisableResponse,
   TailscaleEnableRequest,
   TailscaleEnableResponse,
@@ -80,22 +92,47 @@ import type {
 const DEV_TOKEN_KEY = 'orbit.devToken';
 const CLIENT_TOKEN_KEY = 'orbit.clientToken';
 const DESKTOP_FLAG_KEY = 'orbit.desktopShell';
+const DESKTOP_HELPER_PORT_KEY = 'orbit.desktopHelperPort';
 
 export function detectAndRememberDesktopShell(): boolean {
   try {
     const sp = new URLSearchParams(window.location.search);
-    if (sp.get('orbitDesktop') === '1') {
+    let dirty = false;
+    const isDesktopParam = sp.get('orbitDesktop') === '1';
+    if (isDesktopParam) {
       sessionStorage.setItem(DESKTOP_FLAG_KEY, '1');
-      // Strip query param cleanly without reloading
       sp.delete('orbitDesktop');
+      dirty = true;
+    }
+    const rawHelperPort = sp.get('desktopHelper');
+    if (rawHelperPort !== null) {
+      const port = Number.parseInt(rawHelperPort, 10);
+      if (Number.isInteger(port) && port > 0 && port <= 65535) {
+        sessionStorage.setItem(DESKTOP_HELPER_PORT_KEY, String(port));
+      }
+      sp.delete('desktopHelper');
+      dirty = true;
+    }
+    if (dirty) {
+      // Strip query params cleanly without reloading
       const rest = sp.toString();
       const nextURL = window.location.pathname + (rest ? `?${rest}` : '') + window.location.hash;
       window.history.replaceState(null, '', nextURL);
-      return true;
     }
-    return sessionStorage.getItem(DESKTOP_FLAG_KEY) === '1';
+    return isDesktopParam || sessionStorage.getItem(DESKTOP_FLAG_KEY) === '1';
   } catch {
     return false;
+  }
+}
+
+export function getDesktopHelperPort(): number | null {
+  try {
+    const raw = sessionStorage.getItem(DESKTOP_HELPER_PORT_KEY);
+    if (!raw) return null;
+    const port = Number.parseInt(raw, 10);
+    return Number.isInteger(port) && port > 0 && port <= 65535 ? port : null;
+  } catch {
+    return null;
   }
 }
 
@@ -230,19 +267,48 @@ export const api = {
     return apiFetch<BootstrapResponse>('/api/bootstrap');
   },
 
-  async listAllTasks(opts?: { limit?: number; excludeProject?: string; q?: string }): Promise<TaskSummary[]> {
+  async listAllTasks(opts?: {
+    limit?: number;
+    excludeProject?: string;
+    projectId?: string;
+    q?: string;
+    archived?: 'active' | 'only' | 'all';
+  }): Promise<TaskSummary[]> {
     const q = new URLSearchParams();
     if (opts?.limit) q.set('limit', String(opts.limit));
     if (opts?.excludeProject) q.set('excludeProject', opts.excludeProject);
+    if (opts?.projectId) q.set('projectId', opts.projectId);
     if (opts?.q && opts.q.trim()) q.set('q', opts.q.trim());
+    if (opts?.archived && opts.archived !== 'active') q.set('archived', opts.archived);
     const qs = q.toString();
     const res = await apiFetch<{ tasks: TaskSummary[] }>(`/api/tasks${qs ? `?${qs}` : ''}`);
     return res.tasks ?? [];
   },
 
-  async listProjectTasks(projectId: string): Promise<TaskSummary[]> {
-    const res = await apiFetch<{ tasks: TaskSummary[] }>(`/api/projects/${enc(projectId)}/tasks`);
+  async listProjectTasks(projectId: string, archived?: 'active' | 'only' | 'all'): Promise<TaskSummary[]> {
+    const qs = archived && archived !== 'active' ? `?archived=${enc(archived)}` : '';
+    const res = await apiFetch<{ tasks: TaskSummary[] }>(`/api/projects/${enc(projectId)}/tasks${qs}`);
     return res.tasks ?? [];
+  },
+
+  archiveTask(taskId: string, cancelActive = false): Promise<ArchiveTaskResponse> {
+    return apiFetch<ArchiveTaskResponse>(`/api/tasks/${enc(taskId)}/archive`, {
+      method: 'POST',
+      json: cancelActive ? { cancelActive: true } : {},
+    });
+  },
+
+  unarchiveTask(taskId: string): Promise<ArchiveTaskResponse> {
+    return apiFetch<ArchiveTaskResponse>(`/api/tasks/${enc(taskId)}/unarchive`, {
+      method: 'POST',
+      json: {},
+    });
+  },
+
+  deleteTask(taskId: string): Promise<DeleteTaskResponse> {
+    return apiFetch<DeleteTaskResponse>(`/api/tasks/${enc(taskId)}`, {
+      method: 'DELETE',
+    });
   },
 
   createTask(projectId: string, req: CreateTaskRequest): Promise<CreateTaskResponse> {
@@ -401,6 +467,36 @@ export const api = {
     });
   },
 
+  getHebi8Main(): Promise<Hebi8MainResponse> {
+    return apiFetch<Hebi8MainResponse>('/api/hebi8/main');
+  },
+
+  foldHebi8(req: Hebi8FoldRequest = {}): Promise<Hebi8FoldResponse> {
+    return apiFetch<Hebi8FoldResponse>('/api/hebi8/fold', {
+      method: 'POST',
+      json: req,
+    });
+  },
+
+  getHebi8Line(): Promise<Hebi8LineResponse> {
+    return apiFetch<Hebi8LineResponse>('/api/hebi8/line');
+  },
+
+  expandHebi8Node(nodeId: string, opts?: { offset?: number; limit?: number }): Promise<Hebi8ExpandResponse> {
+    const q = new URLSearchParams();
+    if (opts?.offset !== undefined) q.set('offset', String(opts.offset));
+    if (opts?.limit !== undefined) q.set('limit', String(opts.limit));
+    const qs = q.toString();
+    return apiFetch<Hebi8ExpandResponse>(`/api/hebi8/line/${enc(nodeId)}/expand${qs ? `?${qs}` : ''}`);
+  },
+
+  pinHebi8Node(nodeId: string, pinned: boolean): Promise<Hebi8PinResponse> {
+    return apiFetch<Hebi8PinResponse>(`/api/hebi8/line/${enc(nodeId)}/pin`, {
+      method: 'POST',
+      json: { pinned },
+    });
+  },
+
   getDelivery(deliveryId: string): Promise<DeliveryDetailResponse> {
     return apiFetch<DeliveryDetailResponse>(`/api/deliveries/${enc(deliveryId)}`);
   },
@@ -426,6 +522,20 @@ export const api = {
     return apiFetch<RyugiSyncResponse>(`/api/deliveries/${enc(deliveryId)}/ryugi/sync`, {
       method: 'POST',
     });
+  },
+
+  openDeliveryRyugi(deliveryId: string, bindingId?: string): Promise<RyugiOpenResponse> {
+    const q = bindingId ? `?bindingId=${enc(bindingId)}` : '';
+    return apiFetch<RyugiOpenResponse>(`/api/deliveries/${enc(deliveryId)}/ryugi/open${q}`, {
+      method: 'POST',
+      json: {},
+    });
+  },
+
+  getRyugiArtifactContent(deliveryId: string, bindingId: string): Promise<RyugiArtifactContentResponse> {
+    return apiFetch<RyugiArtifactContentResponse>(
+      `/api/deliveries/${enc(deliveryId)}/ryugi/${enc(bindingId)}/content`,
+    );
   },
 
   completeDeliveryReview(deliveryId: string): Promise<CompleteReviewResponse> {
@@ -597,6 +707,43 @@ export const api = {
   listMachineDirs(machineId: string, path?: string): Promise<ListDirsResponse> {
     const q = path ? `?path=${enc(path)}` : '';
     return apiFetch<ListDirsResponse>(`/api/machines/${enc(machineId)}/dirs${q}`);
+  },
+
+  async getMachineSSHCandidates(
+    machine: Pick<MachineView, 'machineId' | 'displayName' | 'displayAlias' | 'tailscaleHost' | 'sshAlias'>,
+  ): Promise<SSHCandidatesResponse> {
+    const helperPort = getDesktopHelperPort();
+    if (helperPort) {
+      try {
+        const q = new URLSearchParams();
+        if (machine.tailscaleHost) q.set('host', machine.tailscaleHost);
+        const name = machine.displayAlias || machine.displayName;
+        if (name) q.set('name', name);
+        if (machine.machineId) q.set('machineId', machine.machineId);
+        if (machine.sshAlias) q.set('sshAlias', machine.sshAlias);
+        const resp = await fetch(`http://127.0.0.1:${helperPort}/api/local-ssh-candidates?${q.toString()}`, {
+          credentials: 'omit',
+        });
+        if (resp.ok) {
+          const data = (await resp.json()) as SSHCandidatesResponse;
+          return {
+            localConfigAvailable: Boolean(data.localConfigAvailable),
+            recommended: data.recommended,
+            candidates: data.candidates ?? [],
+            allHosts: data.allHosts ?? [],
+          };
+        }
+      } catch {
+        // Fall through to Hub endpoint if desktop helper is unreachable.
+      }
+    }
+    const res = await apiFetch<SSHCandidatesResponse>(`/api/machines/${enc(machine.machineId)}/ssh-candidates`);
+    return {
+      localConfigAvailable: Boolean(res.localConfigAvailable),
+      recommended: res.recommended,
+      candidates: res.candidates ?? [],
+      allHosts: res.allHosts ?? [],
+    };
   },
 
   createProject(req: CreateProjectRequest): Promise<CreateProjectResponse> {
