@@ -23,11 +23,13 @@ function NodeRow({
   latency,
   isActiveDuty,
   isLocal,
+  onOpen,
 }: {
   m: MachineView;
   latency?: number | null;
   isActiveDuty: boolean;
   isLocal: boolean;
+  onOpen: () => void;
 }) {
   const res = Object.entries(m.resources ?? {});
   const busyRes = res.filter(([, v]) => !OK_RESOURCE_STATES.has((v.state || '').toLowerCase()));
@@ -44,13 +46,16 @@ function NodeRow({
 
   return (
     <div className={`node-row-wrap ${tone === 'off' ? 'is-off' : ''}`}>
-      <div className={`node-row ${tone === 'off' ? 'is-off' : ''}`}>
+      <button
+        type="button"
+        className={`node-row ${tone === 'off' ? 'is-off' : ''}`}
+        onClick={onOpen}
+        title={m.runnerVersion ? `${m.machineId} · ${m.runnerVersion} · 点击管理` : `${m.machineId} · 点击管理`}
+      >
         <DeviceRoleIcon machine={m} isActiveDuty={isActiveDuty} isCurrentDevice={isLocal} size={13.5} />
-        <span className="node-name" title={m.runnerVersion ? `${m.machineId} · ${m.runnerVersion}` : m.machineId}>
-          {m.displayAlias || cleanMachineName(m)}
-        </span>
+        <span className="node-name">{m.displayAlias || cleanMachineName(m)}</span>
         <span className={`node-right mono ${tone}`}>{rightText}</span>
-      </div>
+      </button>
       {busyRes.length > 0 && (
         <div className="mbusy" style={{ paddingLeft: 22, paddingBottom: 4 }}>
           {busyRes.map(([k, v]) => (
@@ -67,11 +72,13 @@ function NodeRow({
 export function MachinesPopover({
   machines,
   defaultWorkspaceName,
+  dutyPriority,
   activeDutyMachineId,
   currentMachineId,
 }: {
   machines: MachineView[];
   defaultWorkspaceName?: string;
+  dutyPriority?: string[];
   activeDutyMachineId?: string;
   currentMachineId?: string;
 }) {
@@ -89,7 +96,35 @@ export function MachinesPopover({
   const effectiveLocalId = resolveEffectiveLocalMachineId(machines, currentMachineId || storedLocalId);
   const onlineCount = machines.filter((m) => m.status === 'online').length;
   const anyOnline = machines.length === 0 || onlineCount > 0;
-  const headerTone = latency === null || !anyOnline ? 'off' : typeof latency === 'number' && latency >= 80 ? 'mid' : 'good';
+
+  const primaryDutyId = dutyPriority?.[0] ?? '';
+  const primaryMachine = primaryDutyId ? machines.find((m) => m.machineId === primaryDutyId) : undefined;
+  const activeDutyMachine = activeDutyMachineId
+    ? machines.find((m) => m.machineId === activeDutyMachineId)
+    : undefined;
+  const isFailoverActive =
+    !!primaryDutyId &&
+    !!activeDutyMachineId &&
+    primaryDutyId !== activeDutyMachineId &&
+    (!primaryMachine || primaryMachine.status !== 'online');
+
+  const headerTone =
+    latency === null || !anyOnline
+      ? 'off'
+      : isFailoverActive || (typeof latency === 'number' && latency >= 80)
+        ? 'mid'
+        : 'good';
+
+  const primaryName = primaryMachine ? primaryMachine.displayAlias || cleanMachineName(primaryMachine) : primaryDutyId;
+  const dutyName = activeDutyMachine
+    ? activeDutyMachine.displayAlias || cleanMachineName(activeDutyMachine)
+    : activeDutyMachineId || '';
+  const subText =
+    headerTone === 'off'
+      ? '未连接'
+      : isFailoverActive
+        ? `${primaryName} 离线 · ${dutyName} 接管`
+        : `已连接 · ${onlineCount}/${machines.length} 在线`;
 
   const saveName = async () => {
     const trimmed = draftName.trim();
@@ -125,9 +160,7 @@ export function MachinesPopover({
                 <span className={`ws-dot ${headerTone}`} aria-hidden="true" />
                 <span>{workspaceName}</span>
               </div>
-              <div className="ws-pop-sub">
-                {headerTone === 'off' ? '未连接' : `已连接 · ${onlineCount}/${machines.length} 在线`}
-              </div>
+              <div className="ws-pop-sub">{subText}</div>
             </div>
             <button
               type="button"
@@ -148,13 +181,13 @@ export function MachinesPopover({
                 value={draftName}
                 onChange={(e) => setDraftName(e.target.value)}
                 onKeyDown={(e) => {
-                  if (e.key === 'Enter') saveName();
+                  if (e.key === 'Enter') void saveName();
                   if (e.key === 'Escape') setRenaming(false);
                 }}
                 autoFocus
                 aria-label="全局空间名称"
               />
-              <button type="button" className="btn pri" onClick={saveName}>
+              <button type="button" className="btn pri" onClick={() => void saveName()}>
                 确定
               </button>
             </div>
@@ -174,6 +207,10 @@ export function MachinesPopover({
                     latency={isHubLocal ? latency : undefined}
                     isActiveDuty={activeDutyMachineId ? m.machineId === activeDutyMachineId : isHubLocal}
                     isLocal={!!effectiveLocalId && m.machineId === effectiveLocalId}
+                    onOpen={() => {
+                      setOpen(false);
+                      navigate(paths.settings(m.machineId));
+                    }}
                   />
                 );
               })

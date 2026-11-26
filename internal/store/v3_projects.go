@@ -927,11 +927,23 @@ func (s *Store) CreateProjectLocation(
 	return pv, createdLoc, ev, err
 }
 
-// UpdateProjectLocation updates isDefault or isolation on a bound location.
+// UpdateProjectLocation updates machine/path binding, isDefault, or isolation on a bound location.
 func (s *Store) UpdateProjectLocation(
 	ctx context.Context,
 	projectID, partID, locationID string,
 	req protocol.UpdateProjectLocationRequest,
+	actorID string,
+) (protocol.ProjectView, protocol.EventRecord, error) {
+	return s.UpdateProjectLocationWithRuntime(ctx, projectID, partID, locationID, req, nil, "", actorID)
+}
+
+// UpdateProjectLocationWithRuntime updates a bound location and optionally refreshes its runtime state.
+func (s *Store) UpdateProjectLocationWithRuntime(
+	ctx context.Context,
+	projectID, partID, locationID string,
+	req protocol.UpdateProjectLocationRequest,
+	runtimeState *protocol.LocationRuntimeState,
+	repoIdentity string,
 	actorID string,
 ) (protocol.ProjectView, protocol.EventRecord, error) {
 	var pv protocol.ProjectView
@@ -939,18 +951,34 @@ func (s *Store) UpdateProjectLocation(
 	now := time.Now().UnixMilli()
 	err := s.WithWriteTx(ctx, func(tx *sql.Tx) error {
 		var curDef int
-		var curIso, kindStr string
+		var curMachineID, curAbsPath, curIso, kindStr, curRepoID string
 		err := tx.QueryRowContext(ctx, `
-			SELECT l.is_default, l.isolation, p.kind
+			SELECT l.machine_id, l.abs_path, l.is_default, l.isolation, p.kind, p.repo_identity
 			FROM project_locations l
 			JOIN project_parts p ON p.part_id = l.part_id
 			WHERE l.project_id = ? AND l.part_id = ? AND l.location_id = ?
-		`, projectID, partID, locationID).Scan(&curDef, &curIso, &kindStr)
+		`, projectID, partID, locationID).Scan(&curMachineID, &curAbsPath, &curDef, &curIso, &kindStr, &curRepoID)
 		if errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("%w: location %s", ErrNotFound, locationID)
 		}
 		if err != nil {
 			return err
+		}
+		nextMachineID := curMachineID
+		if req.MachineID != nil {
+			trimmed := strings.TrimSpace(*req.MachineID)
+			if trimmed == "" {
+				return fmt.Errorf("%w: machineId cannot be empty", ErrInvalidInput)
+			}
+			nextMachineID = trimmed
+		}
+		nextAbsPath := curAbsPath
+		if req.AbsPath != nil {
+			cleaned := filepath.Clean(strings.TrimSpace(*req.AbsPath))
+			if cleaned == "" || cleaned == "." {
+				return fmt.Errorf("%w: absPath cannot be empty", ErrInvalidInput)
+			}
+			nextAbsPath = cleaned
 		}
 		nextDef := curDef
 		if req.IsDefault != nil {
@@ -975,10 +1003,22 @@ func (s *Store) UpdateProjectLocation(
 			}
 		}
 		if _, err := tx.ExecContext(ctx, `
-			UPDATE project_locations SET is_default = ?, isolation = ?, updated_at = ?
+			UPDATE project_locations
+			SET machine_id = ?, abs_path = ?, is_default = ?, isolation = ?, updated_at = ?
 			WHERE location_id = ?
-		`, nextDef, nextIso, now, locationID); err != nil {
+		`, nextMachineID, nextAbsPath, nextDef, nextIso, now, locationID); err != nil {
+			if strings.Contains(strings.ToLower(err.Error()), "unique") {
+				return fmt.Errorf("%w: location already bound on %s at %s", ErrConflict, nextMachineID, nextAbsPath)
+			}
 			return err
+		}
+		if runtimeState != nil {
+			if err := upsertLocationRuntimeStateTx(ctx, tx, locationID, *runtimeState); err != nil {
+				return err
+			}
+		}
+		if strings.TrimSpace(curRepoID) == "" && strings.TrimSpace(repoIdentity) != "" {
+			_, _ = tx.ExecContext(ctx, `UPDATE project_parts SET repo_identity = ?, updated_at = ? WHERE part_id = ?`, strings.TrimSpace(repoIdentity), now, partID)
 		}
 		if err := syncProjectAnchorsMirrorTx(ctx, tx, projectID, now); err != nil {
 			return err

@@ -583,6 +583,24 @@ machines:
 		t.Fatalf("PATCH part failed: status=%d %+v", resp.StatusCode, patchPartResp)
 	}
 
+	// Edit location absPath in-place via PATCH
+	subDir2 := filepath.Join(workRoot, "app-service-v2")
+	if err := os.MkdirAll(subDir2, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	resp = doReq(http.MethodPatch, "/api/projects/"+projID+"/parts/"+partID+"/locations/"+locID, protocol.UpdateProjectLocationRequest{
+		AbsPath: &subDir2,
+	})
+	var patchLocResp struct {
+		Project protocol.ProjectView `json:"project"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&patchLocResp)
+	resp.Body.Close()
+	realSubDir2, _ := filepath.EvalSymlinks(subDir2)
+	if resp.StatusCode != http.StatusOK || len(patchLocResp.Project.Parts) != 1 || len(patchLocResp.Project.Parts[0].Locations) != 1 || patchLocResp.Project.Parts[0].Locations[0].AbsPath != realSubDir2 {
+		t.Fatalf("PATCH location absPath failed: status=%d %+v", resp.StatusCode, patchLocResp)
+	}
+
 	// Delete the only location in the part -> part MUST survive with empty locations array
 	resp = doReq(http.MethodDelete, "/api/projects/"+projID+"/parts/"+partID+"/locations/"+locID, nil)
 	var delLocResp struct {

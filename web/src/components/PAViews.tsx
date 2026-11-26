@@ -1,8 +1,15 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { ArrowUpRight, FolderGit2, MessagesSquare } from 'lucide-react';
-import type { PAActionResult, PABriefResponse, PAChatResponse, ProjectView } from '../generated/protocol';
+import { ArrowUpRight, ChevronRight, FolderGit2, MessagesSquare } from 'lucide-react';
+import type {
+  MachineView,
+  PAActionResult,
+  PABriefResponse,
+  PAChatResponse,
+  ProjectView,
+} from '../generated/protocol';
 import { api, errMsg } from '../lib/api';
 import {
+  cleanMachineName,
   displayMarkRank,
   inboxItemsMark,
   indexInboxByTask,
@@ -16,6 +23,56 @@ import { navigate, paths } from '../lib/router';
 import { toast, useWorkbenchStore } from '../store/useWorkbenchStore';
 import { Md } from './Md';
 import { StatusMark } from './StatusMark';
+
+export interface CrossDirSessionItem {
+  key: string;
+  taskId?: string;
+  projectId?: string;
+  title: string;
+  projectLabel: string;
+  machineLabel?: string;
+  mark: SessionMark;
+  hint?: string;
+}
+
+/**
+ * Dedicated Hebi8 / PA cross-directory session jump cards:
+ * Displays StatusMark, title, `project · machine` badge, and concise explanation body.
+ * Clicking navigates directly to the target directory session (never uses parent/child ↗/↵ rails).
+ */
+export function CrossDirSessionCards({ items }: { items: CrossDirSessionItem[] }) {
+  if (items.length === 0) return null;
+  return (
+    <div className="it h8-cross-list" aria-label="跨目录会话提示">
+      {items.map((item) => {
+        const target = item.taskId
+          ? paths.session(item.taskId)
+          : item.projectId
+            ? paths.project(item.projectId)
+            : '';
+        const dirTag = [item.projectLabel, item.machineLabel].filter(Boolean).join(' · ');
+        return (
+          <button
+            key={item.key}
+            type="button"
+            className="h8-cross-card"
+            disabled={!target}
+            onClick={() => target && navigate(target)}
+            title={item.hint ? `${item.title} — ${item.hint}` : item.title}
+          >
+            <div className="h8-cross-top">
+              {item.mark && <StatusMark mark={item.mark} />}
+              <span className="h8-cross-ttl">{item.title}</span>
+              {dirTag && <span className="h8-cross-dir">{dirTag}</span>}
+              {target && <ChevronRight size={13} strokeWidth={1.7} className="h8-cross-chev" aria-hidden="true" />}
+            </div>
+            {item.hint && <div className="h8-cross-hint">{item.hint}</div>}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
 
 export function usePAChat(onDone?: (res: PAChatResponse) => void) {
   const qc = useQueryClient();
@@ -39,30 +96,61 @@ export function usePABrief(onDone?: (res: PABriefResponse) => void) {
   });
 }
 
-export function ActionCards({ actions }: { actions?: PAActionResult[] }) {
+export function ActionCards({
+  actions,
+  projects,
+  machines,
+}: {
+  actions?: PAActionResult[];
+  projects?: ProjectView[];
+  machines?: MachineView[];
+}) {
   if (!actions || actions.length === 0) return null;
+  const projectMap = new Map((projects ?? []).map((p) => [p.projectId, p]));
+  const machineMap = new Map((machines ?? []).map((m) => [m.machineId, m]));
+
+  const items: CrossDirSessionItem[] = [];
+  const plain: PAActionResult[] = [];
+  actions.forEach((a, i) => {
+    const taskId = typeof a.data?.taskId === 'string' ? a.data.taskId : '';
+    const projectId = typeof a.data?.projectId === 'string' ? a.data.projectId : '';
+    if (taskId || projectId) {
+      const proj = projectId ? projectMap.get(projectId) : undefined;
+      const mid = typeof a.data?.machineId === 'string' ? a.data.machineId : '';
+      const mach = mid ? machineMap.get(mid) : undefined;
+      items.push({
+        key: `${a.action}-${i}`,
+        taskId: taskId || undefined,
+        projectId: projectId || undefined,
+        title: (typeof a.data?.title === 'string' && a.data.title) || a.summary,
+        projectLabel: proj?.displayName || projectId || '项目会话',
+        machineLabel: mach ? mach.displayAlias || cleanMachineName(mach) : mid || undefined,
+        mark: a.status === 'error' ? 'failed' : null,
+        hint: typeof a.data?.title === 'string' && a.data.title !== a.summary ? a.summary : undefined,
+      });
+    } else {
+      plain.push(a);
+    }
+  });
+
   return (
-    <div className="acards">
-      {actions.map((a, i) => {
-        const taskId = typeof a.data?.taskId === 'string' ? a.data.taskId : '';
-        const projectId = typeof a.data?.projectId === 'string' ? a.data.projectId : '';
-        const target = taskId ? paths.session(taskId) : projectId ? paths.project(projectId) : '';
-        return (
-          <button
-            key={`${a.action}-${i}`}
-            type="button"
-            className="acard"
-            disabled={!target}
-            onClick={() => target && navigate(target)}
-            title={a.summary}
-          >
-            {taskId ? <MessagesSquare size={13} strokeWidth={1.6} /> : <FolderGit2 size={13} strokeWidth={1.6} />}
-            <span className="ell">{a.summary}</span>
-            {target && <ArrowUpRight size={12} strokeWidth={1.6} />}
-          </button>
-        );
-      })}
-    </div>
+    <>
+      {items.length > 0 && <CrossDirSessionCards items={items} />}
+      {plain.length > 0 && (
+        <div className="acards">
+          {plain.map((a, i) => (
+            <div key={`${a.action}-${i}`} className="acard" title={a.summary}>
+              {a.action.includes('project') ? (
+                <FolderGit2 size={13} strokeWidth={1.6} />
+              ) : (
+                <MessagesSquare size={13} strokeWidth={1.6} />
+              )}
+              <span className="ell">{a.summary}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </>
   );
 }
 
@@ -137,6 +225,11 @@ export function BriefView({ brief, projects }: { brief: PABriefResponse; project
             ))}
           </ul>
         </>
+      )}
+      {rows.length === 0 && brief.recentDeliveries.length === 0 && (
+        <div className="faint" style={{ fontSize: 12, marginTop: 6 }}>
+          暂无待处理事项 <ArrowUpRight size={11} style={{ display: 'inline', verticalAlign: '-1px' }} />
+        </div>
       )}
     </div>
   );

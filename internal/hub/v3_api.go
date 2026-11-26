@@ -429,9 +429,79 @@ func (s *Server) handleUpdateProjectLocation(w http.ResponseWriter, r *http.Requ
 		writeAPIError(w, http.StatusBadRequest, "ERR_INVALID_JSON", "invalid request body")
 		return
 	}
-	pv, ev, err := s.store.UpdateProjectLocation(r.Context(), projectID, partID, locationID, req, actorFromContext(r.Context()))
+
+	var runtimeSt *protocol.LocationRuntimeState
+	repoIdentity := ""
+	if req.MachineID != nil || req.AbsPath != nil {
+		proj, err := s.store.GetProject(r.Context(), projectID)
+		if errors.Is(err, store.ErrNotFound) {
+			writeAPIError(w, http.StatusNotFound, "ERR_PROJECT_NOT_FOUND", err.Error())
+			return
+		}
+		if err != nil {
+			writeAPIError(w, http.StatusInternalServerError, "ERR_PROJECT_LOOKUP", err.Error())
+			return
+		}
+		var curLoc *protocol.ProjectLocationView
+		for i := range proj.Parts {
+			if proj.Parts[i].PartID != partID {
+				continue
+			}
+			for j := range proj.Parts[i].Locations {
+				if proj.Parts[i].Locations[j].LocationID == locationID {
+					curLoc = &proj.Parts[i].Locations[j]
+					break
+				}
+			}
+			break
+		}
+		if curLoc == nil {
+			writeAPIError(w, http.StatusNotFound, "ERR_LOCATION_NOT_FOUND", fmt.Sprintf("location %s not found", locationID))
+			return
+		}
+		targetMachineID := curLoc.MachineID
+		if req.MachineID != nil {
+			targetMachineID = strings.TrimSpace(*req.MachineID)
+		}
+		targetAbsPath := curLoc.AbsPath
+		if req.AbsPath != nil {
+			targetAbsPath = strings.TrimSpace(*req.AbsPath)
+		}
+		if targetMachineID == "" || targetAbsPath == "" {
+			writeAPIError(w, http.StatusBadRequest, "ERR_INVALID_INPUT", "machineId and absPath cannot be empty")
+			return
+		}
+		insp, st, code, err := s.inspectMachineDirectory(r.Context(), targetMachineID, targetAbsPath)
+		if err != nil {
+			writeAPIError(w, st, code, err.Error())
+			return
+		}
+		if !insp.Valid || !insp.Exists {
+			msg := insp.Error
+			if msg == "" {
+				msg = "selected directory does not exist"
+			}
+			writeAPIError(w, http.StatusBadRequest, "ERR_INVALID_DIR", msg)
+			return
+		}
+		if insp.RepoRoot != "" {
+			targetAbsPath = insp.RepoRoot
+		}
+		req.MachineID = &targetMachineID
+		req.AbsPath = &targetAbsPath
+		runtimeSt = checkRepoToRuntimeState(insp)
+		repoIdentity = insp.RepoIdentity
+	}
+
+	pv, ev, err := s.store.UpdateProjectLocationWithRuntime(
+		r.Context(), projectID, partID, locationID, req, runtimeSt, repoIdentity, actorFromContext(r.Context()),
+	)
 	if errors.Is(err, store.ErrNotFound) {
 		writeAPIError(w, http.StatusNotFound, "ERR_LOCATION_NOT_FOUND", err.Error())
+		return
+	}
+	if errors.Is(err, store.ErrConflict) {
+		writeAPIError(w, http.StatusConflict, "ERR_LOCATION_EXISTS", err.Error())
 		return
 	}
 	if errors.Is(err, store.ErrInvalidInput) {

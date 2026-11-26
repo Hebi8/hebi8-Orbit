@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { AlertTriangle, Check, Copy, Globe, Laptop, RefreshCw, Server, ShieldCheck, X } from 'lucide-react';
 import type {
@@ -24,11 +24,13 @@ export function PairDialog({
   open,
   bindMachineId,
   machines,
+  onPaired,
   onClose,
 }: {
   open: boolean;
   bindMachineId?: string;
   machines: MachineView[];
+  onPaired?: (machineId: string) => void;
   onClose: () => void;
 }) {
   const qc = useQueryClient();
@@ -43,6 +45,9 @@ export function PairDialog({
   const [now, setNow] = useState(() => Date.now());
   const [tsEnabling, setTsEnabling] = useState(false);
   const [tsConfirm, setTsConfirm] = useState<TailscaleEnableResponse | null>(null);
+  const notifiedMachineRef = useRef('');
+  const onPairedRef = useRef(onPaired);
+  onPairedRef.current = onPaired;
 
   const createCode = useCallback(
     async (wantRunner: boolean, targetRole: MachineRole) => {
@@ -73,8 +78,10 @@ export function PairDialog({
       setStatus(null);
       setError('');
       setTsConfirm(null);
+      notifiedMachineRef.current = '';
       return;
     }
+    notifiedMachineRef.current = '';
     setRole('full');
     setAsRunner(true);
     void createCode(true, 'full');
@@ -109,6 +116,11 @@ export function PairDialog({
           refreshedOnce = true;
           void qc.invalidateQueries({ queryKey: ['bootstrap'] });
           void qc.invalidateQueries({ queryKey: ['machines'] });
+          void qc.invalidateQueries({ queryKey: ['network-settings'] });
+          if (st.machineId && notifiedMachineRef.current !== st.machineId) {
+            notifiedMachineRef.current = st.machineId;
+            onPairedRef.current?.(st.machineId);
+          }
         }
       } catch {
         // transient poll error ignored

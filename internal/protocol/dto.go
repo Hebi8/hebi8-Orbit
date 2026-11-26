@@ -1295,8 +1295,10 @@ type CreateProjectLocationRequest struct {
 	Isolation LocationIsolation `json:"isolation,omitempty"`
 }
 
-// UpdateProjectLocationRequest updates default flag or isolation mode for a location.
+// UpdateProjectLocationRequest updates machine/path binding, default flag, or isolation mode for a location.
 type UpdateProjectLocationRequest struct {
+	MachineID *string            `json:"machineId,omitempty"`
+	AbsPath   *string            `json:"absPath,omitempty"`
 	IsDefault *bool              `json:"isDefault,omitempty"`
 	Isolation *LocationIsolation `json:"isolation,omitempty"`
 }

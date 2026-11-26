@@ -89,8 +89,6 @@ function useGlobalKeys() {
         s.closeReview();
       } else if (route.name === 'session' && route.childId) {
         navigate(paths.session(route.taskId));
-      } else if (route.name === 'pa' && route.childId) {
-        navigate(paths.pa(route.threadId));
       } else if (route.name === 'session' && route.worker) {
         navigate(paths.session(route.taskId));
       } else if (s.boardOpen && route.name === 'session') {
@@ -398,10 +396,10 @@ export function App() {
   let page;
   switch (route.name) {
     case 'settings':
-      page = <SettingsPage boot={boot} />;
+      page = <SettingsPage boot={boot} initialMachineId={route.machineId} />;
       break;
     case 'pa':
-      page = <PAPage boot={boot} threadId={route.threadId} childId={route.childId} />;
+      page = <PAPage boot={boot} threadId={route.threadId} />;
       break;
     case 'artifacts':
       page = <ArtifactsPage />;
@@ -503,6 +501,7 @@ export function App() {
         <MachinesPopover
           machines={boot.machines}
           defaultWorkspaceName={boot.workspaceName}
+          dutyPriority={boot.setup?.dutyPriority}
           activeDutyMachineId={boot.setup?.activeDutyMachineId}
           currentMachineId={boot.setup?.currentMachineId}
         />

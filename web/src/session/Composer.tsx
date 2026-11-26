@@ -838,6 +838,10 @@ function SessionComposer({
     void qc.invalidateQueries({ queryKey: ['all-tasks'] });
     void qc.invalidateQueries({ queryKey: ['delivery'] });
     void qc.invalidateQueries({ queryKey: ['global-artifacts'] });
+    if (targetProjectId === PA_PROJECT_ID) {
+      void qc.invalidateQueries({ queryKey: ['hebi8-main'] });
+      void qc.invalidateQueries({ queryKey: ['hebi8-line'] });
+    }
     void qc.invalidateQueries({ queryKey: ['bootstrap'] });
   };
 

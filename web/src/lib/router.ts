@@ -13,7 +13,7 @@ export type Route =
   | { name: 'session'; taskId: string; worker?: string; childId?: string }
   | { name: 'projects' }
   | { name: 'onboarding' }
-  | { name: 'settings' }
+  | { name: 'settings'; machineId?: string }
   | { name: 'auth'; code: string }
   | { name: 'join'; code: string; scope?: string };
 
@@ -41,7 +41,7 @@ export function parseHash(hash: string): Route {
     case 'onboarding':
       return { name: 'onboarding' };
     case 'settings':
-      return { name: 'settings' };
+      return { name: 'settings', machineId: q.get('machine') ?? undefined };
     case 'pa':
     case 'hebi8':
       return { name: 'pa', threadId: segs[1], childId: q.get('child') ?? undefined };
@@ -90,7 +90,7 @@ const e = encodeURIComponent;
 export const paths = {
   home: () => '#/',
   onboarding: () => '#/onboarding',
-  settings: () => '#/settings',
+  settings: (machineId?: string) => (machineId ? `#/settings?machine=${e(machineId)}` : '#/settings'),
   hebi8: (childId?: string) => (childId ? `#/hebi8?child=${e(childId)}` : '#/hebi8'),
   pa: (threadId?: string, childId?: string) => {
     const base = threadId ? `#/pa/${e(threadId)}` : '#/hebi8';

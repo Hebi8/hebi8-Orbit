@@ -2516,6 +2516,297 @@ details[open] > .proc-summary .proc-chev { transform: rotate(90deg); }
   padding: 4px 8px 4px 22px; font-size: 11px; color: var(--faint);
 }
 
+/* =====================================================================
+   Phase 2C: Hebi8 Cross-Dir Cards, On-Demand Quick Summary, HEAD-on-Top
+   Git-Tree, Codex Directory Picker, Project Settings & Worker Management
+   ===================================================================== */
+
+/* Clickable full-width node rows in MachinesPopover */
+.node-row { width: 100%; text-align: left; }
+
+/* Hebi8 dedicated cross-directory session jump cards (never forced into ↗/↵ rails) */
+.h8-cross-list { display: flex; flex-direction: column; gap: 7px; margin: 4px 0; }
+.h8-cross-card {
+  width: 100%; text-align: left; padding: 10px 12px; border-radius: 9px;
+  border: 1px solid var(--line2); background: var(--panel);
+  display: flex; flex-direction: column; gap: 5px;
+  transition: border-color var(--motion-fast), background var(--motion-fast);
+}
+.h8-cross-card:hover:not(:disabled) { border-color: var(--accent-line); background: var(--raised); }
+.h8-cross-top { display: flex; align-items: center; gap: 7px; font-size: 12.5px; min-width: 0; }
+.h8-cross-ttl {
+  font-weight: 600; color: var(--fg); flex: 1; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.h8-cross-dir {
+  font-family: "JetBrains Mono", "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+  font-size: 10.5px; color: var(--muted);
+  background: var(--raised); border: 1px solid var(--line);
+  padding: 1px 6px; border-radius: 4px; flex: none;
+}
+.h8-cross-chev { color: var(--faint); flex: none; }
+.h8-cross-hint { font-size: 12px; color: var(--muted); line-height: 1.5; }
+
+/* Hebi8 on-demand quick summary suggestion bar directly above Composer */
+.h8-prompt-wrap {
+  max-width: 760px; margin: 0 auto 8px;
+}
+.h8-prompt-bar {
+  display: flex; align-items: center; gap: 6px;
+  padding: 5px 7px 5px 10px; border-radius: 9px;
+  border: 1px solid var(--line); background: var(--panel); font-size: 12px;
+}
+.h8-prompt-chip {
+  flex: 1; min-width: 0; display: flex; align-items: center; gap: 7px;
+  color: var(--fg2); text-align: left; overflow: hidden;
+  transition: color var(--motion-fast);
+}
+.h8-prompt-chip span:last-child {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.h8-prompt-chip:hover { color: var(--fg); }
+.h8-prompt-ico {
+  color: var(--accent); display: inline-grid; place-items: center; flex: none;
+}
+.h8-prompt-send {
+  height: 22px; padding: 0 8px; border-radius: 5px; font-size: 11px; font-weight: 500;
+  color: var(--accent); background: var(--accent-bg); flex: none;
+  transition: filter var(--motion-fast), opacity var(--motion-fast);
+}
+.h8-prompt-send:hover:not(:disabled) { filter: brightness(1.08); }
+.h8-prompt-send:disabled { opacity: 0.45; cursor: not-allowed; }
+.h8-prompt-dismiss { width: 22px !important; height: 22px !important; flex: none; }
+
+/* Hebi8 Vertical Git-Tree Drawer (HEAD pinned at top, older nodes descending) */
+.h8-drawer-hd-acts { display: inline-flex; align-items: center; gap: 4px; flex: none; }
+.h8-drawer-fold-btn { height: 24px !important; padding: 0 8px !important; font-size: 11px !important; }
+.h8-git-scroll {
+  flex: 1; min-height: 0; overflow-y: auto; padding: 12px 12px 16px;
+  display: flex; flex-direction: column;
+}
+.h8-git-group { display: flex; flex-direction: column; }
+.h8-git-item { position: relative; display: flex; align-items: stretch; gap: 8px; }
+.h8-git-rail {
+  width: 22px; flex: none; position: relative;
+  display: flex; flex-direction: column; align-items: center;
+}
+.h8-git-line-top,
+.h8-git-line-bot {
+  width: 1.5px; background: var(--line2); flex: 1;
+}
+.h8-git-line-top.is-none,
+.h8-git-line-bot.is-none { background: transparent; }
+.h8-git-line-bot.is-active {
+  background: linear-gradient(to bottom, var(--accent), var(--line2));
+}
+.h8-git-dot {
+  width: 9px; height: 9px; border-radius: 99px;
+  border: 2px solid var(--muted); background: var(--panel);
+  flex: none; z-index: 2; margin: 1px 0;
+}
+.h8-git-dot.is-fold {
+  width: 11px; height: 11px; border-color: var(--accent); background: var(--accent-bg);
+}
+.h8-git-dot.is-head {
+  width: 11px; height: 11px; border-color: var(--accent); background: var(--accent);
+}
+.h8-git-card-wrap {
+  flex: 1; min-width: 0; display: flex; align-items: flex-start; gap: 4px; padding: 3px 0 8px;
+}
+.h8-git-card {
+  flex: 1; min-width: 0; text-align: left; padding: 7px 10px; border-radius: 8px;
+  border: 1px solid var(--line); background: var(--bg);
+  transition: border-color var(--motion-fast), background var(--motion-fast);
+}
+.h8-git-card:hover { border-color: var(--line2); background: var(--hover); }
+.h8-git-card.on { border-color: var(--accent-line); background: var(--accent-bg); }
+.h8-git-card.is-head { border-color: var(--accent-line); background: var(--raised); }
+.h8-git-card-top { display: flex; align-items: center; gap: 5px; min-width: 0; }
+.h8-head-badge {
+  font-family: "JetBrains Mono", "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+  font-size: 9.5px; font-weight: 700; letter-spacing: 0.04em;
+  color: var(--accent); background: var(--accent-bg); border: 1px solid var(--accent-line);
+  padding: 0 5px; border-radius: 4px; flex: none;
+}
+.h8-head-lbl { font-size: 11.5px; font-weight: 600; color: var(--fg); }
+.h8-git-card-ttl {
+  font-size: 12px; font-weight: 500; color: var(--fg);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 3px;
+}
+.h8-git-card-sub { font-size: 10.5px; color: var(--faint); margin-top: 2px; }
+.h8-git-exp-btn {
+  width: 24px; height: 24px; margin-top: 6px; border-radius: 6px;
+  border: 1px solid var(--line); background: var(--bg); color: var(--muted);
+  display: inline-grid; place-items: center; flex: none;
+  transition: background var(--motion-fast), color var(--motion-fast), border-color var(--motion-fast);
+}
+.h8-git-exp-btn:hover,
+.h8-git-exp-btn.open { background: var(--hover2); border-color: var(--line2); color: var(--fg); }
+.h8-git-branch { position: relative; display: flex; align-items: stretch; gap: 8px; }
+.h8-git-branch-trunk {
+  width: 22px; flex: none; position: relative; display: flex; justify-content: center;
+}
+.h8-git-branch-trunk::before {
+  content: ""; position: absolute; top: 0; bottom: 0; left: 50%;
+  width: 1.5px; transform: translateX(-50%); background: var(--line2);
+}
+.h8-git-branch-trunk.is-last::before { display: none; }
+.h8-git-branch-list {
+  flex: 1; min-width: 0; position: relative; margin: 0 0 8px 4px; padding-left: 14px;
+  border-left: 1.5px dashed var(--accent-line);
+  display: flex; flex-direction: column; gap: 5px;
+}
+.h8-git-branch-list.is-nested { margin: 5px 0 2px 6px; }
+.h8-git-branch-node { display: flex; flex-direction: column; }
+.h8-git-branch-row-wrap { display: flex; align-items: flex-start; gap: 4px; position: relative; }
+.h8-git-branch-row {
+  position: relative; flex: 1; min-width: 0; text-align: left;
+  padding: 6px 9px; border-radius: 7px; border: 1px solid var(--line); background: var(--side);
+  transition: border-color var(--motion-fast), background var(--motion-fast);
+}
+.h8-git-branch-row::before {
+  content: ""; position: absolute; left: -15px; top: 50%;
+  width: 14px; height: 1.5px; background: var(--accent-line);
+}
+.h8-git-branch-row::after {
+  content: ""; position: absolute; left: -18px; top: 50%; transform: translateY(-50%);
+  width: 6px; height: 6px; border-radius: 99px; background: var(--accent);
+}
+.h8-git-branch-row:hover { border-color: var(--line2); background: var(--hover); }
+.h8-git-branch-row.on { border-color: var(--accent-line); background: var(--accent-bg); }
+.h8-git-empty {
+  padding: 12px 6px 4px 30px; font-size: 11.5px; color: var(--faint);
+}
+.h8-detail-sheet {
+  flex: none; max-height: 48%; overflow-y: auto;
+  border-top: 1px solid var(--line2); background: var(--side);
+  padding: 11px 13px 14px; display: flex; flex-direction: column; gap: 7px;
+}
+.h8-detail-hd-acts { display: inline-flex; align-items: center; gap: 4px; flex: none; }
+
+/* Codex-Style Unified Directory Picker */
+.cdx-meta-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; }
+.cdx-meta-grid.has-kind { grid-template-columns: minmax(0, 1fr) auto; align-items: end; }
+.cdx-meta-field { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+.cdx-meta-lbl { font-size: 11.5px; color: var(--muted); }
+.cdx-dir-box {
+  border: 1px solid var(--line2); border-radius: 9px; background: var(--bg);
+  overflow: hidden; display: flex; flex-direction: column;
+}
+.cdx-nav {
+  height: 34px; padding: 0 6px; border-bottom: 1px solid var(--line); background: var(--panel);
+  display: flex; align-items: center; gap: 5px;
+}
+.cdx-up-btn,
+.cdx-edit-btn {
+  width: 24px; height: 24px; border-radius: 5px; color: var(--muted);
+  display: inline-grid; place-items: center; flex: none;
+  transition: background var(--motion-fast), color var(--motion-fast);
+}
+.cdx-up-btn:hover:not(:disabled),
+.cdx-edit-btn:hover:not(:disabled) { background: var(--hover2); color: var(--fg); }
+.cdx-up-btn:disabled,
+.cdx-edit-btn:disabled { opacity: 0.32; cursor: default; }
+.cdx-crumbs {
+  flex: 1; min-width: 0; height: 24px; display: flex; align-items: center; gap: 1px;
+  overflow-x: auto; scrollbar-width: none; cursor: text;
+}
+.cdx-crumbs::-webkit-scrollbar { display: none; }
+.cdx-crumb-seg { display: inline-flex; align-items: center; gap: 1px; flex: none; }
+.cdx-crumb {
+  height: 22px; padding: 0 5px; border-radius: 4px;
+  font-family: "JetBrains Mono", "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+  font-size: 11.5px;
+  color: var(--muted); white-space: nowrap; flex: none;
+  transition: background var(--motion-fast), color var(--motion-fast);
+}
+.cdx-crumb:hover { background: var(--hover2); color: var(--fg); }
+.cdx-crumb.is-cur { color: var(--fg); font-weight: 500; }
+.cdx-crumb-sep {
+  font-family: "JetBrains Mono", "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+  font-size: 11px; color: var(--faint); opacity: 0.65;
+  flex: none; user-select: none;
+}
+.cdx-path-in {
+  flex: 1; min-width: 0; height: 24px; padding: 0 7px; border-radius: 5px;
+  border: 1px solid var(--accent-line); background: var(--bg);
+  font-size: 11.5px; color: var(--fg); outline: none;
+}
+.cdx-err {
+  padding: 6px 10px; border-bottom: 1px solid color-mix(in srgb, var(--bad) 26%, transparent);
+  background: var(--bad-bg); color: var(--bad); font-size: 11.5px; line-height: 1.4;
+}
+.cdx-list {
+  max-height: 216px; min-height: 110px; overflow-y: auto;
+  display: flex; flex-direction: column; padding: 4px; gap: 1px;
+}
+.cdx-row {
+  width: 100%; height: 31px; padding: 0 4px 0 6px; border-radius: 6px;
+  display: flex; align-items: center; gap: 4px; font-size: 12px; color: var(--fg2);
+  transition: background var(--motion-fast), color var(--motion-fast);
+}
+.cdx-row:hover { background: var(--hover); color: var(--fg); }
+.cdx-row.active { background: var(--hover2); color: var(--fg); font-weight: 500; }
+.cdx-row-main {
+  flex: 1; min-width: 0; height: 100%; display: flex; align-items: center; gap: 7px;
+  text-align: left; padding: 0 2px;
+}
+.cdx-row-ico { color: var(--muted); display: inline-grid; place-items: center; flex: none; }
+.cdx-row.active .cdx-row-ico { color: var(--fg2); }
+.cdx-name {
+  font-family: "JetBrains Mono", "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+  font-size: 12px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.cdx-enter-btn {
+  width: 22px; height: 22px; border-radius: 5px; color: var(--faint);
+  display: inline-grid; place-items: center; flex: none;
+  transition: background var(--motion-fast), color var(--motion-fast);
+}
+.cdx-enter-btn:hover { background: var(--hover2); color: var(--fg); }
+.cdx-empty { padding: 22px 12px; text-align: center; font-size: 11.5px; color: var(--faint); }
+.cdx-foot {
+  padding: 5px 9px; border-top: 1px solid var(--line); background: var(--side);
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  font-size: 10.5px; color: var(--faint);
+}
+.cdx-foot-path {
+  font-family: "JetBrains Mono", "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+  color: var(--fg2);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0;
+}
+.cdx-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; margin-top: 2px; }
+
+/* Project Settings independent Part/Location controls & empty states */
+.pset-part-remote { font-size: 11px; color: var(--faint); max-width: 240px; }
+.pset-loc-empty {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  padding: 12px; font-size: 12px;
+}
+.pset-loc-ico-act { opacity: 0.65; }
+.pset-loc-row:hover .pset-loc-ico-act,
+.pset-loc-ico-act:focus-visible { opacity: 1; }
+.pset-del-part:hover,
+.pset-del-loc:hover { color: var(--bad) !important; }
+.pset-edit-part-modal { width: min(460px, 92vw); }
+
+/* Settings Page: Clean duty list + restricted worker scope note */
+.duty-right { margin-left: auto; display: inline-flex; align-items: center; gap: 4px; flex: none; }
+.duty-move-btn { width: 22px !important; height: 22px !important; }
+.duty-row.is-takeover { background: color-mix(in srgb, var(--warn) 6%, transparent); }
+.duty-takeover {
+  font-size: 11px; color: var(--warn); padding: 1px 6px; border-radius: 4px;
+  background: color-mix(in srgb, var(--warn) 12%, transparent);
+}
+.set-mach-hd { cursor: pointer; }
+.set-mach-os { font-size: 11px; flex: none; }
+.worker-scope-note {
+  padding: 8px 10px; border-radius: 7px; background: var(--bg);
+  border: 1px solid var(--line); font-size: 11.5px; color: var(--muted);
+  display: flex; align-items: center; gap: 8px; line-height: 1.45;
+}
+.worker-scope-note strong { color: var(--fg2); font-weight: 600; }
+
 /* Responsive overlay behavior for ChildSessionDrawer on tablet & mobile */
 @media (max-width: 1080px) {
   .sub-resize-handle { display: none; }

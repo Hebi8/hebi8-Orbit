@@ -7,6 +7,7 @@ import type {
   ChildTaskView,
   EventRecord,
   PendingInput,
+  TaskSummary,
   TaskTimelineResponse,
 } from '../generated/protocol';
 import { api, errMsg } from '../lib/api';
@@ -98,6 +99,7 @@ export function SessionConversation({
   childrenList,
   nativeMembers,
   siblingChildren,
+  extraTasks,
   activeChildId,
   activeNativeMember,
   emptySlot,
@@ -118,6 +120,7 @@ export function SessionConversation({
   childrenList?: ChildTaskView[];
   nativeMembers?: BoardMemberCursor[];
   siblingChildren?: ChildTaskView[];
+  extraTasks?: TaskSummary[];
   activeChildId?: string;
   activeNativeMember?: string;
   emptySlot?: ReactNode;
@@ -184,6 +187,13 @@ export function SessionConversation({
   const pendingInputs = [...tl.pendingInputs].sort((a, b) => a.position - b.position || a.createdAt - b.createdAt);
   const openAnnotations = useMemo(() => tl.annotations.filter((a) => a.status === 'open'), [tl.annotations]);
   const inboxByTask = useMemo(() => indexInboxByTask(boot?.openInboxItems ?? []), [boot?.openInboxItems]);
+
+  const mergedAllTasks = useMemo(() => {
+    const map = new Map<string, TaskSummary>();
+    for (const t of extraTasks ?? []) map.set(t.taskId, t);
+    for (const t of boot?.activeTasks ?? []) map.set(t.taskId, t);
+    return [...map.values()];
+  }, [extraTasks, boot?.activeTasks]);
 
   const effectiveSiblings = siblingChildren ?? tl.siblingChildren ?? [];
   const resolveTaskTitle = useCallback(
@@ -275,7 +285,8 @@ export function SessionConversation({
                       childrenList={childrenList}
                       nativeMembers={nativeMembers}
                       siblingChildren={effectiveSiblings}
-                      allTasks={boot?.activeTasks}
+                      allTasks={mergedAllTasks}
+                      projects={boot?.projects}
                       machines={boot?.machines}
                       inboxByTask={inboxByTask}
                       activeChildId={activeChildId}

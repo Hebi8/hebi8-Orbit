@@ -8,15 +8,18 @@ import {
   Folder,
   GitBranch,
   Lock,
+  Pencil,
   Plus,
   RefreshCw,
   Trash2,
+  X,
 } from 'lucide-react';
 import type {
   BootstrapResponse,
   DeliveryView,
   ProjectEnvVar,
   ProjectLocationView,
+  ProjectPartKind,
   ProjectPartView,
   ProjectView,
   TaskSummary,
@@ -71,7 +74,6 @@ function ProjectSettingsTab({
   const activeDutyId = boot.setup?.activeDutyMachineId ?? '';
 
   const parts: ProjectPartView[] = project.parts ?? [];
-  const collapseSinglePart = parts.length <= 1;
 
   const suggestionsQ = useProjectSuggestions(project.projectId, true);
   const suggestions = suggestionsQ.data?.suggestions ?? [];
@@ -79,9 +81,14 @@ function ProjectSettingsTab({
   const [refreshingLocs, setRefreshingLocs] = useState(false);
   const [browseTarget, setBrowseTarget] = useState<
     | null
-    | { kind: 'location'; partId: string; partName: string }
-    | { kind: 'part' }
+    | { kind: 'add_location'; partId: string; partName: string }
+    | { kind: 'edit_location'; partId: string; partName: string; loc: ProjectLocationView }
+    | { kind: 'add_part' }
   >(null);
+  const [editingPart, setEditingPart] = useState<ProjectPartView | null>(null);
+  const [partNameDraft, setPartNameDraft] = useState('');
+  const [partKindDraft, setPartKindDraft] = useState<ProjectPartKind>('folder');
+  const [savingPart, setSavingPart] = useState(false);
 
   // Shared ENV state
   const [envRows, setEnvRows] = useState<ProjectEnvVar[]>(() => project.sharedEnv ?? []);
@@ -146,23 +153,42 @@ function ProjectSettingsTab({
     }
   };
 
-  const handleToggleIsolation = async (partId: string, loc: ProjectLocationView) => {
-    const next = loc.isolation === 'in_place' ? 'worktree' : 'in_place';
+  const handleDeleteLocation = async (partId: string, loc: ProjectLocationView) => {
     try {
-      await api.updateProjectLocation(project.projectId, partId, loc.locationId, { isolation: next });
+      await api.deleteProjectLocation(project.projectId, partId, loc.locationId);
       invalidate();
+      toast('已移除设备路径');
     } catch (e) {
       toast(errMsg(e), 'err');
     }
   };
 
-  const handleDeleteLocation = async (partId: string, loc: ProjectLocationView) => {
+  const openEditPart = (part: ProjectPartView) => {
+    setEditingPart(part);
+    setPartNameDraft(part.name);
+    setPartKindDraft(part.kind);
+  };
+
+  const handleSavePart = async () => {
+    if (!editingPart) return;
+    const trimmed = partNameDraft.trim();
+    if (!trimmed) {
+      toast('组成部分名称不能为空', 'err');
+      return;
+    }
+    setSavingPart(true);
     try {
-      await api.deleteProjectLocation(project.projectId, partId, loc.locationId);
+      await api.updateProjectPart(project.projectId, editingPart.partId, {
+        name: trimmed,
+        kind: partKindDraft,
+      });
       invalidate();
-      toast('已移除设备位置');
+      setEditingPart(null);
+      toast('已更新组成部分');
     } catch (e) {
       toast(errMsg(e), 'err');
+    } finally {
+      setSavingPart(false);
     }
   };
 
@@ -170,7 +196,7 @@ function ProjectSettingsTab({
     try {
       await api.deleteProjectPart(project.projectId, part.partId);
       invalidate();
-      toast(`已移除 ${part.name}`);
+      toast(`已删除组成部分「${part.name}」`);
     } catch (e) {
       toast(errMsg(e), 'err');
     }
@@ -231,21 +257,10 @@ function ProjectSettingsTab({
             >
               <RefreshCw size={13} strokeWidth={1.7} className={refreshingLocs ? 'spin-ico' : ''} />
             </button>
-            {collapseSinglePart && parts[0] && (
-              <button
-                type="button"
-                className="btn ghost sm"
-                onClick={() =>
-                  setBrowseTarget({ kind: 'location', partId: parts[0].partId, partName: parts[0].name })
-                }
-              >
-                <Plus size={12} strokeWidth={1.8} /> 添加位置
-              </button>
-            )}
             <button
               type="button"
               className="btn ghost sm"
-              onClick={() => setBrowseTarget({ kind: 'part' })}
+              onClick={() => setBrowseTarget({ kind: 'add_part' })}
             >
               <Plus size={12} strokeWidth={1.8} /> 添加组成部分
             </button>
@@ -253,50 +268,80 @@ function ProjectSettingsTab({
         </div>
 
         {parts.length === 0 ? (
-          <div className="quiet">还没有绑定任何目录位置</div>
+          <div className="pset-part">
+            <div className="pset-loc-empty">
+              <span className="muted">还没有组成部分，点击「添加组成部分」绑定 Git 仓库或文件夹</span>
+              <button
+                type="button"
+                className="btn ghost sm"
+                onClick={() => setBrowseTarget({ kind: 'add_part' })}
+              >
+                <Plus size={12} strokeWidth={1.8} /> 添加组成部分
+              </button>
+            </div>
+          </div>
         ) : (
           <div className="pset-parts">
             {parts.map((part) => {
               const partSugs = suggestions.filter((s) => s.partId === part.partId);
               const isGitPart = part.kind === 'git';
               return (
-                <div className={`pset-part ${collapseSinglePart ? 'is-single' : ''}`} key={part.partId}>
-                  {!collapseSinglePart && (
-                    <div className="pset-part-hd">
-                      {isGitPart ? (
-                        <GitBranch size={13.5} strokeWidth={1.7} className="muted" />
-                      ) : (
-                        <Folder size={13.5} strokeWidth={1.6} className="muted" />
-                      )}
-                      <span className="pset-part-name">{part.name}</span>
-                      <div className="pset-part-acts">
+                <div className="pset-part" key={part.partId}>
+                  <div className="pset-part-hd">
+                    {isGitPart ? (
+                      <GitBranch size={13.5} strokeWidth={1.7} className="muted" />
+                    ) : (
+                      <Folder size={13.5} strokeWidth={1.6} className="muted" />
+                    )}
+                    <span className="pset-part-name">{part.name}</span>
+                    {isGitPart && part.repoIdentity && !part.repoIdentity.startsWith('folder:') && (
+                      <span className="pset-part-remote mono ell">{part.repoIdentity}</span>
+                    )}
+                    <div className="pset-part-acts">
+                      <button
+                        type="button"
+                        className="btn ghost sm"
+                        onClick={() =>
+                          setBrowseTarget({ kind: 'add_location', partId: part.partId, partName: part.name })
+                        }
+                      >
+                        <Plus size={11.5} strokeWidth={1.8} /> 添加位置
+                      </button>
+                      <button
+                        type="button"
+                        className="ib"
+                        title={`编辑组成部分「${part.name}」`}
+                        aria-label={`编辑组成部分 ${part.name}`}
+                        onClick={() => openEditPart(part)}
+                      >
+                        <Pencil size={12.5} strokeWidth={1.6} />
+                      </button>
+                      <button
+                        type="button"
+                        className="ib pset-del-part"
+                        title={`删除组成部分「${part.name}」`}
+                        aria-label={`删除组成部分 ${part.name}`}
+                        onClick={() => void handleDeletePart(part)}
+                      >
+                        <Trash2 size={12.5} strokeWidth={1.6} />
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="pset-loc-list">
+                    {part.locations.length === 0 ? (
+                      <div className="pset-loc-empty">
+                        <span className="muted">该组成部分暂无绑定设备路径</span>
                         <button
                           type="button"
                           className="btn ghost sm"
                           onClick={() =>
-                            setBrowseTarget({ kind: 'location', partId: part.partId, partName: part.name })
+                            setBrowseTarget({ kind: 'add_location', partId: part.partId, partName: part.name })
                           }
                         >
-                          <Plus size={11.5} strokeWidth={1.8} /> 添加位置
+                          <Plus size={11.5} strokeWidth={1.8} /> 添加设备路径
                         </button>
-                        {parts.length > 1 && (
-                          <button
-                            type="button"
-                            className="ib"
-                            title={`移除 ${part.name}`}
-                            aria-label={`移除 ${part.name}`}
-                            onClick={() => void handleDeletePart(part)}
-                          >
-                            <Trash2 size={12.5} strokeWidth={1.6} />
-                          </button>
-                        )}
                       </div>
-                    </div>
-                  )}
-
-                  <div className="pset-loc-list">
-                    {part.locations.length === 0 ? (
-                      <div className="pset-loc-empty muted">尚未在任何设备绑定目录</div>
                     ) : (
                       part.locations.map((loc) => {
                         const m = machineById(loc.machineId);
@@ -334,27 +379,31 @@ function ProjectSettingsTab({
                                   设为默认
                                 </button>
                               )}
-                              {isGitPart && (
-                                <button
-                                  type="button"
-                                  className="pset-hover-act mono"
-                                  title="切换 worktree 隔离 / 原位执行"
-                                  onClick={() => void handleToggleIsolation(part.partId, loc)}
-                                >
-                                  {loc.isolation === 'in_place' ? 'in_place' : 'worktree'}
-                                </button>
-                              )}
-                              {part.locations.length > 1 && (
-                                <button
-                                  type="button"
-                                  className="ib pset-del-loc"
-                                  title="移除该设备位置"
-                                  aria-label="移除该设备位置"
-                                  onClick={() => void handleDeleteLocation(part.partId, loc)}
-                                >
-                                  <Trash2 size={12} strokeWidth={1.6} />
-                                </button>
-                              )}
+                              <button
+                                type="button"
+                                className="ib pset-loc-ico-act"
+                                title="编辑设备路径"
+                                aria-label="编辑设备路径"
+                                onClick={() =>
+                                  setBrowseTarget({
+                                    kind: 'edit_location',
+                                    partId: part.partId,
+                                    partName: part.name,
+                                    loc,
+                                  })
+                                }
+                              >
+                                <Pencil size={12} strokeWidth={1.6} />
+                              </button>
+                              <button
+                                type="button"
+                                className="ib pset-del-loc"
+                                title="删除该设备路径"
+                                aria-label="删除该设备路径"
+                                onClick={() => void handleDeleteLocation(part.partId, loc)}
+                              >
+                                <Trash2 size={12} strokeWidth={1.6} />
+                              </button>
                             </div>
                           </div>
                         );
@@ -506,27 +555,48 @@ function ProjectSettingsTab({
       <DirBrowseModal
         open={browseTarget !== null}
         title={
-          browseTarget?.kind === 'location'
-            ? `为「${browseTarget.partName}」添加设备位置`
-            : '添加组成部分（Git 仓库或文件夹）'
+          browseTarget?.kind === 'add_location'
+            ? `为「${browseTarget.partName}」添加设备目录`
+            : browseTarget?.kind === 'edit_location'
+              ? `编辑「${browseTarget.partName}」设备目录`
+              : '添加组成部分（Git 仓库或文件夹）'
         }
-        confirmLabel={browseTarget?.kind === 'location' ? '绑定此位置' : '添加组成部分'}
+        confirmLabel={
+          browseTarget?.kind === 'add_location'
+            ? '添加此位置'
+            : browseTarget?.kind === 'edit_location'
+              ? '保存修改'
+              : '添加组成部分'
+        }
         machines={boot.machines}
-        defaultMachineId={effectiveLocalId || boot.setup?.currentMachineId}
+        defaultMachineId={
+          browseTarget?.kind === 'edit_location'
+            ? browseTarget.loc.machineId
+            : effectiveLocalId || boot.setup?.currentMachineId
+        }
+        initialPath={browseTarget?.kind === 'edit_location' ? browseTarget.loc.absPath : undefined}
         activeDutyMachineId={activeDutyId}
         currentMachineId={effectiveLocalId}
-        extraFieldLabel={browseTarget?.kind === 'part' ? '名称' : undefined}
-        extraFieldPlaceholder={browseTarget?.kind === 'part' ? '留空则默认使用目录名' : undefined}
-        onConfirm={async ({ machineId, absPath, extraValue }) => {
-          if (browseTarget?.kind === 'location') {
+        extraFieldLabel={browseTarget?.kind === 'add_part' ? '组成部分名称' : undefined}
+        extraFieldPlaceholder={browseTarget?.kind === 'add_part' ? '留空则默认使用目录名' : undefined}
+        showPartKindToggle={browseTarget?.kind === 'add_part'}
+        onConfirm={async ({ machineId, absPath, extraValue, partKind }) => {
+          if (browseTarget?.kind === 'add_location') {
             await api.createProjectLocation(project.projectId, browseTarget.partId, {
               machineId,
               absPath,
             });
-            toast('已添加设备位置');
+            toast('已添加设备路径');
+          } else if (browseTarget?.kind === 'edit_location') {
+            await api.updateProjectLocation(project.projectId, browseTarget.partId, browseTarget.loc.locationId, {
+              machineId,
+              absPath,
+            });
+            toast('已更新设备路径');
           } else {
             await api.createProjectPart(project.projectId, {
               name: extraValue || absPath.split('/').pop() || '目录',
+              kind: partKind,
               machineId,
               absPath,
             });
@@ -536,6 +606,97 @@ function ProjectSettingsTab({
         }}
         onClose={() => setBrowseTarget(null)}
       />
+
+      {editingPart && (
+        <div className="modal-scrim" onClick={() => !savingPart && setEditingPart(null)}>
+          <section
+            className="modal-card pset-edit-part-modal"
+            role="dialog"
+            aria-label="编辑组成部分"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="modal-hd">
+              <h3>编辑组成部分</h3>
+              <button
+                type="button"
+                className="ib"
+                disabled={savingPart}
+                onClick={() => setEditingPart(null)}
+                aria-label="关闭"
+              >
+                <X size={15} strokeWidth={1.7} />
+              </button>
+            </div>
+            <div className="modal-body">
+              <div className="cdx-meta-grid has-kind">
+                <div className="cdx-meta-field">
+                  <label className="cdx-meta-lbl" htmlFor="pset-edit-part-name">
+                    组成部分名称
+                  </label>
+                  <input
+                    id="pset-edit-part-name"
+                    className="field"
+                    value={partNameDraft}
+                    autoFocus
+                    onChange={(e) => setPartNameDraft(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.nativeEvent.isComposing) return;
+                      if (e.key === 'Enter') {
+                        e.preventDefault();
+                        void handleSavePart();
+                      } else if (e.key === 'Escape') {
+                        e.preventDefault();
+                        setEditingPart(null);
+                      }
+                    }}
+                  />
+                </div>
+                <div className="cdx-meta-field">
+                  <span className="cdx-meta-lbl">目录类型</span>
+                  <div className="role-seg" role="radiogroup" aria-label="目录类型">
+                    <button
+                      type="button"
+                      role="radio"
+                      aria-checked={partKindDraft === 'git'}
+                      className={partKindDraft === 'git' ? 'on' : ''}
+                      onClick={() => setPartKindDraft('git')}
+                    >
+                      Git 仓库
+                    </button>
+                    <button
+                      type="button"
+                      role="radio"
+                      aria-checked={partKindDraft === 'folder'}
+                      className={partKindDraft === 'folder' ? 'on' : ''}
+                      onClick={() => setPartKindDraft('folder')}
+                    >
+                      普通目录
+                    </button>
+                  </div>
+                </div>
+              </div>
+              <div className="cdx-actions">
+                <button
+                  type="button"
+                  className="btn ghost sm"
+                  disabled={savingPart}
+                  onClick={() => setEditingPart(null)}
+                >
+                  取消
+                </button>
+                <button
+                  type="button"
+                  className="btn pri sm"
+                  disabled={savingPart || !partNameDraft.trim()}
+                  onClick={() => void handleSavePart()}
+                >
+                  {savingPart ? '保存中…' : '保存修改'}
+                </button>
+              </div>
+            </div>
+          </section>
+        </div>
+      )}
     </div>
   );
 }

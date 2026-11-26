@@ -1,6 +1,7 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import {
+  ArrowDown,
   ArrowLeftRight,
   ArrowUp,
   Check,
@@ -14,6 +15,7 @@ import {
   MonitorSmartphone,
   Plus,
   Radar,
+  Server,
   Sparkles,
   Trash2,
 } from 'lucide-react';
@@ -36,7 +38,13 @@ import { resolveEffectiveLocalMachineId } from '../lib/ide';
 import { navigate, paths } from '../lib/router';
 import { toast, useWorkbenchStore } from '../store/useWorkbenchStore';
 
-export function SettingsPage({ boot }: { boot: BootstrapResponse }) {
+export function SettingsPage({
+  boot,
+  initialMachineId,
+}: {
+  boot: BootstrapResponse;
+  initialMachineId?: string;
+}) {
   const qc = useQueryClient();
   const netQ = useNetworkSettings(true);
   const clientsQ = useClientDevices(true);
@@ -62,9 +70,19 @@ export function SettingsPage({ boot }: { boot: BootstrapResponse }) {
   const [savingDuty, setSavingDuty] = useState(false);
 
   const [expandedMachine, setExpandedMachine] = useState<string>(() => {
-    const first = boot.machines.find((m) => m.status === 'online' && m.transportMode !== 'ssh_outbound');
+    if (initialMachineId && boot.machines.some((m) => m.machineId === initialMachineId)) {
+      return initialMachineId;
+    }
+    const first = boot.machines.find((m) => m.status === 'online') ?? boot.machines[0];
     return first?.machineId ?? '';
   });
+
+  useEffect(() => {
+    if (initialMachineId && boot.machines.some((m) => m.machineId === initialMachineId)) {
+      setExpandedMachine(initialMachineId);
+    }
+  }, [initialMachineId, boot.machines]);
+
   const [aliasEdits, setAliasEdits] = useState<Record<string, string>>({});
   const [rootDrafts, setRootDrafts] = useState<Record<string, string>>({});
 
@@ -125,11 +143,10 @@ export function SettingsPage({ boot }: { boot: BootstrapResponse }) {
     }
   };
 
-  const pinDutyMachine = async (machineId: string) => {
-    const next = [machineId, ...dutyPriority.filter((id) => id !== machineId)];
+  const saveDutyOrder = async (nextOrder: string[]) => {
     setSavingDuty(true);
     try {
-      await api.updateNetworkSettings({ dutyPriority: next });
+      await api.updateNetworkSettings({ dutyPriority: nextOrder });
       refreshAll();
       toast('已调整主控顺位');
     } catch (e) {
@@ -137,6 +154,20 @@ export function SettingsPage({ boot }: { boot: BootstrapResponse }) {
     } finally {
       setSavingDuty(false);
     }
+  };
+
+  const pinDutyMachine = async (machineId: string) => {
+    const next = [machineId, ...dutyPriority.filter((id) => id !== machineId)];
+    await saveDutyOrder(next);
+  };
+
+  const moveDutyMachine = async (idx: number, delta: -1 | 1) => {
+    const target = idx + delta;
+    if (target < 0 || target >= dutyMachines.length) return;
+    const order = dutyMachines.map((m) => m.machineId);
+    const [moved] = order.splice(idx, 1);
+    order.splice(target, 0, moved);
+    await saveDutyOrder(order);
   };
 
   const triggerTailscaleShare = async (confirm = false, port?: number) => {
@@ -207,12 +238,18 @@ export function SettingsPage({ boot }: { boot: BootstrapResponse }) {
   const addAllowedRoot = async (m: MachineView) => {
     const raw = (rootDrafts[m.machineId] ?? '').trim();
     if (!raw) return;
-    const next = [...(m.allowedRoots ?? []), raw];
+    const existing = m.allowedRoots ?? [];
+    if (existing.includes(raw)) {
+      setRootDrafts((d) => ({ ...d, [m.machineId]: '' }));
+      toast('该目录已在白名单中');
+      return;
+    }
+    const next = [...existing, raw];
     try {
       await api.updateMachine(m.machineId, { allowedRoots: next });
       setRootDrafts((d) => ({ ...d, [m.machineId]: '' }));
       refreshAll();
-      toast('已添加工作目录');
+      toast('已添加目录白名单');
     } catch (e) {
       toast(errMsg(e), 'err');
     }
@@ -231,6 +268,9 @@ export function SettingsPage({ boot }: { boot: BootstrapResponse }) {
   const removeMachine = async (m: MachineView) => {
     try {
       await api.deleteMachine(m.machineId);
+      if (expandedMachine === m.machineId) {
+        setExpandedMachine('');
+      }
       refreshAll();
       toast(`已移除 ${m.displayAlias || cleanMachineName(m)}`);
     } catch (e) {
@@ -251,6 +291,12 @@ export function SettingsPage({ boot }: { boot: BootstrapResponse }) {
   const dutyMachines = dutyPriority
     .map((id) => machineMap.get(id))
     .filter((m): m is MachineView => !!m);
+  const primaryDutyMachine = dutyMachines[0];
+  const isFailoverActive =
+    !!primaryDutyMachine &&
+    !!activeDutyId &&
+    primaryDutyMachine.machineId !== activeDutyId &&
+    primaryDutyMachine.status !== 'online';
 
   return (
     <main className="main">
@@ -348,19 +394,55 @@ export function SettingsPage({ boot }: { boot: BootstrapResponse }) {
                   <div className="duty-list">
                     {dutyMachines.map((m, idx) => {
                       const isDuty = m.machineId === activeDutyId;
+                      const isTakeover = isFailoverActive && isDuty;
+                      const online = m.status === 'online';
                       const label = m.displayAlias || cleanMachineName(m);
                       return (
-                        <div className="duty-row" key={m.machineId}>
-                          <span className="duty-rank mono">#{idx + 1}</span>
+                        <div
+                          className={`duty-row ${isTakeover ? 'is-takeover' : isDuty ? 'is-active-duty' : ''}`}
+                          key={m.machineId}
+                        >
                           <DeviceRoleIcon
                             machine={m}
                             isActiveDuty={isDuty}
                             isCurrentDevice={m.machineId === effectiveLocalId}
                             size={13.5}
                           />
-                          <span className="duty-name ell">{label}</span>
-                          {isDuty && <span className="duty-cur">当前主控</span>}
+                          <span className={`duty-name ell ${!online ? 'muted' : ''}`}>{label}</span>
+                          {isTakeover ? (
+                            <span className="duty-takeover">当前接管</span>
+                          ) : isDuty ? (
+                            <span className="duty-cur">当前主控</span>
+                          ) : !online ? (
+                            <span className="faint" style={{ fontSize: 11 }}>
+                              离线
+                            </span>
+                          ) : null}
                           <span className="duty-right">
+                            {dutyMachines.length > 2 && (
+                              <>
+                                <button
+                                  type="button"
+                                  className="ib duty-move-btn"
+                                  disabled={savingDuty || idx === 0}
+                                  title="上移一位"
+                                  aria-label={`上移 ${label}`}
+                                  onClick={() => void moveDutyMachine(idx, -1)}
+                                >
+                                  <ArrowUp size={12} strokeWidth={1.8} />
+                                </button>
+                                <button
+                                  type="button"
+                                  className="ib duty-move-btn"
+                                  disabled={savingDuty || idx === dutyMachines.length - 1}
+                                  title="下移一位"
+                                  aria-label={`下移 ${label}`}
+                                  onClick={() => void moveDutyMachine(idx, 1)}
+                                >
+                                  <ArrowDown size={12} strokeWidth={1.8} />
+                                </button>
+                              </>
+                            )}
                             {idx > 0 && (
                               <button
                                 type="button"
@@ -608,12 +690,26 @@ export function SettingsPage({ boot }: { boot: BootstrapResponse }) {
                 const isCurrent = !!effectiveLocalId && m.machineId === effectiveLocalId;
                 const curRole: MachineRole =
                   m.role === 'worker' || !isExec ? 'worker' : 'full';
+                const isWorker = curRole === 'worker';
+
+                const toggleCard = () => {
+                  setExpandedMachine((cur) => (cur === m.machineId ? '' : m.machineId));
+                };
 
                 return (
                   <div className={`set-mach-card ${expanded ? 'open' : ''}`} key={m.machineId}>
                     <div
                       className="set-mach-hd"
-                      onClick={() => isExec && setExpandedMachine(expanded ? '' : m.machineId)}
+                      role="button"
+                      tabIndex={0}
+                      aria-expanded={expanded}
+                      onClick={toggleCard}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter' || e.key === ' ') {
+                          e.preventDefault();
+                          toggleCard();
+                        }
+                      }}
                     >
                       <DeviceRoleIcon
                         machine={m}
@@ -622,6 +718,7 @@ export function SettingsPage({ boot }: { boot: BootstrapResponse }) {
                         size={14}
                       />
                       <span className="set-mach-name ell">{label}</span>
+                      {m.os && <span className="set-mach-os faint">{m.os}</span>}
 
                       <div className="set-mach-summary">
                         {isExec && readyAgents.length > 0 && !expanded && (
@@ -653,16 +750,23 @@ export function SettingsPage({ boot }: { boot: BootstrapResponse }) {
                           {online ? '在线' : m.lastSeenAt ? `离线 · ${relTime(m.lastSeenAt)}` : '离线'}
                         </span>
 
-                        {isExec && (
-                          <span className="muted">
-                            {expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-                          </span>
-                        )}
+                        <span className="muted" aria-hidden="true">
+                          {expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                        </span>
                       </div>
                     </div>
 
-                    {isExec && expanded && (
+                    {expanded && (
                       <div className="set-mach-body">
+                        {isWorker && (
+                          <div className="worker-scope-note">
+                            <Server size={13.5} strokeWidth={1.75} className="muted" aria-hidden="true" />
+                            <span>
+                              <strong>受限节点权限</strong> · 仅执行显式派发任务，不保存全局历史，且仅限访问下方白名单目录。
+                            </span>
+                          </div>
+                        )}
+
                         <div className="set-mach-alias">
                           <span className="muted">显示名称</span>
                           <input
@@ -681,33 +785,43 @@ export function SettingsPage({ boot }: { boot: BootstrapResponse }) {
                             保存
                           </button>
 
-                          <div className="role-seg" style={{ marginLeft: 'auto' }}>
-                            <button
-                              type="button"
-                              className={curRole === 'full' ? 'on' : ''}
-                              onClick={() => curRole !== 'full' && void updateMachineRole(m, 'full')}
-                            >
-                              完整设备
-                            </button>
-                            <button
-                              type="button"
-                              className={curRole === 'worker' ? 'on' : ''}
-                              onClick={() => curRole !== 'worker' && void updateMachineRole(m, 'worker')}
-                            >
-                              受限节点
-                            </button>
-                          </div>
+                          {isExec ? (
+                            <div className="role-seg" style={{ marginLeft: 'auto' }}>
+                              <button
+                                type="button"
+                                className={curRole === 'full' ? 'on' : ''}
+                                onClick={() => curRole !== 'full' && void updateMachineRole(m, 'full')}
+                              >
+                                完整设备
+                              </button>
+                              <button
+                                type="button"
+                                className={curRole === 'worker' ? 'on' : ''}
+                                onClick={() => curRole !== 'worker' && void updateMachineRole(m, 'worker')}
+                              >
+                                受限节点
+                              </button>
+                            </div>
+                          ) : (
+                            <span className="faint" style={{ marginLeft: 'auto', fontSize: 11.5 }}>
+                              受限节点（SSH 目标）
+                            </span>
+                          )}
                         </div>
 
-                        <AgentList machine={m} showAdvanced />
+                        {isExec && <AgentList machine={m} showAdvanced />}
 
-                        {/* Allowed working directories */}
+                        {/* Allowed working directories / worker whitelist */}
                         <div className="roots-block">
-                          <div className="ag-block-lbl">工作目录范围</div>
+                          <div className="ag-block-lbl">
+                            {isWorker ? '允许访问目录白名单' : '工作目录范围'}
+                          </div>
                           <div className="roots-list">
                             {(m.allowedRoots ?? []).length === 0 ? (
                               <span className="faint" style={{ fontSize: 12 }}>
-                                默认使用用户主目录（~）
+                                {isWorker
+                                  ? '未配置白名单时默认限制在用户主目录（~），可添加明确允许访问的目录路径'
+                                  : '默认使用用户主目录（~）'}
                               </span>
                             ) : (
                               (m.allowedRoots ?? []).map((rt) => (
@@ -729,7 +843,9 @@ export function SettingsPage({ boot }: { boot: BootstrapResponse }) {
                             <input
                               className="field mono"
                               style={{ maxWidth: 260 }}
-                              placeholder="添加允许浏览/扫描的路径（如 ~/dev）"
+                              placeholder={
+                                isWorker ? '添加白名单目录路径（如 /srv/apps）' : '添加允许浏览/扫描的路径（如 ~/dev）'
+                              }
                               value={rootDrafts[m.machineId] ?? ''}
                               onChange={(e) =>
                                 setRootDrafts((d) => ({ ...d, [m.machineId]: e.target.value }))
@@ -775,6 +891,10 @@ export function SettingsPage({ boot }: { boot: BootstrapResponse }) {
         open={pairOpen}
         bindMachineId={pairBindMachine}
         machines={boot.machines}
+        onPaired={(machineId) => {
+          setExpandedMachine(machineId);
+          refreshAll();
+        }}
         onClose={() => {
           setPairOpen(false);
           setPairBindMachine(undefined);

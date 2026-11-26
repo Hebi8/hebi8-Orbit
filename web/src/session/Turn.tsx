@@ -17,12 +17,14 @@ import type {
   ChildTaskView,
   InboxItemView,
   MachineView,
+  ProjectView,
   TaskSummary,
   TaskTimelineResponse,
 } from '../generated/protocol';
 import { ApprovalNotice } from '../components/ApprovalNotice';
 import { FolderChangesCard } from '../components/FolderChangesCard';
 import { Md } from '../components/Md';
+import { CrossDirSessionCards, type CrossDirSessionItem } from '../components/PAViews';
 import { StatusMark } from '../components/StatusMark';
 import { useAttemptRaw } from '../hooks/queries';
 import { ADAPTER_LABELS } from '../lib/agentCaps';
@@ -38,6 +40,7 @@ import {
   cleanMachineName,
   hhmm,
   isAttemptLive,
+  sessionMark,
   shortSha,
   taskTitle,
   triggerLabel,
@@ -475,6 +478,7 @@ export function Turn({
   nativeMembers,
   siblingChildren,
   allTasks,
+  projects,
   machines,
   inboxByTask,
   activeChildId,
@@ -491,6 +495,7 @@ export function Turn({
   nativeMembers?: BoardMemberCursor[];
   siblingChildren?: ChildTaskView[];
   allTasks?: TaskSummary[];
+  projects?: ProjectView[];
   machines?: MachineView[];
   inboxByTask?: ReadonlyMap<string, InboxItemView[]>;
   activeChildId?: string;
@@ -547,6 +552,7 @@ export function Turn({
     return { fromId, relation, senderTitle };
   }, [isChildResult, tl.events, tl.siblingChildren, tl.parentSummary, attempt.attemptId, siblingChildren, allTasks]);
 
+  const isPA = tl.task.projectId === PA_PROJECT_ID;
   const isTopLevel = !tl.task.parentTaskId;
   const dispatchedChildren = useMemo(() => {
     if (!isTopLevel) return [];
@@ -560,7 +566,120 @@ export function Turn({
     return [...direct, ...orphans.filter((c) => !seen.has(c.taskId))];
   }, [isTopLevel, childrenList, tl.children, tl.attempts, attempt.attemptId, isLast]);
 
-  const turnNativeMembers = isTopLevel && isLast ? (nativeMembers ?? []) : [];
+  const turnNativeMembers = isTopLevel && isLast && !isPA ? (nativeMembers ?? []) : [];
+
+  // Hebi8 / PA dedicated cross-directory session jump cards (never forced into parent/child ↗/↵ rails).
+  const paCrossDirCards = useMemo<CrossDirSessionItem[]>(() => {
+    if (!isPA) return [];
+    const projectMap = new Map((projects ?? []).map((p) => [p.projectId, p]));
+    const machineMap = new Map((machines ?? []).map((m) => [m.machineId, m]));
+    const taskMap = new Map<string, TaskSummary>();
+    for (const t of allTasks ?? []) {
+      if (t.projectId !== PA_PROJECT_ID && t.taskId !== tl.task.taskId) {
+        taskMap.set(t.taskId, t);
+      }
+    }
+
+    const resolveMachineLabel = (mid?: string, proj?: ProjectView): string | undefined => {
+      const candidateId =
+        mid ||
+        proj?.parts?.[0]?.locations?.find((l) => l.isDefault)?.machineId ||
+        proj?.parts?.[0]?.locations?.[0]?.machineId ||
+        (proj?.defaultCapability ? proj.anchors?.[proj.defaultCapability]?.machine : undefined);
+      if (!candidateId) return undefined;
+      const m = machineMap.get(candidateId);
+      return m ? m.displayAlias?.trim() || cleanMachineName(m) : candidateId;
+    };
+
+    const resolveProjectLabel = (pid: string): string => {
+      if (pid === SCRATCH_PROJECT_ID) return '自由对话';
+      return projectMap.get(pid)?.displayName || pid;
+    };
+
+    const cards: CrossDirSessionItem[] = [];
+    const seen = new Set<string>();
+
+    // 1. Extract cross-directory sessions referenced in Hebi8's reply prose (links `#/t/<id>` or known task IDs)
+    const proseLines = segs
+      .filter((s): s is Extract<typeof s, { kind: 'msg' }> => s.kind === 'msg')
+      .flatMap((s) => s.text.split('\n'));
+
+    const matchedIds: { taskId: string; line?: string }[] = [];
+    const hashLinkRe = /#\/t\/([A-Za-z0-9_-]+)/g;
+    for (const rawLine of proseLines) {
+      let m: RegExpExecArray | null;
+      hashLinkRe.lastIndex = 0;
+      while ((m = hashLinkRe.exec(rawLine)) !== null) {
+        const tid = m[1];
+        if (tid && tid !== tl.task.taskId && !seen.has(tid) && taskMap.has(tid)) {
+          seen.add(tid);
+          matchedIds.push({ taskId: tid, line: rawLine });
+        }
+      }
+      for (const [tid] of taskMap) {
+        if (seen.has(tid)) continue;
+        if (rawLine.includes(tid)) {
+          seen.add(tid);
+          matchedIds.push({ taskId: tid, line: rawLine });
+        }
+      }
+    }
+
+    for (const { taskId: tid, line } of matchedIds) {
+      const t = taskMap.get(tid);
+      if (!t) continue;
+      const proj = projectMap.get(t.projectId);
+      const inboxItems = inboxByTask?.get(t.taskId) ?? [];
+      const mark = sessionMark(t, inboxItems);
+      const cleanedLine = line
+        ? line
+            .replace(/\[([^\]]+)\]\(#\/t\/[A-Za-z0-9_-]+\)/g, '$1')
+            .replace(new RegExp(`\\(?taskId\\s*=\\s*${tid}\\)?`, 'g'), '')
+            .replace(tid, '')
+            .replace(/^[#>*\-\d.\s]+/, '')
+            .replace(/[`*_]/g, '')
+            .replace(/\s+/g, ' ')
+            .trim()
+        : '';
+      const hint =
+        (inboxItems[0]?.title?.trim()) ||
+        t.waitingReason?.trim() ||
+        (cleanedLine && cleanedLine !== taskTitle(t) ? cleanedLine : '') ||
+        t.goal?.split('\n')[0]?.trim() ||
+        undefined;
+
+      cards.push({
+        key: `pa-cross:${t.taskId}`,
+        taskId: t.taskId,
+        projectId: t.projectId,
+        title: taskTitle(t),
+        projectLabel: resolveProjectLabel(t.projectId),
+        machineLabel: resolveMachineLabel(undefined, proj),
+        mark,
+        hint,
+      });
+    }
+
+    // 2. Render any historical pre-v4 PA children as cross-directory jump cards (never parent/child rails)
+    for (const c of dispatchedChildren) {
+      if (seen.has(c.taskId)) continue;
+      seen.add(c.taskId);
+      const proj = projectMap.get(c.projectId);
+      const inboxItems = inboxByTask?.get(c.taskId) ?? [];
+      cards.push({
+        key: `pa-legacy:${c.taskId}`,
+        taskId: c.taskId,
+        projectId: c.projectId,
+        title: taskTitle(c),
+        projectLabel: c.projectName || resolveProjectLabel(c.projectId),
+        machineLabel: resolveMachineLabel(c.machineId, proj),
+        mark: childSessionMark(c, inboxItems),
+        hint: c.currentStep?.trim() || c.goal?.split('\n')[0]?.trim() || undefined,
+      });
+    }
+
+    return cards;
+  }, [isPA, projects, machines, allTasks, tl.task.taskId, segs, inboxByTask, dispatchedChildren]);
 
   const childResultMd = useMemo(() => {
     if (!isChildResult) return '';
@@ -572,7 +691,7 @@ export function Turn({
 
   return (
     <div className="turn" id={`turn-${attempt.attemptId}`} data-turn={index}>
-      {isChildResult ? (
+      {!isPA && isChildResult ? (
         <InboundCommRail
           title={attempt.childResult?.childTitle || attempt.childResult?.childTaskId || '子会话'}
           bodyMd={childResultMd}
@@ -588,7 +707,7 @@ export function Turn({
           openLinkLabel={onOpenChild ? '分屏查看' : '打开会话'}
           onOpenTarget={onOpenChild}
         />
-      ) : delegatedInbound ? (
+      ) : !isPA && delegatedInbound ? (
         <InboundCommRail
           title={delegatedInbound.senderTitle}
           bodyMd={stripSystemWakeupBoilerplate(prompt.text)}
@@ -656,7 +775,11 @@ export function Turn({
         </div>
       ))}
 
-      {(dispatchedChildren.length > 0 || turnNativeMembers.length > 0) && (
+      {isPA && !compact && paCrossDirCards.length > 0 && (
+        <CrossDirSessionCards items={paCrossDirCards} />
+      )}
+
+      {!isPA && (dispatchedChildren.length > 0 || turnNativeMembers.length > 0) && (
         <OutboundCommTrack
           parentTaskId={tl.task.taskId}
           parentProjectId={tl.task.projectId}

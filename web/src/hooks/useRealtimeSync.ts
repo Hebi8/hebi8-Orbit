@@ -105,8 +105,8 @@ export function collectInvalidations(
         add('task-timeline', parentTaskId);
         add('task-children', parentTaskId);
       }
-      if (pid === '_pa') add('hebi8-main');
       if (kind === 'task.source_added' || kind === 'task.source_removed') continue;
+      add('hebi8-main');
       add('bootstrap');
       add('project-tasks', pid);
       add('all-tasks');
@@ -128,7 +128,7 @@ export function collectInvalidations(
         add('task-timeline', parentTaskId);
         add('task-children', parentTaskId);
       }
-      if (pid === '_pa') add('hebi8-main');
+      add('hebi8-main');
       add('bootstrap');
       if (kind === 'attempt.started') {
         add('delivery');

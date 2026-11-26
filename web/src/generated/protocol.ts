@@ -1373,6 +1373,8 @@ export interface CreateProjectLocationRequest {
 }
 
 export interface UpdateProjectLocationRequest {
+  machineId?: string | null;
+  absPath?: string | null;
   isDefault?: boolean | null;
   isolation?: LocationIsolation | null;
 }
