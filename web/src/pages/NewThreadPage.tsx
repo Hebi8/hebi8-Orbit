@@ -8,8 +8,6 @@ import {
   GitBranch,
   Link2,
   Plus,
-  Shield,
-  Sparkles,
   X,
 } from 'lucide-react';
 import type {
@@ -22,19 +20,13 @@ import type {
   TaskSourceKind,
 } from '../generated/protocol';
 import { SessionAdapterValues } from '../generated/protocol';
-import { agentDisplayName } from '../components/AgentList';
 import { DeviceRoleIcon } from '../components/DeviceRoleIcon';
 import { GitZshBadge } from '../components/GitZshBadge';
-import { SendUpIcon } from '../components/Icons';
 import { PageHeader } from '../components/PageHeader';
-import { TaskRefButton, TaskRefChips } from '../components/TaskRefPicker';
 import {
-  defaultModeDisplayLabel,
   defaultModeFor,
-  effortLabel,
   findAgentProbe,
   isFullBypassMode,
-  modeLabel,
   nextModeOverrideAfterSend,
   probeEfforts,
   probeModels,
@@ -44,6 +36,7 @@ import { api, errMsg } from '../lib/api';
 import { PA_PROJECT_ID, SCRATCH_PROJECT_ID, cleanMachineName, isVirtualProject } from '../lib/format';
 import { resolveEffectiveLocalMachineId } from '../lib/ide';
 import { navigate, paths, type NewMode } from '../lib/router';
+import { Composer } from '../session/Composer';
 import { toast, useWorkbenchStore } from '../store/useWorkbenchStore';
 
 interface SourceDraft extends CreateTaskSourceInput {
@@ -96,7 +89,7 @@ const MODE_COPY: Record<NewMode, ModeCopy> = {
   },
 };
 
-type OpenMenu = null | 'machine' | 'project' | 'agent' | 'perm' | 'source';
+type OpenMenu = null | 'machine' | 'project' | 'source';
 
 export function NewThreadPage({
   boot,
@@ -166,10 +159,10 @@ export function NewThreadPage({
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') setOpenMenu(null);
     };
-    window.addEventListener('mousedown', onDown);
+    document.addEventListener('mousedown', onDown);
     window.addEventListener('keydown', onKey);
     return () => {
-      window.removeEventListener('mousedown', onDown);
+      document.removeEventListener('mousedown', onDown);
       window.removeEventListener('keydown', onKey);
     };
   }, [openMenu]);
@@ -251,8 +244,6 @@ export function NewThreadPage({
     !!project?.repoIdentity?.startsWith('folder:') ||
     (matchedLocation?.runtime != null && !matchedLocation.runtime.isGit);
 
-  // Remember per-project Worktree preference consistently across machines/locations
-  // (prefer matchedLocation on a Git part, falling back to any Git location on the project).
   const projectGitIsolation = useMemo(() => {
     if (matchedLocation && activePart?.kind !== 'folder') {
       return matchedLocation.isolation;
@@ -331,7 +322,6 @@ export function NewThreadPage({
     [activeProbe, activeAdapterId, permMode],
   );
 
-  // Reset permission mode to appropriate track default when switching track (PA defaults to auto) or adapter.
   useEffect(() => {
     setModel('');
     setEffort('');
@@ -343,8 +333,6 @@ export function NewThreadPage({
   }, [m]);
 
   const effectivePermMode = permMode || defaultModeFor(activeProbe, activeAdapterId || 'agy', m === 'pa');
-  const activeModeOpt = effectivePermMode ? modeChoices.find((o) => o.id === effectivePermMode) : undefined;
-  const defaultPermLabel = defaultModeDisplayLabel(activeProbe, modeChoices);
 
   const submit = useMutation({
     mutationFn: async () => {
@@ -412,8 +400,13 @@ export function NewThreadPage({
       return { kind: 'task' as const, id: res.task.taskId, pid };
     },
     onSuccess: (r) => {
+      // Clear draft, referenced conversations, and attached reference chips immediately on submit.
       setText('');
       setRefIds([]);
+      setSources([]);
+      setSrcUri('');
+      setSrcLabel('');
+      setOpenMenu(null);
       setPermMode((cur) => nextModeOverrideAfterSend(cur));
       void qc.invalidateQueries({ queryKey: ['bootstrap'] });
       void qc.invalidateQueries({ queryKey: ['all-tasks'] });
@@ -434,13 +427,10 @@ export function NewThreadPage({
     !submit.isPending &&
     (m !== 'project' || !!pid) &&
     machineHasReadyAgent;
-  const send = () => canSend && submit.mutate();
+  const send = () => {
+    if (canSend) submit.mutate();
+  };
   const copy = MODE_COPY[m];
-
-  const displayedModel = model || activeProbe?.defaultModel || '';
-  const agentTriggerLabel = activeAdapterId
-    ? `${agentDisplayName(activeAdapterId)}${displayedModel ? ` · ${displayedModel}` : ''}`
-    : '无可用 Agent';
 
   const addDraftSource = () => {
     const uri = srcUri.trim();
@@ -459,7 +449,84 @@ export function NewThreadPage({
     return set;
   }, [m, activePart]);
 
-  const showTopContextBar = m === 'project' || execMachines.length > 1;
+  const attachSourceControl =
+    m === 'project' ? (
+      <div className="relpos">
+        <button
+          type="button"
+          className={`nt-ico-btn ${openMenu === 'source' ? 'open' : ''}`}
+          title="附加参考（链接 / 文件 / 记忆）"
+          aria-label="附加参考"
+          aria-expanded={openMenu === 'source'}
+          onClick={() => setOpenMenu(openMenu === 'source' ? null : 'source')}
+        >
+          <Plus size={13.5} strokeWidth={1.8} />
+        </button>
+        {openMenu === 'source' && (
+          <div className="nt-pop nt-pop-form" style={{ left: 0, bottom: 'calc(100% + 8px)' }}>
+            <div className="nt-pop-hd">附加参考资料</div>
+            <div className="nt-pop-seg">
+              {(['link', 'file', 'nmem'] as TaskSourceKind[]).map((k) => (
+                <button
+                  key={k}
+                  type="button"
+                  className={srcKind === k ? 'on' : ''}
+                  onClick={() => setSrcKind(k)}
+                >
+                  {k === 'link' ? '链接' : k === 'file' ? '文件' : 'nmem'}
+                </button>
+              ))}
+            </div>
+            <input
+              className="field"
+              placeholder={srcKind === 'link' ? 'https://…' : srcKind === 'file' ? '目录内相对路径' : 'nmem 记忆引用'}
+              value={srcUri}
+              onChange={(e) => setSrcUri(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault();
+                  addDraftSource();
+                }
+              }}
+              autoFocus
+            />
+            <input
+              className="field"
+              placeholder="标题（可选）"
+              value={srcLabel}
+              onChange={(e) => setSrcLabel(e.target.value)}
+            />
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 6 }}>
+              <button type="button" className="btn ghost sm" onClick={() => setOpenMenu(null)}>
+                取消
+              </button>
+              <button type="button" className="btn pri sm" disabled={!srcUri.trim()} onClick={addDraftSource}>
+                添加
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+    ) : undefined;
+
+  const sourceChips =
+    m === 'project' && sources.length > 0 ? (
+      <div className="nt-src-chips">
+        {sources.map((s) => (
+          <span className="nt-src-chip" key={s.key}>
+            <Link2 size={11} strokeWidth={1.7} />
+            <span className="ell">{s.label}</span>
+            <button
+              type="button"
+              aria-label={`移除 ${s.label}`}
+              onClick={() => setSources((xs) => xs.filter((x) => x.key !== s.key))}
+            >
+              <X size={11} strokeWidth={1.8} />
+            </button>
+          </span>
+        ))}
+      </div>
+    ) : undefined;
 
   return (
     <main className="main">
@@ -513,471 +580,229 @@ export function NewThreadPage({
           )}
 
           <div className="nt-lody-stack" ref={composerWrapRef}>
-            {showTopContextBar && (
-              <div className="nt-ctx-bar">
-                <div className="nt-ctx-left">
-                  {/* Project / Part picker FIRST in primary slot (never obscured by hostname) */}
-                  {m === 'project' && project && (
-                    <div className="relpos">
-                      <button
-                        type="button"
-                        className={`nt-ctx-btn ${openMenu === 'project' ? 'open' : ''}`}
-                        onClick={() => setOpenMenu(openMenu === 'project' ? null : 'project')}
-                        aria-label="选择项目与目录"
-                      >
-                        {isPlainFolder ? (
-                          <Folder size={13} strokeWidth={1.7} className="muted" />
-                        ) : (
-                          <GitBranch size={13} strokeWidth={1.7} className="muted" />
-                        )}
-                        <span className="ell">
-                          {project.displayName}
-                          {parts.length > 1 && activePart && activePart.name !== project.displayName
-                            ? ` · ${activePart.name}`
-                            : ''}
-                        </span>
-                        <GitZshBadge
-                          runtime={matchedLocation?.runtime}
-                          fallbackBranch={project.defaultBranch}
-                          isGit={!isPlainFolder}
-                        />
-                        <ChevronDown size={11} strokeWidth={1.8} className="muted" />
-                      </button>
-                      {openMenu === 'project' && (
-                        <div className="nt-pop nt-pop-wide" role="menu" style={{ left: 0, top: 'calc(100% + 6px)' }}>
-                          <div className="nt-pop-hd">项目与目录</div>
-                          {projects.map((p) => {
-                            const pParts = p.parts ?? [];
-                            if (pParts.length > 1) {
-                              return (
-                                <div key={p.projectId} className="nt-pop-group">
-                                  <div className="nt-pop-sub">{p.displayName}</div>
-                                  {pParts.map((pt) => {
-                                    const isSel = pid === p.projectId && activePart?.partId === pt.partId;
-                                    return (
-                                      <button
-                                        key={pt.partId}
-                                        type="button"
-                                        role="menuitem"
-                                        className={`nt-pop-item indent ${isSel ? 'on' : ''}`}
-                                        onClick={() => {
-                                          setPid(p.projectId);
-                                          setPartId(pt.partId);
-                                          const defLoc = pt.locations.find((l) => l.isDefault) ?? pt.locations[0];
-                                          if (defLoc) setMachineId(defLoc.machineId);
-                                          setOpenMenu(null);
-                                        }}
-                                      >
-                                        {pt.kind === 'folder' ? (
-                                          <Folder size={12.5} strokeWidth={1.6} className="muted" />
-                                        ) : (
-                                          <GitBranch size={12.5} strokeWidth={1.7} className="muted" />
-                                        )}
-                                        <span className="ell grow">{pt.name}</span>
-                                        {isSel && <Check size={12.5} strokeWidth={2.2} className="ok-t" />}
-                                      </button>
-                                    );
-                                  })}
-                                </div>
-                              );
-                            }
-                            const singlePart = pParts[0];
-                            const singleFolder =
-                              singlePart?.kind === 'folder' || !!p.repoIdentity?.startsWith('folder:');
-                            const isSel = pid === p.projectId;
-                            return (
-                              <button
-                                key={p.projectId}
-                                type="button"
-                                role="menuitem"
-                                className={`nt-pop-item ${isSel ? 'on' : ''}`}
-                                onClick={() => {
-                                  setPid(p.projectId);
-                                  setPartId(singlePart?.partId ?? '');
-                                  const defLoc =
-                                    singlePart?.locations.find((l) => l.isDefault) ?? singlePart?.locations[0];
-                                  if (defLoc) setMachineId(defLoc.machineId);
-                                  setOpenMenu(null);
-                                }}
-                              >
-                                {singleFolder ? (
-                                  <Folder size={12.5} strokeWidth={1.6} className="muted" />
-                                ) : (
-                                  <GitBranch size={12.5} strokeWidth={1.7} className="muted" />
-                                )}
-                                <span className="ell grow">{p.displayName}</span>
-                                {isSel && <Check size={12.5} strokeWidth={2.2} className="ok-t" />}
-                              </button>
-                            );
-                          })}
-                        </div>
-                      )}
-                    </div>
-                  )}
-
-                  {m === 'chat' && (
-                    <span className="muted" style={{ fontSize: 12 }}>自由对话 · 不绑定项目</span>
-                  )}
-
-                  {m === 'pa' && (
-                    <span className="muted" style={{ fontSize: 12 }}>Hebi8 主对话 · 支持跨对话引用</span>
-                  )}
-
-                  {/* Secondary de-emphasized machine picker — only shown quietly when multiple execution hosts exist */}
-                  {execMachines.length > 1 && selectedMachine && (
-                    <div className="relpos">
-                      <button
-                        type="button"
-                        className={`nt-ctx-mach ${openMenu === 'machine' ? 'open' : ''}`}
-                        onClick={() => setOpenMenu(openMenu === 'machine' ? null : 'machine')}
-                        title="切换执行节点"
-                        aria-label="选择执行节点"
-                      >
-                        <DeviceRoleIcon
-                          machine={selectedMachine}
-                          isActiveDuty={selectedMachine.machineId === activeDutyId}
-                          isCurrentDevice={selectedMachine.machineId === effectiveLocalId}
-                          size={11.5}
-                        />
-                        <span className="ell">{selectedMachine.displayAlias || cleanMachineName(selectedMachine)}</span>
-                        <ChevronDown size={10} strokeWidth={1.8} />
-                      </button>
-                      {openMenu === 'machine' && (
-                        <div className="nt-pop" role="menu" style={{ left: 0, top: 'calc(100% + 6px)' }}>
-                          <div className="nt-pop-hd">执行节点</div>
-                          {execMachines.map((mach) => {
-                            const disabledByPart =
-                              m === 'project' && boundMachineSet.size > 0 && !boundMachineSet.has(mach.machineId);
-                            return (
-                              <button
-                                key={mach.machineId}
-                                type="button"
-                                role="menuitem"
-                                className={`nt-pop-item ${mach.machineId === selectedMachine.machineId ? 'on' : ''}`}
-                                disabled={disabledByPart}
-                                title={disabledByPart ? '该项目未绑定此设备的目录' : undefined}
-                                onClick={() => {
-                                  setMachineId(mach.machineId);
-                                  setOpenMenu(null);
-                                }}
-                              >
-                                <DeviceRoleIcon
-                                  machine={mach}
-                                  isActiveDuty={mach.machineId === activeDutyId}
-                                  isCurrentDevice={mach.machineId === effectiveLocalId}
-                                  size={13}
-                                />
-                                <span className="ell grow">{mach.displayAlias || cleanMachineName(mach)}</span>
-                                {mach.status !== 'online' && <span className="faint" style={{ fontSize: 11 }}>离线</span>}
-                                {disabledByPart && <span className="faint" style={{ fontSize: 11 }}>未绑定</span>}
-                                {mach.machineId === selectedMachine.machineId && (
-                                  <Check size={12.5} strokeWidth={2.2} className="ok-t" />
-                                )}
-                              </button>
-                            );
-                          })}
-                        </div>
-                      )}
-                    </div>
-                  )}
-                </div>
-
-                {/* Clean per-project Worktree switch for Git projects (remembered automatically) */}
-                {m === 'project' && !isPlainFolder && (
-                  <label
-                    className={`nt-wt-toggle ${useWorktree ? 'on' : ''}`}
-                    title={useWorktree ? '已开启 Worktree 隔离；完成后由 Orbit 自动打包交付改动' : '未开启 Worktree；与当前项目目录文件直接保持同步'}
-                  >
-                    <input
-                      type="checkbox"
-                      checked={useWorktree}
-                      onChange={(e) => setUseWorktree(e.target.checked)}
-                    />
-                    <span className="nt-wt-track" aria-hidden="true">
-                      <span className="nt-wt-thumb" />
-                    </span>
-                    <span className="nt-wt-lbl">{useWorktree ? 'Worktree 隔离' : 'Worktree'}</span>
-                  </label>
-                )}
-              </div>
-            )}
-
-            {/* Main input box */}
-            <div className="composer-card nt-lody-card">
-              {refIds.length > 0 && (
-                <TaskRefChips
-                  selectedIds={refIds}
-                  onRemove={(id) => setRefIds((prev) => prev.filter((x) => x !== id))}
-                  projects={boot.projects}
-                />
-              )}
-
-              <textarea
-                ref={taRef}
-                className="composer-ta"
-                value={text}
-                autoFocus
-                placeholder={copy.placeholder}
-                onChange={(e) => setText(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
-                    e.preventDefault();
-                    send();
-                  }
-                }}
-                aria-label="线程目标"
-              />
-
-              {sources.length > 0 && (
-                <div className="nt-src-chips">
-                  {sources.map((s) => (
-                    <span className="nt-src-chip" key={s.key}>
-                      <Link2 size={11} strokeWidth={1.7} />
-                      <span className="ell">{s.label}</span>
-                      <button
-                        type="button"
-                        aria-label={`移除 ${s.label}`}
-                        onClick={() => setSources((xs) => xs.filter((x) => x.key !== s.key))}
-                      >
-                        <X size={11} strokeWidth={1.8} />
-                      </button>
-                    </span>
-                  ))}
-                </div>
-              )}
-
-              <div className="nt-lody-bar">
-                <div className="nt-lody-left">
-                  {/* Attach source (+) for Project */}
-                  {m === 'project' && (
-                    <div className="relpos">
-                      <button
-                        type="button"
-                        className={`nt-ico-btn ${openMenu === 'source' ? 'open' : ''}`}
-                        title="附加参考（链接 / 文件 / 记忆）"
-                        aria-label="附加参考"
-                        onClick={() => setOpenMenu(openMenu === 'source' ? null : 'source')}
-                      >
-                        <Plus size={14.5} strokeWidth={1.8} />
-                      </button>
-                      {openMenu === 'source' && (
-                        <div className="nt-pop nt-pop-form" style={{ left: 0, bottom: 'calc(100% + 8px)' }}>
-                          <div className="nt-pop-hd">附加参考资料</div>
-                          <div className="nt-pop-seg">
-                            {(['link', 'file', 'nmem'] as TaskSourceKind[]).map((k) => (
-                              <button
-                                key={k}
-                                type="button"
-                                className={srcKind === k ? 'on' : ''}
-                                onClick={() => setSrcKind(k)}
-                              >
-                                {k === 'link' ? '链接' : k === 'file' ? '文件' : 'nmem'}
-                              </button>
-                            ))}
-                          </div>
-                          <input
-                            className="field"
-                            placeholder={srcKind === 'link' ? 'https://…' : srcKind === 'file' ? '目录内相对路径' : 'nmem 记忆引用'}
-                            value={srcUri}
-                            onChange={(e) => setSrcUri(e.target.value)}
-                            onKeyDown={(e) => {
-                              if (e.key === 'Enter') {
-                                e.preventDefault();
-                                addDraftSource();
-                              }
-                            }}
-                            autoFocus
-                          />
-                          <input
-                            className="field"
-                            placeholder="标题（可选）"
-                            value={srcLabel}
-                            onChange={(e) => setSrcLabel(e.target.value)}
-                          />
-                          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 6 }}>
-                            <button type="button" className="btn ghost sm" onClick={() => setOpenMenu(null)}>
-                              取消
-                            </button>
-                            <button type="button" className="btn pri sm" disabled={!srcUri.trim()} onClick={addDraftSource}>
-                              添加
-                            </button>
-                          </div>
-                        </div>
-                      )}
-                    </div>
-                  )}
-
-                  {/* Conversation Reference Picker (prominent on PA, available on Chat/Project too) */}
-                  <TaskRefButton
-                    selectedIds={refIds}
-                    onChange={setRefIds}
-                    projects={boot.projects}
-                    prominent={m === 'pa'}
-                  />
-
-                  {/* Real ACP Agent + Model + Effort picker (unified across Project / PA / Chat) */}
+            {/* Fixed-height context strip kept across all 3 tracks for 0px vertical shift */}
+            <div className="nt-ctx-bar">
+              <div className="nt-ctx-left">
+                {m === 'project' && project && (
                   <div className="relpos">
                     <button
                       type="button"
-                      className={`nt-agent-btn ${openMenu === 'agent' ? 'open' : ''}`}
-                      disabled={!machineHasReadyAgent}
-                      onClick={() => setOpenMenu(openMenu === 'agent' ? null : 'agent')}
-                      aria-label="选择 Agent 与模型"
+                      className={`nt-ctx-btn ${openMenu === 'project' ? 'open' : ''}`}
+                      onClick={() => setOpenMenu(openMenu === 'project' ? null : 'project')}
+                      aria-label="选择项目与目录"
                     >
-                      <Sparkles size={13} strokeWidth={1.7} />
-                      <span className="ell">{agentTriggerLabel}</span>
+                      {isPlainFolder ? (
+                        <Folder size={13} strokeWidth={1.7} className="muted" />
+                      ) : (
+                        <GitBranch size={13} strokeWidth={1.7} className="muted" />
+                      )}
+                      <span className="ell">
+                        {project.displayName}
+                        {parts.length > 1 && activePart && activePart.name !== project.displayName
+                          ? ` · ${activePart.name}`
+                          : ''}
+                      </span>
+                      <GitZshBadge
+                        runtime={matchedLocation?.runtime}
+                        fallbackBranch={project.defaultBranch}
+                        isGit={!isPlainFolder}
+                      />
                       <ChevronDown size={11} strokeWidth={1.8} className="muted" />
                     </button>
-                    {openMenu === 'agent' && (
-                      <div className="nt-pop nt-pop-wide" role="menu" style={{ left: 0, bottom: 'calc(100% + 8px)' }}>
-                        <div className="nt-pop-hd">Agent</div>
-                        {SessionAdapterValues.map((adp) => {
-                          const ready = readyAdaptersOnMachine.includes(adp);
-                          const isSel = activeAdapterId === adp;
+                    {openMenu === 'project' && (
+                      <div className="nt-pop nt-pop-wide" role="menu" style={{ left: 0, top: 'calc(100% + 6px)' }}>
+                        <div className="nt-pop-hd">项目与目录</div>
+                        {projects.map((p) => {
+                          const pParts = p.parts ?? [];
+                          if (pParts.length > 1) {
+                            return (
+                              <div key={p.projectId} className="nt-pop-group">
+                                <div className="nt-pop-sub">{p.displayName}</div>
+                                {pParts.map((pt) => {
+                                  const isSel = pid === p.projectId && activePart?.partId === pt.partId;
+                                  return (
+                                    <button
+                                      key={pt.partId}
+                                      type="button"
+                                      role="menuitem"
+                                      className={`nt-pop-item indent ${isSel ? 'on' : ''}`}
+                                      onClick={() => {
+                                        setPid(p.projectId);
+                                        setPartId(pt.partId);
+                                        const defLoc = pt.locations.find((l) => l.isDefault) ?? pt.locations[0];
+                                        if (defLoc) setMachineId(defLoc.machineId);
+                                        setOpenMenu(null);
+                                      }}
+                                    >
+                                      {pt.kind === 'folder' ? (
+                                        <Folder size={12.5} strokeWidth={1.6} className="muted" />
+                                      ) : (
+                                        <GitBranch size={12.5} strokeWidth={1.7} className="muted" />
+                                      )}
+                                      <span className="ell grow">{pt.name}</span>
+                                      {isSel && <Check size={12.5} strokeWidth={2.2} className="ok-t" />}
+                                    </button>
+                                  );
+                                })}
+                              </div>
+                            );
+                          }
+                          const singlePart = pParts[0];
+                          const singleFolder =
+                            singlePart?.kind === 'folder' || !!p.repoIdentity?.startsWith('folder:');
+                          const isSel = pid === p.projectId;
                           return (
                             <button
-                              key={adp}
+                              key={p.projectId}
                               type="button"
                               role="menuitem"
                               className={`nt-pop-item ${isSel ? 'on' : ''}`}
-                              disabled={!ready}
                               onClick={() => {
-                                setAdapter(adp);
+                                setPid(p.projectId);
+                                setPartId(singlePart?.partId ?? '');
+                                const defLoc =
+                                  singlePart?.locations.find((l) => l.isDefault) ?? singlePart?.locations[0];
+                                if (defLoc) setMachineId(defLoc.machineId);
+                                setOpenMenu(null);
                               }}
                             >
-                              <span className="ell grow">{agentDisplayName(adp)}</span>
-                              {!ready && <span className="faint" style={{ fontSize: 11 }}>未就绪</span>}
+                              {singleFolder ? (
+                                <Folder size={12.5} strokeWidth={1.6} className="muted" />
+                              ) : (
+                                <GitBranch size={12.5} strokeWidth={1.7} className="muted" />
+                              )}
+                              <span className="ell grow">{p.displayName}</span>
                               {isSel && <Check size={12.5} strokeWidth={2.2} className="ok-t" />}
                             </button>
                           );
                         })}
-
-                        <div className="nt-pop-div" />
-                        <div className="nt-pop-hd">模型</div>
-                        <div style={{ maxHeight: 168, overflowY: 'auto' }}>
-                          <button
-                            type="button"
-                            role="menuitem"
-                            className={`nt-pop-item ${!model ? 'on' : ''}`}
-                            onClick={() => {
-                              setModel('');
-                              setOpenMenu(null);
-                            }}
-                          >
-                            <span className="ell grow">
-                              {activeProbe?.defaultModel
-                                ? `默认 (${activeProbe.defaultModel})`
-                                : '跟随 Agent 默认值'}
-                            </span>
-                            {!model && <Check size={12.5} strokeWidth={2.2} className="ok-t" />}
-                          </button>
-                          {modelChoices.map((mc) => (
-                            <button
-                              key={mc}
-                              type="button"
-                              role="menuitem"
-                              className={`nt-pop-item ${model === mc ? 'on' : ''}`}
-                              onClick={() => {
-                                setModel(mc);
-                                setOpenMenu(null);
-                              }}
-                            >
-                              <span className="ell grow mono" style={{ fontSize: 12 }}>{mc}</span>
-                              {model === mc && <Check size={12.5} strokeWidth={2.2} className="ok-t" />}
-                            </button>
-                          ))}
-                        </div>
-
-                        {effortChoices.length > 0 && (
-                          <>
-                            <div className="nt-pop-div" />
-                            <div className="nt-pop-hd">思考强度</div>
-                            <div className="nt-pop-seg" style={{ padding: '2px 6px 4px', flexWrap: 'wrap' }}>
-                              {effortChoices.map((eff) => (
-                                <button
-                                  key={eff}
-                                  type="button"
-                                  className={(effort || activeProbe?.defaultEffort || '') === eff ? 'on' : ''}
-                                  onClick={() => setEffort(eff)}
-                                >
-                                  {effortLabel(eff)}
-                                </button>
-                              ))}
-                            </div>
-                          </>
-                        )}
                       </div>
                     )}
                   </div>
+                )}
 
-                  {/* Real ACP Permission Mode picker (same full user choice across Project / PA / Chat) */}
+                {m === 'chat' && (
+                  <span className="muted ell" style={{ fontSize: 12 }}>自由对话 · 不绑定项目</span>
+                )}
+
+                {m === 'pa' && (
+                  <span className="muted ell" style={{ fontSize: 12 }}>Hebi8 主对话 · 支持跨对话引用</span>
+                )}
+
+                {execMachines.length > 1 && selectedMachine && (
                   <div className="relpos">
                     <button
                       type="button"
-                      className={`nt-agent-btn ${openMenu === 'perm' ? 'open' : ''}`}
-                      disabled={!machineHasReadyAgent}
-                      title={activeModeOpt?.description || '选择 Agent 权限模式'}
-                      aria-label={`权限模式：${activeModeOpt ? modeLabel(activeModeOpt) : effectivePermMode || defaultPermLabel}`}
-                      onClick={() => setOpenMenu(openMenu === 'perm' ? null : 'perm')}
+                      className={`nt-ctx-mach ${openMenu === 'machine' ? 'open' : ''}`}
+                      onClick={() => setOpenMenu(openMenu === 'machine' ? null : 'machine')}
+                      title="切换执行节点"
+                      aria-label="选择执行节点"
                     >
-                      <Shield size={12.5} strokeWidth={1.7} />
-                      <span className="ell">
-                        {activeModeOpt ? modeLabel(activeModeOpt) : effectivePermMode || defaultPermLabel}
-                      </span>
-                      <ChevronDown size={11} strokeWidth={1.8} className="muted" />
+                      <DeviceRoleIcon
+                        machine={selectedMachine}
+                        isActiveDuty={selectedMachine.machineId === activeDutyId}
+                        isCurrentDevice={selectedMachine.machineId === effectiveLocalId}
+                        size={11.5}
+                      />
+                      <span className="ell">{selectedMachine.displayAlias || cleanMachineName(selectedMachine)}</span>
+                      <ChevronDown size={10} strokeWidth={1.8} />
                     </button>
-                    {openMenu === 'perm' && (
-                      <div className="nt-pop nt-pop-wide" role="menu" style={{ left: 0, bottom: 'calc(100% + 8px)' }}>
-                        <div className="nt-pop-hd">Agent 权限模式</div>
-                        <button
-                          type="button"
-                          role="menuitem"
-                          className={`nt-pop-item ${!effectivePermMode ? 'on' : ''}`}
-                          onClick={() => {
-                            setPermMode('');
-                            setOpenMenu(null);
-                          }}
-                        >
-                          <span className="ell grow">{defaultPermLabel}</span>
-                          {!effectivePermMode && <Check size={12.5} strokeWidth={2.2} className="ok-t" />}
-                        </button>
-                        {modeChoices.map((opt) => (
-                          <button
-                            key={opt.id}
-                            type="button"
-                            role="menuitem"
-                            className={`nt-pop-item ${effectivePermMode === opt.id ? 'on' : ''}`}
-                            onClick={() => {
-                              setPermMode(opt.id);
-                              setOpenMenu(null);
-                            }}
-                          >
-                            <div className="grow" style={{ textAlign: 'left' }}>
-                              <div>{modeLabel(opt)}</div>
-                              {opt.description && (
-                                <div className="faint" style={{ fontSize: 11 }}>{opt.description}</div>
+                    {openMenu === 'machine' && (
+                      <div className="nt-pop" role="menu" style={{ left: 0, top: 'calc(100% + 6px)' }}>
+                        <div className="nt-pop-hd">执行节点</div>
+                        {execMachines.map((mach) => {
+                          const disabledByPart =
+                            m === 'project' && boundMachineSet.size > 0 && !boundMachineSet.has(mach.machineId);
+                          return (
+                            <button
+                              key={mach.machineId}
+                              type="button"
+                              role="menuitem"
+                              className={`nt-pop-item ${mach.machineId === selectedMachine.machineId ? 'on' : ''}`}
+                              disabled={disabledByPart}
+                              title={disabledByPart ? '该项目未绑定此设备的目录' : undefined}
+                              onClick={() => {
+                                setMachineId(mach.machineId);
+                                setOpenMenu(null);
+                              }}
+                            >
+                              <DeviceRoleIcon
+                                machine={mach}
+                                isActiveDuty={mach.machineId === activeDutyId}
+                                isCurrentDevice={mach.machineId === effectiveLocalId}
+                                size={13}
+                              />
+                              <span className="ell grow">{mach.displayAlias || cleanMachineName(mach)}</span>
+                              {mach.status !== 'online' && <span className="faint" style={{ fontSize: 11 }}>离线</span>}
+                              {disabledByPart && <span className="faint" style={{ fontSize: 11 }}>未绑定</span>}
+                              {mach.machineId === selectedMachine.machineId && (
+                                <Check size={12.5} strokeWidth={2.2} className="ok-t" />
                               )}
-                            </div>
-                            {effectivePermMode === opt.id && <Check size={12.5} strokeWidth={2.2} className="ok-t" />}
-                          </button>
-                        ))}
+                            </button>
+                          );
+                        })}
                       </div>
                     )}
                   </div>
-                </div>
-
-                <button
-                  type="button"
-                  className={`send-icon-btn ${canSend ? 'is-ready' : 'is-idle'}`}
-                  disabled={!canSend}
-                  title="发送 (Enter)"
-                  aria-label="发送"
-                  onClick={send}
-                >
-                  {submit.isPending ? <span className="spin" /> : <SendUpIcon size={14} />}
-                </button>
+                )}
               </div>
+
+              {/* Fixed "Worktree" label — never toggles text on state change (v4 invariant) */}
+              {m === 'project' && !isPlainFolder && (
+                <label
+                  className={`nt-wt-toggle ${useWorktree ? 'on' : ''}`}
+                  title={
+                    useWorktree
+                      ? '已开启 Worktree 隔离；完成后由 Orbit 自动打包交付改动'
+                      : '未开启 Worktree；与当前项目目录文件直接保持同步'
+                  }
+                >
+                  <input
+                    type="checkbox"
+                    checked={useWorktree}
+                    onChange={(e) => setUseWorktree(e.target.checked)}
+                  />
+                  <span className="nt-wt-track" aria-hidden="true">
+                    <span className="nt-wt-thumb" />
+                  </span>
+                  <span className="nt-wt-lbl">Worktree</span>
+                </label>
+              )}
             </div>
+
+            {/* Unified site-wide Composer with indicatorMode="quota" */}
+            <Composer
+              standalone
+              indicatorMode="quota"
+              value={text}
+              onChange={setText}
+              onSubmit={send}
+              placeholder={copy.placeholder}
+              autoFocus
+              textareaRef={taRef}
+              canSend={canSend}
+              submitting={submit.isPending}
+              controlsDisabled={!machineHasReadyAgent}
+              availableAdapters={readyAdaptersOnMachine}
+              effectiveAdapter={activeAdapterId}
+              onAdapterChange={(adp) => setAdapter(adp)}
+              activeProbe={activeProbe}
+              effectiveModel={model}
+              modelChoices={modelChoices}
+              onModelChange={setModel}
+              effectiveEffort={effort}
+              effortChoices={effortChoices}
+              onEffortChange={setEffort}
+              effectiveMode={effectivePermMode}
+              modeChoices={modeChoices}
+              onModeChange={setPermMode}
+              refIds={refIds}
+              onRefIdsChange={setRefIds}
+              projects={boot.projects}
+              refProminent={m === 'pa'}
+              leadingExtra={attachSourceControl}
+              chipsSlot={sourceChips}
+            />
           </div>
 
           <div className="nt-starters">

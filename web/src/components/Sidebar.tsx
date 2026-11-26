@@ -1,18 +1,22 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import { Archive, CornerDownRight, Layers, LayoutGrid, MoreHorizontal, PanelLeftClose, Plus, Search, Settings, Trash2 } from 'lucide-react';
-import type { BootstrapResponse, ChildTaskView, MachineView, ProjectView, TaskSummary } from '../generated/protocol';
+import { Archive, ChevronRight, Folder, Layers, LayoutGrid, PanelLeftClose, Plus, Search, Settings } from 'lucide-react';
+import type {
+  BootstrapResponse,
+  ChildTaskView,
+  InboxItemView,
+  MachineView,
+  ProjectView,
+  TaskSummary,
+} from '../generated/protocol';
 import { useManyProjectTasks, useTaskChildren, useTimeline } from '../hooks/queries';
 import { useHubLatency } from '../hooks/useHubLatency';
 import { api, errMsg } from '../lib/api';
 import {
-  PA_PROJECT_ID,
   SCRATCH_PROJECT_ID,
-  childStateDot,
-  childStateLabel,
+  childSessionMark,
   cleanMachineName,
   indexInboxByTask,
-  isChildStateLive,
   isVirtualProject,
   rootSessionMark,
   sessionMark,
@@ -20,9 +24,10 @@ import {
   taskTitle,
   type SessionMark,
 } from '../lib/format';
+import { resolveEffectiveLocalMachineId } from '../lib/ide';
 import { navigate, paths, type Route } from '../lib/router';
 import { toast, useWorkbenchStore } from '../store/useWorkbenchStore';
-import { CaretIcon, MoonIcon, PAIcon, SunIcon } from './Icons';
+import { CaretIcon, DirectLocalIcon, PAIcon } from './Icons';
 import { StatusMark } from './StatusMark';
 
 const MAX_THREADS = 8;
@@ -35,12 +40,14 @@ function SidebarChildTree({
   parentTaskId,
   localChildren,
   machines,
+  inboxByTask,
   activeTaskId,
   activeChildDrawerId,
 }: {
   parentTaskId: string;
   localChildren: TaskSummary[];
   machines: MachineView[];
+  inboxByTask: ReadonlyMap<string, InboxItemView[]>;
   activeTaskId: string;
   activeChildDrawerId: string;
 }) {
@@ -78,32 +85,23 @@ function SidebarChildTree({
   return (
     <div className="th-children" role="group" aria-label="子会话列表">
       {items.map((child) => {
-        const dot = childStateDot(child.state, child.openApprovalCount);
+        const mark = childSessionMark(child, inboxByTask.get(child.taskId));
+        const hint = sessionMarkHint(mark);
         const isCurrent = activeTaskId === child.taskId || activeChildDrawerId === child.taskId;
         const mach = machines.find((m) => m.machineId === child.machineId);
         const machName = mach ? mach.displayAlias?.trim() || cleanMachineName(mach) : child.machineId || '';
-        const tooltip = [
-          child.delegatedRole ? `[${child.delegatedRole}]` : '',
-          taskTitle(child),
-          childStateLabel(child.state, child.openApprovalCount),
-          machName,
-          child.projectName,
-        ]
-          .filter(Boolean)
-          .join(' · ');
+        const tooltip = [taskTitle(child), hint, machName, child.projectName].filter(Boolean).join(' · ');
 
         return (
           <button
             type="button"
             key={child.taskId}
-            className={`th-child ${isCurrent ? 'on' : ''}`}
+            className={`th-child ${isCurrent ? 'on' : ''} ${!mark ? 'resting' : ''}`}
             onClick={() => navigate(paths.session(child.taskId))}
             title={tooltip}
           >
-            <span className={`sub-dot is-${dot}`} aria-hidden="true" />
-            {child.delegatedRole && <span className="th-child-role">{child.delegatedRole}</span>}
             <span className="tt">{taskTitle(child)}</span>
-            {child.openApprovalCount > 0 && <span className="th-child-ap" title="有待确认审批" />}
+            <StatusMark mark={mark} />
           </button>
         );
       })}
@@ -113,148 +111,103 @@ function SidebarChildTree({
 
 function SidebarThreadItem({
   task,
-  mark,
+  ownMark,
+  aggregatedMark,
   active,
-  flat,
   childCount,
-  activeChildCount,
-  pendingChildApprovals,
   childrenExpanded,
+  hasActiveChild,
   onToggleChildren,
   localChildren,
   machines,
+  inboxByTask,
   activeTaskId,
   activeChildDrawerId,
-  menuOpen,
-  onToggleMenu,
-  onCloseMenu,
-  onArchive,
-  onDelete,
+  archiveArmed,
+  onArmArchive,
+  onConfirmArchive,
 }: {
   task: TaskSummary;
-  mark: SessionMark;
+  ownMark: SessionMark;
+  aggregatedMark: SessionMark;
   active: boolean;
-  flat?: boolean;
   childCount: number;
-  activeChildCount: number;
-  pendingChildApprovals: number;
   childrenExpanded: boolean;
+  hasActiveChild: boolean;
   onToggleChildren: () => void;
   localChildren: TaskSummary[];
   machines: MachineView[];
+  inboxByTask: ReadonlyMap<string, InboxItemView[]>;
   activeTaskId: string;
   activeChildDrawerId: string;
-  menuOpen: boolean;
-  onToggleMenu: () => void;
-  onCloseMenu: () => void;
-  onArchive: () => void;
-  onDelete: () => void;
+  archiveArmed: boolean;
+  onArmArchive: () => void;
+  onConfirmArchive: () => void;
 }) {
-  const [confirmDelete, setConfirmDelete] = useState(false);
-  const hint = sessionMarkHint(mark);
   const hasChildren = childCount > 0;
+  // Conditional status bleed-through (v4 invariant):
+  // Collapsed -> rollup children onto parent row; Expanded -> parent shows its own status only.
+  const displayedMark: SessionMark = hasChildren && childrenExpanded ? ownMark : aggregatedMark;
+  const hint = sessionMarkHint(displayedMark);
 
   return (
-    <div className="th-node">
-      <div className={`th-wrap ${menuOpen ? 'menu-open' : ''}`}>
-        <div
-          role="button"
-          tabIndex={0}
-          className={`th ${flat ? 'flat' : ''} ${active ? 'on' : ''} ${!mark ? 'resting' : ''}`}
-          style={{ cursor: 'pointer' }}
+    <div
+      className={`th-node ${hasChildren && childrenExpanded ? 'is-open' : ''} ${hasActiveChild ? 'has-active-child' : ''}`}
+    >
+      <div className={`th-wrap ${archiveArmed ? 'is-arm-archive' : ''}`}>
+        {hasChildren && (
+          <button
+            type="button"
+            className="th-caret-btn"
+            title={childrenExpanded ? '收起子会话' : '展开子会话'}
+            aria-label={childrenExpanded ? '收起子会话' : '展开子会话'}
+            aria-expanded={childrenExpanded}
+            onClick={(e) => {
+              e.stopPropagation();
+              onToggleChildren();
+            }}
+          >
+            <ChevronRight size={11} strokeWidth={1.8} />
+          </button>
+        )}
+        <button
+          type="button"
+          className={`th ${active ? 'on' : ''} ${!displayedMark ? 'resting' : ''}`}
           onClick={() => navigate(paths.session(task.taskId))}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter' || e.key === ' ') {
-              e.preventDefault();
-              navigate(paths.session(task.taskId));
-            }
-          }}
           title={hint ? `${taskTitle(task)} · ${hint}` : taskTitle(task)}
         >
           <span className="tt">{taskTitle(task)}</span>
-          {hasChildren && (
-            <button
-              type="button"
-              className={`th-child-toggle ${childrenExpanded ? 'open' : ''} ${activeChildCount > 0 ? 'has-live' : ''} ${pendingChildApprovals > 0 ? 'has-ap' : ''}`}
-              title={`${childrenExpanded ? '收起' : '展开'} ${childCount} 个子会话${activeChildCount > 0 ? ` · ${activeChildCount} 运行中` : ''}${pendingChildApprovals > 0 ? ` · ${pendingChildApprovals} 待审批` : ''}`}
-              aria-expanded={childrenExpanded}
-              onClick={(e) => {
-                e.stopPropagation();
-                onToggleChildren();
-              }}
-            >
-              <CornerDownRight size={10} strokeWidth={2} />
-              <span className="mono">{childCount}</span>
-              {pendingChildApprovals > 0 && <span className="th-child-ap" aria-hidden="true" />}
-            </button>
-          )}
-          <StatusMark mark={mark} />
-        </div>
-        <button
-          type="button"
-          className="th-more-btn"
-          title="会话操作"
-          aria-label="会话操作"
-          aria-expanded={menuOpen}
-          onClick={(e) => {
-            e.stopPropagation();
-            setConfirmDelete(false);
-            onToggleMenu();
-          }}
-        >
-          <MoreHorizontal size={13} strokeWidth={1.7} />
+          <StatusMark mark={displayedMark} />
         </button>
-        {menuOpen && (
-          <>
-            <div
-              className="scrim"
-              style={{ background: 'transparent', backdropFilter: 'none', zIndex: 49 }}
-              onClick={() => {
-                setConfirmDelete(false);
-                onCloseMenu();
-              }}
-            />
-            <div className="th-menu" role="menu">
-              <button
-                type="button"
-                role="menuitem"
-                className="th-menu-item"
-                onClick={() => {
-                  setConfirmDelete(false);
-                  onCloseMenu();
-                  onArchive();
-                }}
-              >
-                <Archive size={12.5} strokeWidth={1.6} />
-                <span>归档会话</span>
-              </button>
-              {confirmDelete ? (
-                <button
-                  type="button"
-                  role="menuitem"
-                  className="th-menu-item danger"
-                  onClick={() => {
-                    setConfirmDelete(false);
-                    onCloseMenu();
-                    onDelete();
-                  }}
-                >
-                  <Trash2 size={12.5} strokeWidth={1.7} />
-                  <span>确认永久删除</span>
-                </button>
-              ) : (
-                <button
-                  type="button"
-                  role="menuitem"
-                  className="th-menu-item danger"
-                  onClick={() => setConfirmDelete(true)}
-                >
-                  <Trash2 size={12.5} strokeWidth={1.6} />
-                  <span>永久删除</span>
-                </button>
-              )}
-            </div>
-          </>
+        {archiveArmed ? (
+          <button
+            type="button"
+            className="th-arch-btn is-armed"
+            data-arm-archive-root="1"
+            title="再次点击确认归档"
+            aria-label="确认归档会话"
+            onClick={(e) => {
+              e.stopPropagation();
+              onConfirmArchive();
+            }}
+          >
+            <Archive size={11} strokeWidth={1.8} />
+            <span>确认</span>
+          </button>
+        ) : (
+          <button
+            type="button"
+            className="th-arch-btn"
+            data-arm-archive-root="1"
+            title="归档会话"
+            aria-label="归档会话"
+            onClick={(e) => {
+              e.stopPropagation();
+              onArmArchive();
+            }}
+          >
+            <Archive size={11.5} strokeWidth={1.7} />
+          </button>
         )}
       </div>
       {hasChildren && childrenExpanded && (
@@ -262,6 +215,7 @@ function SidebarThreadItem({
           parentTaskId={task.taskId}
           localChildren={localChildren}
           machines={machines}
+          inboxByTask={inboxByTask}
           activeTaskId={activeTaskId}
           activeChildDrawerId={activeChildDrawerId}
         />
@@ -272,29 +226,60 @@ function SidebarThreadItem({
 
 function WorkspaceFooterButton({
   workspaceName,
-  machines,
+  boot,
   open,
   onClick,
 }: {
   workspaceName: string;
-  machines: MachineView[];
+  boot: BootstrapResponse;
   open: boolean;
   onClick: () => void;
 }) {
   const wsStatus = useWorkbenchStore((s) => s.wsStatus);
+  const storedLocalId = useWorkbenchStore((s) => s.localMachineId);
   const latency = useHubLatency();
 
+  const machines = boot.machines;
   const anyOnline = machines.length === 0 || machines.some((m) => m.status === 'online');
   const unreachable = latency === null || !anyOnline;
-  const degraded = !unreachable && (wsStatus === 'reconnecting' || (typeof latency === 'number' && latency >= 80));
+
+  const primaryDutyId = boot.setup?.dutyPriority?.[0] ?? '';
+  const activeDutyId = boot.setup?.activeDutyMachineId ?? '';
+  const primaryMachine = primaryDutyId ? machines.find((m) => m.machineId === primaryDutyId) : undefined;
+  const isFailover =
+    !!primaryDutyId &&
+    !!activeDutyId &&
+    primaryDutyId !== activeDutyId &&
+    (!primaryMachine || primaryMachine.status !== 'online');
+
+  const effectiveLocalId = resolveEffectiveLocalMachineId(
+    machines,
+    boot.setup?.currentMachineId || storedLocalId,
+  );
+  const hubMachine = machines.find((m) => m.transportMode === 'local_ws');
+  const isLoopbackHost =
+    typeof window !== 'undefined' &&
+    (window.location.hostname === '127.0.0.1' ||
+      window.location.hostname === 'localhost' ||
+      window.location.hostname === '::1');
+  const isDirectLocal =
+    !unreachable &&
+    wsStatus !== 'reconnecting' &&
+    (isLoopbackHost || (!!effectiveLocalId && !!hubMachine && effectiveLocalId === hubMachine.machineId));
+
+  const degraded =
+    !unreachable &&
+    (isFailover || wsStatus === 'reconnecting' || (typeof latency === 'number' && latency >= 80));
 
   const statusText = unreachable
     ? '离线'
     : wsStatus === 'reconnecting'
       ? '重连中'
-      : typeof latency === 'number'
-        ? `${latency}ms`
-        : '';
+      : isDirectLocal
+        ? '直连本机'
+        : typeof latency === 'number'
+          ? `${latency}ms`
+          : '';
 
   const dotClass = unreachable ? 'off' : degraded ? 'mid' : 'good';
   const latClass = unreachable ? 'off' : degraded ? 'mid' : 'good';
@@ -309,7 +294,17 @@ function WorkspaceFooterButton({
     >
       <span className={`ws-dot ${dotClass}`} aria-hidden="true" />
       <span className="hn ell">{workspaceName}</span>
-      {statusText && <span className={`hl mono ${latClass}`}>{statusText}</span>}
+      {isDirectLocal ? (
+        <span
+          className={`ws-direct-ico ${isFailover ? 'is-warn' : 'is-local'}`}
+          title="直连本机"
+          aria-label="直连本机"
+        >
+          <DirectLocalIcon size={13} />
+        </span>
+      ) : (
+        statusText && <span className={`hl mono ${latClass}`}>{statusText}</span>
+      )}
     </button>
   );
 }
@@ -324,17 +319,36 @@ export function Sidebar({
   onAddProject?: () => void;
 }) {
   const qc = useQueryClient();
-  const [openMenuTaskId, setOpenMenuTaskId] = useState<string | null>(null);
-  const [expandedParents, setExpandedParents] = useState<Record<string, boolean>>({});
+  const [armArchiveTaskId, setArmArchiveTaskId] = useState<string | null>(null);
   const expanded = useWorkbenchStore((s) => s.expandedProjects);
   const setExpanded = useWorkbenchStore((s) => s.setProjectExpanded);
+  const expandedParents = useWorkbenchStore((s) => s.expandedParents);
+  const toggleParentExpanded = useWorkbenchStore((s) => s.toggleParentExpanded);
+  const ensureParentExpanded = useWorkbenchStore((s) => s.ensureParentExpanded);
   const toggleSidebar = useWorkbenchStore((s) => s.toggleSidebar);
-  const theme = useWorkbenchStore((s) => s.theme);
-  const toggleTheme = useWorkbenchStore((s) => s.toggleTheme);
   const machinesOpen = useWorkbenchStore((s) => s.machinesOpen);
   const setMachinesOpen = useWorkbenchStore((s) => s.setMachinesOpen);
   const setCmdkOpen = useWorkbenchStore((s) => s.setCmdkOpen);
   const workspaceNameOverride = useWorkbenchStore((s) => s.workspaceNameOverride);
+
+  // Reset in-place 2-step archive confirmation when clicking outside or pressing Escape.
+  useEffect(() => {
+    if (!armArchiveTaskId) return;
+    const onDown = (e: MouseEvent) => {
+      const el = e.target as HTMLElement | null;
+      if (el?.closest('[data-arm-archive-root="1"]')) return;
+      setArmArchiveTaskId(null);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setArmArchiveTaskId(null);
+    };
+    document.addEventListener('mousedown', onDown);
+    window.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onDown);
+      window.removeEventListener('keydown', onKey);
+    };
+  }, [armArchiveTaskId]);
 
   const workspaceName = workspaceNameOverride || boot.workspaceName || 'Home LAN';
 
@@ -342,7 +356,8 @@ export function Sidebar({
   const scratch = boot.projects.find((p) => p.projectId === SCRATCH_PROJECT_ID);
 
   const isOpen = (p: ProjectView) =>
-    expanded[p.projectId] ?? (p.activeTaskCount + p.blockedTaskCount > 0 || (route.name === 'project' && route.projectId === p.projectId));
+    expanded[p.projectId] ??
+    (p.activeTaskCount + p.blockedTaskCount > 0 || (route.name === 'project' && route.projectId === p.projectId));
 
   const fetchList = [...projects.filter(isOpen), ...(scratch ? [scratch] : [])];
   const tasksByProject = useManyProjectTasks(fetchList);
@@ -351,68 +366,51 @@ export function Sidebar({
   const activeTaskId = route.name === 'session' ? route.taskId : '';
   const activeChildDrawerId = route.name === 'session' || route.name === 'pa' ? route.childId ?? '' : '';
 
-  // Deduplicated local children map across boot.activeTasks + loaded project lists.
-  const localChildrenByParent = useMemo(() => {
-    const map = new Map<string, Map<string, TaskSummary>>();
-    const ingest = (list: readonly TaskSummary[]) => {
+  // Deduplicated merged task index + local children map across boot.activeTasks + loaded project lists.
+  const { allKnownTasks, localChildrenByParent } = useMemo(() => {
+    const byId = new Map<string, TaskSummary>();
+    for (const t of boot.activeTasks) byId.set(t.taskId, t);
+    for (const list of Object.values(tasksByProject)) {
       for (const t of list) {
-        if (!t.parentTaskId) continue;
-        let bucket = map.get(t.parentTaskId);
-        if (!bucket) {
-          bucket = new Map<string, TaskSummary>();
-          map.set(t.parentTaskId, bucket);
-        }
-        bucket.set(t.taskId, t);
+        if (!byId.has(t.taskId)) byId.set(t.taskId, t);
       }
-    };
-    ingest(boot.activeTasks);
-    for (const list of Object.values(tasksByProject)) ingest(list);
-    const out = new Map<string, TaskSummary[]>();
-    for (const [pid, bucket] of map) {
-      out.set(pid, [...bucket.values()].sort((a, b) => b.updatedAt - a.updatedAt));
     }
-    return out;
+    const known = [...byId.values()];
+    const map = new Map<string, TaskSummary[]>();
+    for (const t of known) {
+      if (!t.parentTaskId) continue;
+      const list = map.get(t.parentTaskId) ?? [];
+      list.push(t);
+      map.set(t.parentTaskId, list);
+    }
+    for (const list of map.values()) {
+      list.sort((a, b) => b.updatedAt - a.updatedAt);
+    }
+    return { allKnownTasks: known, localChildrenByParent: map };
   }, [boot.activeTasks, tasksByProject]);
 
-  // Auto-expand parent thread when currently viewing a child session (reuses SessionPage's timeline query).
+  // Expand stability invariant (v4):
+  // Opening a full child-session page auto-expands its parent branch (persisted in store);
+  // switching to any other session NEVER auto-collapses an expanded branch.
   const activeSessionTl = useTimeline(route.name === 'session' ? route.taskId : undefined);
-  const viewingParentId = activeSessionTl.data?.task?.parentTaskId || activeSessionTl.data?.parentSummary?.taskId || '';
+  const localViewingParentId = activeTaskId
+    ? allKnownTasks.find((t) => t.taskId === activeTaskId)?.parentTaskId ?? ''
+    : '';
+  const viewingParentId =
+    localViewingParentId ||
+    activeSessionTl.data?.task?.parentTaskId ||
+    activeSessionTl.data?.parentSummary?.taskId ||
+    '';
+
   useEffect(() => {
     if (!viewingParentId) return;
-    setExpandedParents((prev) => (prev[viewingParentId] ? prev : { ...prev, [viewingParentId]: true }));
-  }, [viewingParentId]);
-
-  const toggleParentExpanded = (parentTaskId: string) => {
-    setExpandedParents((prev) => ({ ...prev, [parentTaskId]: !prev[parentTaskId] }));
-  };
-
-  // Hebi8 main task child status badge for top nav button
-  const hebi8ChildStats = useMemo(() => {
-    const paMains = boot.activeTasks.filter((t) => t.projectId === PA_PROJECT_ID && !t.parentTaskId);
-    let active = 0;
-    let approvals = 0;
-    for (const t of paMains) {
-      const localKids = localChildrenByParent.get(t.taskId) ?? [];
-      const localLive = localKids.filter((c) => isChildStateLive(c.state)).length;
-      const localAp = localKids.filter((c) => c.state === 'waiting_approval').length;
-      active += Math.max(t.activeChildCount ?? 0, localLive);
-      approvals += Math.max(t.pendingChildApprovals ?? 0, localAp);
-    }
-    return { active, approvals };
-  }, [boot.activeTasks, localChildrenByParent]);
+    ensureParentExpanded(viewingParentId);
+  }, [viewingParentId, ensureParentExpanded]);
 
   const childStatsFor = (t: TaskSummary) => {
     const localKids = localChildrenByParent.get(t.taskId) ?? [];
     const childCount = Math.max(t.childCount ?? 0, localKids.length);
-    const activeChildCount = Math.max(
-      t.activeChildCount ?? 0,
-      localKids.filter((c) => isChildStateLive(c.state)).length,
-    );
-    const pendingChildApprovals = Math.max(
-      t.pendingChildApprovals ?? 0,
-      localKids.filter((c) => c.state === 'waiting_approval').length,
-    );
-    return { localKids, childCount, activeChildCount, pendingChildApprovals };
+    return { localKids, childCount };
   };
 
   const invalidateTasks = (projectId: string) => {
@@ -424,6 +422,7 @@ export function Sidebar({
   };
 
   const handleArchiveTask = async (t: TaskSummary) => {
+    setArmArchiveTaskId(null);
     try {
       await api.archiveTask(t.taskId);
       invalidateTasks(t.projectId);
@@ -447,19 +446,6 @@ export function Sidebar({
     }
   };
 
-  const handleDeleteTask = async (t: TaskSummary) => {
-    try {
-      await api.deleteTask(t.taskId);
-      invalidateTasks(t.projectId);
-      if (activeTaskId === t.taskId) {
-        navigate(isVirtualProject(t.projectId) ? paths.home() : paths.project(t.projectId));
-      }
-      toast(`已永久删除「${taskTitle(t)}」`);
-    } catch (e) {
-      toast(errMsg(e), 'err');
-    }
-  };
-
   return (
     <aside className="side">
       <div className="side-in">
@@ -475,7 +461,7 @@ export function Sidebar({
             </button>
           </div>
         </div>
-        <div className="quick">
+        <div className="quick" role="navigation" aria-label="主导航">
           <button type="button" className={`qi ${route.name === 'home' ? 'on' : ''}`} onClick={() => navigate(paths.home())}>
             <LayoutGrid size={14} strokeWidth={1.6} />
             总览
@@ -483,28 +469,10 @@ export function Sidebar({
           <button type="button" className={`qi ${route.name === 'pa' ? 'on' : ''}`} onClick={() => navigate(paths.hebi8())}>
             <PAIcon />
             <span>Hebi8</span>
-            {(hebi8ChildStats.approvals > 0 || hebi8ChildStats.active > 0) && (
-              <span className="qi-sub-badges">
-                {hebi8ChildStats.approvals > 0 && (
-                  <span className="qi-sub-badge is-ap mono" title={`${hebi8ChildStats.approvals} 个子会话待审批`}>
-                    {hebi8ChildStats.approvals}
-                  </span>
-                )}
-                {hebi8ChildStats.active > 0 && (
-                  <span className="qi-sub-badge is-run mono" title={`${hebi8ChildStats.active} 个子会话运行中`}>
-                    {hebi8ChildStats.active}
-                  </span>
-                )}
-              </span>
-            )}
           </button>
           <button type="button" className={`qi ${route.name === 'artifacts' ? 'on' : ''}`} onClick={() => navigate(paths.artifacts())}>
             <Layers size={14} strokeWidth={1.6} />
             Artifacts
-          </button>
-          <button type="button" className={`qi ${route.name === 'archived' ? 'on' : ''}`} onClick={() => navigate(paths.archived())}>
-            <Archive size={14} strokeWidth={1.6} />
-            已归档
           </button>
           <button type="button" className={`qi ${route.name === 'new' ? 'on' : ''}`} onClick={() => navigate(paths.newThread())}>
             <Plus size={14} strokeWidth={1.6} />
@@ -526,11 +494,13 @@ export function Sidebar({
                     type="button"
                     className={`caretb ${open ? 'open' : ''}`}
                     title={open ? '收起' : '展开主线程'}
+                    aria-label={open ? '收起项目' : '展开项目'}
                     onClick={() => setExpanded(p.projectId, !open)}
                   >
                     <CaretIcon />
                   </button>
                   <button type="button" className="pname" onClick={() => navigate(paths.project(p.projectId))}>
+                    <Folder size={12.5} strokeWidth={1.7} className="ph-folder-ico" aria-hidden="true" />
                     <span className="pn ell">{p.displayName}</span>
                   </button>
                   <button
@@ -546,79 +516,86 @@ export function Sidebar({
                     type="button"
                     className="padd"
                     title={`在 ${p.displayName} 新建线程`}
+                    aria-label={`在 ${p.displayName} 新建线程`}
                     onClick={() => navigate(paths.newThread('project', p.projectId))}
                   >
                     <Plus size={13} strokeWidth={1.6} />
                   </button>
                 </div>
-                {open &&
-                  threads.slice(0, MAX_THREADS).map((t) => {
-                    const mark = rootSessionMark(t, allProjTasks, inboxByTask);
-                    const cs = childStatsFor(t);
-                    return (
-                      <SidebarThreadItem
-                        key={t.taskId}
-                        task={t}
-                        mark={mark}
-                        active={activeTaskId === t.taskId}
-                        childCount={cs.childCount}
-                        activeChildCount={cs.activeChildCount}
-                        pendingChildApprovals={cs.pendingChildApprovals}
-                        childrenExpanded={!!expandedParents[t.taskId]}
-                        onToggleChildren={() => toggleParentExpanded(t.taskId)}
-                        localChildren={cs.localKids}
-                        machines={boot.machines}
-                        activeTaskId={activeTaskId}
-                        activeChildDrawerId={activeChildDrawerId}
-                        menuOpen={openMenuTaskId === t.taskId}
-                        onToggleMenu={() => setOpenMenuTaskId((cur) => (cur === t.taskId ? null : t.taskId))}
-                        onCloseMenu={() => setOpenMenuTaskId(null)}
-                        onArchive={() => void handleArchiveTask(t)}
-                        onDelete={() => void handleDeleteTask(t)}
-                      />
-                    );
-                  })}
-                {open && threads.length > MAX_THREADS && (
-                  <button type="button" className="th-more" onClick={() => navigate(paths.project(p.projectId))}>
-                    全部线程 →
-                  </button>
+                {open && threads.length > 0 && (
+                  <div className="proj-threads">
+                    {threads.slice(0, MAX_THREADS).map((t) => {
+                      const ownMark = sessionMark(t, inboxByTask.get(t.taskId));
+                      const aggregatedMark = rootSessionMark(t, allKnownTasks, inboxByTask);
+                      const cs = childStatsFor(t);
+                      const isParentOfViewingChild =
+                        viewingParentId === t.taskId || (activeTaskId === t.taskId && !!activeChildDrawerId);
+                      return (
+                        <SidebarThreadItem
+                          key={t.taskId}
+                          task={t}
+                          ownMark={ownMark}
+                          aggregatedMark={aggregatedMark}
+                          active={activeTaskId === t.taskId}
+                          childCount={cs.childCount}
+                          childrenExpanded={!!expandedParents[t.taskId]}
+                          hasActiveChild={isParentOfViewingChild}
+                          onToggleChildren={() => toggleParentExpanded(t.taskId)}
+                          localChildren={cs.localKids}
+                          machines={boot.machines}
+                          inboxByTask={inboxByTask}
+                          activeTaskId={activeTaskId}
+                          activeChildDrawerId={activeChildDrawerId}
+                          archiveArmed={armArchiveTaskId === t.taskId}
+                          onArmArchive={() => setArmArchiveTaskId(t.taskId)}
+                          onConfirmArchive={() => void handleArchiveTask(t)}
+                        />
+                      );
+                    })}
+                    {threads.length > MAX_THREADS && (
+                      <button type="button" className="th-more" onClick={() => navigate(paths.project(p.projectId))}>
+                        全部线程 →
+                      </button>
+                    )}
+                  </div>
                 )}
               </div>
             );
           })}
           {scratchThreads.length > 0 && (
-            <>
-              <div className="slabel" style={{ marginTop: 10 }}>
-                自由对话
+            <div className="pgroup">
+              <div className="slabel">自由对话</div>
+              <div className="proj-threads">
+                {scratchThreads.slice(0, MAX_THREADS).map((t) => {
+                  const ownMark = sessionMark(t, inboxByTask.get(t.taskId));
+                  const aggregatedMark = rootSessionMark(t, allKnownTasks, inboxByTask);
+                  const cs = childStatsFor(t);
+                  const isParentOfViewingChild =
+                    viewingParentId === t.taskId || (activeTaskId === t.taskId && !!activeChildDrawerId);
+                  return (
+                    <SidebarThreadItem
+                      key={t.taskId}
+                      task={t}
+                      ownMark={ownMark}
+                      aggregatedMark={aggregatedMark}
+                      active={activeTaskId === t.taskId}
+                      childCount={cs.childCount}
+                      childrenExpanded={!!expandedParents[t.taskId]}
+                      hasActiveChild={isParentOfViewingChild}
+                      onToggleChildren={() => toggleParentExpanded(t.taskId)}
+                      localChildren={cs.localKids}
+                      machines={boot.machines}
+                      inboxByTask={inboxByTask}
+                      activeTaskId={activeTaskId}
+                      activeChildDrawerId={activeChildDrawerId}
+                      archiveArmed={armArchiveTaskId === t.taskId}
+                      onArmArchive={() => setArmArchiveTaskId(t.taskId)}
+                      onConfirmArchive={() => void handleArchiveTask(t)}
+                    />
+                  );
+                })}
               </div>
-              {scratchThreads.slice(0, MAX_THREADS).map((t) => {
-                const mark = sessionMark(t, inboxByTask.get(t.taskId));
-                const cs = childStatsFor(t);
-                return (
-                  <SidebarThreadItem
-                    key={t.taskId}
-                    task={t}
-                    mark={mark}
-                    active={activeTaskId === t.taskId}
-                    flat
-                    childCount={cs.childCount}
-                    activeChildCount={cs.activeChildCount}
-                    pendingChildApprovals={cs.pendingChildApprovals}
-                    childrenExpanded={!!expandedParents[t.taskId]}
-                    onToggleChildren={() => toggleParentExpanded(t.taskId)}
-                    localChildren={cs.localKids}
-                    machines={boot.machines}
-                    activeTaskId={activeTaskId}
-                    activeChildDrawerId={activeChildDrawerId}
-                    menuOpen={openMenuTaskId === t.taskId}
-                    onToggleMenu={() => setOpenMenuTaskId((cur) => (cur === t.taskId ? null : t.taskId))}
-                    onCloseMenu={() => setOpenMenuTaskId(null)}
-                    onArchive={() => void handleArchiveTask(t)}
-                    onDelete={() => void handleDeleteTask(t)}
-                  />
-                );
-              })}
-            </>
+            </div>
           )}
           {onAddProject && (
             <button type="button" className="side-add-proj" onClick={onAddProject}>
@@ -630,12 +607,18 @@ export function Sidebar({
         <div className="sfoot">
           <WorkspaceFooterButton
             workspaceName={workspaceName}
-            machines={boot.machines}
+            boot={boot}
             open={machinesOpen}
             onClick={() => setMachinesOpen(!machinesOpen)}
           />
-          <button type="button" className="ib" title="切换深 / 浅色" aria-label="切换深浅色" onClick={toggleTheme}>
-            {theme === 'dark' ? <SunIcon /> : <MoonIcon />}
+          <button
+            type="button"
+            className={`ib ${route.name === 'archived' ? 'on' : ''}`}
+            title="已归档会话"
+            aria-label="已归档会话"
+            onClick={() => navigate(paths.archived())}
+          >
+            <Archive size={14} strokeWidth={1.6} />
           </button>
         </div>
       </div>

@@ -2,6 +2,7 @@ import type {
   ApprovalState,
   AttemptState,
   BoardMemberState,
+  ChildTaskView,
   InboxItemView,
   PendingInputSource,
   TaskState,
@@ -147,7 +148,28 @@ export function mergeSessionMarks(...marks: SessionMark[]): SessionMark {
   return best;
 }
 
-/** Rolls hidden child-task marks up onto their root thread so each root row draws at most one mark. */
+/** Derives the single trailing StatusMark for a ChildTaskView. */
+export function childSessionMark(
+  child: Pick<ChildTaskView, 'state' | 'openApprovalCount'>,
+  inboxItems?: readonly InboxItemView[],
+): SessionMark {
+  if (child.state === 'failed') return 'failed';
+  const hasApprovalOrBlock = inboxItems?.some(
+    (it) => it.category === 'approval_pending' || it.category === 'task_blocked' || it.category === 'memory_conflict',
+  );
+  if (child.openApprovalCount > 0 || child.state === 'waiting_approval' || hasApprovalOrBlock) {
+    return 'needs-you';
+  }
+  if (child.state === 'running' || child.state === 'queued' || child.state === 'waiting_resource') {
+    return 'running';
+  }
+  if (child.state === 'in_review' || inboxItems?.some((it) => it.category === 'delivery_review')) {
+    return 'ready';
+  }
+  return null;
+}
+
+/** Rolls child-task marks up onto their root thread so a collapsed parent row draws at most one mark. */
 export function rootSessionMark(
   root: TaskSummary,
   allTasks: readonly TaskSummary[],
@@ -159,7 +181,28 @@ export function rootSessionMark(
       best = mergeSessionMarks(best, sessionMark(child, inboxByTask.get(child.taskId)));
     }
   }
+  if ((root.pendingChildApprovals ?? 0) > 0) {
+    best = mergeSessionMarks(best, 'needs-you');
+  }
+  if ((root.activeChildCount ?? 0) > 0) {
+    best = mergeSessionMarks(best, 'running');
+  }
   return best;
+}
+
+/** Formats token counts compactly (e.g. 18400 -> "18.4k", 200000 -> "200k", 1000000 -> "1M"). */
+export function formatTokenCount(n: number): string {
+  if (!Number.isFinite(n) || n <= 0) return '0';
+  if (n >= 1_000_000) {
+    const m = n / 1_000_000;
+    return `${Number.isInteger(m) ? m : m.toFixed(1).replace(/\.0$/, '')}M`;
+  }
+  if (n >= 100_000) return `${Math.round(n / 1_000)}k`;
+  if (n >= 1_000) {
+    const k = n / 1_000;
+    return `${k.toFixed(1).replace(/\.0$/, '')}k`;
+  }
+  return String(Math.round(n));
 }
 
 /** Strictly for `title` / `aria-label` tooltips — never rendered inline in visible prose. */

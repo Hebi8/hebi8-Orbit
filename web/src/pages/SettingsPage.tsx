@@ -26,6 +26,7 @@ import type {
 } from '../generated/protocol';
 import { AgentList, agentDisplayName } from '../components/AgentList';
 import { DeviceRoleIcon } from '../components/DeviceRoleIcon';
+import { MoonIcon, SunIcon } from '../components/Icons';
 import { PageHeader } from '../components/PageHeader';
 import { PairDialog } from '../components/PairDialog';
 import { useClientDevices, useNetworkSettings } from '../hooks/queries';
@@ -41,6 +42,8 @@ export function SettingsPage({ boot }: { boot: BootstrapResponse }) {
   const clientsQ = useClientDevices(true);
   const storedLocalId = useWorkbenchStore((s) => s.localMachineId);
   const setWorkspaceNameOverride = useWorkbenchStore((s) => s.setWorkspaceNameOverride);
+  const theme = useWorkbenchStore((s) => s.theme);
+  const toggleTheme = useWorkbenchStore((s) => s.toggleTheme);
   const inDesktop = isDesktopShell();
 
   const net = netQ.data;
@@ -261,6 +264,15 @@ export function SettingsPage({ boot }: { boot: BootstrapResponse }) {
             <div className="set-hd">
               <h2>网络</h2>
               <div style={{ display: 'flex', gap: 6 }}>
+                <button
+                  type="button"
+                  className="btn ghost sm"
+                  title="切换深 / 浅色外观"
+                  onClick={toggleTheme}
+                >
+                  {theme === 'dark' ? <SunIcon size={12.5} /> : <MoonIcon size={12.5} />}
+                  <span>{theme === 'dark' ? '浅色模式' : '深色模式'}</span>
+                </button>
                 {inDesktop && (
                   <button type="button" className="btn ghost sm" onClick={() => openDesktopSetup()}>
                     <ArrowLeftRight size={12} strokeWidth={1.7} /> 切换网络

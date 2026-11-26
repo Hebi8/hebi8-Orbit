@@ -1,7 +1,5 @@
 import { useMemo, useRef } from 'react';
-import { Plus } from 'lucide-react';
 import type { BootstrapResponse, InboxItemView, ProjectView, TaskSummary } from '../generated/protocol';
-import { PAIcon } from '../components/Icons';
 import { PageHeader } from '../components/PageHeader';
 import { StatusMark } from '../components/StatusMark';
 import { useManyProjectTasks } from '../hooks/queries';
@@ -127,15 +125,16 @@ function HomeRow({ row, projects }: { row: HomeRowItem; projects: ProjectView[] 
       <span className="t-proj">{projectName(projects, row.projectId)}</span>
       <span className="t-right">
         <span className="t-time">{relTime(row.updatedAt)}</span>
-        <StatusMark mark={row.mark} />
+        <StatusMark mark={row.mark} reserveSlot />
       </span>
     </button>
   );
 }
 
 /**
- * Compact title-only Home overview:
- * Shows status and intervention priority cleanly — no second-line gists and no direct-to-artifact jumps.
+ * Compact title-only Home overview (v4 final):
+ * Minimal clean header (no redundant Hebi8/NewThread buttons), 9px radius rows with flat 2.5px
+ * solid left arc for urgent rows (zero blur/glow), and single trailing StatusMark slot.
  */
 export function HomePage({ boot }: { boot: BootstrapResponse }) {
   const tasksByProject = useManyProjectTasks(boot.projects);
@@ -160,18 +159,6 @@ export function HomePage({ boot }: { boot: BootstrapResponse }) {
       </PageHeader>
       <div className="page-scroll">
         <div className="page home-page">
-          <div className="home-hd">
-            <h1 className="home-title">总览</h1>
-            <div className="home-acts">
-              <button type="button" className="btn ghost" onClick={() => navigate(paths.hebi8())}>
-                <PAIcon size={13} /> Hebi8
-              </button>
-              <button type="button" className="btn pri" onClick={() => navigate(paths.newThread())}>
-                <Plus size={13} strokeWidth={1.8} /> 新建线程
-              </button>
-            </div>
-          </div>
-
           {sections.length === 0 ? (
             <div className="quiet-alone">都安静着</div>
           ) : (

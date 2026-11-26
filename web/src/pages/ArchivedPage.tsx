@@ -1,6 +1,14 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { ArchiveRestore, Search, Trash2 } from 'lucide-react';
+import {
+  ArchiveRestore,
+  ArrowDownWideNarrow,
+  Check,
+  ChevronDown,
+  Folder,
+  Search,
+  Trash2,
+} from 'lucide-react';
 import type { BootstrapResponse, TaskSummary } from '../generated/protocol';
 import { PageHeader } from '../components/PageHeader';
 import { useArchivedTasks } from '../hooks/queries';
@@ -9,17 +17,43 @@ import { PA_PROJECT_ID, SCRATCH_PROJECT_ID, isVirtualProject, relTime, taskTitle
 import { navigate, paths } from '../lib/router';
 import { toast } from '../store/useWorkbenchStore';
 
+type ArchivedSortKey = 'archived_desc' | 'active_desc' | 'title_asc';
+
+const SORT_OPTIONS: { id: ArchivedSortKey; label: string }[] = [
+  { id: 'archived_desc', label: '最近归档' },
+  { id: 'active_desc', label: '最近活跃' },
+  { id: 'title_asc', label: '按名称' },
+];
+
 export function ArchivedPage({ boot }: { boot: BootstrapResponse }) {
   const qc = useQueryClient();
   const [search, setSearch] = useState('');
   const [projectFilter, setProjectFilter] = useState('');
+  const [sortBy, setSortBy] = useState<ArchivedSortKey>('archived_desc');
+  const [openMenu, setOpenMenu] = useState<null | 'proj' | 'sort'>(null);
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  const toolbarRef = useRef<HTMLDivElement | null>(null);
 
-  const archivedQ = useArchivedTasks({
-    projectId: projectFilter || undefined,
-    q: search || undefined,
-    limit: 200,
-  });
+  // Fetch all archived sessions once so per-project counts in the pulldown stay exact across filters.
+  const archivedQ = useArchivedTasks({ limit: 200 });
+
+  useEffect(() => {
+    if (!openMenu) return;
+    const onDown = (e: MouseEvent) => {
+      if (toolbarRef.current && !toolbarRef.current.contains(e.target as Node)) {
+        setOpenMenu(null);
+      }
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setOpenMenu(null);
+    };
+    document.addEventListener('mousedown', onDown);
+    window.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onDown);
+      window.removeEventListener('keydown', onKey);
+    };
+  }, [openMenu]);
 
   const projectNames = useMemo(() => {
     const map = new Map<string, string>();
@@ -37,20 +71,83 @@ export function ArchivedPage({ boot }: { boot: BootstrapResponse }) {
     return map;
   }, [boot.projects]);
 
-  const filterProjects = useMemo(() => {
-    const list: { id: string; label: string }[] = [{ id: '', label: '全部' }];
-    for (const p of boot.projects) {
-      if (p.archived) continue;
-      if (p.projectId === SCRATCH_PROJECT_ID) {
-        list.push({ id: SCRATCH_PROJECT_ID, label: '自由对话' });
-      } else if (p.projectId === PA_PROJECT_ID) {
-        list.push({ id: PA_PROJECT_ID, label: 'Hebi8' });
-      } else if (!isVirtualProject(p.projectId)) {
-        list.push({ id: p.projectId, label: p.displayName });
-      }
+  const allTopArchived = useMemo(
+    () => (archivedQ.data ?? []).filter((t) => !t.parentTaskId),
+    [archivedQ.data],
+  );
+
+  const projectOptions = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const t of allTopArchived) {
+      counts.set(t.projectId, (counts.get(t.projectId) ?? 0) + 1);
     }
-    return list;
-  }, [boot.projects]);
+    const opts: { id: string; label: string; count: number }[] = [
+      { id: '', label: '全部项目', count: allTopArchived.length },
+    ];
+    const added = new Set<string>();
+    for (const p of boot.projects) {
+      if (p.archived || isVirtualProject(p.projectId)) continue;
+      added.add(p.projectId);
+      opts.push({
+        id: p.projectId,
+        label: p.displayName,
+        count: counts.get(p.projectId) ?? 0,
+      });
+    }
+    if ((counts.get(SCRATCH_PROJECT_ID) ?? 0) > 0) {
+      added.add(SCRATCH_PROJECT_ID);
+      opts.push({
+        id: SCRATCH_PROJECT_ID,
+        label: '自由对话',
+        count: counts.get(SCRATCH_PROJECT_ID) ?? 0,
+      });
+    }
+    if ((counts.get(PA_PROJECT_ID) ?? 0) > 0) {
+      added.add(PA_PROJECT_ID);
+      opts.push({
+        id: PA_PROJECT_ID,
+        label: 'Hebi8',
+        count: counts.get(PA_PROJECT_ID) ?? 0,
+      });
+    }
+    for (const [pid, count] of counts.entries()) {
+      if (added.has(pid)) continue;
+      opts.push({
+        id: pid,
+        label: projectNames.get(pid) ?? pid,
+        count,
+      });
+    }
+    return opts;
+  }, [allTopArchived, boot.projects, projectNames]);
+
+  const activeProjOpt = projectOptions.find((o) => o.id === projectFilter) ?? projectOptions[0];
+  const activeSortOpt = SORT_OPTIONS.find((o) => o.id === sortBy) ?? SORT_OPTIONS[0];
+
+  const tasks = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    const filtered = allTopArchived.filter((t) => {
+      if (projectFilter && t.projectId !== projectFilter) return false;
+      if (q) {
+        const title = taskTitle(t).toLowerCase();
+        const goal = (t.goal || '').toLowerCase();
+        const proj = (projectNames.get(t.projectId) ?? t.projectId).toLowerCase();
+        if (!title.includes(q) && !goal.includes(q) && !proj.includes(q)) return false;
+      }
+      return true;
+    });
+    return [...filtered].sort((a, b) => {
+      if (sortBy === 'title_asc') {
+        return taskTitle(a).localeCompare(taskTitle(b), 'zh-CN');
+      }
+      if (sortBy === 'active_desc') {
+        return b.updatedAt - a.updatedAt;
+      }
+      const aArch = a.archivedAt ?? a.updatedAt;
+      const bArch = b.archivedAt ?? b.updatedAt;
+      return bArch - aArch;
+    });
+  }, [allTopArchived, projectFilter, search, sortBy, projectNames]);
 
   const invalidateAll = (projectId?: string) => {
     void qc.invalidateQueries({ queryKey: ['archived-tasks'] });
@@ -83,48 +180,114 @@ export function ArchivedPage({ boot }: { boot: BootstrapResponse }) {
     onError: (e) => toast(errMsg(e), 'err'),
   });
 
-  const tasks = useMemo(() => (archivedQ.data ?? []).filter((t) => !t.parentTaskId), [archivedQ.data]);
-
   return (
     <main className="main">
-      <PageHeader>
+      <PageHeader
+        right={
+          !archivedQ.isLoading ? (
+            <span className="faint no-mobile" style={{ fontSize: 11.5, marginRight: 6 }}>
+              共 {allTopArchived.length} 条
+            </span>
+          ) : undefined
+        }
+      >
         <span className="ttl">已归档</span>
       </PageHeader>
       <div className="page-scroll">
         <div className="page">
-          <div className="home-hd">
-            <div>
-              <h1 className="home-title">已归档会话</h1>
-            </div>
-          </div>
-
-          <div className="arch-toolbar">
+          <div className="arch-toolbar" ref={toolbarRef}>
             <div className="arch-search-wrap">
               <Search size={13} strokeWidth={1.6} className="faint" />
               <input
                 type="text"
                 className="arch-search-in"
-                placeholder="搜索已归档会话标题或内容…"
+                placeholder="按标题搜索已归档会话…"
                 value={search}
                 onChange={(e) => setSearch(e.target.value)}
+                aria-label="搜索已归档会话"
               />
             </div>
-            {filterProjects.length > 1 && (
-              <div className="art-filters" style={{ marginBottom: 0 }} role="tablist" aria-label="按项目筛选">
-                {filterProjects.map((fp) => (
-                  <button
-                    key={fp.id || 'all'}
-                    type="button"
-                    role="tab"
-                    aria-selected={projectFilter === fp.id}
-                    className={`art-filter-btn ${projectFilter === fp.id ? 'active' : ''}`}
-                    onClick={() => setProjectFilter(fp.id)}
-                  >
-                    {fp.label}
-                  </button>
-                ))}
-              </div>
-            )}
+
+            <div className="arch-drop-wrap">
+              <button
+                type="button"
+                className={`arch-drop-btn ${openMenu === 'proj' ? 'open' : ''} ${projectFilter ? 'is-filtered' : ''}`}
+                aria-haspopup="menu"
+                aria-expanded={openMenu === 'proj'}
+                title="按项目筛选"
+                onClick={() => setOpenMenu((m) => (m === 'proj' ? null : 'proj'))}
+              >
+                <Folder size={12.5} strokeWidth={1.6} className="muted" />
+                <span className="ell">{activeProjOpt.label}</span>
+                <ChevronDown size={11.5} strokeWidth={1.7} className="muted" />
+              </button>
+              {openMenu === 'proj' && (
+                <div className="arch-drop-menu" role="menu" aria-label="按项目筛选">
+                  {projectOptions.map((opt) => {
+                    const selected = projectFilter === opt.id;
+                    return (
+                      <button
+                        key={opt.id || 'all'}
+                        type="button"
+                        role="menuitem"
+                        className={`arch-drop-item ${selected ? 'on' : ''}`}
+                        onClick={() => {
+                          setProjectFilter(opt.id);
+                          setOpenMenu(null);
+                        }}
+                      >
+                        <span className="ell">{opt.label}</span>
+                        <span className="arch-drop-cnt">
+                          {opt.count}
+                          {selected && <Check size={11} strokeWidth={2.2} className="ok-t" style={{ marginLeft: 4 }} />}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+
+            <div className="arch-drop-wrap">
+              <button
+                type="button"
+                className={`arch-drop-btn ${openMenu === 'sort' ? 'open' : ''}`}
+                aria-haspopup="menu"
+                aria-expanded={openMenu === 'sort'}
+                title="排序方式"
+                onClick={() => setOpenMenu((m) => (m === 'sort' ? null : 'sort'))}
+              >
+                <ArrowDownWideNarrow size={12.5} strokeWidth={1.6} className="muted" />
+                <span>{activeSortOpt.label}</span>
+                <ChevronDown size={11.5} strokeWidth={1.7} className="muted" />
+              </button>
+              {openMenu === 'sort' && (
+                <div className="arch-drop-menu" role="menu" aria-label="排序方式">
+                  {SORT_OPTIONS.map((opt) => {
+                    const selected = sortBy === opt.id;
+                    return (
+                      <button
+                        key={opt.id}
+                        type="button"
+                        role="menuitem"
+                        className={`arch-drop-item ${selected ? 'on' : ''}`}
+                        onClick={() => {
+                          setSortBy(opt.id);
+                          setOpenMenu(null);
+                        }}
+                      >
+                        <span className="ell">{opt.label}</span>
+                        {selected && (
+                          <span className="arch-drop-cnt">
+                            <Check size={11} strokeWidth={2.2} className="ok-t" />
+                          </span>
+                        )}
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
           </div>
 
           {archivedQ.isLoading ? (
@@ -140,6 +303,10 @@ export function ArchivedPage({ boot }: { boot: BootstrapResponse }) {
               {tasks.map((t) => {
                 const projLabel = projectNames.get(t.projectId) ?? t.projectId;
                 const confirming = confirmDeleteId === t.taskId;
+                const timeText =
+                  sortBy === 'active_desc'
+                    ? `活跃于 ${relTime(t.updatedAt)}`
+                    : `归档于 ${relTime(t.archivedAt ?? t.updatedAt)}`;
                 return (
                   <div className="arch-row" key={t.taskId}>
                     <button
@@ -149,9 +316,7 @@ export function ArchivedPage({ boot }: { boot: BootstrapResponse }) {
                     >
                       <span className="arch-row-title ell">{taskTitle(t)}</span>
                       <span className="arch-row-proj">{projLabel}</span>
-                      <span className="arch-row-time faint">
-                        归档于 {relTime(t.archivedAt ?? t.updatedAt)}
-                      </span>
+                      <span className="arch-row-time faint">{timeText}</span>
                     </button>
                     <div className="arch-row-acts">
                       <button

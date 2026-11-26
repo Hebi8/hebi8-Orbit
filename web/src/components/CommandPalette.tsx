@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { ArrowUpRight, FolderGit2, Layers, LayoutGrid, MessageSquare, Plus, SunMoon, Zap } from 'lucide-react';
+import { Archive, ArrowUpRight, FolderGit2, Layers, LayoutGrid, MessageSquare, Plus, SlidersHorizontal, SunMoon, Zap } from 'lucide-react';
 import type { BootstrapResponse, PABriefResponse } from '../generated/protocol';
 import { useManyProjectTasks } from '../hooks/queries';
 import { api, errMsg } from '../lib/api';
@@ -132,6 +132,8 @@ export function CommandPalette({ boot }: { boot: BootstrapResponse }) {
       { key: 'home', group: '动作', icon: <LayoutGrid size={14} strokeWidth={1.6} />, label: '总览', run: () => go(paths.home()) },
       { key: 'pa', group: '动作', icon: <PAIcon />, label: 'Hebi8', run: () => go(paths.hebi8()) },
       { key: 'artifacts', group: '动作', icon: <Layers size={14} strokeWidth={1.6} />, label: 'Artifacts', run: () => go(paths.artifacts()) },
+      { key: 'archived', group: '动作', icon: <Archive size={14} strokeWidth={1.6} />, label: '已归档会话', run: () => go(paths.archived()) },
+      { key: 'settings', group: '动作', icon: <SlidersHorizontal size={14} strokeWidth={1.6} />, label: '网络与机器设置', run: () => go(paths.settings()) },
       { key: 'theme', group: '动作', icon: <SunMoon size={14} strokeWidth={1.6} />, label: '切换深 / 浅色', run: () => toggleTheme() },
     ];
     list.push(...actions.filter((a) => match(a.label)));

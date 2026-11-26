@@ -1,8 +1,10 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { Check, Link2, Search, X } from 'lucide-react';
 import type { ProjectView, TaskSummary } from '../generated/protocol';
 import { useAllTasks } from '../hooks/queries';
 import { PA_PROJECT_ID, SCRATCH_PROJECT_ID, relTime, taskTitle } from '../lib/format';
+import { useAnchoredPopover } from '../lib/popover';
 
 export function projectLabelForTask(task: Pick<TaskSummary, 'projectId'>, projects?: readonly ProjectView[]): string {
   if (task.projectId === SCRATCH_PROJECT_ID) return '对话';
@@ -56,6 +58,7 @@ export function TaskRefButton({
   currentTaskId,
   prominent = false,
   placement = 'up',
+  disabled = false,
 }: {
   selectedIds: string[];
   onChange: (next: string[]) => void;
@@ -63,11 +66,14 @@ export function TaskRefButton({
   currentTaskId?: string;
   prominent?: boolean;
   placement?: 'up' | 'down';
+  disabled?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState('');
   const [debouncedQuery, setDebouncedQuery] = useState('');
-  const wrapRef = useRef<HTMLDivElement | null>(null);
+  const btnRef = useRef<HTMLButtonElement | null>(null);
+  const popRef = useRef<HTMLDivElement | null>(null);
+  const close = useCallback(() => setOpen(false), []);
 
   useEffect(() => {
     const t = window.setTimeout(() => setDebouncedQuery(query.trim()), 180);
@@ -80,23 +86,17 @@ export function TaskRefButton({
     enabled: open || selectedIds.length > 0,
   });
 
-  useEffect(() => {
-    if (!open) return;
-    const onDown = (e: MouseEvent) => {
-      if (wrapRef.current && !wrapRef.current.contains(e.target as Node)) {
-        setOpen(false);
-      }
-    };
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setOpen(false);
-    };
-    window.addEventListener('mousedown', onDown);
-    window.addEventListener('keydown', onKey);
-    return () => {
-      window.removeEventListener('mousedown', onDown);
-      window.removeEventListener('keydown', onKey);
-    };
-  }, [open]);
+  const popStyle = useAnchoredPopover({
+    open,
+    anchorRef: btnRef,
+    popRef,
+    width: 308,
+    align: 'left',
+    placement,
+    gap: 8,
+    minSpaceUp: 220,
+    onClose: close,
+  });
 
   const candidates = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -124,69 +124,75 @@ export function TaskRefButton({
   };
 
   return (
-    <div className="relpos" ref={wrapRef}>
+    <div className="relpos ref-anchor">
       <button
+        ref={btnRef}
         type="button"
+        disabled={disabled}
         className={`ref-trigger ${prominent ? 'prominent' : ''} ${open || selectedIds.length > 0 ? 'on' : ''}`}
         title="引用历史对话或项目线程上下文"
         aria-label="引用对话"
         aria-expanded={open}
         onClick={() => setOpen((v) => !v)}
       >
-        <Link2 size={12.5} strokeWidth={1.8} />
-        <span>{selectedIds.length > 0 ? `引用 ${selectedIds.length}` : prominent ? '引用对话' : '引用'}</span>
+        <Link2 size={12} strokeWidth={1.8} />
+        <span>{selectedIds.length > 0 ? `引用 ${selectedIds.length}` : '引用'}</span>
       </button>
-      {open && (
-        <div
-          className="ref-pop"
-          style={placement === 'up' ? { left: 0, bottom: 'calc(100% + 8px)' } : { left: 0, top: 'calc(100% + 6px)' }}
-          role="dialog"
-          aria-label="选择要引用的对话"
-        >
-          <div className="ref-pop-hd">
-            <span>引用对话上下文</span>
-            <span className="faint" style={{ fontSize: 11 }}>{selectedIds.length}/6</span>
-          </div>
-          <div className="ref-search-wrap">
-            <Search size={12} strokeWidth={1.7} className="muted" />
-            <input
-              className="ref-search"
-              placeholder="搜索项目名或对话标题…"
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              autoFocus
-            />
-          </div>
-          <div className="ref-list">
-            {tasksQ.isLoading && <div className="ref-empty">载入对话列表…</div>}
-            {!tasksQ.isLoading && candidates.length === 0 && (
-              <div className="ref-empty">{query.trim() ? '没有匹配的对话' : '还没有可引用的对话'}</div>
-            )}
-            {candidates.map((t) => {
-              const checked = selectedIds.includes(t.taskId);
-              const proj = projectLabelForTask(t, projects);
-              return (
-                <button
-                  key={t.taskId}
-                  type="button"
-                  className={`ref-item ${checked ? 'on' : ''}`}
-                  disabled={!checked && selectedIds.length >= 6}
-                  onClick={() => toggle(t.taskId)}
-                >
-                  <div className="ref-item-main">
-                    <div className="ref-item-top">
-                      <span className="ref-item-proj">{proj}</span>
-                      <span className="ref-item-time">{relTime(t.updatedAt)}</span>
+      {open &&
+        popStyle &&
+        createPortal(
+          <div
+            ref={popRef}
+            className="ref-pop ref-pop-portal"
+            style={popStyle}
+            role="dialog"
+            aria-label="选择要引用的对话"
+          >
+            <div className="ref-pop-hd">
+              <span>引用对话上下文</span>
+              <span className="faint" style={{ fontSize: 11 }}>{selectedIds.length}/6</span>
+            </div>
+            <div className="ref-search-wrap">
+              <Search size={12} strokeWidth={1.7} className="muted" />
+              <input
+                className="ref-search"
+                placeholder="搜索项目名或对话标题…"
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                autoFocus
+              />
+            </div>
+            <div className="ref-list">
+              {tasksQ.isLoading && <div className="ref-empty">载入对话列表…</div>}
+              {!tasksQ.isLoading && candidates.length === 0 && (
+                <div className="ref-empty">{query.trim() ? '没有匹配的对话' : '还没有可引用的对话'}</div>
+              )}
+              {candidates.map((t) => {
+                const checked = selectedIds.includes(t.taskId);
+                const proj = projectLabelForTask(t, projects);
+                return (
+                  <button
+                    key={t.taskId}
+                    type="button"
+                    className={`ref-item ${checked ? 'on' : ''}`}
+                    disabled={!checked && selectedIds.length >= 6}
+                    onClick={() => toggle(t.taskId)}
+                  >
+                    <div className="ref-item-main">
+                      <div className="ref-item-top">
+                        <span className="ref-item-proj">{proj}</span>
+                        <span className="ref-item-time">{relTime(t.updatedAt)}</span>
+                      </div>
+                      <div className="ref-item-ttl ell">{taskTitle(t)}</div>
                     </div>
-                    <div className="ref-item-ttl ell">{taskTitle(t)}</div>
-                  </div>
-                  {checked && <Check size={13} strokeWidth={2.2} className="ok-t" />}
-                </button>
-              );
-            })}
-          </div>
-        </div>
-      )}
+                    {checked && <Check size={13} strokeWidth={2.2} className="ok-t" />}
+                  </button>
+                );
+              })}
+            </div>
+          </div>,
+          document.body,
+        )}
     </div>
   );
 }

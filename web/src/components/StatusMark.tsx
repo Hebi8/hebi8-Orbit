@@ -35,8 +35,10 @@ function StillWorkingGrid() {
  * - ready     -> 6px solid dot (var(--accent))
  * - null      -> renders nothing (resting silence)
  */
-export function StatusMark({ mark }: { mark: SessionMark }) {
-  if (!mark) return null;
+export function StatusMark({ mark, reserveSlot = false }: { mark: SessionMark; reserveSlot?: boolean }) {
+  if (!mark) {
+    return reserveSlot ? <span className="smark" aria-hidden="true" /> : null;
+  }
   const hint = sessionMarkHint(mark);
   return (
     <span

@@ -198,6 +198,9 @@ export function collectInvalidations(
     if (kind.startsWith('acp.')) {
       add('attempt-raw', aid);
       add('worker-stream', tid);
+      if (kind === 'acp.usage') {
+        add('task-timeline', tid);
+      }
       continue;
     }
     if (kind === 'queue.updated') {

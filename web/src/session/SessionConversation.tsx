@@ -95,6 +95,8 @@ export function SessionConversation({
   inDrawer = false,
   childrenList,
   emptySlot,
+  composerTopSlot,
+  composerDraftInsert,
   onOpenReview,
   onOpenFoldNode,
   onOpenChild,
@@ -108,6 +110,8 @@ export function SessionConversation({
   inDrawer?: boolean;
   childrenList?: ChildTaskView[];
   emptySlot?: ReactNode;
+  composerTopSlot?: ReactNode;
+  composerDraftInsert?: { id: number; text: string } | null;
   onOpenReview?: () => void;
   onOpenFoldNode?: (nodeId: string) => void;
   onOpenChild?: (childTaskId: string) => void;
@@ -276,11 +280,15 @@ export function SessionConversation({
           onEditDone={() => setEditing(null)}
           openAnnotations={openAnnotations}
           runtimeConfig={tl.runtimeConfig}
+          contextUsage={tl.contextUsage}
+          indicatorMode="context"
           machines={boot?.machines}
           projects={boot?.projects}
           machineId={lastAttempt?.machineId}
           compact={compact}
           inDrawer={inDrawer}
+          topSlot={composerTopSlot}
+          draftInsert={composerDraftInsert}
           onOpenReview={onOpenReview}
         />
       )}

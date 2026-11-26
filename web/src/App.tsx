@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react';
+import { X } from 'lucide-react';
 import { AddProjectModal } from './components/AddProjectModal';
 import { CommandPalette } from './components/CommandPalette';
+import { DeviceRoleIcon } from './components/DeviceRoleIcon';
 import { MachinesPopover } from './components/MachinesPopover';
 import { MobileTabs } from './components/MobileTabs';
 import { Sidebar } from './components/Sidebar';
@@ -16,7 +18,8 @@ import {
   setStoredClientToken,
   setStoredDevToken,
 } from './lib/api';
-import { hasUrgentSession } from './lib/format';
+import { cleanMachineName, hasUrgentSession } from './lib/format';
+import { resolveEffectiveLocalMachineId } from './lib/ide';
 import { navigate, parseHash, paths, replaceHash, useRoute } from './lib/router';
 import { ArchivedPage } from './pages/ArchivedPage';
 import { ArtifactsPage } from './pages/ArtifactsPage';
@@ -352,6 +355,8 @@ export function App() {
   const boot = bootQ.data;
   const storedLocalMachineId = useWorkbenchStore((s) => s.localMachineId);
   const setLocalMachineId = useWorkbenchStore((s) => s.setLocalMachineId);
+  const failoverBannerDismissedKey = useWorkbenchStore((s) => s.failoverBannerDismissedKey);
+  const dismissFailoverBanner = useWorkbenchStore((s) => s.dismissFailoverBanner);
 
   // Auto-hydrate current client device identity from server-authenticated bootstrap
   // (fixes Mac mini desktop client mistakenly displaying hub's local_ws machine as "本机").
@@ -428,11 +433,68 @@ export function App() {
       page = <HomePage boot={boot} />;
   }
 
+  const primaryDutyId = boot.setup?.dutyPriority?.[0] ?? '';
+  const activeDutyId = boot.setup?.activeDutyMachineId ?? '';
+  const primaryMachine = primaryDutyId ? boot.machines.find((m) => m.machineId === primaryDutyId) : undefined;
+  const activeDutyMachine = activeDutyId ? boot.machines.find((m) => m.machineId === activeDutyId) : undefined;
+  const isFailoverActive =
+    !!primaryDutyId &&
+    !!activeDutyId &&
+    primaryDutyId !== activeDutyId &&
+    (!primaryMachine || primaryMachine.status !== 'online');
+  const failoverKey = isFailoverActive ? `${primaryDutyId}->${activeDutyId}` : '';
+  const showFailoverBanner = isFailoverActive && failoverBannerDismissedKey !== failoverKey;
+  const effectiveLocalId = resolveEffectiveLocalMachineId(
+    boot.machines,
+    boot.setup?.currentMachineId || storedLocalMachineId,
+  );
+  const primaryName = primaryMachine ? primaryMachine.displayAlias || cleanMachineName(primaryMachine) : primaryDutyId;
+  const dutyName = activeDutyMachine ? activeDutyMachine.displayAlias || cleanMachineName(activeDutyMachine) : activeDutyId;
+
   return (
     <>
       <div className={`app ${collapsed ? 'side-collapsed' : ''}`}>
         <Sidebar boot={boot} route={route} onAddProject={() => setAddProjectOpen(true)} />
-        {page}
+        <div className="app-stage">
+          {showFailoverBanner && (
+            <div className="route-banner is-warn" role="status">
+              <div className="route-banner-left">
+                {activeDutyMachine && (
+                  <DeviceRoleIcon
+                    machine={activeDutyMachine}
+                    isActiveDuty
+                    isCurrentDevice={activeDutyMachine.machineId === effectiveLocalId}
+                    size={13.5}
+                  />
+                )}
+                <span className="ell">
+                  <strong>{primaryName} 当前离线</strong> · 已由 {dutyName} 自动接管主控
+                </span>
+              </div>
+              <div className="route-banner-acts">
+                {route.name !== 'settings' && (
+                  <button
+                    type="button"
+                    className="route-banner-link no-mobile"
+                    onClick={() => navigate(paths.settings())}
+                  >
+                    查看网络
+                  </button>
+                )}
+                <button
+                  type="button"
+                  className="ib route-banner-close"
+                  title="关闭提示"
+                  aria-label="关闭提示"
+                  onClick={() => dismissFailoverBanner(failoverKey)}
+                >
+                  <X size={13} strokeWidth={1.8} />
+                </button>
+              </div>
+            </div>
+          )}
+          {page}
+        </div>
         <MobileTabs route={route} hasUrgent={hasUrgentSession(boot.openInboxItems, boot.activeTasks)} />
       </div>
       <ReviewOverlay boot={boot} />

@@ -136,3 +136,37 @@ export const SunIcon = (p: P) => (
     <path d="M12 2.5v2M12 19.5v2M2.5 12h2M19.5 12h2M5.3 5.3l1.4 1.4M17.3 17.3l1.4 1.4M5.3 18.7l1.4-1.4M17.3 6.7l1.4-1.4" />
   </Svg>
 );
+export const DirectLocalIcon = (p: P) => (
+  <Svg size={13} {...p}>
+    <rect x="3" y="4" width="18" height="12" rx="2" />
+    <path d="M2 20h20" />
+    <circle cx="12" cy="10" r="1.6" fill="currentColor" stroke="none" />
+  </Svg>
+);
+export const PermAutoIcon = (p: P) => (
+  <Svg size={13.5} {...p}>
+    <path d="M12 3 5 6v6c0 4.5 3 7.5 7 9 4-1.5 7-4.5 7-9V6Z" />
+    <path d="M12 3v18" strokeOpacity={0.75} />
+    <path d="M12 5.2 6.8 7.5V12c0 3.4 2.1 5.8 5.2 7.1Z" fill="currentColor" fillOpacity={0.28} stroke="none" />
+  </Svg>
+);
+export const PermAskIcon = (p: P) => (
+  <Svg size={13.5} {...p}>
+    <path d="M12 3 5 6v6c0 4.5 3 7.5 7 9 4-1.5 7-4.5 7-9V6Z" />
+    <path d="M9.8 9.8a2.2 2.2 0 1 1 3.3 1.9c-.8.4-1.1.8-1.1 1.5" />
+    <circle cx="12" cy="16" r="0.7" fill="currentColor" stroke="none" />
+  </Svg>
+);
+export const PermPlanIcon = (p: P) => (
+  <Svg size={13.5} {...p}>
+    <path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9Z" />
+    <path d="M14 3v6h6" />
+    <path d="M8 13h8M8 17h5" />
+  </Svg>
+);
+export const PermYoloIcon = (p: P) => (
+  <Svg size={13.5} {...p}>
+    <path d="M12 3 5 6v6c0 4.5 3 7.5 7 9 4-1.5 7-4.5 7-9V6Z" />
+    <path d="M13 7.5 9.2 12.6h2.8l-.8 4 3.8-5.1h-2.8Z" fill="currentColor" stroke="none" />
+  </Svg>
+);

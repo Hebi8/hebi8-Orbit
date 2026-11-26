@@ -8,6 +8,8 @@ export const ADAPTER_LABELS: Record<string, string> = {
 
 const SAFE_AUTO_MODE_CANDIDATES = ['auto', 'agent', 'acceptEdits', 'accept-edits', 'workspace-write'] as const;
 
+export type PermissionIconKind = 'auto' | 'ask' | 'plan' | 'yolo';
+
 export function isFullBypassMode(modeId: string | undefined | null): boolean {
   switch ((modeId ?? '').trim().toLowerCase()) {
     case 'full':
@@ -19,6 +21,16 @@ export function isFullBypassMode(modeId: string | undefined | null): boolean {
     default:
       return false;
   }
+}
+
+/** Classifies an ACP permission mode ID into one of the 4 low-stimulus geometric icon families. */
+export function classifyPermissionMode(modeId: string | undefined | null): PermissionIconKind {
+  const id = (modeId ?? '').trim().toLowerCase();
+  if (!id) return 'auto';
+  if (isFullBypassMode(id)) return 'yolo';
+  if (/(plan|read[-_]?only|architect|explore)/.test(id)) return 'plan';
+  if (/(ask|confirm|prompt|suggest|untrusted|default)/.test(id)) return 'ask';
+  return 'auto';
 }
 
 /**

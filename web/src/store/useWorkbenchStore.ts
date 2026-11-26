@@ -84,6 +84,8 @@ interface WorkbenchState {
   sshAliasRev: number;
   workspaceNameOverride: string;
   expandedProjects: Record<string, boolean>;
+  expandedParents: Record<string, boolean>;
+  failoverBannerDismissedKey: string | null;
   promptCache: Record<string, string>;
   deselectedAnnotations: Record<string, string[]>;
   toast: ToastState | null;
@@ -108,6 +110,10 @@ interface WorkbenchState {
   bumpSshAliasRev: () => void;
   setWorkspaceNameOverride: (name: string) => void;
   setProjectExpanded: (projectId: string, open: boolean) => void;
+  setParentExpanded: (parentTaskId: string, open: boolean) => void;
+  toggleParentExpanded: (parentTaskId: string) => void;
+  ensureParentExpanded: (parentTaskId: string) => void;
+  dismissFailoverBanner: (key: string) => void;
   rememberPrompt: (key: string, body: string) => void;
   toggleAnnotationSelected: (taskId: string, annotationId: string, selected: boolean) => void;
   clearDeselectedAnnotations: (taskId: string) => void;
@@ -138,6 +144,8 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
   sshAliasRev: 0,
   workspaceNameOverride: readLS('orbit.workspaceName', ''),
   expandedProjects: readJSON<Record<string, boolean>>('orbit.expandedProjects', {}),
+  expandedParents: readJSON<Record<string, boolean>>('orbit.expandedParents', {}),
+  failoverBannerDismissedKey: null,
   promptCache: readJSON<Record<string, string>>(PROMPT_CACHE_KEY, {}),
   deselectedAnnotations: {},
   toast: null,
@@ -199,6 +207,26 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
     writeLS('orbit.expandedProjects', JSON.stringify(next));
     set({ expandedProjects: next });
   },
+  setParentExpanded: (parentTaskId, open) => {
+    if (!parentTaskId) return;
+    const cur = get().expandedParents;
+    if (Boolean(cur[parentTaskId]) === open) return;
+    const next = { ...cur };
+    if (open) next[parentTaskId] = true;
+    else delete next[parentTaskId];
+    writeLS('orbit.expandedParents', JSON.stringify(next));
+    set({ expandedParents: next });
+  },
+  toggleParentExpanded: (parentTaskId) => {
+    if (!parentTaskId) return;
+    const open = !get().expandedParents[parentTaskId];
+    get().setParentExpanded(parentTaskId, open);
+  },
+  ensureParentExpanded: (parentTaskId) => {
+    if (!parentTaskId || get().expandedParents[parentTaskId]) return;
+    get().setParentExpanded(parentTaskId, true);
+  },
+  dismissFailoverBanner: (key) => set({ failoverBannerDismissedKey: key }),
   rememberPrompt: (key, body) => {
     if (!key || !body) return;
     const cur = get().promptCache;
