@@ -18,7 +18,7 @@
 |---|---|
 | [ui-ux-and-pa-interface.md](ux/ui-ux-and-pa-interface.md) | 全局信息架构、5 个一级主页面交互模型、移动端 3-Tab 视图，以及全局 PA 旁路控制口协议与 8 个白名单接口 |
 | [ux-design-spec-v2.md](ux/ux-design-spec-v2.md) | v2 视觉与交互定稿：低刺激单槽 `StatusMark`、对话内嵌附件 / 全局 `Artifacts` / 项目级 `Source Review`（Checkpoint Diff）三类边界、GitHub PR 风格行内评与纯图标 Composer |
-| [subsession-ux-v4-spec.md](ux/subsession-ux-v4-spec.md) | v4 一等子会话视觉减法定稿：左侧栏**方案 A**、顶栏紧凑入口、左轨单行派发节点、折叠式 `child_result`、无遮罩可拖拽分屏抽屉、主/子 Composer 严格等高同构，以及与 PoC / Ryugi 画板的双向对齐基线 |
+| [subsession-ux-v4-spec.md](ux/subsession-ux-v4-spec.md) | **v4 全量 UX 与一等子会话设计定稿**（收口 `orbit-ux-v4` 全部 60 条审阅结论：总览/侧栏/已归档、全站统一 Composer 与 Lody 单一微标、新建线程、可折叠 RightCard/IDE 铅笔编辑/全宽普通文件夹/Source Review/单块过程折叠、单层子会话与方案 A 展收及条件穿透、`↗/↵` 极简通信轨、Hebi8 无子会话与 `HEAD` 置顶 Git-Tree、项目设置与 Codex 风格目录选择器） |
 
 > 注：v3 阶段新增的 3 层项目设置、普通文件夹紧凑变更条、Lody 风格双栏输入框与彩色角色图标规范统一收口在 [peer-mesh-and-v3-spec.md](architecture/peer-mesh-and-v3-spec.md#五逐页-ui--交互修正规范融合全部-17-条-ryugi-批注与-lody-输入框习惯)。
 

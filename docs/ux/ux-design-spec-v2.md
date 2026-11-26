@@ -4,8 +4,8 @@
 > **配套本地 Ryugi 画板（`.gitignore` 忽略）**：`.ryugi/artifacts/artboard/orbit-ux-v2/canvas.json`  
 > **后续叠加规范**：
 > - v3 3 层项目设置、双栏输入框、普通文件夹变更条与彩色角色图标：[peer-mesh-and-v3-spec.md](../architecture/peer-mesh-and-v3-spec.md#五逐页-ui--交互修正规范融合全部-17-条-ryugi-批注与-lody-输入框习惯)
-> - v4 一等子会话视觉减法定稿：[subsession-ux-v4-spec.md](./subsession-ux-v4-spec.md)  
-> **状态**：核心视觉基线已定稿并落地至 `web/src/`，后续迭代不得破坏以下核心不变量。
+> - v4 全量 UX 与一等子会话最终定稿：[subsession-ux-v4-spec.md](./subsession-ux-v4-spec.md)（**凡涉及总览顶栏、侧栏层级与归档、统一 Composer 顺序与 Lody 微标、代码变动迁入 `RightCard`、IDE 铅笔编辑、Source Review `×` 与撤销 Checkpoint、单块过程折叠、PA 暂不挂子会话与 Git-Tree 等最新拍板项，一律以 v4 定稿为准**）  
+> **状态**：v2 核心低刺激与审阅分栏基线，已被 v4 全量 UX 定稿承接并收口。
 
 ---
 
@@ -60,10 +60,9 @@
 - **顶部 2 行紧凑顶栏**：
   - 左侧第 1 行：`Session 标题` + **紧凑 Artifact 图标**（含本会话及子会话产出的 Artifacts；**点击先弹出列表选择**，不直接盲跳预览）+ `StatusMark`。
   - 左侧第 2 行：极简微元行（`项目名 · 主机 SSH 别名 · 分支`），当前会话归属一眼可见。
-  - 右侧：
-    1. **IDE 打开按钮（自动本机 / SSH 别名机制）**：使用**各 IDE 专属图标 + `ssh 主机别名`**（本机工作区时为 `图标 + 编辑器名`）；下拉菜单仅保留干净的编辑器图标列表（`Cursor / VS Code / Antigravity / Zed / 终端` 等），**零自解释头尾文案**。
-    2. **实时 Diff 入口**：直接显示 `+218 −64`，点击直进 Source Review。
-    3. **子会话紧凑计数入口**（有子会话时显示，详见 [subsession-ux-v4-spec.md](./subsession-ux-v4-spec.md)）。
+  - 右侧（v4 精简收口见 [subsession-ux-v4-spec.md](./subsession-ux-v4-spec.md#四会话页ide-下拉普通文件夹source-review-与过程折叠)）：
+    1. **IDE 打开按钮**：顶栏仅留各 IDE 专属图标 + 编辑器名（不展示 `ssh <alias>`）；下拉菜单保留干净的编辑器列表并在 `SSH · <name>` 后提供铅笔图标原位编辑别名，**零自解释头尾文案**。
+    2. **代码变动入口迁入 `RightCard`**：v4 将原顶栏实时 Diff（`+N −M` / `Checkpoint`）统一移入右侧紧凑可折叠浮卡 `RightCard`，顶栏不再保留代码变动或子会话下拉入口。
 - **底部输入框（Composer）**：
   - **输入框顶部**：存在待发 Review 评论时，以和附件文件同形态的紧凑胶囊提示 **`💬 N 条 Review 批注`**，让用户一眼感知发送会一并带上这些批注（正文留空也可直接发出）。
   - **Placeholder**：空闲态完全**留白**；仅在模型运行中提示极简快捷键 **`Enter 入队 · ⌘↵ 立刻插入`**。
