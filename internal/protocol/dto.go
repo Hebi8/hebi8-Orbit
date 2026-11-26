@@ -365,10 +365,12 @@ type AttemptView struct {
 	LocationID       string                `json:"locationId,omitempty"`
 	Isolation        LocationIsolation     `json:"isolation,omitempty"`
 	TriggerKind      TriggerKind           `json:"triggerKind"`
-	PromptText       string                `json:"promptText,omitempty"`
-	RefTasks         []ReferencedTaskMeta  `json:"refTasks,omitempty"`
-	ChildResult      *ChildResultMeta      `json:"childResult,omitempty"`
-	WorktreePath     string                `json:"worktreePath,omitempty"`
+	PromptText          string                `json:"promptText,omitempty"`
+	RefTasks            []ReferencedTaskMeta  `json:"refTasks,omitempty"`
+	ChildResult         *ChildResultMeta      `json:"childResult,omitempty"`
+	DelegatedFromTaskID string                `json:"delegatedFromTaskId,omitempty"`
+	DelegatedRelation   string                `json:"delegatedRelation,omitempty"`
+	WorktreePath        string                `json:"worktreePath,omitempty"`
 	BaseSHA          string                `json:"baseSha,omitempty"`
 	OutputDeliveryID string                `json:"outputDeliveryId,omitempty"`
 	FolderChanges    *FolderChangesSummary `json:"folderChanges,omitempty"`
@@ -409,6 +411,13 @@ type TaskSummary struct {
 	CreatedAt             int64         `json:"createdAt"`
 	UpdatedAt             int64         `json:"updatedAt"`
 	ArchivedAt            *int64        `json:"archivedAt,omitempty"`
+}
+
+// ListTasksResponse is returned by GET /api/tasks.
+type ListTasksResponse struct {
+	Tasks         []TaskSummary  `json:"tasks"`
+	ProjectCounts map[string]int `json:"projectCounts,omitempty"`
+	TotalCount    int            `json:"totalCount,omitempty"`
 }
 
 // EventRecord is a single row from the unified append-only events log.

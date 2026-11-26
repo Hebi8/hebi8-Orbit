@@ -562,12 +562,31 @@ func (s *Server) handleListAllTasks(w http.ResponseWriter, r *http.Request) {
 	projectID := strings.TrimSpace(r.URL.Query().Get("projectId"))
 	searchQuery := strings.TrimSpace(r.URL.Query().Get("q"))
 	archivedFilter := strings.TrimSpace(r.URL.Query().Get("archived"))
-	tasks, err := s.store.ListRecentTasksFiltered(r.Context(), limit, searchQuery, excludeProj, projectID, archivedFilter)
+	sortKey := strings.TrimSpace(r.URL.Query().Get("sort"))
+	topLevelOnly := r.URL.Query().Get("topLevelOnly") == "1" || strings.EqualFold(r.URL.Query().Get("topLevelOnly"), "true")
+
+	res, err := s.store.ListRecentTasksWithMeta(r.Context(), store.ListRecentTasksOptions{
+		Limit:          limit,
+		Query:          searchQuery,
+		ExcludeProject: excludeProj,
+		ProjectID:      projectID,
+		ArchivedFilter: archivedFilter,
+		Sort:           sortKey,
+		TopLevelOnly:   topLevelOnly,
+	})
 	if err != nil {
 		writeAPIError(w, http.StatusInternalServerError, "ERR_LIST_TASKS_FAILED", err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"tasks": tasks})
+	if strings.EqualFold(archivedFilter, "only") {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"tasks":         res.Tasks,
+			"projectCounts": res.ProjectCounts,
+			"totalCount":    res.TotalCount,
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, protocol.ListTasksResponse{Tasks: res.Tasks})
 }
 
 func (s *Server) handleListProjectTasks(w http.ResponseWriter, r *http.Request) {
@@ -1022,7 +1041,11 @@ func (s *Server) handleCompleteDeliveryReview(w http.ResponseWriter, r *http.Req
 	deliveryID := chi.URLParam(r, "deliveryId")
 	resp, ev, err := s.store.CompleteDeliveryReview(r.Context(), deliveryID, actorFromContext(r.Context()))
 	if errors.Is(err, store.ErrNotFound) {
-		writeAPIError(w, http.StatusNotFound, "ERR_DELIVERY_NOT_FOUND", "delivery not found")
+		writeAPIError(w, http.StatusNotFound, "ERR_DELIVERY_NOT_FOUND", err.Error())
+		return
+	}
+	if errors.Is(err, store.ErrConflict) {
+		writeAPIError(w, http.StatusConflict, "ERR_REVIEW_NOT_OPEN", err.Error())
 		return
 	}
 	if err != nil {

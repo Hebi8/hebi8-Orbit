@@ -568,6 +568,111 @@ func (s *Store) ClaimChildParentNotification(ctx context.Context, childTaskID, a
 	return claimed, parentTaskID, err
 }
 
+// IsDirectChildTask reports whether parentTaskID is a top-level session (empty parent_task_id)
+// and childTaskID is its direct child (target.parent_task_id == parentTaskID).
+// Enforces the strict depth-1 delegation boundary even on legacy multi-level databases.
+func (s *Store) IsDirectChildTask(ctx context.Context, parentTaskID, childTaskID string) (bool, error) {
+	var matched bool
+	err := s.WithReadTx(ctx, func(tx *sql.Tx) error {
+		var err error
+		matched, err = isDirectChildTaskTx(ctx, tx, parentTaskID, childTaskID)
+		return err
+	})
+	return matched, err
+}
+
+func isDirectChildTaskTx(ctx context.Context, tx *sql.Tx, parentTaskID, childTaskID string) (bool, error) {
+	parentTaskID = strings.TrimSpace(parentTaskID)
+	childTaskID = strings.TrimSpace(childTaskID)
+	if parentTaskID == "" || childTaskID == "" || parentTaskID == childTaskID {
+		return false, nil
+	}
+	var callerParent, targetParent sql.NullString
+	if err := tx.QueryRowContext(ctx, `SELECT parent_task_id FROM tasks WHERE task_id = ?`, parentTaskID).Scan(&callerParent); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	// Only top-level parents (depth 0) can act as parent over direct children; child sessions cannot operate on legacy grandchildren.
+	if callerParent.Valid && strings.TrimSpace(callerParent.String) != "" {
+		return false, nil
+	}
+	if err := tx.QueryRowContext(ctx, `SELECT parent_task_id FROM tasks WHERE task_id = ?`, childTaskID).Scan(&targetParent); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	return targetParent.Valid && strings.TrimSpace(targetParent.String) == parentTaskID, nil
+}
+
+// RecordDelegationSentParams describes a lightweight outbound delegation communication record
+// written onto the sender task's timeline when POST /api/runner/delegate/send succeeds.
+type RecordDelegationSentParams struct {
+	SenderTaskID    string
+	SenderAttemptID string
+	TargetTaskID    string
+	Relation        string // "parent" | "sibling"
+	Mode            protocol.FollowupMode
+	Summary         string
+	ActorID         string
+}
+
+// RecordDelegationSent appends a lightweight delegation.sent timeline event onto the sender task.
+func (s *Store) RecordDelegationSent(ctx context.Context, p RecordDelegationSentParams) (protocol.EventRecord, error) {
+	var ev protocol.EventRecord
+	now := time.Now().UnixMilli()
+	actorID := strings.TrimSpace(p.ActorID)
+	if actorID == "" {
+		actorID = "agent"
+	}
+	err := s.WithWriteTx(ctx, func(tx *sql.Tx) error {
+		var senderProjectID string
+		if err := tx.QueryRowContext(ctx, `SELECT project_id FROM tasks WHERE task_id = ?`, p.SenderTaskID).Scan(&senderProjectID); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("%w: sender task %s", ErrNotFound, p.SenderTaskID)
+			}
+			return err
+		}
+		var targetProjectID, targetTitle, targetGoal string
+		if err := tx.QueryRowContext(ctx, `SELECT project_id, title, goal FROM tasks WHERE task_id = ?`, p.TargetTaskID).Scan(&targetProjectID, &targetTitle, &targetGoal); err != nil {
+			if !errors.Is(err, sql.ErrNoRows) {
+				return err
+			}
+		}
+		title := strings.TrimSpace(targetTitle)
+		if title == "" {
+			title = strings.TrimSpace(strings.Split(targetGoal, "\n")[0])
+		}
+		if title == "" {
+			title = p.TargetTaskID
+		}
+		var err error
+		ev, err = insertEventTx(ctx, tx, eventInsert{
+			StreamID:   "task:" + p.SenderTaskID,
+			ProjectID:  senderProjectID,
+			TaskID:     p.SenderTaskID,
+			AttemptID:  strings.TrimSpace(p.SenderAttemptID),
+			ActorKind:  protocol.ActorAgent,
+			ActorID:    actorID,
+			Kind:       protocol.EventDelegationSent,
+			Visibility: protocol.VisibilityTimeline,
+			Payload: map[string]any{
+				"targetTaskId":    p.TargetTaskID,
+				"targetProjectId": targetProjectID,
+				"targetTitle":     title,
+				"relation":        strings.TrimSpace(p.Relation),
+				"mode":            string(p.Mode),
+				"summary":         truncatePromptText(p.Summary),
+			},
+			CreatedAt: now,
+		})
+		return err
+	})
+	return ev, err
+}
+
 // IsDescendantTask reports whether targetTaskID is strictly under ancestorTaskID's delegation subtree.
 func (s *Store) IsDescendantTask(ctx context.Context, ancestorTaskID, targetTaskID string) (bool, error) {
 	var matched bool

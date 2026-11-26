@@ -500,6 +500,10 @@ func (s *Server) handleUpdateProjectLocation(w http.ResponseWriter, r *http.Requ
 		writeAPIError(w, http.StatusNotFound, "ERR_LOCATION_NOT_FOUND", err.Error())
 		return
 	}
+	if errors.Is(err, store.ErrRepoIdentityConflict) {
+		writeAPIError(w, http.StatusConflict, "ERR_REPO_IDENTITY_CONFLICT", err.Error())
+		return
+	}
 	if errors.Is(err, store.ErrConflict) {
 		writeAPIError(w, http.StatusConflict, "ERR_LOCATION_EXISTS", err.Error())
 		return

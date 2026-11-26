@@ -136,7 +136,8 @@ export function TaskRefButton({
         onClick={() => setOpen((v) => !v)}
       >
         <Link2 size={12} strokeWidth={1.8} />
-        <span>{selectedIds.length > 0 ? `引用 ${selectedIds.length}` : '引用'}</span>
+        <span className="ref-trigger-lbl">{selectedIds.length > 0 ? `引用 ${selectedIds.length}` : '引用'}</span>
+        {selectedIds.length > 0 && <span className="ref-trigger-cnt">{selectedIds.length}</span>}
       </button>
       {open &&
         popStyle &&

@@ -605,6 +605,7 @@ const (
 	EventHebi8Folded             EventKind = "hebi8.folded"
 	EventTaskChildSpawned        EventKind = "task.child_spawned"
 	EventTaskChildUpdated        EventKind = "task.child_updated"
+	EventDelegationSent          EventKind = "delegation.sent"
 )
 
 var AllEventKinds = []EventKind{
@@ -655,6 +656,7 @@ var AllEventKinds = []EventKind{
 	EventHebi8Folded,
 	EventTaskChildSpawned,
 	EventTaskChildUpdated,
+	EventDelegationSent,
 }
 
 // IDEScheme defines supported URI schemes for one-click IDE jump.

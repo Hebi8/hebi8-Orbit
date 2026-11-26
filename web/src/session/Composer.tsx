@@ -102,7 +102,6 @@ export interface StandaloneComposerProps {
   onRefIdsChange: (ids: string[]) => void;
   projects?: readonly ProjectView[];
   refProminent?: boolean;
-  leadingExtra?: ReactNode;
   chipsSlot?: ReactNode;
   topSlot?: ReactNode;
 }
@@ -395,7 +394,6 @@ interface ComposerViewProps {
   projects?: readonly ProjectView[];
   currentTaskId?: string;
   refProminent?: boolean;
-  leadingExtra?: ReactNode;
   controlsDisabled?: boolean;
   availableAdapters: readonly SessionAdapter[];
   effectiveAdapter: SessionAdapter | '';
@@ -442,7 +440,6 @@ function ComposerView({
   projects,
   currentTaskId,
   refProminent = false,
-  leadingExtra,
   controlsDisabled = false,
   availableAdapters,
   effectiveAdapter,
@@ -487,20 +484,21 @@ function ComposerView({
         {!workerLabel ? (
           <div className="runtime-controls" aria-label="会话运行配置">
             {!hideRef && (
-              <TaskRefButton
-                selectedIds={refIds}
-                onChange={onRefIdsChange}
-                projects={projects}
-                currentTaskId={currentTaskId}
-                prominent={refProminent}
-                disabled={controlsDisabled}
-              />
+              <>
+                <TaskRefButton
+                  selectedIds={refIds}
+                  onChange={onRefIdsChange}
+                  projects={projects}
+                  currentTaskId={currentTaskId}
+                  prominent={refProminent}
+                  disabled={controlsDisabled}
+                />
+                <span className="rt-sep">·</span>
+              </>
             )}
-            {leadingExtra}
-            {(!hideRef || leadingExtra) && <span className="rt-sep">·</span>}
 
             <div className="rt-scroll">
-              <label className={`rt-pill ${controlsDisabled ? 'is-disabled' : ''}`} title={`Agent：${agentDisplay}`}>
+              <label className={`rt-pill rt-pill-agent ${controlsDisabled ? 'is-disabled' : ''}`} title={`Agent：${agentDisplay}`}>
                 <span className="rt-pill-val">{agentDisplay}</span>
                 <ChevronDown size={10} strokeWidth={1.8} className="rt-pill-chev" aria-hidden="true" />
                 <select
@@ -523,7 +521,7 @@ function ComposerView({
 
               <span className="rt-sep">·</span>
 
-              <label className={`rt-pill ${controlsDisabled ? 'is-disabled' : ''}`} title={`模型：${modelDisplay}`}>
+              <label className={`rt-pill rt-pill-model ${controlsDisabled ? 'is-disabled' : ''}`} title={`模型：${modelDisplay}`}>
                 <span className="rt-pill-val">{modelDisplay}</span>
                 <ChevronDown size={10} strokeWidth={1.8} className="rt-pill-chev" aria-hidden="true" />
                 <select
@@ -546,7 +544,7 @@ function ComposerView({
               {effortChoices.length > 0 && (
                 <>
                   <span className="rt-sep">·</span>
-                  <label className={`rt-pill ${controlsDisabled ? 'is-disabled' : ''}`} title={`思考强度：${effortDisplay}`}>
+                  <label className={`rt-pill rt-pill-effort ${controlsDisabled ? 'is-disabled' : ''}`} title={`思考强度：${effortDisplay}`}>
                     <span className="rt-pill-val">{effortDisplay}</span>
                     <ChevronDown size={10} strokeWidth={1.8} className="rt-pill-chev" aria-hidden="true" />
                     <select
@@ -660,7 +658,6 @@ function StandaloneComposer(props: StandaloneComposerProps) {
       onRefIdsChange={props.onRefIdsChange}
       projects={props.projects}
       refProminent={props.refProminent}
-      leadingExtra={props.leadingExtra}
       controlsDisabled={props.controlsDisabled}
       availableAdapters={props.availableAdapters}
       effectiveAdapter={props.effectiveAdapter}
@@ -810,13 +807,27 @@ function SessionComposer({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [editing?.inputId]);
 
-  const grow = () => {
+  const grow = useCallback(() => {
     const el = taRef.current;
     if (!el) return;
     el.style.height = '30px';
     el.style.height = `${Math.min(Math.max(el.scrollHeight, 30), 140)}px`;
-  };
-  useEffect(grow, [text]);
+  }, []);
+  useEffect(grow, [text, grow]);
+  useEffect(() => {
+    const el = taRef.current;
+    if (!el) return;
+    let lastW = Math.round(el.getBoundingClientRect().width);
+    const ro = new ResizeObserver(() => {
+      const nextW = Math.round(el.getBoundingClientRect().width);
+      if (nextW > 0 && nextW !== lastW) {
+        lastW = nextW;
+        grow();
+      }
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [grow]);
 
   const setDraft = (v: string) => {
     setText(v);

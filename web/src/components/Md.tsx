@@ -1,17 +1,52 @@
 import { Fragment, type ReactNode } from 'react';
+import { navigate } from '../lib/router';
 
-/** Renders inline `code` and **bold** without injecting HTML. */
+/** Renders inline `code`, **bold**, and safe Markdown links `[label](href)` without injecting HTML. */
 function inline(text: string, keyBase: string): ReactNode[] {
   const out: ReactNode[] = [];
-  const re = /(`[^`\n]+`|\*\*[^*\n]+\*\*)/g;
+  const re = /(`[^`\n]+`|\*\*[^*\n]+\*\*|\[[^\]\n]+\]\([^)\s]+\))/g;
   let last = 0;
   let m: RegExpExecArray | null;
   let i = 0;
   while ((m = re.exec(text)) !== null) {
     if (m.index > last) out.push(<Fragment key={`${keyBase}t${i}`}>{text.slice(last, m.index)}</Fragment>);
     const tok = m[0];
-    if (tok.startsWith('`')) out.push(<code key={`${keyBase}c${i}`}>{tok.slice(1, -1)}</code>);
-    else out.push(<b key={`${keyBase}b${i}`}>{tok.slice(2, -2)}</b>);
+    if (tok.startsWith('`')) {
+      out.push(<code key={`${keyBase}c${i}`}>{tok.slice(1, -1)}</code>);
+    } else if (tok.startsWith('**')) {
+      out.push(<b key={`${keyBase}b${i}`}>{tok.slice(2, -2)}</b>);
+    } else {
+      const lm = /^\[([^\]\n]+)\]\(([^)\s]+)\)$/.exec(tok);
+      if (lm) {
+        const label = lm[1];
+        const href = lm[2];
+        if (href.startsWith('#/')) {
+          out.push(
+            <a
+              key={`${keyBase}a${i}`}
+              href={href}
+              className="md-link"
+              onClick={(e) => {
+                e.preventDefault();
+                navigate(href);
+              }}
+            >
+              {label}
+            </a>,
+          );
+        } else if (/^https?:\/\//i.test(href)) {
+          out.push(
+            <a key={`${keyBase}a${i}`} href={href} className="md-link" target="_blank" rel="noopener noreferrer">
+              {label}
+            </a>,
+          );
+        } else {
+          out.push(<Fragment key={`${keyBase}l${i}`}>{tok}</Fragment>);
+        }
+      } else {
+        out.push(<Fragment key={`${keyBase}l${i}`}>{tok}</Fragment>);
+      }
+    }
     last = m.index + tok.length;
     i++;
   }

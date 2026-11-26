@@ -738,7 +738,8 @@ func TestSubsession_AutoWakeupParentOnChildFinishAndGuards(t *testing.T) {
 		select {
 		case df := <-dispatches:
 			if df.TaskID == c1.Task.TaskID {
-				if strings.Contains(df.SystemPromptAppend, "orbit_spawn_child") &&
+				if !strings.Contains(df.SystemPromptAppend, "orbit_spawn_child") &&
+					strings.Contains(df.SystemPromptAppend, "orbit_send_child") &&
 					strings.Contains(df.SystemPromptAppend, parentRes.Task.TaskID) &&
 					strings.Contains(df.SystemPromptAppend, "role=analyzer") {
 					sawChildPrompt = true

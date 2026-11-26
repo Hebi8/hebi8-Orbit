@@ -526,21 +526,25 @@ export function Turn({
   const hasCodeDiff = !!delivery && CODE_KINDS.has(delivery.kind) && delivery.manifest.filesChanged > 0;
   const isChildResult = attempt.triggerKind === 'child_result' || !!attempt.childResult;
 
-  // Detect inbound delegated sibling/parent followup from timeline events (if recorded by runner delegate send).
+  // Detect inbound delegated sibling/parent followup directly from AttemptView projection (with event fallback).
   const delegatedInbound = useMemo(() => {
     if (isChildResult) return null;
-    const matchEv = tl.events.find((e) => {
-      if (e.kind === 'attempt.started' && e.attemptId === attempt.attemptId) {
-        return typeof e.payload?.delegatedFromTaskId === 'string' && e.payload.delegatedFromTaskId.length > 0;
-      }
-      if (e.kind === 'queue.updated' && e.payload?.dispatchedAttemptId === attempt.attemptId) {
-        return typeof e.payload?.delegatedFromTaskId === 'string' && e.payload.delegatedFromTaskId.length > 0;
-      }
-      return false;
-    });
-    const fromId = typeof matchEv?.payload?.delegatedFromTaskId === 'string' ? matchEv.payload.delegatedFromTaskId : '';
+    let fromId = attempt.delegatedFromTaskId ?? '';
+    let relation = attempt.delegatedRelation ?? '';
+    if (!fromId) {
+      const matchEv = tl.events.find((e) => {
+        if (e.kind === 'attempt.started' && e.attemptId === attempt.attemptId) {
+          return typeof e.payload?.delegatedFromTaskId === 'string' && e.payload.delegatedFromTaskId.length > 0;
+        }
+        if (e.kind === 'queue.updated' && e.payload?.dispatchedAttemptId === attempt.attemptId) {
+          return typeof e.payload?.delegatedFromTaskId === 'string' && e.payload.delegatedFromTaskId.length > 0;
+        }
+        return false;
+      });
+      fromId = typeof matchEv?.payload?.delegatedFromTaskId === 'string' ? matchEv.payload.delegatedFromTaskId : '';
+      relation = typeof matchEv?.payload?.delegatedRelation === 'string' ? matchEv.payload.delegatedRelation : '';
+    }
     if (!fromId) return null;
-    const relation = typeof matchEv?.payload?.delegatedRelation === 'string' ? matchEv.payload.delegatedRelation : '';
     const sibMatch = (siblingChildren ?? tl.siblingChildren ?? []).find((s) => s.taskId === fromId);
     const parentMatch = tl.parentSummary?.taskId === fromId ? tl.parentSummary : undefined;
     const taskMatch = allTasks?.find((t) => t.taskId === fromId);
@@ -550,10 +554,48 @@ export function Turn({
       (taskMatch && taskTitle(taskMatch)) ||
       fromId;
     return { fromId, relation, senderTitle };
-  }, [isChildResult, tl.events, tl.siblingChildren, tl.parentSummary, attempt.attemptId, siblingChildren, allTasks]);
+  }, [
+    isChildResult,
+    attempt.delegatedFromTaskId,
+    attempt.delegatedRelation,
+    tl.events,
+    tl.siblingChildren,
+    tl.parentSummary,
+    attempt.attemptId,
+    siblingChildren,
+    allTasks,
+  ]);
 
   const isPA = tl.task.projectId === PA_PROJECT_ID;
   const isTopLevel = !tl.task.parentTaskId;
+  const sentDelegations = useMemo(() => {
+    if (isPA) return [];
+    const sibPool = siblingChildren ?? tl.siblingChildren ?? [];
+    const childPool = childrenList ?? tl.children ?? [];
+    return tl.events
+      .filter((e) => e.kind === 'delegation.sent' && e.attemptId === attempt.attemptId)
+      .map((e) => {
+        const p = e.payload ?? {};
+        const targetTaskId = typeof p.targetTaskId === 'string' ? p.targetTaskId : '';
+        const relation = typeof p.relation === 'string' ? p.relation : '';
+        const summary = typeof p.summary === 'string' ? p.summary.trim() : '';
+        const targetMatch =
+          sibPool.find((x) => x.taskId === targetTaskId) ??
+          childPool.find((x) => x.taskId === targetTaskId) ??
+          allTasks?.find((x) => x.taskId === targetTaskId);
+        const rawTitle = typeof p.targetTitle === 'string' ? p.targetTitle.trim() : '';
+        const targetTitle = (targetMatch && taskTitle(targetMatch)) || rawTitle || targetTaskId;
+        return {
+          key: e.eventId || `ds:${e.seq}`,
+          targetTaskId,
+          targetTitle,
+          relation,
+          summary,
+          createdAt: e.createdAt,
+        };
+      })
+      .filter((x) => !!x.targetTaskId);
+  }, [isPA, tl.events, tl.siblingChildren, tl.children, siblingChildren, childrenList, allTasks, attempt.attemptId]);
   const dispatchedChildren = useMemo(() => {
     if (!isTopLevel) return [];
     const pool = childrenList ?? tl.children ?? [];
@@ -793,6 +835,43 @@ export function Turn({
           onOpenNativeMember={onOpenNativeMember}
         />
       )}
+
+      {!isPA &&
+        sentDelegations.map((msg) => (
+          <details className="it comm-out-msg" key={msg.key}>
+            <summary className="comm-row is-out">
+              <span className="comm-dir-ico is-out" aria-hidden="true">
+                <ArrowUpRight size={13} strokeWidth={1.75} />
+              </span>
+              <span className="comm-ttl" title={msg.targetTitle}>
+                {msg.targetTitle}
+              </span>
+              <span className="comm-meta">{extractOneLineGist(msg.summary)}</span>
+              <span className="comm-trail">
+                <span className="comm-chev" aria-hidden="true">
+                  <ChevronRight size={12} strokeWidth={1.7} />
+                </span>
+              </span>
+            </summary>
+            <div className="comm-in-body">
+              <Md text={msg.summary || '已发送消息'} />
+              <div className="comm-in-foot">
+                <span>{hhmm(msg.createdAt)}</span>
+                <button
+                  type="button"
+                  className="sub-ret-link"
+                  onClick={() => {
+                    if (onOpenChild) onOpenChild(msg.targetTaskId);
+                    else navigate(paths.session(msg.targetTaskId));
+                  }}
+                >
+                  <span>{onOpenChild ? (msg.relation === 'sibling' ? '切换查看' : '分屏查看') : '打开会话'}</span>
+                  <ChevronRight size={11.5} strokeWidth={1.8} />
+                </button>
+              </div>
+            </div>
+          </details>
+        ))}
 
       {live && attempt.state !== 'waiting_approval' && attempt.state !== 'waiting_resource' && !hasActiveToolStep && (
         <div className="it running">

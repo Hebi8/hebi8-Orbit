@@ -403,18 +403,18 @@ func (s *Server) handleRunnerDelegateList(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusOK, out)
 }
 
-func (s *Server) verifyDescendantScope(ctx context.Context, parentTaskID, childTaskID string) (int, string, error) {
+func (s *Server) verifyDirectChildScope(ctx context.Context, parentTaskID, childTaskID string) (int, string, error) {
 	parentTaskID = strings.TrimSpace(parentTaskID)
 	childTaskID = strings.TrimSpace(childTaskID)
 	if parentTaskID == "" || childTaskID == "" {
 		return http.StatusBadRequest, "ERR_INVALID_INPUT", errors.New("parentTaskId and childTaskId are required")
 	}
-	ok, err := s.store.IsDescendantTask(ctx, parentTaskID, childTaskID)
+	ok, err := s.store.IsDirectChildTask(ctx, parentTaskID, childTaskID)
 	if err != nil {
 		return http.StatusInternalServerError, "ERR_SCOPE_CHECK", err
 	}
 	if !ok {
-		return http.StatusForbidden, "ERR_FORBIDDEN", fmt.Errorf("task %s is not a descendant of %s", childTaskID, parentTaskID)
+		return http.StatusForbidden, "ERR_FORBIDDEN", fmt.Errorf("task %s is not a direct child of top-level parent %s", childTaskID, parentTaskID)
 	}
 	return http.StatusOK, "", nil
 }
@@ -425,11 +425,11 @@ func (s *Server) verifyDelegateCollabScope(ctx context.Context, callerTaskID, ta
 	if callerTaskID == "" || targetTaskID == "" {
 		return "", http.StatusBadRequest, "ERR_INVALID_INPUT", errors.New("parentTaskId and childTaskId are required")
 	}
-	isDesc, err := s.store.IsDescendantTask(ctx, callerTaskID, targetTaskID)
+	isDirectChild, err := s.store.IsDirectChildTask(ctx, callerTaskID, targetTaskID)
 	if err != nil {
 		return "", http.StatusInternalServerError, "ERR_SCOPE_CHECK", err
 	}
-	if isDesc {
+	if isDirectChild {
 		return "parent", http.StatusOK, "", nil
 	}
 	isSib, err := s.store.IsSiblingTask(ctx, callerTaskID, targetTaskID)
@@ -439,7 +439,7 @@ func (s *Server) verifyDelegateCollabScope(ctx context.Context, callerTaskID, ta
 	if isSib {
 		return "sibling", http.StatusOK, "", nil
 	}
-	return "", http.StatusForbidden, "ERR_FORBIDDEN", fmt.Errorf("task %s is neither a child nor a sibling of %s", targetTaskID, callerTaskID)
+	return "", http.StatusForbidden, "ERR_FORBIDDEN", fmt.Errorf("task %s is neither a direct child nor a sibling of %s", targetTaskID, callerTaskID)
 }
 
 func (s *Server) handleRunnerDelegateSend(w http.ResponseWriter, r *http.Request) {
@@ -491,6 +491,17 @@ func (s *Server) handleRunnerDelegateSend(w http.ResponseWriter, r *http.Request
 		writeAPIError(w, status, code, err.Error())
 		return
 	}
+	if ev, evErr := s.store.RecordDelegationSent(r.Context(), store.RecordDelegationSentParams{
+		SenderTaskID:    strings.TrimSpace(req.ParentTaskID),
+		SenderAttemptID: strings.TrimSpace(req.ParentAttemptID),
+		TargetTaskID:    strings.TrimSpace(req.ChildTaskID),
+		Relation:        relation,
+		Mode:            mode,
+		Summary:         strings.TrimSpace(req.Message),
+		ActorID:         "agent:" + runnerMachineID,
+	}); evErr == nil {
+		s.broker.Broadcast(ev)
+	}
 	writeJSON(w, status, resp)
 }
 
@@ -532,7 +543,7 @@ func (s *Server) handleRunnerDelegateCancel(w http.ResponseWriter, r *http.Reque
 		writeAPIError(w, st, code, err.Error())
 		return
 	}
-	if st, code, err := s.verifyDescendantScope(r.Context(), req.ParentTaskID, req.ChildTaskID); err != nil {
+	if st, code, err := s.verifyDirectChildScope(r.Context(), req.ParentTaskID, req.ChildTaskID); err != nil {
 		writeAPIError(w, st, code, err.Error())
 		return
 	}

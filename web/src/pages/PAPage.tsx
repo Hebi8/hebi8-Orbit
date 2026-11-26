@@ -36,7 +36,7 @@ export function PAPage({
     if (mainQ.isLoading) {
       return (
         <main className="main">
-          <PageHeader>
+          <PageHeader hideCmdK>
             <span className="ttl">Hebi8</span>
           </PageHeader>
           <div className="empty">载入对话…</div>
@@ -69,11 +69,12 @@ function Hebi8MainView({
   const [draftInsert, setDraftInsert] = useState<{ id: number; text: string } | null>(null);
   const [dismissedAtCount, setDismissedAtCount] = useState<number | null>(null);
 
-  // Escape closes the Git-Tree drawer cleanly
+  // Escape closes the Git-Tree drawer cleanly (respecting higher-layer popovers)
   useEffect(() => {
     if (!drawerOpen) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && !e.isComposing) {
+      if (e.key === 'Escape' && !e.isComposing && !e.defaultPrevented) {
+        e.preventDefault();
         setDrawerOpen(false);
       }
     };
@@ -253,6 +254,7 @@ function Hebi8MainView({
   return (
     <main className="main">
       <PageHeader
+        hideCmdK
         right={
           <button
             type="button"
@@ -292,7 +294,7 @@ function Hebi8MainView({
           />
           {drawerOpen && (
             <div
-              className="dock has-card h8-dock"
+              className="dock has-card h8-dock mobile-open"
               onClick={(e) => {
                 if (e.target === e.currentTarget) setDrawerOpen(false);
               }}

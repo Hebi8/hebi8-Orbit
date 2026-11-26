@@ -112,6 +112,7 @@ func ExportedDTOTypes() []reflect.Type {
 		reflect.TypeOf(ContextUsage{}),
 		reflect.TypeOf(AttemptView{}),
 		reflect.TypeOf(TaskSummary{}),
+		reflect.TypeOf(ListTasksResponse{}),
 		reflect.TypeOf(EventRecord{}),
 		reflect.TypeOf(PendingInput{}),
 		reflect.TypeOf(ApprovalOption{}),

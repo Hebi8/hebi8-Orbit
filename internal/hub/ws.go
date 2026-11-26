@@ -65,14 +65,31 @@ func (b *EventBroker) Notify() {
 	}
 }
 
-// Broadcast notifies connected subscribers when any non-raw event was committed.
+// Broadcast notifies connected subscribers when any non-raw event (or live acp.usage update) was committed.
 func (b *EventBroker) Broadcast(events ...protocol.EventRecord) {
 	for _, ev := range events {
-		if ev.Visibility != protocol.VisibilityRawACP {
+		if ev.Visibility != protocol.VisibilityRawACP || ev.Kind == protocol.EventACPUsage {
 			b.Notify()
 			return
 		}
 	}
+}
+
+// projectWSEvent converts raw acp.usage records into lightweight non-raw notifications for client WS.
+func projectWSEvent(ev protocol.EventRecord) protocol.EventRecord {
+	if ev.Kind != protocol.EventACPUsage {
+		return ev
+	}
+	slim := make(map[string]any, 2)
+	if v, ok := ev.Payload["used"]; ok {
+		slim["used"] = v
+	}
+	if v, ok := ev.Payload["size"]; ok {
+		slim["size"] = v
+	}
+	ev.Visibility = protocol.VisibilityTimeline
+	ev.Payload = slim
+	return ev
 }
 
 type clientWSConn struct {
@@ -345,6 +362,9 @@ func (s *Server) handleClientWS(w http.ResponseWriter, r *http.Request) {
 		if hook := s.getWSBeforeReplayWriteHook(); hook != nil {
 			hook()
 		}
+		for i := range batch {
+			batch[i] = projectWSEvent(batch[i])
+		}
 		if err := wsEntry.writeData(protocol.WSServerMessage{
 			Type:          protocol.WSMessageReplay,
 			Events:        batch,
@@ -387,7 +407,7 @@ func (s *Server) handleClientWS(w http.ResponseWriter, r *http.Request) {
 				if wsEntry.revoked.Load() || ctx.Err() != nil {
 					return context.Canceled
 				}
-				ev := batch[i]
+				ev := projectWSEvent(batch[i])
 				if err := wsEntry.writeData(protocol.WSServerMessage{
 					Type:       protocol.WSMessageEvent,
 					Event:      &ev,

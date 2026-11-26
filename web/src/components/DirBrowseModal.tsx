@@ -212,6 +212,8 @@ export function CodexDirBrowser({
   // Load default home (~ / allowed root) or initialPath when machine changes
   useEffect(() => {
     if (!machineId) return;
+    reqSeqRef.current += 1;
+    setValidating(false);
     setCurPath('');
     setHomePath('');
     setParentPath('');
@@ -321,6 +323,7 @@ export function CodexDirBrowser({
 
   const handleConfirm = useCallback(async () => {
     if (!machineId || submitting || validating) return;
+    const targetMid = machineId;
     setError('');
 
     // If the user is currently editing the path bar with unapplied text, validate it against the backend first.
@@ -330,41 +333,50 @@ export function CodexDirBrowser({
         setError('请输入有效的目录路径');
         return;
       }
+      const seq = ++reqSeqRef.current;
       setValidating(true);
       try {
-        const res = await api.listMachineDirs(machineId, raw);
+        const res = await api.listMachineDirs(targetMid, raw);
+        // Discard stale response if user switched machines or triggered a newer directory request while validating.
+        if (seq !== reqSeqRef.current || activeMachineRef.current !== targetMid) return;
         setCurPath(res.path);
         setHomePath(res.homePath || '');
         setParentPath(res.parentPath ?? '');
         setEntries(res.entries ?? []);
         setFocusIdx(-1);
         setEditingPath(false);
-        setLoadedMachineId(machineId);
+        setLoadedMachineId(targetMid);
         await onConfirm({
-          machineId,
+          machineId: targetMid,
           absPath: res.path,
           isGit: false,
           entryName: res.path.split('/').filter(Boolean).pop() || '',
         });
       } catch (e) {
-        setError(formatBrowseError(e));
+        if (seq === reqSeqRef.current && activeMachineRef.current === targetMid) {
+          setError(formatBrowseError(e));
+        }
       } finally {
-        setValidating(false);
+        if (seq === reqSeqRef.current && activeMachineRef.current === targetMid) {
+          setValidating(false);
+        }
       }
       return;
     }
 
-    if (loadedMachineId !== machineId || !effectivePath) return;
+    if (loadedMachineId !== targetMid || !effectivePath) return;
     try {
       await onConfirm({
-        machineId,
+        machineId: targetMid,
         absPath: effectivePath,
         isGit: effectiveIsGit,
         branch: effectiveBranch,
         entryName: effectiveEntryName,
       });
     } catch (e) {
-      setError(formatBrowseError(e));
+      if (activeMachineRef.current === targetMid) {
+        setError(formatBrowseError(e));
+      }
     }
   }, [
     machineId,
@@ -409,6 +421,7 @@ export function CodexDirBrowser({
       if (inFormField) return;
 
       if (e.key === 'Escape') {
+        if (e.defaultPrevented) return;
         if (editingPathRef.current) {
           e.preventDefault();
           e.stopPropagation();
@@ -516,7 +529,13 @@ export function CodexDirBrowser({
               role="tab"
               aria-selected={machineId === m.machineId}
               className={`dir-mach-tab ${machineId === m.machineId ? 'on' : ''}`}
-              onClick={() => onMachineChange(m.machineId)}
+              onClick={() => {
+                if (m.machineId !== machineId) {
+                  reqSeqRef.current += 1;
+                  setValidating(false);
+                  onMachineChange(m.machineId);
+                }
+              }}
             >
               <DeviceRoleIcon
                 machine={m}
@@ -650,6 +669,7 @@ export function CodexDirBrowser({
                   <button
                     type="button"
                     className="cdx-row-main"
+                    onFocus={() => setFocusIdx(idx)}
                     onClick={() => handleRowClick(entry, idx)}
                     onDoubleClick={(e) => {
                       e.stopPropagation();

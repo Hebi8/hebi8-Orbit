@@ -157,13 +157,18 @@ export function NewThreadPage({
       }
     };
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setOpenMenu(null);
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        e.stopPropagation();
+        setOpenMenu(null);
+      }
     };
     document.addEventListener('mousedown', onDown);
-    window.addEventListener('keydown', onKey);
+    window.addEventListener('keydown', onKey, true);
     return () => {
       document.removeEventListener('mousedown', onDown);
-      window.removeEventListener('keydown', onKey);
+      window.removeEventListener('keydown', onKey, true);
     };
   }, [openMenu]);
 
@@ -463,7 +468,7 @@ export function NewThreadPage({
           <Plus size={13.5} strokeWidth={1.8} />
         </button>
         {openMenu === 'source' && (
-          <div className="nt-pop nt-pop-form" style={{ left: 0, bottom: 'calc(100% + 8px)' }}>
+          <div className="nt-pop nt-pop-form" style={{ right: 0, top: 'calc(100% + 6px)' }}>
             <div className="nt-pop-hd">附加参考资料</div>
             <div className="nt-pop-seg">
               {(['link', 'file', 'nmem'] as TaskSourceKind[]).map((k) => (
@@ -747,27 +752,30 @@ export function NewThreadPage({
                 )}
               </div>
 
-              {/* Fixed "Worktree" label — never toggles text on state change (v4 invariant) */}
-              {m === 'project' && !isPlainFolder && (
-                <label
-                  className={`nt-wt-toggle ${useWorktree ? 'on' : ''}`}
-                  title={
-                    useWorktree
-                      ? '已开启 Worktree 隔离；完成后由 Orbit 自动打包交付改动'
-                      : '未开启 Worktree；与当前项目目录文件直接保持同步'
-                  }
-                >
-                  <input
-                    type="checkbox"
-                    checked={useWorktree}
-                    onChange={(e) => setUseWorktree(e.target.checked)}
-                  />
-                  <span className="nt-wt-track" aria-hidden="true">
-                    <span className="nt-wt-thumb" />
-                  </span>
-                  <span className="nt-wt-lbl">Worktree</span>
-                </label>
-              )}
+              {/* Right context controls: optional project source attachment + fixed "Worktree" label */}
+              <div className="nt-ctx-right">
+                {attachSourceControl}
+                {m === 'project' && !isPlainFolder && (
+                  <label
+                    className={`nt-wt-toggle ${useWorktree ? 'on' : ''}`}
+                    title={
+                      useWorktree
+                        ? '已开启 Worktree 隔离；完成后由 Orbit 自动打包交付改动'
+                        : '未开启 Worktree；与当前项目目录文件直接保持同步'
+                    }
+                  >
+                    <input
+                      type="checkbox"
+                      checked={useWorktree}
+                      onChange={(e) => setUseWorktree(e.target.checked)}
+                    />
+                    <span className="nt-wt-track" aria-hidden="true">
+                      <span className="nt-wt-thumb" />
+                    </span>
+                    <span className="nt-wt-lbl">Worktree</span>
+                  </label>
+                )}
+              </div>
             </div>
 
             {/* Unified site-wide Composer with indicatorMode="quota" */}
@@ -800,7 +808,6 @@ export function NewThreadPage({
               onRefIdsChange={setRefIds}
               projects={boot.projects}
               refProminent={m === 'pa'}
-              leadingExtra={attachSourceControl}
               chipsSlot={sourceChips}
             />
           </div>

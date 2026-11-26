@@ -276,16 +276,41 @@ export const api = {
     projectId?: string;
     q?: string;
     archived?: 'active' | 'only' | 'all';
+    sort?: 'archived_at' | 'updated_at' | 'title';
+    topLevelOnly?: boolean;
   }): Promise<TaskSummary[]> {
+    const res = await api.listTasksWithMeta(opts);
+    return res.tasks ?? [];
+  },
+
+  async listTasksWithMeta(opts?: {
+    limit?: number;
+    excludeProject?: string;
+    projectId?: string;
+    q?: string;
+    archived?: 'active' | 'only' | 'all';
+    sort?: 'archived_at' | 'updated_at' | 'title';
+    topLevelOnly?: boolean;
+  }): Promise<{ tasks: TaskSummary[]; projectCounts?: Record<string, number>; totalCount?: number }> {
     const q = new URLSearchParams();
     if (opts?.limit) q.set('limit', String(opts.limit));
     if (opts?.excludeProject) q.set('excludeProject', opts.excludeProject);
     if (opts?.projectId) q.set('projectId', opts.projectId);
     if (opts?.q && opts.q.trim()) q.set('q', opts.q.trim());
     if (opts?.archived && opts.archived !== 'active') q.set('archived', opts.archived);
+    if (opts?.sort) q.set('sort', opts.sort);
+    if (opts?.topLevelOnly) q.set('topLevelOnly', '1');
     const qs = q.toString();
-    const res = await apiFetch<{ tasks: TaskSummary[] }>(`/api/tasks${qs ? `?${qs}` : ''}`);
-    return res.tasks ?? [];
+    const res = await apiFetch<{
+      tasks?: TaskSummary[];
+      projectCounts?: Record<string, number>;
+      totalCount?: number;
+    }>(`/api/tasks${qs ? `?${qs}` : ''}`);
+    return {
+      tasks: res.tasks ?? [],
+      projectCounts: res.projectCounts,
+      totalCount: res.totalCount,
+    };
   },
 
   async listProjectTasks(projectId: string, archived?: 'active' | 'only' | 'all'): Promise<TaskSummary[]> {

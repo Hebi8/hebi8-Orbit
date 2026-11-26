@@ -545,21 +545,28 @@ func buildOrbitSystemPromptAppend(taskID, projectID, attemptID string, isPlainFo
 			projectID, taskID, attemptID,
 		)
 	}
-	base += "\n\nOrbit Sub-Session Delegation:\n" +
-		"- When splitting independent/parallel subtasks or delegating work to another machine, model, or project, prefer Orbit sub-session tools (`orbit_spawn_child`, or `orbit child spawn` in terminal).\n" +
-		"- Delegated sub-sessions are live-observable in the Orbit UI so the user can inspect, take over, steer, or approve them directly.\n" +
-		"- When a child session finishes, Orbit automatically delivers its summary back to you; do not poll in a loop."
-	if strings.TrimSpace(parentTaskID) != "" {
+	switch {
+	case projectID == protocol.PAProjectID:
+		base += "\n\nHebi8 Cross-Directory Coordination:\n" +
+			"- Hebi8 operates across directories and project sessions directly rather than spawning attached child sessions.\n" +
+			"- Reference relevant conversations using Markdown links (`[Title](#/t/<taskId>)`) and synthesize cross-project progress faithfully."
+	case strings.TrimSpace(parentTaskID) != "":
 		roleNote := ""
 		if r := strings.TrimSpace(delegatedRole); r != "" {
 			roleNote = fmt.Sprintf(" (role=%s)", r)
 		}
 		base += fmt.Sprintf(
 			"\n\nDelegated Child Context:\n"+
-				"- You are a delegated child session of parent task %s%s.\n"+
+				"- You are a delegated child session of parent task %s%s (maximum sub-session depth = 1).\n"+
+				"- Do NOT spawn grandchild sessions; only sibling collaboration is allowed (`orbit_list_children`, `orbit_send_child`, `orbit_read_child`).\n"+
 				"- Stay focused on your assigned scope and summarize your findings/changes clearly in your final reply; Orbit will automatically report it back to the parent session.",
 			strings.TrimSpace(parentTaskID), roleNote,
 		)
+	default:
+		base += "\n\nOrbit Sub-Session Delegation:\n" +
+			"- When splitting independent/parallel subtasks or delegating work to another machine, model, or project, prefer Orbit sub-session tools (`orbit_spawn_child`, or `orbit child spawn` in terminal).\n" +
+			"- Delegated sub-sessions are live-observable in the Orbit UI so the user can inspect, take over, steer, or approve them directly.\n" +
+			"- When a child session finishes, Orbit automatically delivers its summary back to you; do not poll in a loop."
 	}
 	if custom := strings.TrimSpace(projectSystemPrompt); custom != "" {
 		return base + "\n\nProject Instructions:\n" + custom

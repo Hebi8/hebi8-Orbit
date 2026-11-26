@@ -33,6 +33,7 @@ var (
 	ErrMaxSubsessionDepth     = errors.New("maximum sub-session depth exceeded")
 	ErrPANoSubsessions        = errors.New("PA/Hebi8 sessions cannot spawn sub-sessions")
 	ErrCheckpointLocked       = errors.New("delivery review checkpoint is locked after a subsequent message")
+	ErrRepoIdentityConflict   = errors.New("repo identity conflict")
 )
 
 // Store manages the single-writer SQLite WAL pool and a separate read-only query pool.

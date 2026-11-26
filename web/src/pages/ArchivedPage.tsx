@@ -19,23 +19,36 @@ import { toast } from '../store/useWorkbenchStore';
 
 type ArchivedSortKey = 'archived_desc' | 'active_desc' | 'title_asc';
 
-const SORT_OPTIONS: { id: ArchivedSortKey; label: string }[] = [
-  { id: 'archived_desc', label: '最近归档' },
-  { id: 'active_desc', label: '最近活跃' },
-  { id: 'title_asc', label: '按名称' },
+const SORT_OPTIONS: { id: ArchivedSortKey; serverSort: 'archived_at' | 'updated_at' | 'title'; label: string }[] = [
+  { id: 'archived_desc', serverSort: 'archived_at', label: '最近归档' },
+  { id: 'active_desc', serverSort: 'updated_at', label: '最近活跃' },
+  { id: 'title_asc', serverSort: 'title', label: '按名称' },
 ];
 
 export function ArchivedPage({ boot }: { boot: BootstrapResponse }) {
   const qc = useQueryClient();
   const [search, setSearch] = useState('');
+  const [debouncedSearch, setDebouncedSearch] = useState('');
   const [projectFilter, setProjectFilter] = useState('');
   const [sortBy, setSortBy] = useState<ArchivedSortKey>('archived_desc');
   const [openMenu, setOpenMenu] = useState<null | 'proj' | 'sort'>(null);
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
   const toolbarRef = useRef<HTMLDivElement | null>(null);
 
-  // Fetch all archived sessions once so per-project counts in the pulldown stay exact across filters.
-  const archivedQ = useArchivedTasks({ limit: 200 });
+  useEffect(() => {
+    const t = window.setTimeout(() => setDebouncedSearch(search.trim()), 150);
+    return () => window.clearTimeout(t);
+  }, [search]);
+
+  const activeSortOpt = SORT_OPTIONS.find((o) => o.id === sortBy) ?? SORT_OPTIONS[0];
+
+  // Server filters by projectId & q and sorts BEFORE LIMIT 200, and returns untruncated top-level projectCounts & totalCount.
+  const archivedQ = useArchivedTasks({
+    projectId: projectFilter || undefined,
+    q: debouncedSearch || undefined,
+    sort: activeSortOpt.serverSort,
+    limit: 200,
+  });
 
   useEffect(() => {
     if (!openMenu) return;
@@ -45,13 +58,17 @@ export function ArchivedPage({ boot }: { boot: BootstrapResponse }) {
       }
     };
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setOpenMenu(null);
+      if (e.key === 'Escape' && !e.isComposing) {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        setOpenMenu(null);
+      }
     };
     document.addEventListener('mousedown', onDown);
-    window.addEventListener('keydown', onKey);
+    window.addEventListener('keydown', onKey, true);
     return () => {
       document.removeEventListener('mousedown', onDown);
-      window.removeEventListener('keydown', onKey);
+      window.removeEventListener('keydown', onKey, true);
     };
   }, [openMenu]);
 
@@ -71,18 +88,26 @@ export function ArchivedPage({ boot }: { boot: BootstrapResponse }) {
     return map;
   }, [boot.projects]);
 
-  const allTopArchived = useMemo(
-    () => (archivedQ.data ?? []).filter((t) => !t.parentTaskId),
-    [archivedQ.data],
+  const tasks = useMemo(
+    () => (archivedQ.data?.tasks ?? []).filter((t) => !t.parentTaskId),
+    [archivedQ.data?.tasks],
   );
+  const serverProjectCounts = archivedQ.data?.projectCounts;
+  const totalArchivedCount = archivedQ.data?.totalCount ?? tasks.length;
 
   const projectOptions = useMemo(() => {
     const counts = new Map<string, number>();
-    for (const t of allTopArchived) {
-      counts.set(t.projectId, (counts.get(t.projectId) ?? 0) + 1);
+    if (serverProjectCounts) {
+      for (const [pid, cnt] of Object.entries(serverProjectCounts)) {
+        counts.set(pid, cnt);
+      }
+    } else {
+      for (const t of tasks) {
+        counts.set(t.projectId, (counts.get(t.projectId) ?? 0) + 1);
+      }
     }
     const opts: { id: string; label: string; count: number }[] = [
-      { id: '', label: '全部项目', count: allTopArchived.length },
+      { id: '', label: '全部项目', count: totalArchivedCount },
     ];
     const added = new Set<string>();
     for (const p of boot.projects) {
@@ -119,35 +144,9 @@ export function ArchivedPage({ boot }: { boot: BootstrapResponse }) {
       });
     }
     return opts;
-  }, [allTopArchived, boot.projects, projectNames]);
+  }, [serverProjectCounts, totalArchivedCount, tasks, boot.projects, projectNames]);
 
   const activeProjOpt = projectOptions.find((o) => o.id === projectFilter) ?? projectOptions[0];
-  const activeSortOpt = SORT_OPTIONS.find((o) => o.id === sortBy) ?? SORT_OPTIONS[0];
-
-  const tasks = useMemo(() => {
-    const q = search.trim().toLowerCase();
-    const filtered = allTopArchived.filter((t) => {
-      if (projectFilter && t.projectId !== projectFilter) return false;
-      if (q) {
-        const title = taskTitle(t).toLowerCase();
-        const goal = (t.goal || '').toLowerCase();
-        const proj = (projectNames.get(t.projectId) ?? t.projectId).toLowerCase();
-        if (!title.includes(q) && !goal.includes(q) && !proj.includes(q)) return false;
-      }
-      return true;
-    });
-    return [...filtered].sort((a, b) => {
-      if (sortBy === 'title_asc') {
-        return taskTitle(a).localeCompare(taskTitle(b), 'zh-CN');
-      }
-      if (sortBy === 'active_desc') {
-        return b.updatedAt - a.updatedAt;
-      }
-      const aArch = a.archivedAt ?? a.updatedAt;
-      const bArch = b.archivedAt ?? b.updatedAt;
-      return bArch - aArch;
-    });
-  }, [allTopArchived, projectFilter, search, sortBy, projectNames]);
 
   const invalidateAll = (projectId?: string) => {
     void qc.invalidateQueries({ queryKey: ['archived-tasks'] });
@@ -186,7 +185,7 @@ export function ArchivedPage({ boot }: { boot: BootstrapResponse }) {
         right={
           !archivedQ.isLoading ? (
             <span className="faint no-mobile" style={{ fontSize: 11.5, marginRight: 6 }}>
-              共 {allTopArchived.length} 条
+              共 {totalArchivedCount} 条
             </span>
           ) : undefined
         }

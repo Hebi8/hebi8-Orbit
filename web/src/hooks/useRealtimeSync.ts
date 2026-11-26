@@ -147,6 +147,12 @@ export function collectInvalidations(
       }
       continue;
     }
+    if (kind === 'delegation.sent') {
+      add('task-timeline', tid);
+      const targetTaskId = strField(p, 'targetTaskId');
+      if (targetTaskId) add('task-timeline', targetTaskId);
+      continue;
+    }
     if (kind === 'delivery.review_reopened' || kind === 'delivery.review_completed') {
       if (deliveryId) add('delivery', deliveryId);
       else add('delivery');
@@ -157,6 +163,7 @@ export function collectInvalidations(
       }
       add('project-tasks', pid);
       add('all-tasks');
+      add('hebi8-main');
       add('bootstrap');
       continue;
     }
@@ -171,6 +178,7 @@ export function collectInvalidations(
       add('project-tasks', pid);
       add('all-tasks');
       add('global-artifacts');
+      add('hebi8-main');
       add('bootstrap');
       continue;
     }
@@ -204,6 +212,7 @@ export function collectInvalidations(
         add('task-timeline', parentTaskId);
         add('task-children', parentTaskId);
       }
+      add('hebi8-main');
       add('bootstrap');
       continue;
     }

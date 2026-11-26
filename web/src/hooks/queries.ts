@@ -49,19 +49,29 @@ export function useAllTasks(opts?: {
   });
 }
 
-export function useArchivedTasks(opts?: { projectId?: string; q?: string; limit?: number; enabled?: boolean }) {
+export function useArchivedTasks(opts?: {
+  projectId?: string;
+  q?: string;
+  sort?: 'archived_at' | 'updated_at' | 'title';
+  limit?: number;
+  enabled?: boolean;
+}) {
   const trimmedQ = opts?.q?.trim() ?? '';
+  const sort = opts?.sort ?? 'archived_at';
   return useQuery({
-    queryKey: ['archived-tasks', opts?.projectId ?? '', opts?.limit ?? 150, trimmedQ],
+    queryKey: ['archived-tasks', opts?.projectId ?? '', sort, opts?.limit ?? 200, trimmedQ],
     queryFn: () =>
-      api.listAllTasks({
-        limit: opts?.limit ?? 150,
+      api.listTasksWithMeta({
+        limit: opts?.limit ?? 200,
         projectId: opts?.projectId || undefined,
         q: trimmedQ || undefined,
         archived: 'only',
+        sort,
+        topLevelOnly: true,
       }),
     enabled: opts?.enabled ?? true,
     staleTime: 10_000,
+    placeholderData: (prev) => prev,
   });
 }
 

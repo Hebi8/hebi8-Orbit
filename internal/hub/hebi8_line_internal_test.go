@@ -162,3 +162,31 @@ machines:
 		t.Fatalf("expected attempt state=failed, got %s", reloadedAtt.State)
 	}
 }
+
+func TestPhase4_SchedulerPromptByRole(t *testing.T) {
+	// 1. Top-level normal project session keeps orbit_spawn_child delegation instructions
+	topPrompt := buildOrbitSystemPromptAppend("tsk_top", "demo-app", "att_1", false, "", "", "")
+	if !strings.Contains(topPrompt, "orbit_spawn_child") {
+		t.Fatalf("expected top-level session prompt to include orbit_spawn_child, got: %s", topPrompt)
+	}
+
+	// 2. Child session forbids grandchild spawning and allows only sibling collaboration tools
+	childPrompt := buildOrbitSystemPromptAppend("tsk_child", "demo-app", "att_2", false, "", "tsk_top", "backend")
+	if strings.Contains(childPrompt, "orbit_spawn_child") {
+		t.Fatalf("child session prompt must NOT suggest orbit_spawn_child, got: %s", childPrompt)
+	}
+	for _, want := range []string{"orbit_list_children", "orbit_send_child", "orbit_read_child", "grandchild"} {
+		if !strings.Contains(childPrompt, want) {
+			t.Fatalf("expected child session prompt to contain %q, got: %s", want, childPrompt)
+		}
+	}
+
+	// 3. Hebi8 / PA session must NOT inject orbit_spawn_child and keeps cross-directory coordination guidance
+	paPrompt := buildOrbitSystemPromptAppend("tsk_pa", protocol.PAProjectID, "att_3", false, "", "", "")
+	if strings.Contains(paPrompt, "orbit_spawn_child") {
+		t.Fatalf("PA/Hebi8 prompt must NOT include orbit_spawn_child, got: %s", paPrompt)
+	}
+	if !strings.Contains(paPrompt, "Cross-Directory") {
+		t.Fatalf("expected PA/Hebi8 prompt to preserve cross-directory guidance, got: %s", paPrompt)
+	}
+}

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   Diff,
@@ -80,10 +80,11 @@ function isDiffAnnotation(a: AnnotationView) {
 
 function formatLineAnchor(a: AnnotationView): string {
   const path = a.anchor.path?.split('/').pop() || a.anchor.path || '';
+  const sideLabel = a.anchor.side === 'old' ? '左侧' : '右侧';
   const s = a.anchor.startLine ?? 0;
   const e = a.anchor.endLine ?? s;
   if (s <= 0) return path;
-  return e > s ? `${path} · L${s}–L${e}` : `${path} · L${s}`;
+  return e > s ? `${path} · ${sideLabel} L${s}–L${e}` : `${path} · ${sideLabel} L${s}`;
 }
 
 export function CodeReviewPane({
@@ -140,7 +141,7 @@ export function CodeReviewPane({
   const isNarrow = typeof window !== 'undefined' && window.innerWidth < 768;
   const defaultTreeOpen = !isNarrow && files.length > 1;
   const treeOpen = treeOverride ?? defaultTreeOpen;
-  const effectiveViewType: ViewType = isNarrow ? 'unified' : viewType;
+  const effectiveViewType: ViewType = viewType;
 
   const diffQ = useQuery({
     queryKey: ['delivery-diff', effectiveDeliveryId, activeFile],
@@ -424,10 +425,11 @@ export function CodeReviewPane({
     }
 
     if (draft && draft.deliveryId === effectiveDeliveryId && draft.path === activeFile) {
+      const sideLabel = draft.side === 'old' ? '左侧' : '右侧';
       const locLabel =
         draft.endLine > draft.startLine
-          ? `${draft.path.split('/').pop()} · L${draft.startLine}–L${draft.endLine}`
-          : `${draft.path.split('/').pop()} · L${draft.startLine}`;
+          ? `${draft.path.split('/').pop()} · ${sideLabel} L${draft.startLine}–L${draft.endLine}`
+          : `${draft.path.split('/').pop()} · ${sideLabel} L${draft.startLine}`;
       (map[draft.endChangeKey] ??= []).push(
         <div className="gh-comment-wrap gh-comment-draft" key="__draft">
           <div className="gh-comment-hd">
@@ -448,6 +450,7 @@ export function CodeReviewPane({
               }}
               onKeyDown={(e) => {
                 if (e.key === 'Escape') {
+                  e.preventDefault();
                   e.stopPropagation();
                   setDraft(null);
                 }
@@ -479,9 +482,70 @@ export function CodeReviewPane({
     }
 
     const out: Record<string, ReactNode> = {};
-    for (const [k, nodes] of Object.entries(map)) out[k] = <div className="cmrow">{nodes}</div>;
+    if (effectiveViewType === 'split') {
+      // In split mode, merge paired delete+insert rows into ONE shared React element assigned to BOTH keys
+      // so react-diff-view's SplitWidget natively emits a single full-width `<td colSpan={4}>`.
+      const handled = new Set<string>();
+      for (const hunk of parsed.hunks) {
+        const changes = hunk.changes;
+        for (let i = 0; i < changes.length; i++) {
+          const cur = changes[i];
+          if (cur.type === 'delete' && i + 1 < changes.length && changes[i + 1].type === 'insert') {
+            const delKey = getChangeKey(cur);
+            const insKey = getChangeKey(changes[i + 1]);
+            const combined = [...(map[delKey] ?? []), ...(map[insKey] ?? [])];
+            if (combined.length > 0) {
+              const sharedEl = <div className="cmrow">{combined}</div>;
+              out[delKey] = sharedEl;
+              out[insKey] = sharedEl;
+            }
+            handled.add(delKey);
+            handled.add(insKey);
+            i += 1;
+          }
+        }
+      }
+      for (const [k, nodes] of Object.entries(map)) {
+        if (!handled.has(k)) out[k] = <div className="cmrow">{nodes}</div>;
+      }
+    } else {
+      for (const [k, nodes] of Object.entries(map)) out[k] = <div className="cmrow">{nodes}</div>;
+    }
     return out;
-  }, [parsed, fileAnns, draft, body, effectiveDeliveryId, activeFile, create, removeAnn, lineIndex]);
+  }, [parsed, fileAnns, draft, body, effectiveDeliveryId, activeFile, create, removeAnn, lineIndex, effectiveViewType]);
+
+  // For pure-insert / pure-delete lines in Split Diff mode, react-diff-view renders two colSpan=2 cells
+  // (one empty, one with widget content). Promote the populated cell to full-width colSpan=4 without
+  // mutating React's DOM tree structure (empty sibling is merely display:none).
+  useLayoutEffect(() => {
+    const pane = diffPaneRef.current;
+    if (!pane || effectiveViewType !== 'split') return;
+    const rows = pane.querySelectorAll<HTMLTableRowElement>('table.diff-split tr.diff-widget');
+    for (const row of rows) {
+      const cells = Array.from(row.children).filter(
+        (el): el is HTMLTableCellElement => el.tagName === 'TD' && el.classList.contains('diff-widget-content'),
+      );
+      if (cells.length === 2) {
+        const [left, right] = cells;
+        const leftHas = left.childNodes.length > 0;
+        const rightHas = right.childNodes.length > 0;
+        if (leftHas && !rightHas) {
+          left.colSpan = 4;
+          left.style.display = '';
+          right.style.display = 'none';
+        } else if (rightHas && !leftHas) {
+          right.colSpan = 4;
+          right.style.display = '';
+          left.style.display = 'none';
+        } else {
+          left.colSpan = 2;
+          right.colSpan = 2;
+          left.style.display = '';
+          right.style.display = '';
+        }
+      }
+    }
+  }, [effectiveViewType, widgets]);
 
   const renderGutter = ({ change, side, renderDefault }: GutterOptions) => {
     const ln = side === 'old' ? computeOldLineNumber(change) : computeNewLineNumber(change);
@@ -521,6 +585,7 @@ export function CodeReviewPane({
   const isCheckpointed = detail?.reviewState === 'resolved';
   const canUndoCheckpoint = isCheckpointed && !!detail?.canUndoReview;
   const isCheckpointLocked = isCheckpointed && !detail?.canUndoReview;
+  const isReviewUnavailable = !detail?.reviewState || detail.reviewState === 'dismissed';
   const checkpointBusy = checkpoint.isPending || undoCheckpoint.isPending;
 
   return (
@@ -557,7 +622,7 @@ export function CodeReviewPane({
           </span>
         )}
         <div className="rev-h-acts">
-          <div className="seg no-mobile" role="group" aria-label="Diff 视图模式">
+          <div className="seg rev-view-seg" role="group" aria-label="Diff 视图模式">
             <button
               type="button"
               className={viewType === 'unified' ? 'on' : ''}
@@ -574,7 +639,7 @@ export function CodeReviewPane({
             </button>
           </div>
           {project && d && (
-            <div className="no-mobile">
+            <div className="rev-ide-slot">
               <IdeOpenButton
                 project={project}
                 delivery={d}
@@ -587,23 +652,34 @@ export function CodeReviewPane({
           {d && (
             <button
               type="button"
-              className={`btn-checkpoint ${isCheckpointed ? 'is-checked' : ''} ${isCheckpointLocked ? 'is-locked' : ''}`}
-              disabled={checkpointBusy || isCheckpointLocked}
+              className={`btn-checkpoint ${isCheckpointed ? 'is-checked' : ''} ${isCheckpointLocked || isReviewUnavailable ? 'is-locked' : ''}`}
+              disabled={checkpointBusy || isCheckpointLocked || isReviewUnavailable}
               title={
-                canUndoCheckpoint
-                  ? '已标记 Checkpoint（发送消息前再次点击可撤销）'
-                  : isCheckpointLocked
-                    ? '已发送新消息，该 Checkpoint 已确认锁定不可撤销'
-                    : '确认无误并记为 Checkpoint（发送消息前可再次点击撤销）'
+                detail?.reviewState === 'dismissed'
+                  ? '该交付审阅已关闭（任务已归档或已忽略）'
+                  : !detail?.reviewState
+                    ? '当前交付无可审阅状态'
+                    : canUndoCheckpoint
+                      ? '已标记 Checkpoint（发送消息前再次点击可撤销）'
+                      : isCheckpointLocked
+                        ? '已发送新消息，该 Checkpoint 已确认锁定不可撤销'
+                        : '确认无误并记为 Checkpoint（发送消息前可再次点击撤销）'
               }
               onClick={() => {
+                if (isReviewUnavailable) return;
                 if (canUndoCheckpoint) undoCheckpoint.mutate();
                 else if (!isCheckpointed) checkpoint.mutate();
               }}
             >
               <Check size={12} strokeWidth={2.2} />
               <span>
-                {canUndoCheckpoint ? '已 Check · 撤销' : isCheckpointLocked ? '已 Checkpoint' : 'Checkpoint'}
+                {detail?.reviewState === 'dismissed'
+                  ? '已关闭'
+                  : canUndoCheckpoint
+                    ? '已 Check · 撤销'
+                    : isCheckpointLocked
+                      ? '已 Checkpoint'
+                      : 'Checkpoint'}
               </span>
             </button>
           )}

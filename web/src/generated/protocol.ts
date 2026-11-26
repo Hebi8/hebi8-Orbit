@@ -84,7 +84,7 @@ export type InboxCategory = (typeof InboxCategoryValues)[number];
 export const InboxStateValues = ["open", "resolved", "dismissed"] as const;
 export type InboxState = (typeof InboxStateValues)[number];
 
-export const EventKindValues = ["task.created", "task.state_changed", "task.cancelled", "task.archived", "task.unarchived", "task.deleted", "attempt.started", "attempt.state_changed", "attempt.finished", "resource.waiting", "resource.acquired", "delivery.published", "delivery.verified", "delivery.ryugi_updated", "delivery.review_completed", "delivery.review_reopened", "annotation.created", "annotation.addressed", "approval.requested", "approval.decided", "approval.expired", "approval.consumed", "deploy.started", "deploy.verified", "deploy.failed", "acp.message_batch", "acp.thought_batch", "acp.tool_call", "acp.unsolicited_update", "acp.usage", "pa.turn", "pa.action_executed", "pa.thread_created", "board.message_posted", "board.member_updated", "queue.updated", "task.project_bound", "task.source_added", "task.source_removed", "machine.state_changed", "pairing.updated", "machine.agents_updated", "project.changed", "network.settings_changed", "hebi8.folded", "task.child_spawned", "task.child_updated"] as const;
+export const EventKindValues = ["task.created", "task.state_changed", "task.cancelled", "task.archived", "task.unarchived", "task.deleted", "attempt.started", "attempt.state_changed", "attempt.finished", "resource.waiting", "resource.acquired", "delivery.published", "delivery.verified", "delivery.ryugi_updated", "delivery.review_completed", "delivery.review_reopened", "annotation.created", "annotation.addressed", "approval.requested", "approval.decided", "approval.expired", "approval.consumed", "deploy.started", "deploy.verified", "deploy.failed", "acp.message_batch", "acp.thought_batch", "acp.tool_call", "acp.unsolicited_update", "acp.usage", "pa.turn", "pa.action_executed", "pa.thread_created", "board.message_posted", "board.member_updated", "queue.updated", "task.project_bound", "task.source_added", "task.source_removed", "machine.state_changed", "pairing.updated", "machine.agents_updated", "project.changed", "network.settings_changed", "hebi8.folded", "task.child_spawned", "task.child_updated", "delegation.sent"] as const;
 export type EventKind = (typeof EventKindValues)[number];
 
 export const IDESchemeValues = ["cursor", "vscode", "zed", "antigravity"] as const;
@@ -581,6 +581,8 @@ export interface AttemptView {
   promptText?: string;
   refTasks?: ReferencedTaskMeta[];
   childResult?: ChildResultMeta | null;
+  delegatedFromTaskId?: string;
+  delegatedRelation?: string;
   worktreePath?: string;
   baseSha?: string;
   outputDeliveryId?: string;
@@ -621,6 +623,12 @@ export interface TaskSummary {
   createdAt: number;
   updatedAt: number;
   archivedAt?: number | null;
+}
+
+export interface ListTasksResponse {
+  tasks: TaskSummary[];
+  projectCounts?: Record<string, number>;
+  totalCount?: number;
 }
 
 export interface EventRecord {

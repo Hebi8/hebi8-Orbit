@@ -710,12 +710,12 @@ func (s *Store) SubmitFollowupAtomic(ctx context.Context, p SubmitFollowupParams
 	}
 
 	err := s.WithWriteTx(ctx, func(tx *sql.Tx) error {
-		// P1-1: Atomically verify runner caller control + delegate scope (descendant, or same-parent sibling when AllowSibling is set) inside the write tx.
+		// P1-1: Atomically verify runner caller control + strict 1-hop delegate scope (direct child of top-level parent, or same-parent sibling when AllowSibling is set) inside the write tx.
 		if p.RunnerParentGuard != nil {
 			if err := verifyRunnerParentControlTx(ctx, tx, p.RunnerParentGuard); err != nil {
 				return err
 			}
-			allowed, err := isDescendantTaskTx(ctx, tx, p.RunnerParentGuard.ParentTaskID, p.TaskID)
+			allowed, err := isDirectChildTaskTx(ctx, tx, p.RunnerParentGuard.ParentTaskID, p.TaskID)
 			if err != nil {
 				return err
 			}
@@ -1899,6 +1899,12 @@ func (s *Store) ConsumeNextPendingInput(ctx context.Context, p ConsumeNextPendin
 			"action":              "dispatched",
 			"inputId":             pi.InputID,
 			"dispatchedAttemptId": att.AttemptID,
+		}
+		if fromTaskID := stringField(triggerPayload, "delegatedFromTaskId"); fromTaskID != "" {
+			evQPayload["delegatedFromTaskId"] = fromTaskID
+		}
+		if rel := stringField(triggerPayload, "delegatedRelation"); rel != "" {
+			evQPayload["delegatedRelation"] = rel
 		}
 		if len(affectedDeliveryIDs) > 0 {
 			evQPayload["deliveryIds"] = affectedDeliveryIDs

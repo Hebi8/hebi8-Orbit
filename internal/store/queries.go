@@ -868,14 +868,16 @@ func (s *Store) GetTaskTimeline(ctx context.Context, taskID string, beforeSeq in
 }
 
 func loadTaskLatestContextUsageTx(ctx context.Context, tx *sql.Tx, taskID string) (*protocol.ContextUsage, error) {
-	var latestSessionID sql.NullString
+	var sessID, runtimeState string
+	var locked int
 	err := tx.QueryRowContext(ctx, `
-		SELECT wb_session_id
-		FROM attempts
-		WHERE task_id = ?
-		ORDER BY attempt_no DESC
+		SELECT a.wb_session_id, s.runtime_state, s.locked
+		FROM attempts a
+		JOIN agent_sessions s ON s.wb_session_id = a.wb_session_id
+		WHERE a.task_id = ? AND a.wb_session_id IS NOT NULL AND TRIM(a.wb_session_id) != ''
+		ORDER BY a.attempt_no DESC
 		LIMIT 1
-	`, taskID).Scan(&latestSessionID)
+	`, taskID).Scan(&sessID, &runtimeState, &locked)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -883,41 +885,21 @@ func loadTaskLatestContextUsageTx(ctx context.Context, tx *sql.Tx, taskID string
 		return nil, err
 	}
 
-	var query string
-	var args []any
-	if latestSessionID.Valid && strings.TrimSpace(latestSessionID.String) != "" {
-		sessID := strings.TrimSpace(latestSessionID.String)
-		var runtimeState string
-		var locked int
-		if sErr := tx.QueryRowContext(ctx, `
-			SELECT runtime_state, locked FROM agent_sessions WHERE wb_session_id = ?
-		`, sessID).Scan(&runtimeState, &locked); sErr == nil {
-			if locked != 0 || runtimeState == string(protocol.SessionDead) {
-				// Session was rolled over or closed (e.g. Hebi8 manual fold); context resets until a new attempt runs.
-				return nil, nil
-			}
-		}
-		query = `
-			SELECT e.attempt_id, e.payload_json, e.created_at
-			FROM events e
-			JOIN attempts a ON a.attempt_id = e.attempt_id
-			WHERE e.task_id = ? AND e.kind = ? AND a.wb_session_id = ?
-			ORDER BY e.seq DESC
-			LIMIT 20
-		`
-		args = []any{taskID, string(protocol.EventACPUsage), sessID}
-	} else {
-		query = `
-			SELECT attempt_id, payload_json, created_at
-			FROM events
-			WHERE task_id = ? AND kind = ?
-			ORDER BY seq DESC
-			LIMIT 20
-		`
-		args = []any{taskID, string(protocol.EventACPUsage)}
+	sessID = strings.TrimSpace(sessID)
+	if sessID == "" || locked != 0 || runtimeState == string(protocol.SessionDead) {
+		// Session was rolled over, locked, or closed (e.g. Hebi8 manual fold / needs_verification);
+		// never fall back to task-wide history even if a later manual_import attempt has no wb_session_id.
+		return nil, nil
 	}
 
-	rows, err := tx.QueryContext(ctx, query, args...)
+	rows, err := tx.QueryContext(ctx, `
+		SELECT e.attempt_id, e.payload_json, e.created_at
+		FROM events e
+		JOIN attempts a ON a.attempt_id = e.attempt_id
+		WHERE e.task_id = ? AND e.kind = ? AND a.wb_session_id = ?
+		ORDER BY e.seq DESC
+		LIMIT 20
+	`, taskID, string(protocol.EventACPUsage), sessID)
 	if err != nil {
 		return nil, err
 	}
@@ -992,6 +974,38 @@ func extractChildResultMeta(triggerPayloadJSON string) *protocol.ChildResultMeta
 	return doc.ChildResult
 }
 
+func extractDelegatedOrigin(triggerPayloadJSON string) (string, string) {
+	if strings.TrimSpace(triggerPayloadJSON) == "" {
+		return "", ""
+	}
+	var doc struct {
+		DelegatedFromTaskID string `json:"delegatedFromTaskId"`
+		DelegatedRelation   string `json:"delegatedRelation"`
+	}
+	if err := json.Unmarshal([]byte(triggerPayloadJSON), &doc); err != nil {
+		return "", ""
+	}
+	return strings.TrimSpace(doc.DelegatedFromTaskID), strings.TrimSpace(doc.DelegatedRelation)
+}
+
+// ListRecentTasksOptions configures server-side filtering, sorting, and archived metadata counts for GET /api/tasks.
+type ListRecentTasksOptions struct {
+	Limit          int
+	Query          string
+	ExcludeProject string
+	ProjectID      string
+	ArchivedFilter string // "active" | "only" | "all"
+	Sort           string // "archived_at" | "updated_at" | "title"
+	TopLevelOnly   bool
+}
+
+// ListRecentTasksResult returns filtered/sorted tasks and (for archived=only) full untruncated top-level counts.
+type ListRecentTasksResult struct {
+	Tasks         []protocol.TaskSummary
+	ProjectCounts map[string]int
+	TotalCount    int
+}
+
 // ListRecentTasks returns recent non-archived tasks across all projects ordered by recency.
 func (s *Store) ListRecentTasks(ctx context.Context, limit int) ([]protocol.TaskSummary, error) {
 	return s.ListRecentTasksFiltered(ctx, limit, "", "", "", "active")
@@ -1001,23 +1015,49 @@ func (s *Store) ListRecentTasks(ctx context.Context, limit int) ([]protocol.Task
 // (matching title, goal, project_id, or project display_name), optional excluded project ID,
 // optional included projectId, and archivedFilter ("active" | "only" | "all", default "active").
 func (s *Store) ListRecentTasksFiltered(ctx context.Context, limit int, query, excludeProject, projectID, archivedFilter string) ([]protocol.TaskSummary, error) {
+	res, err := s.ListRecentTasksWithMeta(ctx, ListRecentTasksOptions{
+		Limit:          limit,
+		Query:          query,
+		ExcludeProject: excludeProject,
+		ProjectID:      projectID,
+		ArchivedFilter: archivedFilter,
+	})
+	return res.Tasks, err
+}
+
+// ListRecentTasksWithMeta filters and sorts tasks in SQL before LIMIT, and when archivedFilter=="only"
+// computes untruncated top-level archived counts per project and totalCount inside the same read transaction.
+func (s *Store) ListRecentTasksWithMeta(ctx context.Context, opts ListRecentTasksOptions) (ListRecentTasksResult, error) {
+	limit := opts.Limit
 	if limit <= 0 {
 		limit = 80
 	}
 	if limit > 200 {
 		limit = 200
 	}
-	q := strings.ToLower(strings.TrimSpace(query))
-	excludeProject = strings.TrimSpace(excludeProject)
-	projectID = strings.TrimSpace(projectID)
+	q := strings.ToLower(strings.TrimSpace(opts.Query))
+	excludeProject := strings.TrimSpace(opts.ExcludeProject)
+	projectID := strings.TrimSpace(opts.ProjectID)
+	archivedFilter := strings.TrimSpace(opts.ArchivedFilter)
+	sortKey := strings.ToLower(strings.TrimSpace(opts.Sort))
+	isArchivedOnly := strings.EqualFold(archivedFilter, "only")
 
-	out := []protocol.TaskSummary{}
+	res := ListRecentTasksResult{
+		Tasks: []protocol.TaskSummary{},
+	}
+	if isArchivedOnly {
+		res.ProjectCounts = map[string]int{}
+	}
+
 	err := s.WithReadTx(ctx, func(tx *sql.Tx) error {
 		var sb strings.Builder
 		sb.WriteString(taskSummarySelectSQL)
 		sb.WriteString(` LEFT JOIN projects p ON p.project_id = t.project_id`)
 		sb.WriteString(` WHERE ` + archivedFilterSQL(archivedFilter))
 		args := []any{}
+		if opts.TopLevelOnly {
+			sb.WriteString(` AND (t.parent_task_id IS NULL OR t.parent_task_id = '')`)
+		}
 		if projectID != "" {
 			sb.WriteString(` AND t.project_id = ?`)
 			args = append(args, projectID)
@@ -1032,10 +1072,19 @@ func (s *Store) ListRecentTasksFiltered(ctx context.Context, limit int, query, e
 			sb.WriteString(` AND (LOWER(t.title) LIKE ? ESCAPE '\' OR LOWER(t.goal) LIKE ? ESCAPE '\' OR LOWER(t.project_id) LIKE ? ESCAPE '\' OR LOWER(COALESCE(p.display_name, '')) LIKE ? ESCAPE '\')`)
 			args = append(args, like, like, like, like)
 		}
-		if strings.EqualFold(strings.TrimSpace(archivedFilter), "only") {
-			sb.WriteString(` ORDER BY COALESCE(t.archived_at, t.updated_at) DESC, t.updated_at DESC LIMIT ?`)
-		} else {
+		switch sortKey {
+		case "title":
+			sb.WriteString(` ORDER BY LOWER(COALESCE(NULLIF(TRIM(t.title), ''), NULLIF(TRIM(t.goal), ''), t.task_id)) ASC, t.updated_at DESC LIMIT ?`)
+		case "updated_at":
 			sb.WriteString(` ORDER BY t.updated_at DESC LIMIT ?`)
+		case "archived_at":
+			sb.WriteString(` ORDER BY COALESCE(t.archived_at, t.updated_at) DESC, t.updated_at DESC LIMIT ?`)
+		default:
+			if isArchivedOnly {
+				sb.WriteString(` ORDER BY COALESCE(t.archived_at, t.updated_at) DESC, t.updated_at DESC LIMIT ?`)
+			} else {
+				sb.WriteString(` ORDER BY t.updated_at DESC LIMIT ?`)
+			}
 		}
 		args = append(args, limit)
 
@@ -1049,11 +1098,44 @@ func (s *Store) ListRecentTasksFiltered(ctx context.Context, limit int, query, e
 			if err != nil {
 				return err
 			}
-			out = append(out, ts)
+			res.Tasks = append(res.Tasks, ts)
 		}
-		return rows.Err()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+
+		if isArchivedOnly {
+			var csb strings.Builder
+			csb.WriteString(`SELECT t.project_id, COUNT(*) FROM tasks t WHERE t.archived_at IS NOT NULL AND (t.parent_task_id IS NULL OR t.parent_task_id = '')`)
+			cArgs := []any{}
+			if excludeProject != "" {
+				csb.WriteString(` AND t.project_id != ?`)
+				cArgs = append(cArgs, excludeProject)
+			}
+			csb.WriteString(` GROUP BY t.project_id`)
+			cRows, err := tx.QueryContext(ctx, csb.String(), cArgs...)
+			if err != nil {
+				return err
+			}
+			defer cRows.Close()
+			total := 0
+			for cRows.Next() {
+				var pid string
+				var cnt int
+				if err := cRows.Scan(&pid, &cnt); err != nil {
+					return err
+				}
+				res.ProjectCounts[pid] = cnt
+				total += cnt
+			}
+			if err := cRows.Err(); err != nil {
+				return err
+			}
+			res.TotalCount = total
+		}
+		return nil
 	})
-	return out, err
+	return res, err
 }
 
 func truncatePromptText(prompt string) string {
@@ -1110,6 +1192,7 @@ func scanAttemptView(scanner interface{ Scan(...any) error }) (protocol.AttemptV
 	a.PromptText = extractBoundedPromptText(triggerPayloadJSON)
 	a.RefTasks = extractReferencedTasks(triggerPayloadJSON)
 	a.ChildResult = extractChildResultMeta(triggerPayloadJSON)
+	a.DelegatedFromTaskID, a.DelegatedRelation = extractDelegatedOrigin(triggerPayloadJSON)
 	a.State = protocol.AttemptState(state)
 	if worktree.Valid {
 		a.WorktreePath = worktree.String
@@ -2303,6 +2386,33 @@ func (s *Store) CompleteDeliveryReview(ctx context.Context, deliveryID, actorID 
 		}
 
 		inboxID := "inb:dlv:" + deliveryID
+		var stateStr string
+		var existingResolved sql.NullInt64
+		if err := tx.QueryRowContext(ctx, `SELECT state, resolved_at FROM inbox_items WHERE inbox_id = ?`, inboxID).Scan(&stateStr, &existingResolved); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("%w: delivery review inbox item %s not found", ErrNotFound, inboxID)
+			}
+			return err
+		}
+
+		curState := protocol.InboxState(stateStr)
+		if curState == protocol.InboxResolved {
+			resolvedAt := now
+			if existingResolved.Valid {
+				resolvedAt = existingResolved.Int64
+			}
+			resp = protocol.CompleteReviewResponse{
+				DeliveryID: deliveryID,
+				InboxID:    inboxID,
+				InboxState: protocol.InboxResolved,
+				ResolvedAt: resolvedAt,
+			}
+			return nil
+		}
+		if curState != protocol.InboxOpen {
+			return fmt.Errorf("%w: delivery review state is %s", ErrConflict, curState)
+		}
+
 		res, err := tx.ExecContext(ctx, `
 			UPDATE inbox_items
 			SET state = 'resolved', resolved_at = ?, updated_at = ?
@@ -2312,42 +2422,37 @@ func (s *Store) CompleteDeliveryReview(ctx context.Context, deliveryID, actorID 
 			return err
 		}
 		changed, _ := res.RowsAffected()
-
-		resolvedAt := now
-		if changed > 0 {
-			if actorID == "" {
-				actorID = "human"
-			}
-			ev, err := insertEventTx(ctx, tx, eventInsert{
-				StreamID:   "task:" + taskID,
-				ProjectID:  projectID,
-				TaskID:     taskID,
-				ActorKind:  protocol.ActorHuman,
-				ActorID:    actorID,
-				Kind:       protocol.EventDeliveryReviewCompleted,
-				Visibility: protocol.VisibilityInbox,
-				Payload: map[string]any{
-					"deliveryId": deliveryID,
-					"inboxId":    inboxID,
-				},
-				CreatedAt: now,
-			})
-			if err != nil {
-				return err
-			}
-			emitted = &ev
-		} else {
-			var existingResolved sql.NullInt64
-			if err := tx.QueryRowContext(ctx, `SELECT resolved_at FROM inbox_items WHERE inbox_id = ?`, inboxID).Scan(&existingResolved); err == nil && existingResolved.Valid {
-				resolvedAt = existingResolved.Int64
-			}
+		if changed == 0 {
+			return fmt.Errorf("%w: delivery review %s is no longer open", ErrConflict, deliveryID)
 		}
+
+		if actorID == "" {
+			actorID = "human"
+		}
+		ev, err := insertEventTx(ctx, tx, eventInsert{
+			StreamID:   "task:" + taskID,
+			ProjectID:  projectID,
+			TaskID:     taskID,
+			ActorKind:  protocol.ActorHuman,
+			ActorID:    actorID,
+			Kind:       protocol.EventDeliveryReviewCompleted,
+			Visibility: protocol.VisibilityInbox,
+			Payload: map[string]any{
+				"deliveryId": deliveryID,
+				"inboxId":    inboxID,
+			},
+			CreatedAt: now,
+		})
+		if err != nil {
+			return err
+		}
+		emitted = &ev
 
 		resp = protocol.CompleteReviewResponse{
 			DeliveryID: deliveryID,
 			InboxID:    inboxID,
 			InboxState: protocol.InboxResolved,
-			ResolvedAt: resolvedAt,
+			ResolvedAt: now,
 		}
 		return nil
 	})
@@ -2377,10 +2482,12 @@ func canUndoDeliveryReviewTx(ctx context.Context, tx *sql.Tx, taskID, deliveryID
 		return false, nil
 	}
 
+	// Any follow-up / batch submitted after Checkpoint permanently locks undo,
+	// even if that queued pending input is later withdrawn/cancelled.
 	var laterInputs int
 	if err := tx.QueryRowContext(ctx, `
 		SELECT COUNT(*) FROM task_pending_inputs
-		WHERE task_id = ? AND state IN ('queued', 'dispatched') AND created_at > ?
+		WHERE task_id = ? AND created_at > ?
 	`, taskID, resolvedAt).Scan(&laterInputs); err != nil {
 		return false, err
 	}
@@ -2448,8 +2555,7 @@ func canUndoDeliveryReviewTx(ctx context.Context, tx *sql.Tx, taskID, deliveryID
 				return false, err
 			}
 			var doc struct {
-				Action  string `json:"action"`
-				InputID string `json:"inputId"`
+				Action string `json:"action"`
 			}
 			if json.Unmarshal([]byte(raw), &doc) != nil {
 				continue
@@ -2457,18 +2563,12 @@ func canUndoDeliveryReviewTx(ctx context.Context, tx *sql.Tx, taskID, deliveryID
 			switch doc.Action {
 			case "deleted", "cancelled", "reordered", "updated":
 				continue
+			case "enqueued", "steered", "annotation_batch_queued", "annotation_batch_dispatched", "dispatched":
+				// Historical submission/dispatch event after Checkpoint locks undo permanently,
+				// regardless of whether the queued item was subsequently cancelled/withdrawn.
+				return false, nil
 			default:
-				if strings.TrimSpace(doc.InputID) != "" {
-					var activeCount int
-					if err := tx.QueryRowContext(ctx, `
-						SELECT COUNT(*) FROM task_pending_inputs
-						WHERE input_id = ? AND state IN ('queued', 'dispatched')
-					`, doc.InputID).Scan(&activeCount); err == nil && activeCount > 0 {
-						return false, nil
-					}
-				} else {
-					return false, nil
-				}
+				return false, nil
 			}
 		}
 		if err := qRows.Err(); err != nil {
@@ -2677,7 +2777,7 @@ func (s *Store) ListEventsPage(ctx context.Context, afterSeq, upToSeq int64, lim
 			SELECT seq, event_id, stream_id, project_id, task_id, attempt_id,
 			       actor_kind, actor_id, kind, visibility, payload_json, created_at
 			FROM events
-			WHERE seq > ? AND seq <= ? AND visibility != 'raw_acp'
+			WHERE seq > ? AND seq <= ? AND (visibility != 'raw_acp' OR kind = 'acp.usage')
 			ORDER BY seq ASC
 			LIMIT ?
 		`, afterSeq, upToSeq, limit)
@@ -2686,7 +2786,7 @@ func (s *Store) ListEventsPage(ctx context.Context, afterSeq, upToSeq int64, lim
 			SELECT seq, event_id, stream_id, project_id, task_id, attempt_id,
 			       actor_kind, actor_id, kind, visibility, payload_json, created_at
 			FROM events
-			WHERE seq > ? AND visibility != 'raw_acp'
+			WHERE seq > ? AND (visibility != 'raw_acp' OR kind = 'acp.usage')
 			ORDER BY seq ASC
 			LIMIT ?
 		`, afterSeq, limit)

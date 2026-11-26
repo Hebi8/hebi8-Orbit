@@ -1002,6 +1002,22 @@ func (s *Store) UpdateProjectLocationWithRuntime(
 				nextIso = string(*req.Isolation)
 			}
 		}
+		pathChanged := req.AbsPath != nil || req.MachineID != nil
+		newRepoID := strings.TrimSpace(repoIdentity)
+		if runtimeState != nil && !runtimeState.IsGit {
+			newRepoID = ""
+		}
+		var locCount int
+		if pathChanged {
+			if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM project_locations WHERE part_id = ?`, partID).Scan(&locCount); err != nil {
+				return err
+			}
+			curID := strings.TrimSpace(curRepoID)
+			if locCount > 1 && curID != "" && newRepoID != "" && !strings.EqualFold(curID, newRepoID) {
+				return fmt.Errorf("%w: directory repoIdentity %q conflicts with part repoIdentity %q", ErrRepoIdentityConflict, newRepoID, curID)
+			}
+		}
+
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE project_locations
 			SET machine_id = ?, abs_path = ?, is_default = ?, isolation = ?, updated_at = ?
@@ -1017,8 +1033,20 @@ func (s *Store) UpdateProjectLocationWithRuntime(
 				return err
 			}
 		}
-		if strings.TrimSpace(curRepoID) == "" && strings.TrimSpace(repoIdentity) != "" {
-			_, _ = tx.ExecContext(ctx, `UPDATE project_parts SET repo_identity = ?, updated_at = ? WHERE part_id = ?`, strings.TrimSpace(repoIdentity), now, partID)
+		if pathChanged {
+			if locCount <= 1 {
+				if _, err := tx.ExecContext(ctx, `UPDATE project_parts SET repo_identity = ?, updated_at = ? WHERE part_id = ?`, newRepoID, now, partID); err != nil {
+					return err
+				}
+			} else if strings.TrimSpace(curRepoID) == "" && newRepoID != "" {
+				if _, err := tx.ExecContext(ctx, `UPDATE project_parts SET repo_identity = ?, updated_at = ? WHERE part_id = ?`, newRepoID, now, partID); err != nil {
+					return err
+				}
+			}
+		} else if strings.TrimSpace(curRepoID) == "" && newRepoID != "" {
+			if _, err := tx.ExecContext(ctx, `UPDATE project_parts SET repo_identity = ?, updated_at = ? WHERE part_id = ?`, newRepoID, now, partID); err != nil {
+				return err
+			}
 		}
 		if err := syncProjectAnchorsMirrorTx(ctx, tx, projectID, now); err != nil {
 			return err

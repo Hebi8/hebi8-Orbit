@@ -86,16 +86,18 @@ export function useAnchoredPopover({
       onClose();
     };
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
+      if (e.key === 'Escape' && !e.isComposing) {
+        e.preventDefault();
+        e.stopImmediatePropagation();
         e.stopPropagation();
         onClose();
       }
     };
     document.addEventListener('mousedown', onDown);
-    window.addEventListener('keydown', onKey);
+    window.addEventListener('keydown', onKey, true);
     return () => {
       document.removeEventListener('mousedown', onDown);
-      window.removeEventListener('keydown', onKey);
+      window.removeEventListener('keydown', onKey, true);
     };
   }, [open, anchorRef, popRef, onClose]);
 

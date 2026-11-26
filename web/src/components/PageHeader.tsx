@@ -65,6 +65,8 @@ export interface PageHeaderProps {
   /** Optional second-line metadata rendered beneath the breadcrumb inside `.topbar-left`. */
   subtitle?: ReactNode;
   right?: ReactNode;
+  /** When true, omits the default top-right ⌘K/Search button (shortcut remains active globally). */
+  hideCmdK?: boolean;
   className?: string;
 }
 
@@ -75,6 +77,7 @@ export function PageHeader({
   titleTrail,
   subtitle,
   right,
+  hideCmdK = false,
   className,
 }: PageHeaderProps) {
   const collapsed = useWorkbenchStore((s) => s.sidebarCollapsed);
@@ -107,12 +110,14 @@ export function PageHeader({
       )}
       <div className="hact">
         {right}
-        <button type="button" className="hb" title="全局快唤 (⌘K)" aria-label="全局快唤" onClick={() => setCmdk(true)}>
-          <Search size={13} strokeWidth={1.6} className="only-mobile" />
-          <span className="kbd no-mobile" style={{ border: 0 }}>
-            ⌘K
-          </span>
-        </button>
+        {!hideCmdK && (
+          <button type="button" className="hb" title="全局快唤 (⌘K)" aria-label="全局快唤" onClick={() => setCmdk(true)}>
+            <Search size={13} strokeWidth={1.6} className="only-mobile" />
+            <span className="kbd no-mobile" style={{ border: 0 }}>
+              ⌘K
+            </span>
+          </button>
+        )}
       </div>
     </header>
   );

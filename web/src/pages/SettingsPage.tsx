@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import {
   ArrowDown,
@@ -69,6 +69,10 @@ export function SettingsPage({
   const [savingName, setSavingName] = useState(false);
   const [savingDuty, setSavingDuty] = useState(false);
 
+  const consumedInitialRef = useRef<string | null>(
+    initialMachineId && boot.machines.some((m) => m.machineId === initialMachineId) ? initialMachineId : null,
+  );
+
   const [expandedMachine, setExpandedMachine] = useState<string>(() => {
     if (initialMachineId && boot.machines.some((m) => m.machineId === initialMachineId)) {
       return initialMachineId;
@@ -78,7 +82,13 @@ export function SettingsPage({
   });
 
   useEffect(() => {
-    if (initialMachineId && boot.machines.some((m) => m.machineId === initialMachineId)) {
+    if (!initialMachineId) {
+      consumedInitialRef.current = null;
+      return;
+    }
+    if (consumedInitialRef.current === initialMachineId) return;
+    if (boot.machines.some((m) => m.machineId === initialMachineId)) {
+      consumedInitialRef.current = initialMachineId;
       setExpandedMachine(initialMachineId);
     }
   }, [initialMachineId, boot.machines]);
@@ -693,6 +703,7 @@ export function SettingsPage({
                 const isWorker = curRole === 'worker';
 
                 const toggleCard = () => {
+                  consumedInitialRef.current = initialMachineId ?? '__manual__';
                   setExpandedMachine((cur) => (cur === m.machineId ? '' : m.machineId));
                 };
 
@@ -892,6 +903,7 @@ export function SettingsPage({
         bindMachineId={pairBindMachine}
         machines={boot.machines}
         onPaired={(machineId) => {
+          consumedInitialRef.current = initialMachineId ?? '__paired__';
           setExpandedMachine(machineId);
           refreshAll();
         }}

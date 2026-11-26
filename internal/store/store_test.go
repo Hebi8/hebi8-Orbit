@@ -700,6 +700,124 @@ func TestDeliveryReviewCheckpointReopenBeforeSendAndLockAfterMessage(t *testing.
 	}
 }
 
+func TestDeliveryReviewCheckpointStaysLockedAfterWithdrawnQueuedFollowup(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	// Create a running task with an active attempt so subsequent follow-up enters task_pending_inputs
+	created, err := s.CreateTask(ctx, store.CreateTaskParams{
+		ProjectID:     "proj-a",
+		Title:         "Busy Checkpoint Task",
+		Goal:          "Initial goal",
+		MachineID:     "hub-node",
+		Adapter:       protocol.AdapterAgy,
+		CreateAttempt: true,
+		LeaseTTLMs:    60000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dlvID := "dlv_withdraw_lock_1"
+	if _, err := s.CreateManualImportDelivery(ctx, store.ManualImportParams{
+		DeliveryID:      dlvID,
+		ProjectID:       "proj-a",
+		TaskID:          created.Task.TaskID,
+		Title:           "Busy Checkpoint Task",
+		Summary:         "Ready for review",
+		SourceMachineID: "hub-node",
+		BaseSHA:         "1111111111111111111111111111111111111111",
+		HeadSHA:         "2222222222222222222222222222222222222222",
+		GitRef:          "refs/orbit/deliveries/" + dlvID,
+		Kind:            protocol.DeliveryCodeDiff,
+		ActorID:         "human",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Mark Checkpoint
+	if _, _, err := s.CompleteDeliveryReview(ctx, dlvID, "human"); err != nil {
+		t.Fatalf("CompleteDeliveryReview failed: %v", err)
+	}
+	// Enqueue a queued follow-up (using EnqueuePendingInput or SubmitFollowupAtomic while active attempt exists)
+	subRes, err := s.SubmitFollowupAtomic(ctx, store.SubmitFollowupParams{
+		TaskID:           created.Task.TaskID,
+		Body:             "Queued follow-up after checkpoint",
+		Mode:             protocol.FollowupModeQueue,
+		MachineID:        "hub-node",
+		Adapter:          protocol.AdapterAgy,
+		AnchorCapability: "primary-dev",
+		ActorKind:        protocol.ActorHuman,
+		ActorID:          "human",
+	})
+	if err != nil || subRes.PendingInput == nil {
+		t.Fatalf("expected queued pending input, got res=%+v err=%v", subRes, err)
+	}
+
+	// Withdraw / cancel the queued follow-up
+	if _, err := s.DeletePendingInput(ctx, created.Task.TaskID, subRes.PendingInput.InputID, "human"); err != nil {
+		t.Fatalf("DeletePendingInput failed: %v", err)
+	}
+
+	// Checkpoint MUST remain permanently locked even after the queued follow-up was withdrawn!
+	st, _, canUndo, err := s.GetDeliveryReviewState(ctx, dlvID)
+	if err != nil || st != protocol.InboxResolved || canUndo {
+		t.Fatalf("expected checkpoint to stay locked after withdrawing queued followup: st=%q canUndo=%v err=%v", st, canUndo, err)
+	}
+	if _, _, err := s.ReopenDeliveryReview(ctx, dlvID, "human"); !errors.Is(err, store.ErrCheckpointLocked) {
+		t.Fatalf("expected ErrCheckpointLocked after withdraw, got %v", err)
+	}
+}
+
+func TestCompleteDeliveryReviewRejectsDismissedOrMissingInbox(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	dlvID := "dlv_dismissed_check"
+	res, err := s.CreateManualImportDelivery(ctx, store.ManualImportParams{
+		DeliveryID:      dlvID,
+		ProjectID:       "proj-a",
+		Title:           "Dismissed Review Task",
+		Summary:         "Summary",
+		SourceMachineID: "hub-node",
+		BaseSHA:         "1111111111111111111111111111111111111111",
+		HeadSHA:         "2222222222222222222222222222222222222222",
+		GitRef:          "refs/orbit/deliveries/" + dlvID,
+		Kind:            protocol.DeliveryCodeDiff,
+		ActorID:         "human",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Idempotent complete on open -> resolved -> resolved returns original resolvedAt
+	cr1, ev1, err := s.CompleteDeliveryReview(ctx, dlvID, "human")
+	if err != nil || cr1.InboxState != protocol.InboxResolved || ev1 == nil {
+		t.Fatalf("first CompleteDeliveryReview failed: cr=%+v ev=%+v err=%v", cr1, ev1, err)
+	}
+	cr2, ev2, err := s.CompleteDeliveryReview(ctx, dlvID, "human")
+	if err != nil || cr2.InboxState != protocol.InboxResolved || cr2.ResolvedAt != cr1.ResolvedAt || ev2 != nil {
+		t.Fatalf("idempotent CompleteDeliveryReview mismatch: cr1=%+v cr2=%+v ev2=%+v err=%v", cr1, cr2, ev2, err)
+	}
+
+	// Dismissed inbox item (e.g. archived task) MUST fail with ErrConflict, NEVER return fake resolved
+	if _, err := s.WriteDB().ExecContext(ctx, `UPDATE inbox_items SET state = 'dismissed', resolved_at = NULL WHERE inbox_id = ?`, "inb:dlv:"+dlvID); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.CompleteDeliveryReview(ctx, dlvID, "human"); !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("expected ErrConflict for dismissed inbox item, got %v", err)
+	}
+
+	// Missing inbox item row (e.g. late delivery with no inbox card) MUST fail with ErrNotFound
+	if _, err := s.WriteDB().ExecContext(ctx, `DELETE FROM inbox_items WHERE inbox_id = ?`, "inb:dlv:"+dlvID); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.CompleteDeliveryReview(ctx, dlvID, "human"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound for missing inbox item, got %v", err)
+	}
+	_ = res
+}
+
 func TestTaskTimelineExposesRealTokenUsageAndContextUsage(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()
@@ -791,5 +909,29 @@ func TestTaskTimelineExposesRealTokenUsageAndContextUsage(t *testing.T) {
 	}
 	if tlAfterLock.ContextUsage != nil {
 		t.Fatalf("expected ContextUsage=nil after session locked/dead, got %+v", tlAfterLock.ContextUsage)
+	}
+
+	// Subsequent manual import delivery (attempt with wb_session_id = NULL) MUST NOT resurrect locked session's old ContextUsage!
+	if _, err := s.CreateManualImportDelivery(ctx, store.ManualImportParams{
+		DeliveryID:      "dlv_manual_after_lock",
+		ProjectID:       "proj-a",
+		TaskID:          created.Task.TaskID,
+		Title:           "Usage Task",
+		Summary:         "Manual import after session lock",
+		SourceMachineID: "hub-node",
+		BaseSHA:         "1111111111111111111111111111111111111111",
+		HeadSHA:         "2222222222222222222222222222222222222222",
+		GitRef:          "refs/orbit/deliveries/dlv_manual_after_lock",
+		Kind:            protocol.DeliveryCodeDiff,
+		ActorID:         "human",
+	}); err != nil {
+		t.Fatalf("CreateManualImportDelivery failed: %v", err)
+	}
+	tlAfterManual, err := s.GetTaskTimeline(ctx, created.Task.TaskID, 0, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tlAfterManual.ContextUsage != nil {
+		t.Fatalf("manual import attempt must NOT resurrect locked session ContextUsage, got %+v", tlAfterManual.ContextUsage)
 	}
 }

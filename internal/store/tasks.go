@@ -1064,6 +1064,19 @@ func createAttemptInTx(ctx context.Context, tx *sql.Tx, p createAttemptTxParams)
 		return AttemptRecord{}, protocol.EventRecord{}, fmt.Errorf("update task active_attempt_id: %w", err)
 	}
 
+	attStartedPayload := map[string]any{
+		"attemptNo":   nextAttemptNo,
+		"machineId":   machineID,
+		"adapter":     p.Adapter,
+		"triggerKind": p.TriggerKind,
+		"wbSessionId": wbSessionID,
+	}
+	if fromTaskID, ok := p.TriggerPayload["delegatedFromTaskId"].(string); ok && strings.TrimSpace(fromTaskID) != "" {
+		attStartedPayload["delegatedFromTaskId"] = strings.TrimSpace(fromTaskID)
+	}
+	if rel, ok := p.TriggerPayload["delegatedRelation"].(string); ok && strings.TrimSpace(rel) != "" {
+		attStartedPayload["delegatedRelation"] = strings.TrimSpace(rel)
+	}
 	ev, err := insertEventTx(ctx, tx, eventInsert{
 		StreamID:   "task:" + p.TaskID,
 		ProjectID:  p.ProjectID,
@@ -1073,14 +1086,8 @@ func createAttemptInTx(ctx context.Context, tx *sql.Tx, p createAttemptTxParams)
 		ActorID:    p.ActorID,
 		Kind:       protocol.EventAttemptStarted,
 		Visibility: protocol.VisibilityTimeline,
-		Payload: map[string]any{
-			"attemptNo":   nextAttemptNo,
-			"machineId":   machineID,
-			"adapter":     p.Adapter,
-			"triggerKind": p.TriggerKind,
-			"wbSessionId": wbSessionID,
-		},
-		CreatedAt: p.Now,
+		Payload:    attStartedPayload,
+		CreatedAt:  p.Now,
 	})
 	if err != nil {
 		return AttemptRecord{}, protocol.EventRecord{}, err
@@ -1525,12 +1532,12 @@ func (s *Store) CancelTaskActiveAttemptWithGuard(ctx context.Context, taskID, ac
 			if err := verifyRunnerParentControlTx(ctx, tx, guard); err != nil {
 				return err
 			}
-			isDesc, err := isDescendantTaskTx(ctx, tx, guard.ParentTaskID, taskID)
+			isDirectChild, err := isDirectChildTaskTx(ctx, tx, guard.ParentTaskID, taskID)
 			if err != nil {
 				return err
 			}
-			if !isDesc {
-				return fmt.Errorf("%w: task %s is not a descendant of %s", ErrForbidden, taskID, guard.ParentTaskID)
+			if !isDirectChild {
+				return fmt.Errorf("%w: task %s is not a direct child of top-level parent %s", ErrForbidden, taskID, guard.ParentTaskID)
 			}
 		}
 		if prevReceipt, found, err := lookupPAActionReceiptTx(ctx, tx, idemp); err != nil {

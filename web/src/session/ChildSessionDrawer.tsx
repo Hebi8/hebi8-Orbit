@@ -219,7 +219,7 @@ export function ChildSessionDrawer({
   useEffect(() => {
     if (childTaskId || !nativeMember) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key !== 'Escape' || e.isComposing) return;
+      if (e.key !== 'Escape' || e.isComposing || e.defaultPrevented) return;
       const s = useWorkbenchStore.getState();
       if (s.cmdkOpen || s.machinesOpen || s.review) return;
       e.preventDefault();
@@ -298,9 +298,6 @@ export function ChildSessionDrawer({
     formalCodeDeliveries.find((d) => d.deliveryId === task?.latestDeliveryId) ??
     formalCodeDeliveries[formalCodeDeliveries.length - 1] ??
     codeDeliveries[codeDeliveries.length - 1];
-  const hasCodeDiff =
-    !!latestCode &&
-    (latestCode.manifest.insertions > 0 || latestCode.manifest.deletions > 0 || latestCode.manifest.filesChanged > 0);
 
   const openApprovals =
     (childTl?.approvals.filter((a) => a.state === 'pending').length ?? childSummary?.openApprovalCount) || 0;
@@ -330,17 +327,6 @@ export function ChildSessionDrawer({
         />
 
         <div className="sub-hd-acts">
-          {!isMismatchedParent && hasCodeDiff && latestCode && (
-            <button
-              type="button"
-              className="sub-hd-diff"
-              title="打开该子会话的 Source Review"
-              onClick={() => openReview('code', childTaskId, latestCode.deliveryId)}
-            >
-              <span className="add">+{latestCode.manifest.insertions}</span>
-              <span className="del">−{latestCode.manifest.deletions}</span>
-            </button>
-          )}
           {!isMismatchedParent && (
             <button
               type="button"

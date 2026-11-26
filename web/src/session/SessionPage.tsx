@@ -31,9 +31,52 @@ import { SessionConversation } from './SessionConversation';
 
 const CODE_KINDS = new Set(['code_diff', 'mixed', 'workspace_snapshot']);
 const SUB_DRAWER_WIDTH_KEY = 'orbit.subDrawerWidth';
-const SUB_DRAWER_MIN = 340;
+const SUB_DRAWER_MIN = 260;
 const SUB_DRAWER_MAX = 680;
 const SUB_DRAWER_DEFAULT = 468;
+
+function measureNaturalDockHeight(cwrap: HTMLElement | null): number {
+  if (!cwrap) return 0;
+  const cs = getComputedStyle(cwrap);
+  const padBorder =
+    (parseFloat(cs.paddingTop) || 0) +
+    (parseFloat(cs.paddingBottom) || 0) +
+    (parseFloat(cs.borderTopWidth) || 0) +
+    (parseFloat(cs.borderBottomWidth) || 0);
+  let total = padBorder;
+  for (const child of Array.from(cwrap.children) as HTMLElement[]) {
+    if (child.classList.contains('composer')) {
+      const bcs = getComputedStyle(child);
+      const boxPadBorder =
+        (parseFloat(bcs.paddingTop) || 0) +
+        (parseFloat(bcs.paddingBottom) || 0) +
+        (parseFloat(bcs.borderTopWidth) || 0) +
+        (parseFloat(bcs.borderBottomWidth) || 0);
+      const gap = parseFloat(bcs.rowGap) || 0;
+      let kidsH = 0;
+      let visCount = 0;
+      for (const k of Array.from(child.children) as HTMLElement[]) {
+        const kh = k.getBoundingClientRect().height;
+        if (kh > 0) {
+          const kcs = getComputedStyle(k);
+          const marginExtra = k.classList.contains('composer-meta-bar')
+            ? parseFloat(kcs.marginBottom) || 0
+            : (parseFloat(kcs.marginTop) || 0) + (parseFloat(kcs.marginBottom) || 0);
+          kidsH += kh + marginExtra;
+          visCount += 1;
+        }
+      }
+      total += boxPadBorder + kidsH + Math.max(0, visCount - 1) * gap;
+    } else {
+      const ch = child.getBoundingClientRect().height;
+      if (ch > 0) {
+        const ccs = getComputedStyle(child);
+        total += ch + (parseFloat(ccs.marginTop) || 0) + (parseFloat(ccs.marginBottom) || 0);
+      }
+    }
+  }
+  return Math.ceil(total);
+}
 
 function readDrawerWidth(): number {
   try {
@@ -92,6 +135,7 @@ export function SessionPage({
   const [actionBusy, setActionBusy] = useState(false);
   const [activeNativeMemberName, setActiveNativeMemberName] = useState<string | null>(null);
   const [drawerWidth, setDrawerWidth] = useState<number>(readDrawerWidth);
+  const [stageWidth, setStageWidth] = useState<number>(0);
   const [draggingSash, setDraggingSash] = useState(false);
 
   const artMenuRef = useRef<HTMLDivElement | null>(null);
@@ -168,25 +212,81 @@ export function SessionPage({
     if (task && !isVirtual && expandedProjects[task.projectId] === undefined) setProjectExpanded(task.projectId, true);
   }, [task, isVirtual, expandedProjects, setProjectExpanded]);
 
-  // Keep `--composer-dock-h` synchronized with the main Composer dock height so the sash's
-  // continuous 1px top divider line bridges both Composer borders with 0px vertical drift.
+  // Observe stage width so split layout at narrow desktop viewports (e.g. 920px with 220px sidebar = 700px)
+  // stays cleanly side-by-side without the child drawer ever overlapping the main session.
+  useLayoutEffect(() => {
+    const root = sessRef.current;
+    if (!root) return;
+    const update = () => {
+      const w = Math.round(root.getBoundingClientRect().width);
+      if (w > 0) setStageWidth(w);
+    };
+    update();
+    const ro = new ResizeObserver(update);
+    ro.observe(root);
+    return () => ro.disconnect();
+  }, [taskId, childDrawerOpen]);
+
+  // Keep `--composer-dock-h` synchronized to the MAX natural height of BOTH main & child Composer docks
+  // (accounting for multiline textarea growth, pending Review annotation rows, banners, and ref chips),
+  // guaranteeing Δtop = 0px and Δheight = 0px across every state and smooth snap-back to 113px when cleared.
   useLayoutEffect(() => {
     const root = sessRef.current;
     if (!root || !childDrawerOpen) return;
-    const dockEl = root.querySelector('.session-main-col .cwrap') as HTMLElement | null;
-    if (!dockEl) return;
-    const sync = () => {
-      const h = Math.round(dockEl.getBoundingClientRect().height);
-      if (h > 0) root.style.setProperty('--composer-dock-h', `${h}px`);
+
+    let rafId = 0;
+    const observed = new Set<Element>();
+    const ro = new ResizeObserver(() => scheduleSync());
+
+    const attachTargets = () => {
+      const selectors = [
+        '.session-main-col .cwrap',
+        '.session-main-col .composer',
+        '.session-main-col .composer > *',
+        '.sub-drawer .cwrap',
+        '.sub-drawer .composer',
+        '.sub-drawer .composer > *',
+      ];
+      for (const el of root.querySelectorAll(selectors.join(', '))) {
+        if (!observed.has(el)) {
+          observed.add(el);
+          ro.observe(el);
+        }
+      }
     };
+
+    const sync = () => {
+      attachTargets();
+      const mainDock = root.querySelector('.session-main-col .cwrap') as HTMLElement | null;
+      const childDock = root.querySelector('.sub-drawer .cwrap') as HTMLElement | null;
+      const mainH = measureNaturalDockHeight(mainDock);
+      const childH = measureNaturalDockHeight(childDock);
+      const targetH = Math.max(113, mainH, childH);
+      root.style.setProperty('--composer-dock-h', `${targetH}px`);
+    };
+
+    const scheduleSync = () => {
+      if (rafId) cancelAnimationFrame(rafId);
+      rafId = requestAnimationFrame(() => {
+        rafId = 0;
+        sync();
+      });
+    };
+
     sync();
-    const ro = new ResizeObserver(sync);
-    ro.observe(dockEl);
+    const mo = new MutationObserver(() => {
+      attachTargets();
+      sync();
+    });
+    mo.observe(root, { childList: true, subtree: true, attributes: true, attributeFilter: ['style', 'class'] });
+
     return () => {
+      if (rafId) cancelAnimationFrame(rafId);
+      mo.disconnect();
       ro.disconnect();
       root.style.removeProperty('--composer-dock-h');
     };
-  }, [childDrawerOpen, taskId]);
+  }, [childDrawerOpen, taskId, effectiveChildId, activeNativeMember?.memberName]);
 
   useEffect(() => {
     if (!artMenuOpen && !moreMenuOpen) return;
@@ -200,8 +300,21 @@ export function SessionPage({
         setConfirmDeleteMenu(false);
       }
     };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !e.isComposing) {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        setArtMenuOpen(false);
+        setMoreMenuOpen(false);
+        setConfirmDeleteMenu(false);
+      }
+    };
     window.addEventListener('mousedown', onDown);
-    return () => window.removeEventListener('mousedown', onDown);
+    window.addEventListener('keydown', onKey, true);
+    return () => {
+      window.removeEventListener('mousedown', onDown);
+      window.removeEventListener('keydown', onKey, true);
+    };
   }, [artMenuOpen, moreMenuOpen]);
 
   const invalidateAfterTaskMut = (pid?: string) => {
@@ -487,11 +600,22 @@ export function SessionPage({
     </>
   );
 
-  const clampDrawerWidth = (rawW: number) => {
-    const stageW = sessRef.current?.getBoundingClientRect().width ?? 0;
-    const maxAllowed = stageW > 0 ? Math.min(SUB_DRAWER_MAX, Math.max(SUB_DRAWER_MIN, stageW - 310)) : SUB_DRAWER_MAX;
-    return Math.round(Math.min(maxAllowed, Math.max(SUB_DRAWER_MIN, rawW)));
+  const clampDrawerWidth = (rawW: number, curStageW = stageWidth || (sessRef.current?.getBoundingClientRect().width ?? 0)) => {
+    const minMain = curStageW > 0 && curStageW < 820 ? 310 : 340;
+    const minDrawer = curStageW > 0 && curStageW < 820 ? SUB_DRAWER_MIN : 320;
+    const sashW = 5;
+    const maxAllowed =
+      curStageW > 0
+        ? Math.min(SUB_DRAWER_MAX, Math.max(minDrawer, curStageW - minMain - sashW))
+        : SUB_DRAWER_MAX;
+    return Math.round(Math.min(maxAllowed, Math.max(minDrawer, rawW)));
   };
+
+  // Proportional cap at narrow desktop widths (e.g. 920px with 220px sidebar => 700px stage => ~345px drawer, ~350px main)
+  const effectiveDrawerWidth =
+    stageWidth > 0 && stageWidth < 820
+      ? clampDrawerWidth(Math.min(drawerWidth, Math.floor((stageWidth - 5) * 0.49)), stageWidth)
+      : clampDrawerWidth(drawerWidth, stageWidth);
 
   return (
     <main className="main">
@@ -707,7 +831,7 @@ export function SessionPage({
               aria-label="拖拽调整子会话分屏宽度"
               aria-valuemin={SUB_DRAWER_MIN}
               aria-valuemax={SUB_DRAWER_MAX}
-              aria-valuenow={drawerWidth}
+              aria-valuenow={effectiveDrawerWidth}
               tabIndex={0}
               className={`sub-resize-handle no-mobile ${draggingSash ? 'is-dragging' : ''}`}
               title="拖拽调整分屏宽度"
@@ -721,7 +845,7 @@ export function SessionPage({
                 if (!e.currentTarget.hasPointerCapture(e.pointerId)) return;
                 const rect = sessRef.current?.getBoundingClientRect();
                 if (!rect) return;
-                setDrawerWidth(clampDrawerWidth(rect.right - e.clientX));
+                setDrawerWidth(clampDrawerWidth(rect.right - e.clientX, rect.width));
               }}
               onPointerUp={(e) => {
                 if (e.currentTarget.hasPointerCapture(e.pointerId)) {
@@ -735,7 +859,7 @@ export function SessionPage({
                 const delta = e.key === 'ArrowLeft' ? 24 : e.key === 'ArrowRight' ? -24 : 0;
                 if (delta === 0) return;
                 e.preventDefault();
-                const next = clampDrawerWidth(drawerWidth + delta);
+                const next = clampDrawerWidth(effectiveDrawerWidth + delta);
                 setDrawerWidth(next);
                 writeDrawerWidth(next);
               }}
@@ -748,7 +872,7 @@ export function SessionPage({
               nativeMember={activeNativeMember}
               childrenList={childrenList}
               nativeMembers={nativeMembers}
-              width={drawerWidth}
+              width={effectiveDrawerWidth}
               onSelectChild={openChildDrawer}
               onSelectNativeMember={openNativeMemberDrawer}
               onClose={closeChildDrawer}

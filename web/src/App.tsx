@@ -80,7 +80,7 @@ function useGlobalKeys() {
         s.toggleSidebar();
         return;
       }
-      if (e.key !== 'Escape' || e.isComposing) return;
+      if (e.key !== 'Escape' || e.isComposing || e.defaultPrevented) return;
       if (s.cmdkOpen) {
         s.setCmdkOpen(false);
       } else if (s.machinesOpen) {
