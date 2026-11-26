@@ -19,28 +19,38 @@ type SwarmProjection struct {
 }
 
 type mergedToolCall struct {
-	ToolCallID       string
-	Name             string
-	Title            string
-	Status           string
-	RawInput         json.RawMessage
-	RawOutput        json.RawMessage
-	WorkerTracked    bool
-	ExitCodeTracked  bool
-	BoardMsgEmitted  bool
-	ReadBoardTracked bool
-	WorkerName       string
+	ToolCallID             string
+	Name                   string
+	Title                  string
+	Status                 string
+	RawInput               json.RawMessage
+	RawOutput              json.RawMessage
+	WorkerTracked          bool
+	ExitCodeTracked        bool
+	BoardMsgEmitted        bool
+	ReadBoardTracked       bool
+	SubagentStartedEmitted bool
+	SubagentFinalEmitted   bool
+	SubagentActionTracked  bool
+	SubagentName           string
+	SubagentRole           string
+	SubagentBrief          string
+	SubagentExternalID     string
+	WorkerName             string
 }
 
 // ActiveSwarmTracker merges tool_call and tool_call_update notifications by toolCallId.
 // Only status == "completed" calls update activeWorkers or emit board projections,
 // preventing failed calls or streamed argument fragments from corrupting worker accounting.
 // Separate per-aspect flags ensure late rawInput/rawOutput updates after completed are still observed (S3).
+// Native subagent tool calls (invoke_subagent / Claude Agent / Task) are also projected to board_members
+// with sourceKind="native_subagent" without affecting activeWorkers or swarm_monitoring invariants.
 type ActiveSwarmTracker struct {
 	mu                          sync.Mutex
 	attemptID                   string
 	calls                       map[string]*mergedToolCall
 	activeWorkers               map[string]bool
+	subagentsByExtID            map[string]string
 	usedSwarm                   bool
 	rejectedToolCount           int
 	unresolvedRejectedToolCount int
@@ -51,10 +61,11 @@ type ActiveSwarmTracker struct {
 
 func NewActiveSwarmTracker(attemptID string) *ActiveSwarmTracker {
 	return &ActiveSwarmTracker{
-		attemptID:      attemptID,
-		calls:          map[string]*mergedToolCall{},
-		activeWorkers:  map[string]bool{},
-		failedCommands: map[string]int{},
+		attemptID:        attemptID,
+		calls:            map[string]*mergedToolCall{},
+		activeWorkers:    map[string]bool{},
+		subagentsByExtID: map[string]string{},
+		failedCommands:   map[string]int{},
 	}
 }
 
@@ -83,7 +94,9 @@ func (t *ActiveSwarmTracker) ObserveToolCall(tc *acp.SessionUpdateToolCall) Swar
 	if len(tc.RawOutput) > 0 {
 		rec.RawOutput = append(json.RawMessage(nil), tc.RawOutput...)
 	}
-	return t.evaluateCompletedLocked(rec)
+	subProj := t.observeNativeSubagentLocked(rec)
+	swarmProj := t.evaluateCompletedLocked(rec)
+	return mergeProjections(subProj, swarmProj)
 }
 
 // ObserveToolCallUpdate merges a SessionToolCallUpdate patch into the toolCallId ledger.
@@ -111,7 +124,9 @@ func (t *ActiveSwarmTracker) ObserveToolCallUpdate(tu *acp.SessionToolCallUpdate
 	if v, ok := tu.RawOutput.Value(); ok && len(v) > 0 {
 		rec.RawOutput = append(json.RawMessage(nil), v...)
 	}
-	return t.evaluateCompletedLocked(rec)
+	subProj := t.observeNativeSubagentLocked(rec)
+	swarmProj := t.evaluateCompletedLocked(rec)
+	return mergeProjections(subProj, swarmProj)
 }
 
 func (t *ActiveSwarmTracker) RecordToolRejection() {
@@ -228,6 +243,8 @@ func (t *ActiveSwarmTracker) evaluateCompletedLocked(rec *mergedToolCall) SwarmP
 							"memberName":  w,
 							"state":       string(protocol.BoardMemberWorking),
 							"currentStep": "assigned",
+							"sourceKind":  "native_swarm",
+							"brief":       truncateTrackerText(brief, 240),
 						})
 						if brief != "" {
 							proj.Messages = append(proj.Messages, map[string]any{
@@ -351,9 +368,240 @@ func normalizeToolName(name, title string) string {
 		return "post_message"
 	case strings.Contains(tl, "read_board"):
 		return "read_board"
+	case strings.Contains(tl, "invoke_subagent"):
+		return "invoke_subagent"
+	case strings.Contains(tl, "manage_subagents"):
+		return "manage_subagents"
+	case strings.Contains(tl, "send_message"):
+		return "send_message"
 	default:
 		return tl
 	}
+}
+
+func mergeProjections(a, b SwarmProjection) SwarmProjection {
+	if len(a.Members) == 0 && len(a.Messages) == 0 {
+		return b
+	}
+	if len(b.Members) == 0 && len(b.Messages) == 0 {
+		return a
+	}
+	return SwarmProjection{
+		Members:  append(a.Members, b.Members...),
+		Messages: append(a.Messages, b.Messages...),
+	}
+}
+
+func truncateTrackerText(s string, maxRunes int) string {
+	s = strings.TrimSpace(s)
+	if s == "" || maxRunes <= 0 {
+		return ""
+	}
+	r := []rune(s)
+	if len(r) <= maxRunes {
+		return s
+	}
+	return string(r[:maxRunes]) + "…"
+}
+
+func getMapStringAny(m map[string]any, keys ...string) string {
+	for _, k := range keys {
+		if v := getMapString(m, k); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// observeNativeSubagentLocked projects native invoke_subagent / Claude Agent / Task / send_message / manage_subagents
+// calls to board_members with sourceKind="native_subagent". It NEVER mutates activeWorkers or usedSwarm.
+func (t *ActiveSwarmTracker) observeNativeSubagentLocked(rec *mergedToolCall) SwarmProjection {
+	var proj SwarmProjection
+	toolName := normalizeToolName(rec.Name, rec.Title)
+
+	var inMap, outMap map[string]any
+	if len(rec.RawInput) > 0 {
+		_ = json.Unmarshal(rec.RawInput, &inMap)
+	}
+	if len(rec.RawOutput) > 0 {
+		_ = json.Unmarshal(rec.RawOutput, &outMap)
+	}
+
+	switch toolName {
+	case "invoke_subagent", "agent", "task":
+		// Extract role, display name, brief, and externalSessionId incrementally across updates.
+		if role := getMapStringAny(inMap, "role", "Role", "subagent_type", "TypeName", "type_name"); role != "" {
+			rec.SubagentRole = role
+		}
+		if brief := getMapStringAny(inMap, "prompt", "Prompt", "description", "Description"); brief != "" {
+			rec.SubagentBrief = truncateTrackerText(brief, 240)
+		}
+		if rec.SubagentName == "" {
+			name := getMapStringAny(inMap, "name", "Name", "description", "Description", "role", "Role", "subagent_type", "TypeName")
+			if name == "" && rec.Title != "" && !strings.EqualFold(rec.Title, toolName) {
+				name = rec.Title
+			}
+			if name == "" {
+				shortID := rec.ToolCallID
+				if len(shortID) > 8 {
+					shortID = shortID[:8]
+				}
+				if shortID == "" {
+					shortID = "worker"
+				}
+				name = "subagent-" + shortID
+			}
+			rec.SubagentName = truncateTrackerText(name, 48)
+		}
+		if rec.SubagentName != "" {
+			rec.WorkerName = rec.SubagentName
+		}
+
+		extID := getMapStringAny(outMap, "conversationId", "conversation_id", "agentId", "agent_id", "sessionId", "session_id", "taskId", "task_id")
+		if extID == "" && len(rec.RawOutput) > 0 {
+			// Check nested result map if present
+			if resMap, ok := outMap["result"].(map[string]any); ok {
+				extID = getMapStringAny(resMap, "conversationId", "conversation_id", "agentId", "sessionId")
+			}
+		}
+		if extID != "" {
+			rec.SubagentExternalID = extID
+			if rec.SubagentName != "" {
+				t.subagentsByExtID[extID] = rec.SubagentName
+			}
+		}
+
+		status := strings.ToLower(strings.TrimSpace(rec.Status))
+		isDone := status == string(acp.ToolCallStatusCompleted) || status == string(acp.ToolCallStatusFailed)
+		if !isDone {
+			if !rec.SubagentStartedEmitted && rec.SubagentName != "" {
+				rec.SubagentStartedEmitted = true
+				m := map[string]any{
+					"memberName":  rec.SubagentName,
+					"state":       string(protocol.BoardMemberWorking),
+					"currentStep": "running",
+					"sourceKind":  "native_subagent",
+				}
+				if rec.SubagentRole != "" {
+					m["role"] = rec.SubagentRole
+				}
+				if rec.SubagentBrief != "" {
+					m["brief"] = rec.SubagentBrief
+				}
+				if rec.SubagentExternalID != "" {
+					m["externalSessionId"] = rec.SubagentExternalID
+				}
+				proj.Members = append(proj.Members, m)
+			}
+			return proj
+		}
+
+		// Completed or failed: emit final stopped state (also re-emit once if externalSessionId arrived late).
+		if (!rec.SubagentFinalEmitted || (extID != "" && !rec.SubagentActionTracked)) && rec.SubagentName != "" {
+			rec.SubagentStartedEmitted = true
+			rec.SubagentFinalEmitted = true
+			if extID != "" {
+				rec.SubagentActionTracked = true
+			}
+			step := "completed"
+			if status == string(acp.ToolCallStatusFailed) {
+				step = "failed"
+			}
+			m := map[string]any{
+				"memberName":  rec.SubagentName,
+				"state":       string(protocol.BoardMemberStopped),
+				"currentStep": step,
+				"sourceKind":  "native_subagent",
+			}
+			if rec.SubagentRole != "" {
+				m["role"] = rec.SubagentRole
+			}
+			if rec.SubagentBrief != "" {
+				m["brief"] = rec.SubagentBrief
+			}
+			if rec.SubagentExternalID != "" {
+				m["externalSessionId"] = rec.SubagentExternalID
+			}
+			proj.Members = append(proj.Members, m)
+		}
+
+	case "send_message":
+		if strings.ToLower(strings.TrimSpace(rec.Status)) != string(acp.ToolCallStatusCompleted) || rec.SubagentActionTracked || inMap == nil {
+			return proj
+		}
+		recipient := getMapStringAny(inMap, "recipient", "Recipient")
+		if recipient == "" {
+			return proj
+		}
+		if memberName, ok := t.subagentsByExtID[recipient]; ok && memberName != "" {
+			rec.SubagentActionTracked = true
+			rec.WorkerName = memberName
+			proj.Members = append(proj.Members, map[string]any{
+				"memberName":        memberName,
+				"state":             string(protocol.BoardMemberWorking),
+				"currentStep":       "messaged",
+				"sourceKind":        "native_subagent",
+				"externalSessionId": recipient,
+			})
+		}
+
+	case "manage_subagents":
+		if strings.ToLower(strings.TrimSpace(rec.Status)) != string(acp.ToolCallStatusCompleted) || rec.SubagentActionTracked || inMap == nil {
+			return proj
+		}
+		action := strings.ToLower(getMapStringAny(inMap, "action", "Action"))
+		switch action {
+		case "kill":
+			ids := extractAnyStringSlice(inMap, "conversationIds", "ConversationIds")
+			if len(ids) > 0 {
+				rec.SubagentActionTracked = true
+				for _, cid := range ids {
+					if memberName, ok := t.subagentsByExtID[cid]; ok && memberName != "" {
+						proj.Members = append(proj.Members, map[string]any{
+							"memberName":        memberName,
+							"state":             string(protocol.BoardMemberKilled),
+							"currentStep":       "killed",
+							"sourceKind":        "native_subagent",
+							"externalSessionId": cid,
+						})
+					}
+				}
+			}
+		case "kill_all":
+			if len(t.subagentsByExtID) > 0 {
+				rec.SubagentActionTracked = true
+				for cid, memberName := range t.subagentsByExtID {
+					proj.Members = append(proj.Members, map[string]any{
+						"memberName":        memberName,
+						"state":             string(protocol.BoardMemberKilled),
+						"currentStep":       "killed",
+						"sourceKind":        "native_subagent",
+						"externalSessionId": cid,
+					})
+				}
+			}
+		}
+	}
+	return proj
+}
+
+func extractAnyStringSlice(m map[string]any, keys ...string) []string {
+	for _, k := range keys {
+		raw, ok := m[k]
+		if !ok || raw == nil {
+			continue
+		}
+		if arr, ok := raw.([]any); ok {
+			out := make([]string, 0, len(arr))
+			for _, it := range arr {
+				if s, ok := it.(string); ok && strings.TrimSpace(s) != "" {
+					out = append(out, strings.TrimSpace(s))
+				}
+			}
+			return out
+		}
+	}
+	return nil
 }
 
 func extractSwarmWorkerNames(inMap map[string]any) []string {

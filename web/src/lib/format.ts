@@ -4,6 +4,7 @@ import type {
   BoardMemberState,
   InboxItemView,
   PendingInputSource,
+  TaskState,
   TaskSummary,
   TriggerKind,
 } from '../generated/protocol';
@@ -236,8 +237,36 @@ export function triggerLabel(k: TriggerKind): string {
     deploy: '部署',
     workspace_import: '导入工作区',
     manual_import: '手动导入',
+    child_result: '子会话回传',
   };
   return m[k] ?? k;
+}
+
+export function isChildStateLive(s: TaskState): boolean {
+  return s === 'running' || s === 'queued' || s === 'waiting_approval' || s === 'waiting_resource';
+}
+
+export function childStateDot(s: TaskState, openApprovals = 0): 'approval' | 'run' | 'done' | 'bad' | 'idle' {
+  if (openApprovals > 0 || s === 'waiting_approval') return 'approval';
+  if (s === 'running' || s === 'queued' || s === 'waiting_resource') return 'run';
+  if (s === 'done' || s === 'in_review') return 'done';
+  if (s === 'failed' || s === 'cancelled') return 'bad';
+  return 'idle';
+}
+
+export function childStateLabel(s: TaskState, openApprovals = 0): string {
+  if (openApprovals > 0) return '待审批';
+  const m: Record<TaskState, string> = {
+    queued: '排队中',
+    waiting_resource: '等待资源',
+    running: '运行中',
+    waiting_approval: '待审批',
+    in_review: '待审阅',
+    done: '已完成',
+    failed: '失败',
+    cancelled: '已停止',
+  };
+  return m[s] ?? s;
 }
 
 export function sourceLabel(s: PendingInputSource): string {

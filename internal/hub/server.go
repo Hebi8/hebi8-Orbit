@@ -64,6 +64,7 @@ type Server struct {
 	paBeforeCommitHook           func(fromSeq, highSeq int64)
 	hebi8Mu                      sync.Mutex
 	hebi8BeforeCommitHook        func() error
+	childNotifMu                 sync.Mutex
 	deliveryLocks                *deliveryLocker
 	testHookMu                   sync.Mutex
 	removeFrozenDirFn            func(string) error
@@ -368,12 +369,17 @@ func (s *Server) buildRouter() http.Handler {
 		blobs.Head("/{sha256}", s.handleHeadBlob)
 	})
 
-	// Runner-authenticated git bundle transport for remote_ws cross-OS project deliveries
+	// Runner-authenticated git bundle transport & child delegation endpoints
 	r.Route("/api/runner", func(rr chi.Router) {
 		rr.Use(s.runnerAuthMiddleware)
 		rr.Get("/projects/{projectId}/mirror-heads", s.handleGetRunnerMirrorHeads)
 		rr.Put("/projects/{projectId}/deliveries/{deliveryId}/bundle", s.handlePutRunnerDeliveryBundle)
 		rr.Get("/projects/{projectId}/deliveries/{deliveryId}/bundle", s.handleGetRunnerDeliveryBundle)
+		rr.Post("/delegate/spawn", s.handleRunnerDelegateSpawn)
+		rr.Post("/delegate/list", s.handleRunnerDelegateList)
+		rr.Post("/delegate/send", s.handleRunnerDelegateSend)
+		rr.Post("/delegate/read", s.handleRunnerDelegateRead)
+		rr.Post("/delegate/cancel", s.handleRunnerDelegateCancel)
 	})
 
 	// Authenticated REST API
@@ -427,6 +433,9 @@ func (s *Server) buildRouter() http.Handler {
 
 		api.Post("/tasks/{taskId}/bind-project", s.handleBindScratchTask)
 		api.Get("/tasks/{taskId}/timeline", s.handleGetTaskTimeline)
+		api.Post("/tasks/{taskId}/children", s.handleCreateChildTask)
+		api.Get("/tasks/{taskId}/children", s.handleListChildTasks)
+		api.Get("/tasks/{taskId}/transcript", s.handleGetTaskTranscript)
 		api.Post("/tasks/{taskId}/followup", s.handleFollowupTask)
 		api.Post("/tasks/{taskId}/cancel", s.handleCancelTask)
 		api.Post("/tasks/{taskId}/retry", s.handleRetryTask)

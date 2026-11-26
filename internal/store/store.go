@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/ncruces/go-sqlite3/driver"
@@ -95,9 +96,24 @@ func Open(ctx context.Context, dbPath string) (*Store, error) {
 		return nil, fmt.Errorf("backup before v6 migration: %w", err)
 	}
 
+	if err := backupBeforeV7Migration(ctx, rw, absPath); err != nil {
+		_ = rw.Close()
+		return nil, fmt.Errorf("backup before v7 migration: %w", err)
+	}
+
+	if err := repairDanglingAttemptForeignKeys(ctx, rw, absPath); err != nil {
+		_ = rw.Close()
+		return nil, fmt.Errorf("repair dangling attempt foreign keys: %w", err)
+	}
+
 	if err := applySchema(ctx, rw); err != nil {
 		_ = rw.Close()
 		return nil, fmt.Errorf("apply schema: %w", err)
+	}
+
+	if err := applyMigrationV7Atomic(ctx, rw); err != nil {
+		_ = rw.Close()
+		return nil, fmt.Errorf("apply v7 migration: %w", err)
 	}
 
 	roDSN := buildFileURI(absPath, map[string]string{
@@ -415,6 +431,7 @@ func applySchema(ctx context.Context, db *sql.DB) error {
 	}
 
 	// Idempotently ensure pending_delivery_cleanups and its BEFORE INSERT guard trigger exist on both fresh and existing DBs.
+	// Note: child_parent_notifications is created strictly inside applyMigrationV7Atomic so v6->v7 upgrades roll back cleanly.
 	if _, err := tx.ExecContext(ctx, `
 		CREATE TABLE IF NOT EXISTS pending_delivery_cleanups (
 			delivery_id TEXT PRIMARY KEY,
@@ -706,6 +723,48 @@ func backupBeforeV6Migration(ctx context.Context, db *sql.DB, absPath string) er
 	if err := os.Rename(tmpPath, bakPath); err != nil {
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("finalize pre-v6 backup: %w", err)
+	}
+	return nil
+}
+
+// backupBeforeV7Migration takes a consistent VACUUM INTO hot backup once before applying v7
+// (or before rebuilding legacy attempts table for TriggerChildResult) on an existing on-disk database.
+func backupBeforeV7Migration(ctx context.Context, db *sql.DB, absPath string) error {
+	if absPath == "" || absPath == ":memory:" {
+		return nil
+	}
+	var tableExists int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='schema_migrations'`).Scan(&tableExists); err != nil {
+		return fmt.Errorf("check schema_migrations table: %w", err)
+	}
+	if tableExists == 0 {
+		return nil
+	}
+	var hasV7 int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version = 7`).Scan(&hasV7); err != nil {
+		return fmt.Errorf("check schema version 7: %w", err)
+	}
+	var attSQL sql.NullString
+	_ = db.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE type='table' AND name='attempts'`).Scan(&attSQL)
+	needsAttemptsRebuild := attSQL.Valid && !strings.Contains(attSQL.String, "'"+string(protocol.TriggerChildResult)+"'")
+	if hasV7 > 0 && !needsAttemptsRebuild {
+		return nil
+	}
+	bakPath := absPath + ".pre-v7.bak"
+	if _, err := os.Stat(bakPath); err == nil {
+		return nil
+	}
+	tmpPath := fmt.Sprintf("%s.tmp.%d", bakPath, time.Now().UnixNano())
+	_ = os.Remove(tmpPath)
+	escaped := filepath.ToSlash(tmpPath)
+	escaped = fmt.Sprintf("'%s'", replaceAllSingleQuotes(escaped))
+	if _, err := db.ExecContext(ctx, "VACUUM INTO "+escaped); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("vacuum pre-v7 backup: %w", err)
+	}
+	if err := os.Rename(tmpPath, bakPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("finalize pre-v7 backup: %w", err)
 	}
 	return nil
 }

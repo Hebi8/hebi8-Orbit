@@ -14,6 +14,7 @@ import type {
   CompleteReviewResponse,
   CreateAnnotationRequest,
   CreateAnnotationResponse,
+  CreateChildTaskRequest,
   CreatePairingCodeRequest,
   CreatePairingCodeResponse,
   CreateProjectLocationRequest,
@@ -42,6 +43,7 @@ import type {
   Hebi8MainResponse,
   Hebi8PinResponse,
   ListArtifactsResponse,
+  ListChildrenResponse,
   ListClientsResponse,
   ListDirsResponse,
   ListMachinesResponse,
@@ -329,6 +331,20 @@ export const api = {
 
   getTaskTimeline(taskId: string): Promise<TaskTimelineResponse> {
     return apiFetch<TaskTimelineResponse>(`/api/tasks/${enc(taskId)}/timeline?includeRaw=0`);
+  },
+
+  listChildren(taskId: string, includeArchived = false): Promise<ListChildrenResponse> {
+    const qs = includeArchived ? '?includeArchived=1' : '';
+    return apiFetch<ListChildrenResponse>(`/api/tasks/${enc(taskId)}/children${qs}`);
+  },
+
+  spawnChild(taskId: string, req: CreateChildTaskRequest): Promise<CreateTaskResponse> {
+    const key = req.idempotencyKey || makeIdempotencyKey();
+    return apiFetch<CreateTaskResponse>(`/api/tasks/${enc(taskId)}/children`, {
+      method: 'POST',
+      json: { ...req, idempotencyKey: key },
+      idempotencyKey: key,
+    });
   },
 
   followup(taskId: string, req: FollowupTaskRequest): Promise<FollowupTaskResponse> {

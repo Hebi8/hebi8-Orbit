@@ -30,6 +30,8 @@ type IngestOutboxResult struct {
 	AcceptedMode        protocol.OutboxAcceptedMode
 	TaskID              string
 	AttemptSucceeded    bool
+	TerminalAttemptID   string
+	TerminalState       protocol.AttemptState
 	AutoConsumeQueue    bool
 	SteerInputID        string
 	CancelRequested     bool
@@ -450,16 +452,20 @@ func applyActiveOutboxItemTx(
 			adapter = att.Adapter
 		}
 		ev, err := upsertBoardMemberTx(ctx, tx, protocol.BoardMemberCursor{
-			TaskID:          att.TaskID,
-			ProjectID:       att.ProjectID,
-			MemberName:      memberName,
-			MachineID:       machineID,
-			Adapter:         adapter,
-			State:           state,
-			LastConsumedSeq: consumedSeq,
-			CurrentStep:     step,
-			WorkerTaskID:    workerTaskID,
-			UpdatedAt:       ts,
+			TaskID:            att.TaskID,
+			ProjectID:         att.ProjectID,
+			MemberName:        memberName,
+			MachineID:         machineID,
+			Adapter:           adapter,
+			State:             state,
+			LastConsumedSeq:   consumedSeq,
+			CurrentStep:       step,
+			WorkerTaskID:      workerTaskID,
+			SourceKind:        stringField(item.Payload, "sourceKind"),
+			Role:              stringField(item.Payload, "role"),
+			Brief:             stringField(item.Payload, "brief"),
+			ExternalSessionID: stringField(item.Payload, "externalSessionId"),
+			UpdatedAt:         ts,
 		})
 		if err != nil {
 			return err
@@ -807,9 +813,14 @@ func applyStateFrameTx(
 	evKind := protocol.EventAttemptStateChanged
 	evVis := protocol.VisibilityTimeline
 	if isTerminal {
+		res.TerminalAttemptID = att.AttemptID
+		res.TerminalState = newState
 		evKind = protocol.EventAttemptFinished
 		if newState == protocol.AttemptNeedsVerification || newState == protocol.AttemptFailed || newState == protocol.AttemptExpired {
 			evVis = protocol.VisibilityInbox
+		}
+		if err := enqueueChildParentNotificationTx(ctx, tx, att.TaskID, att.AttemptID, newState, ts); err != nil {
+			return err
 		}
 	}
 	evPayload := cloneMap(item.Payload)

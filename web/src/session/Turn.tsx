@@ -1,11 +1,25 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { FileSpreadsheet, FileText, Layers, Link2, Presentation, Table } from 'lucide-react';
-import type { AttemptView, TaskTimelineResponse } from '../generated/protocol';
+import {
+  ArrowUpRight,
+  ChevronDown,
+  ChevronRight,
+  CornerDownRight,
+  FileSpreadsheet,
+  FileText,
+  Layers,
+  Link2,
+  PanelRightOpen,
+  Presentation,
+  Square,
+  Table,
+} from 'lucide-react';
+import type { AttemptView, ChildTaskView, MachineView, TaskTimelineResponse } from '../generated/protocol';
 import { ApprovalNotice } from '../components/ApprovalNotice';
 import { FolderChangesCard } from '../components/FolderChangesCard';
 import { CaretIcon } from '../components/Icons';
 import { useAttemptRaw } from '../hooks/queries';
+import { ADAPTER_LABELS } from '../lib/agentCaps';
 import { api, errMsg } from '../lib/api';
 import { deliveryInlineImages, deliveryReusableArtifacts } from '../lib/artifacts';
 import {
@@ -14,9 +28,14 @@ import {
   artifactShortLabel,
   attemptStateLabel,
   basename,
+  childStateDot,
+  childStateLabel,
+  cleanMachineName,
   hhmm,
   isAttemptLive,
+  isChildStateLive,
   shortSha,
+  taskTitle,
   triggerLabel,
 } from '../lib/format';
 import { navigate, paths } from '../lib/router';
@@ -188,18 +207,232 @@ function RetryNotice({ attempt, taskId, needsVerify }: { attempt: AttemptView; t
   );
 }
 
+function ChildResultSystemCard({
+  attempt,
+  onOpenChild,
+}: {
+  attempt: AttemptView;
+  onOpenChild?: (childTaskId: string) => void;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const cr = attempt.childResult;
+  const rawPrompt = attempt.promptText?.trim() ?? '';
+  const summaryText = cr?.summary?.trim() || cr?.errorDetail?.trim() || rawPrompt;
+  const hasLongDetails = !!rawPrompt && (rawPrompt.length > 180 || rawPrompt.includes('\n') || rawPrompt !== summaryText);
+
+  const stateTone =
+    cr?.childState === 'succeeded'
+      ? 'ok'
+      : cr?.childState === 'failed' || cr?.childState === 'expired' || cr?.childState === 'cancelled'
+        ? 'bad'
+        : 'muted';
+
+  const hasDiff =
+    (cr?.filesChanged ?? 0) > 0 || (cr?.insertions ?? 0) > 0 || (cr?.deletions ?? 0) > 0;
+
+  const openTarget = () => {
+    if (!cr?.childTaskId) return;
+    if (onOpenChild) onOpenChild(cr.childTaskId);
+    else navigate(paths.session(cr.childTaskId));
+  };
+
+  return (
+    <div className="it child-res-card">
+      <div className="child-res-hd">
+        <span className="child-res-k">
+          <CornerDownRight size={12} strokeWidth={1.8} />
+          <span>子会话回传</span>
+        </span>
+        {cr?.childRole && <span className="csd-role-pill">{cr.childRole}</span>}
+        {cr?.childTaskId ? (
+          <button
+            type="button"
+            className="child-res-title ell"
+            title={`分屏查看子会话「${cr.childTitle}」`}
+            onClick={openTarget}
+          >
+            {cr.childTitle || cr.childTaskId}
+          </button>
+        ) : (
+          <span className="child-res-title ell">子会话已完成</span>
+        )}
+        {cr && <span className={`child-res-state is-${stateTone}`}>{attemptStateLabel(cr.childState)}</span>}
+        {hasDiff && (
+          <span className="child-res-diff mono">
+            <span className="add">+{cr?.insertions ?? 0}</span> <span className="del">−{cr?.deletions ?? 0}</span>
+          </span>
+        )}
+        <span className="child-res-time">{hhmm(attempt.startedAt)}</span>
+      </div>
+
+      {summaryText && !expanded && <div className="child-res-preview">{summaryText}</div>}
+      {expanded && rawPrompt && <pre className="child-res-raw">{rawPrompt}</pre>}
+
+      <div className="child-res-acts">
+        {cr?.childTaskId && (
+          <>
+            <button type="button" className="child-act-btn" onClick={openTarget}>
+              <PanelRightOpen size={11.5} strokeWidth={1.7} />
+              <span>分屏查看</span>
+            </button>
+            <button
+              type="button"
+              className="child-act-btn"
+              onClick={() => navigate(paths.session(cr.childTaskId))}
+            >
+              <span>完整页</span>
+              <ArrowUpRight size={11.5} strokeWidth={1.7} />
+            </button>
+          </>
+        )}
+        {hasLongDetails && (
+          <button type="button" className="child-act-btn faint" onClick={() => setExpanded((v) => !v)}>
+            {expanded ? <ChevronDown size={11.5} strokeWidth={1.8} /> : <ChevronRight size={11.5} strokeWidth={1.8} />}
+            <span>{expanded ? '收起回传原文' : '展开完整回传'}</span>
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function InlineDispatchedChildren({
+  parentTaskId,
+  parentProjectId,
+  children,
+  machines,
+  onOpenChild,
+}: {
+  parentTaskId: string;
+  parentProjectId: string;
+  children: ChildTaskView[];
+  machines?: MachineView[];
+  onOpenChild?: (childTaskId: string) => void;
+}) {
+  const qc = useQueryClient();
+  const stopMut = useMutation({
+    mutationFn: (childId: string) => api.cancelTask(childId, 'stopped from inline dispatch card'),
+    onSuccess: (res, childId) => {
+      toast(res.cancelSent || res.immediateState ? '已请求停止子会话' : '停止请求已记录');
+      void qc.invalidateQueries({ queryKey: ['task-timeline', parentTaskId] });
+      void qc.invalidateQueries({ queryKey: ['task-timeline', childId] });
+      void qc.invalidateQueries({ queryKey: ['task-children', parentTaskId] });
+      void qc.invalidateQueries({ queryKey: ['all-tasks'] });
+      void qc.invalidateQueries({ queryKey: ['bootstrap'] });
+    },
+    onError: (e) => toast(errMsg(e), 'err'),
+  });
+
+  if (children.length === 0) return null;
+
+  return (
+    <div className="it child-dispatch-list" aria-label="派发的子会话">
+      {children.map((c) => {
+        const live = isChildStateLive(c.state);
+        const dot = childStateDot(c.state, c.openApprovalCount);
+        const needsApproval = c.openApprovalCount > 0 || c.state === 'waiting_approval';
+        const mach = machines?.find((m) => m.machineId === c.machineId);
+        const machName = mach ? mach.displayAlias?.trim() || cleanMachineName(mach) : c.machineId || '';
+        const adpLabel = c.preferredAdapter ? ADAPTER_LABELS[c.preferredAdapter] ?? c.preferredAdapter : '';
+        const hasDiff = (c.filesChanged ?? 0) > 0 || (c.insertions ?? 0) > 0 || (c.deletions ?? 0) > 0;
+        const preview =
+          (live && c.currentStep?.trim()) ||
+          c.errorDetail?.trim() ||
+          c.lastMessagePreview?.trim() ||
+          '';
+        const title = taskTitle(c);
+        const isCrossProject = c.projectId && c.projectId !== parentProjectId && c.projectName;
+
+        const openSplit = () => {
+          if (onOpenChild) onOpenChild(c.taskId);
+          else navigate(paths.session(parentTaskId, undefined, c.taskId));
+        };
+
+        return (
+          <div key={c.taskId} className={`child-dcard ${needsApproval ? 'is-ap' : ''} ${live ? 'is-live' : ''}`}>
+            <div className="child-dcard-hd">
+              <span className={`sub-dot is-${dot}`} aria-hidden="true" />
+              {c.delegatedRole && <span className="csd-role-pill">{c.delegatedRole}</span>}
+              <button type="button" className="child-dcard-ttl ell" onClick={openSplit} title={c.goal || title}>
+                {title}
+              </button>
+              <span className="child-dcard-state">{childStateLabel(c.state, c.openApprovalCount)}</span>
+            </div>
+
+            <div className="child-dcard-meta">
+              {isCrossProject && <span className="child-dcard-proj">{c.projectName}</span>}
+              {machName && <span className="mono">{machName}</span>}
+              {adpLabel && (
+                <>
+                  {machName && <span className="topbar-meta-dot">·</span>}
+                  <span>{adpLabel}</span>
+                </>
+              )}
+              {hasDiff && (
+                <>
+                  <span className="topbar-meta-dot">·</span>
+                  <span className="mono">
+                    <span className="add">+{c.insertions ?? 0}</span> <span className="del">−{c.deletions ?? 0}</span>
+                  </span>
+                </>
+              )}
+              {needsApproval && (
+                <span className="sub-chip-ap">
+                  待审批{c.openApprovalCount > 1 ? ` ${c.openApprovalCount}` : ''}
+                </span>
+              )}
+            </div>
+
+            {preview && (
+              <div className={`child-dcard-preview ${c.state === 'failed' ? 'is-err' : ''}`}>{preview}</div>
+            )}
+
+            <div className="child-dcard-acts">
+              <button type="button" className="child-act-btn is-pri" onClick={openSplit}>
+                <PanelRightOpen size={11.5} strokeWidth={1.7} />
+                <span>分屏查看/接管</span>
+              </button>
+              <button type="button" className="child-act-btn" onClick={() => navigate(paths.session(c.taskId))}>
+                <span>完整页</span>
+                <ArrowUpRight size={11.5} strokeWidth={1.7} />
+              </button>
+              {live && (
+                <button
+                  type="button"
+                  className="child-act-btn is-stop"
+                  disabled={stopMut.isPending && stopMut.variables === c.taskId}
+                  onClick={() => stopMut.mutate(c.taskId)}
+                >
+                  <Square size={9} fill="currentColor" strokeWidth={0} />
+                  <span>停止</span>
+                </button>
+              )}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 export function Turn({
   attempt,
   index,
   isLast,
   tl,
   compact = false,
+  childrenList,
+  machines,
+  onOpenChild,
 }: {
   attempt: AttemptView;
   index: number;
   isLast: boolean;
   tl: TaskTimelineResponse;
   compact?: boolean;
+  childrenList?: ChildTaskView[];
+  machines?: MachineView[];
+  onOpenChild?: (childTaskId: string) => void;
 }) {
   const live = isAttemptLive(attempt.state);
   const [expanded, setExpanded] = useState(false);
@@ -219,42 +452,51 @@ export function Turn({
   const inlineImages = delivery ? deliveryInlineImages(delivery) : [];
   const artifacts = delivery ? deliveryReusableArtifacts(delivery, tl.annotations) : [];
   const hasCodeDiff = !!delivery && CODE_KINDS.has(delivery.kind) && delivery.manifest.filesChanged > 0;
+  const isChildResult = attempt.triggerKind === 'child_result' || !!attempt.childResult;
+  const dispatchedChildren = useMemo(
+    () => (childrenList ?? tl.children ?? []).filter((c) => c.delegatedByAttemptId === attempt.attemptId),
+    [childrenList, tl.children, attempt.attemptId],
+  );
 
   return (
     <div className="turn" id={`turn-${attempt.attemptId}`} data-turn={index}>
-      <div className="it u">
-        {attempt.refTasks && attempt.refTasks.length > 0 && (
-          <div className="turn-refs" aria-label="引用的对话">
-            {attempt.refTasks.map((ref) => (
-              <button
-                key={ref.taskId}
-                type="button"
-                className="turn-ref-pill"
-                title={ref.projectName ? `${ref.projectName} · ${ref.title}` : ref.title}
-                onClick={() => navigate(ref.projectId === PA_PROJECT_ID ? paths.pa(ref.taskId) : paths.session(ref.taskId))}
-              >
-                <Link2 size={11} strokeWidth={1.7} />
-                <span className="turn-ref-proj">
-                  {ref.projectName || (ref.projectId === SCRATCH_PROJECT_ID ? '对话' : ref.projectId === PA_PROJECT_ID ? 'Hebi8' : ref.projectId)}
-                </span>
-                <span className="ell">{ref.title || ref.taskId}</span>
-              </button>
-            ))}
-          </div>
-        )}
-        <div className={`ub ${prompt.placeholder ? 'phd' : ''}`}>{prompt.text}</div>
-        {prompt.detail.length > 0 && (
-          <div className="udetail">
-            {prompt.detail.slice(0, 8).map((d, i) => (
-              <div key={i} className="ell">
-                {d}
-              </div>
-            ))}
-            {prompt.detail.length > 8 && <div className="faint">… 另 {prompt.detail.length - 8} 条</div>}
-          </div>
-        )}
-        <div className="umeta hover-meta">{hhmm(attempt.startedAt)}</div>
-      </div>
+      {isChildResult ? (
+        <ChildResultSystemCard attempt={attempt} onOpenChild={onOpenChild} />
+      ) : (
+        <div className="it u">
+          {attempt.refTasks && attempt.refTasks.length > 0 && (
+            <div className="turn-refs" aria-label="引用的对话">
+              {attempt.refTasks.map((ref) => (
+                <button
+                  key={ref.taskId}
+                  type="button"
+                  className="turn-ref-pill"
+                  title={ref.projectName ? `${ref.projectName} · ${ref.title}` : ref.title}
+                  onClick={() => navigate(ref.projectId === PA_PROJECT_ID ? paths.pa(ref.taskId) : paths.session(ref.taskId))}
+                >
+                  <Link2 size={11} strokeWidth={1.7} />
+                  <span className="turn-ref-proj">
+                    {ref.projectName || (ref.projectId === SCRATCH_PROJECT_ID ? '对话' : ref.projectId === PA_PROJECT_ID ? 'Hebi8' : ref.projectId)}
+                  </span>
+                  <span className="ell">{ref.title || ref.taskId}</span>
+                </button>
+              ))}
+            </div>
+          )}
+          <div className={`ub ${prompt.placeholder ? 'phd' : ''}`}>{prompt.text}</div>
+          {prompt.detail.length > 0 && (
+            <div className="udetail">
+              {prompt.detail.slice(0, 8).map((d, i) => (
+                <div key={i} className="ell">
+                  {d}
+                </div>
+              ))}
+              {prompt.detail.length > 8 && <div className="faint">… 另 {prompt.detail.length - 8} 条</div>}
+            </div>
+          )}
+          <div className="umeta hover-meta">{hhmm(attempt.startedAt)}</div>
+        </div>
+      )}
 
       {attempt.state === 'waiting_resource' && (
         <div className="it nt">
@@ -287,6 +529,16 @@ export function Turn({
           <ApprovalNotice approval={ap} />
         </div>
       ))}
+
+      {dispatchedChildren.length > 0 && (
+        <InlineDispatchedChildren
+          parentTaskId={tl.task.taskId}
+          parentProjectId={tl.task.projectId}
+          children={dispatchedChildren}
+          machines={machines}
+          onOpenChild={onOpenChild}
+        />
+      )}
 
       {live && attempt.state !== 'waiting_approval' && attempt.state !== 'waiting_resource' && !hasActiveToolStep && (
         <div className="it running">

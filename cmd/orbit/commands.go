@@ -127,7 +127,7 @@ func runTasks(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	case "-h", "--help", "help":
 		fmt.Fprintln(stdout, `Usage:
   orbit tasks [list] [--project <id>] [--json]
-  orbit tasks new (--project <id> | --chat) --goal "..." [--title "..."] [--adapter agy|claude|codex] [--model <m>] [--effort <lvl>] [--mode <mode>] [--capability <cap>] [--dirty] [--json]
+  orbit tasks new (--project <id> | --chat) --goal "..." [--title "..."] [--parent <taskId>] [--role "..."] [--machine <id>] [--worktree[=true|false]] [--adapter agy|claude|codex] [--model <m>] [--effort <lvl>] [--mode <mode>] [--capability <cap>] [--dirty] [--json]
   orbit tasks show <taskId> [--json]
   orbit tasks followup <taskId> --message "..." [--mode queue|steer|fork_new_session] [--adapter <adp>] [--model <m>] [--json]
   orbit tasks cancel <taskId> [--reason "..."]
@@ -201,6 +201,44 @@ func runTasksList(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	return nil
 }
 
+type optionalBoolFlag struct {
+	set bool
+	val bool
+}
+
+func (f *optionalBoolFlag) IsBoolFlag() bool { return true }
+func (f *optionalBoolFlag) String() string {
+	if !f.set {
+		return ""
+	}
+	if f.val {
+		return "true"
+	}
+	return "false"
+}
+func (f *optionalBoolFlag) Set(s string) error {
+	s = strings.ToLower(strings.TrimSpace(s))
+	switch s {
+	case "", "1", "true", "yes":
+		f.set = true
+		f.val = true
+		return nil
+	case "0", "false", "no":
+		f.set = true
+		f.val = false
+		return nil
+	default:
+		return fmt.Errorf("invalid boolean value %q", s)
+	}
+}
+func (f *optionalBoolFlag) Ptr() *bool {
+	if !f.set {
+		return nil
+	}
+	v := f.val
+	return &v
+}
+
 func runTasksNew(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("tasks new", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -209,6 +247,9 @@ func runTasksNew(ctx context.Context, args []string, stdout, stderr io.Writer) e
 		chatMode   = fs.Bool("chat", false, "start a free chat session (_scratch)")
 		goal       = fs.String("goal", "", "task goal / initial prompt (or pass as positional args)")
 		title      = fs.String("title", "", "optional task title")
+		parentID   = fs.String("parent", "", "optional parent task ID (creates a delegated child session)")
+		machineID  = fs.String("machine", "", "optional target machine ID")
+		role       = fs.String("role", "", "optional delegated role label")
 		adapter    = fs.String("adapter", "", "agent adapter: agy | claude | codex")
 		model      = fs.String("model", "", "optional model override")
 		effort     = fs.String("effort", "", "optional thought_level / effort override (low|medium|high|xhigh)")
@@ -220,7 +261,9 @@ func runTasksNew(ctx context.Context, args []string, stdout, stderr io.Writer) e
 		configDir  = fs.String("config-dir", "", "orbit config directory")
 		dataDirFlg = fs.String("data-dir", "", "orbit data directory")
 		jsonOut    = fs.Bool("json", false, "output JSON")
+		worktree   optionalBoolFlag
 	)
+	fs.Var(&worktree, "worktree", "override Git worktree isolation (true|false)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -243,6 +286,10 @@ func runTasksNew(ctx context.Context, args []string, stdout, stderr io.Writer) e
 	req := protocol.CreateTaskRequest{
 		Title:                strings.TrimSpace(*title),
 		Goal:                 goalText,
+		ParentTaskID:         strings.TrimSpace(*parentID),
+		DelegatedRole:        strings.TrimSpace(*role),
+		MachineID:            strings.TrimSpace(*machineID),
+		UseWorktree:          worktree.Ptr(),
 		RequiredCapability:   strings.TrimSpace(*capability),
 		ImportDirtyWorkspace: *dirty,
 	}

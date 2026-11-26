@@ -149,6 +149,27 @@ export function useTimeline(taskId: string | undefined) {
   });
 }
 
+export function useTaskChildren(taskId: string | undefined, enabled = true, includeArchived = false) {
+  return useQuery({
+    queryKey: ['task-children', taskId, includeArchived ? 'all' : 'active'],
+    queryFn: () => api.listChildren(taskId!, includeArchived),
+    enabled: !!taskId && enabled,
+    staleTime: 5_000,
+    refetchInterval: (query) => {
+      const children = query.state.data?.children ?? [];
+      const hasLive = children.some(
+        (c) =>
+          c.state === 'running' ||
+          c.state === 'queued' ||
+          c.state === 'waiting_approval' ||
+          c.state === 'waiting_resource' ||
+          c.openApprovalCount > 0,
+      );
+      return hasLive ? 4_000 : false;
+    },
+  });
+}
+
 export function useBoard(taskId: string | undefined, enabled = true) {
   return useQuery({
     queryKey: ['task-board', taskId],

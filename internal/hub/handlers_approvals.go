@@ -54,6 +54,7 @@ func (s *Server) handleDecideApproval(w http.ResponseWriter, r *http.Request) {
 	// inbox resolution, and events were COMMITTED — broadcast events and unblock the Runner before 409.
 	if len(res.Events) > 0 {
 		s.broker.Broadcast(res.Events...)
+		s.notifyChildTaskProgressAsync(res.Events)
 	}
 	if res.Expired && res.MachineID != "" {
 		_ = s.runners.SendApprovalDecision(res.MachineID, protocol.ApprovalDecisionFrame{

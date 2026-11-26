@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { Brain, FileText, Link2, Plus, X } from 'lucide-react';
 import type {
+  BoardMemberCursor,
   MachineView,
   ProjectView,
   TaskBoardResponse,
@@ -31,12 +32,14 @@ export function RightCard({
   machines,
   board,
   onOpenBoard,
+  onSelectMember,
 }: {
   tl: TaskTimelineResponse;
   project?: ProjectView;
   machines: MachineView[];
   board?: TaskBoardResponse;
   onOpenBoard: () => void;
+  onSelectMember?: (member: BoardMemberCursor) => void;
 }) {
   const qc = useQueryClient();
   const openReview = useWorkbenchStore((s) => s.openReview);
@@ -144,11 +147,16 @@ export function RightCard({
               type="button"
               key={m.memberName}
               className="frow"
-              onClick={() => navigate(paths.session(taskId, m.memberName))}
+              onClick={() => {
+                if (onSelectMember) onSelectMember(m);
+                else if (m.workerTaskId) navigate(paths.session(taskId, undefined, m.workerTaskId));
+                else navigate(paths.session(taskId, m.memberName));
+              }}
               title={`${memberStateLabel(m.state)}${m.currentStep ? ` · ${m.currentStep}` : ''}`}
             >
               <span className={`sd ${memberDot(m.state)}`} />
               <span className="ell" style={{ flex: 1 }}>
+                {m.role ? `${m.role} · ` : ''}
                 {m.memberName}
               </span>
             </button>

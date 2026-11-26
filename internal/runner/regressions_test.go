@@ -51,9 +51,13 @@ type FakeAcpDriver struct {
 	cancelCalls    []acp.SessionId
 	systemPrompts  []string
 
-	OnCloseSession    func(ctx context.Context, sid acp.SessionId) error
-	OnSetConfigOption func(ctx context.Context, sid acp.SessionId, key, val string) (acp.SetSessionConfigOptionResponse, error)
-	OnPrompt          func(ctx context.Context, d *FakeAcpDriver, sid acp.SessionId, promptText string) (acp.PromptResponse, error)
+	OnNewSession        func(ctx context.Context, cwd, systemPromptAppend string)
+	OnResumeSession     func(ctx context.Context, sid acp.SessionId, cwd string) error
+	OnLoadSession       func(ctx context.Context, sid acp.SessionId, cwd string) error
+	OnCloseSession      func(ctx context.Context, sid acp.SessionId) error
+	OnSetConfigOption   func(ctx context.Context, sid acp.SessionId, key, val string) (acp.SetSessionConfigOptionResponse, error)
+	OnPrompt            func(ctx context.Context, d *FakeAcpDriver, sid acp.SessionId, promptText string) (acp.PromptResponse, error)
+	SimulateMCPFallback bool
 }
 
 func NewFakeAcpDriver() *FakeAcpDriver {
@@ -109,6 +113,12 @@ func (f *FakeAcpDriver) AskPermission(ctx context.Context, req acp.RequestPermis
 
 func (f *FakeAcpDriver) NewSession(ctx context.Context, cwd, systemPromptAppend string) (acp.NewSessionResponse, error) {
 	f.mu.Lock()
+	hook := f.OnNewSession
+	f.mu.Unlock()
+	if hook != nil {
+		hook(ctx, cwd, systemPromptAppend)
+	}
+	f.mu.Lock()
 	f.nextSessSeq++
 	sid := acp.SessionId(fmt.Sprintf("fake-ses-%d", f.nextSessSeq))
 	f.liveSessions[sid] = true
@@ -116,27 +126,49 @@ func (f *FakeAcpDriver) NewSession(ctx context.Context, cwd, systemPromptAppend 
 	f.sessionConfig[sid] = map[string]string{"model": "gemini-4-neon", "thought_level": "high", "mode": "default"}
 	f.newCalls = append(f.newCalls, cwd)
 	f.systemPrompts = append(f.systemPrompts, systemPromptAppend)
+	attached := len(runner.SessionMCPServersFromContext(ctx)) > 0 && !f.SimulateMCPFallback
 	f.mu.Unlock()
+	runner.ReportSessionMCPAttached(ctx, attached)
 	return acp.NewSessionResponse{SessionId: sid}, nil
 }
 
 func (f *FakeAcpDriver) ResumeSession(ctx context.Context, sid acp.SessionId, cwd string) (acp.ResumeSessionResponse, error) {
 	f.mu.Lock()
+	hook := f.OnResumeSession
+	f.resumeCalls = append(f.resumeCalls, sid)
+	f.mu.Unlock()
+	if hook != nil {
+		if err := hook(ctx, sid, cwd); err != nil {
+			return acp.ResumeSessionResponse{}, err
+		}
+	}
+	f.mu.Lock()
 	f.liveSessions[sid] = true
 	f.sessionCWD[sid] = cwd
 	// Simulate real agy Spike finding: ResumeSession resets config options back to CLI defaults!
 	f.sessionConfig[sid] = map[string]string{"model": "gemini-4-neon", "thought_level": "high", "mode": "default"}
-	f.resumeCalls = append(f.resumeCalls, sid)
+	attached := len(runner.SessionMCPServersFromContext(ctx)) > 0 && !f.SimulateMCPFallback
 	f.mu.Unlock()
+	runner.ReportSessionMCPAttached(ctx, attached)
 	return acp.ResumeSessionResponse{}, nil
 }
 
 func (f *FakeAcpDriver) LoadSession(ctx context.Context, sid acp.SessionId, cwd string) (acp.LoadSessionResponse, error) {
 	f.mu.Lock()
+	hook := f.OnLoadSession
+	f.mu.Unlock()
+	if hook != nil {
+		if err := hook(ctx, sid, cwd); err != nil {
+			return acp.LoadSessionResponse{}, err
+		}
+	}
+	f.mu.Lock()
 	f.liveSessions[sid] = true
 	f.sessionCWD[sid] = cwd
 	f.sessionConfig[sid] = map[string]string{"model": "gemini-4-neon", "thought_level": "high", "mode": "default"}
+	attached := len(runner.SessionMCPServersFromContext(ctx)) > 0 && !f.SimulateMCPFallback
 	f.mu.Unlock()
+	runner.ReportSessionMCPAttached(ctx, attached)
 	return acp.LoadSessionResponse{}, nil
 }
 

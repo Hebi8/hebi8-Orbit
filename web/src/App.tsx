@@ -84,6 +84,10 @@ function useGlobalKeys() {
         s.setMachinesOpen(false);
       } else if (s.review) {
         s.closeReview();
+      } else if (route.name === 'session' && route.childId) {
+        navigate(paths.session(route.taskId));
+      } else if (route.name === 'pa' && route.childId) {
+        navigate(paths.pa(route.threadId));
       } else if (route.name === 'session' && route.worker) {
         navigate(paths.session(route.taskId));
       } else if (s.boardOpen && route.name === 'session') {
@@ -392,7 +396,7 @@ export function App() {
       page = <SettingsPage boot={boot} />;
       break;
     case 'pa':
-      page = <PAPage boot={boot} threadId={route.threadId} />;
+      page = <PAPage boot={boot} threadId={route.threadId} childId={route.childId} />;
       break;
     case 'artifacts':
       page = <ArtifactsPage />;
@@ -418,7 +422,7 @@ export function App() {
       page = <ProjectsListPage boot={boot} />;
       break;
     case 'session':
-      page = <SessionPage key={route.taskId} boot={boot} taskId={route.taskId} worker={route.worker} />;
+      page = <SessionPage key={route.taskId} boot={boot} taskId={route.taskId} worker={route.worker} childId={route.childId} />;
       break;
     default:
       page = <HomePage boot={boot} />;

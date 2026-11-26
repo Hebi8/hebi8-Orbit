@@ -1,16 +1,18 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { ArrowRight, FoldVertical, Layers, Sparkles, Zap } from 'lucide-react';
-import type { BootstrapResponse } from '../generated/protocol';
+import type { BoardMemberCursor, BootstrapResponse } from '../generated/protocol';
 import { Hebi8LineDrawer } from '../components/Hebi8LineDrawer';
 import { PageHeader } from '../components/PageHeader';
 import { StatusMark } from '../components/StatusMark';
-import { useHebi8Main, useTimeline } from '../hooks/queries';
+import { useHebi8Main, useTaskChildren, useTimeline } from '../hooks/queries';
 import { api, errMsg } from '../lib/api';
 import { PA_PROJECT_ID, indexInboxByTask, isTaskBusy, sessionMark } from '../lib/format';
 import { navigate, paths } from '../lib/router';
+import { ChildSessionDrawer } from '../session/ChildSessionDrawer';
 import { SessionConversation } from '../session/SessionConversation';
 import { SessionPage } from '../session/SessionPage';
+import { SubsessionStrip } from '../session/SubsessionStrip';
 import { toast } from '../store/useWorkbenchStore';
 
 const HEBI8_STARTERS = [
@@ -22,7 +24,15 @@ const HEBI8_STARTERS = [
 const QUICK_BRIEF_PROMPT =
   '请基于当前工作区概览，简明汇总各个项目的最新进展、待我确认的审批或阻塞项，并按优先级给出接下来的建议。';
 
-export function PAPage({ boot, threadId }: { boot: BootstrapResponse; threadId?: string }) {
+export function PAPage({
+  boot,
+  threadId,
+  childId,
+}: {
+  boot: BootstrapResponse;
+  threadId?: string;
+  childId?: string;
+}) {
   const mainQ = useHebi8Main();
   const mainTaskId = mainQ.data?.task?.taskId;
 
@@ -41,21 +51,48 @@ export function PAPage({ boot, threadId }: { boot: BootstrapResponse; threadId?:
       );
     }
     if (mainQ.isError || (mainTaskId && threadId !== mainTaskId)) {
-      return <SessionPage key={threadId} boot={boot} taskId={threadId} />;
+      return <SessionPage key={threadId} boot={boot} taskId={threadId} childId={childId} />;
     }
   }
 
-  return <Hebi8MainView boot={boot} mainQ={mainQ} />;
+  return <Hebi8MainView boot={boot} mainQ={mainQ} childId={childId} />;
 }
 
-function Hebi8MainView({ boot, mainQ }: { boot: BootstrapResponse; mainQ: ReturnType<typeof useHebi8Main> }) {
+function Hebi8MainView({
+  boot,
+  mainQ,
+  childId,
+}: {
+  boot: BootstrapResponse;
+  mainQ: ReturnType<typeof useHebi8Main>;
+  childId?: string;
+}) {
   const qc = useQueryClient();
   const mainTask = mainQ.data?.task;
   const activeTaskId = mainTask?.taskId;
   const tlq = useTimeline(activeTaskId);
+  const childrenQ = useTaskChildren(activeTaskId, !!activeTaskId);
 
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+  const [activeNativeMemberName, setActiveNativeMemberName] = useState<string | null>(null);
+
+  const boardMembers = tlq.data?.boardMembers ?? [];
+  const childrenList = childrenQ.data?.children ?? tlq.data?.children ?? [];
+  const nativeMembers = useMemo(() => boardMembers.filter((m) => !m.workerTaskId), [boardMembers]);
+  const activeNativeMember = !childId && activeNativeMemberName
+    ? nativeMembers.find((m) => m.memberName === activeNativeMemberName)
+    : undefined;
+  const childDrawerOpen = !!childId || !!activeNativeMember;
+
+  // Mutual exclusion between ChildSessionDrawer and Hebi8LineDrawer
+  useEffect(() => {
+    if (childDrawerOpen) setDrawerOpen(false);
+  }, [childDrawerOpen]);
+
+  useEffect(() => {
+    if (childId) setActiveNativeMemberName(null);
+  }, [childId]);
 
   const inboxByTask = useMemo(() => indexInboxByTask(boot.openInboxItems), [boot.openInboxItems]);
 
@@ -117,7 +154,29 @@ function Hebi8MainView({ boot, mainQ }: { boot: BootstrapResponse; mainQ: Return
   };
   const pendingTurns = mainQ.data?.pendingTurnsSinceLastFold ?? 0;
 
+  const closeChildDrawer = () => {
+    setActiveNativeMemberName(null);
+    if (childId) navigate(paths.hebi8());
+  };
+
+  const openChildDrawer = (cid: string) => {
+    setDrawerOpen(false);
+    setActiveNativeMemberName(null);
+    navigate(paths.hebi8(cid));
+  };
+
+  const openNativeMemberDrawer = (member: BoardMemberCursor) => {
+    if (member.workerTaskId) {
+      openChildDrawer(member.workerTaskId);
+      return;
+    }
+    setDrawerOpen(false);
+    if (childId) navigate(paths.hebi8());
+    setActiveNativeMemberName(member.memberName);
+  };
+
   const openFoldNode = (nodeId: string) => {
+    closeChildDrawer();
     setSelectedNodeId(nodeId);
     setDrawerOpen(true);
   };
@@ -169,10 +228,17 @@ function Hebi8MainView({ boot, mainQ }: { boot: BootstrapResponse; mainQ: Return
           <>
             <button
               type="button"
-              className={`h8-hdr-btn ${drawerOpen ? 'on' : ''}`}
+              className={`h8-hdr-btn ${drawerOpen && !childDrawerOpen ? 'on' : ''}`}
               title="上下文折叠树"
               aria-label="上下文折叠树"
-              onClick={() => setDrawerOpen((v) => !v)}
+              onClick={() => {
+                if (childDrawerOpen) {
+                  closeChildDrawer();
+                  setDrawerOpen(true);
+                } else {
+                  setDrawerOpen((v) => !v);
+                }
+              }}
             >
               <Layers size={13.5} strokeWidth={1.7} />
               <span className="no-mobile">上下文折叠树</span>
@@ -225,6 +291,19 @@ function Hebi8MainView({ boot, mainQ }: { boot: BootstrapResponse; mainQ: Return
         </div>
       </PageHeader>
 
+      {activeTaskId && tlq.data && (
+        <SubsessionStrip
+          parentTaskId={activeTaskId}
+          childrenList={childrenList}
+          boardMembers={boardMembers}
+          machines={boot.machines}
+          activeChildId={childId}
+          activeNativeMember={activeNativeMember?.memberName}
+          onSelectChild={openChildDrawer}
+          onSelectNativeMember={openNativeMemberDrawer}
+        />
+      )}
+
       {mainQ.isError ? (
         <div className="empty">载入 Hebi8 主对话失败：{errMsg(mainQ.error)}</div>
       ) : !activeTaskId || tlq.isLoading ? (
@@ -232,30 +311,47 @@ function Hebi8MainView({ boot, mainQ }: { boot: BootstrapResponse; mainQ: Return
       ) : tlq.isError || !tlq.data ? (
         <div className="empty">载入对话时间线失败：{errMsg(tlq.error)}</div>
       ) : (
-        <div className="sess">
+        <div className={`sess ${childDrawerOpen ? 'has-child-drawer' : ''}`}>
           <SessionConversation
             taskId={activeTaskId}
             tl={tlq.data}
             boot={boot}
+            childrenList={childrenList}
             emptySlot={emptyWelcome}
             onOpenFoldNode={openFoldNode}
+            onOpenChild={openChildDrawer}
           />
-          {drawerOpen && (
-            <div
-              className="dock has-card h8-dock"
-              onClick={(e) => {
-                if (e.target === e.currentTarget) setDrawerOpen(false);
-              }}
-            >
-              <Hebi8LineDrawer
-                nodes={nodes}
-                pins={pins}
-                summary={lineSummary}
-                selectedNodeId={selectedNodeId}
-                onSelectNode={setSelectedNodeId}
-                onClose={() => setDrawerOpen(false)}
-              />
-            </div>
+          {childDrawerOpen ? (
+            <ChildSessionDrawer
+              boot={boot}
+              parentTaskId={activeTaskId}
+              parentProjectId={PA_PROJECT_ID}
+              childTaskId={childId}
+              nativeMember={activeNativeMember}
+              childrenList={childrenList}
+              nativeMembers={nativeMembers}
+              onSelectChild={openChildDrawer}
+              onSelectNativeMember={openNativeMemberDrawer}
+              onClose={closeChildDrawer}
+            />
+          ) : (
+            drawerOpen && (
+              <div
+                className="dock has-card h8-dock"
+                onClick={(e) => {
+                  if (e.target === e.currentTarget) setDrawerOpen(false);
+                }}
+              >
+                <Hebi8LineDrawer
+                  nodes={nodes}
+                  pins={pins}
+                  summary={lineSummary}
+                  selectedNodeId={selectedNodeId}
+                  onSelectNode={setSelectedNodeId}
+                  onClose={() => setDrawerOpen(false)}
+                />
+              </div>
+            )
           )}
         </div>
       )}

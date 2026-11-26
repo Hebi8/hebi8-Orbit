@@ -15,12 +15,14 @@ export function BoardPanel({
   fallbackMembers,
   worker,
   onClose,
+  onSelectMember,
 }: {
   taskId: string;
   board?: TaskBoardResponse;
   fallbackMembers: BoardMemberCursor[];
   worker?: string;
   onClose: () => void;
+  onSelectMember?: (member: BoardMemberCursor) => void;
 }) {
   const qc = useQueryClient();
   const members = board?.members ?? fallbackMembers;
@@ -122,8 +124,12 @@ export function BoardPanel({
               type="button"
               key={m.memberName}
               className={`mem ${worker === m.memberName ? 'cur-view' : ''}`}
-              onClick={() => navigate(paths.session(taskId, m.memberName))}
-              title="下钻到该 Worker 的完整思考与工具流"
+              onClick={() => {
+                if (onSelectMember) onSelectMember(m);
+                else if (m.workerTaskId) navigate(paths.session(taskId, undefined, m.workerTaskId));
+                else navigate(paths.session(taskId, m.memberName));
+              }}
+              title={m.workerTaskId ? '分屏查看并接管该子会话' : '查看该成员的投影记录与消息流'}
             >
               <span className={`sd ${memberDot(m.state)}`} />
               <span className="nm">

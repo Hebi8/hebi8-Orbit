@@ -143,6 +143,7 @@ func (s *Server) failUndispatchedAttemptDetached(reqCtx context.Context, attempt
 	}
 	if len(failEvents) > 0 {
 		s.broker.Broadcast(failEvents...)
+		s.notifyChildTaskProgressAsync(failEvents)
 	}
 	return nil
 }
@@ -163,6 +164,18 @@ func safeDeliveryFrozenDir(dataDir, deliveryID string) (string, bool) {
 	return target, true
 }
 
+func enforceChildNoDeployGuard(parentTaskID string, route resolvedRoute) error {
+	if strings.TrimSpace(parentTaskID) == "" {
+		return nil
+	}
+	if route.Adapter == protocol.AdapterSSHDeploy ||
+		route.MachineCfg.Transport == protocol.TransportSSHOutbound ||
+		(route.HasAnchor && route.Anchor.DeployStrategy != nil) {
+		return errors.New("child sessions cannot target ssh_deploy")
+	}
+	return nil
+}
+
 func (s *Server) createTaskInternal(
 	ctx context.Context,
 	projectID string,
@@ -171,7 +184,7 @@ func (s *Server) createTaskInternal(
 	actorID string,
 	idempHeader string,
 ) (protocol.CreateTaskResponse, int, string, error) {
-	resp, _, status, code, err := s.createTaskInternalWithPA(ctx, projectID, req, actorKind, actorID, idempHeader, nil)
+	resp, _, status, code, err := s.createTaskInternalWithGuards(ctx, projectID, req, actorKind, actorID, idempHeader, nil, nil)
 	return resp, status, code, err
 }
 
@@ -184,6 +197,19 @@ func (s *Server) createTaskInternalWithPA(
 	idempHeader string,
 	paIdemp *store.PAActionIdempotencySpec,
 ) (protocol.CreateTaskResponse, *protocol.PAActionResult, int, string, error) {
+	return s.createTaskInternalWithGuards(ctx, projectID, req, actorKind, actorID, idempHeader, paIdemp, nil)
+}
+
+func (s *Server) createTaskInternalWithGuards(
+	ctx context.Context,
+	projectID string,
+	req protocol.CreateTaskRequest,
+	actorKind protocol.ActorKind,
+	actorID string,
+	idempHeader string,
+	paIdemp *store.PAActionIdempotencySpec,
+	runnerGuard *store.RunnerParentControlGuard,
+) (protocol.CreateTaskResponse, *protocol.PAActionResult, int, string, error) {
 	var resp protocol.CreateTaskResponse
 	req.Goal = strings.TrimSpace(req.Goal)
 	if req.Goal == "" {
@@ -191,6 +217,9 @@ func (s *Server) createTaskInternalWithPA(
 	}
 	if req.Adapter != "" && !req.Adapter.IsValid() {
 		return resp, nil, http.StatusBadRequest, "ERR_INVALID_ADAPTER", fmt.Errorf("invalid adapter %q", req.Adapter)
+	}
+	if strings.TrimSpace(req.ParentTaskID) != "" && req.Adapter == protocol.AdapterSSHDeploy {
+		return resp, nil, http.StatusForbidden, "ERR_DEPLOY_FORBIDDEN", errors.New("child sessions cannot use ssh_deploy adapter")
 	}
 
 	proj, err := s.store.GetProject(ctx, projectID)
@@ -204,6 +233,9 @@ func (s *Server) createTaskInternalWithPA(
 	route, err := s.resolveExecutionRouteWithLocation(proj, req.RequiredCapability, req.Adapter, req.MachineID, req.PartID, req.LocationID)
 	if err != nil {
 		return resp, nil, http.StatusBadRequest, "ERR_ROUTE_FAILED", err
+	}
+	if err := enforceChildNoDeployGuard(req.ParentTaskID, route); err != nil {
+		return resp, nil, http.StatusForbidden, "ERR_DEPLOY_FORBIDDEN", err
 	}
 	if err := enforcePostRouteGuard(actorKind, route); err != nil {
 		return resp, nil, http.StatusForbidden, "ERR_DEPLOY_FORBIDDEN", err
@@ -317,9 +349,12 @@ func (s *Server) createTaskInternalWithPA(
 	}
 
 	res, err := s.store.CreateTask(ctx, store.CreateTaskParams{
-		ProjectID:           projectID,
-		ParentTaskID:        strings.TrimSpace(req.ParentTaskID),
-		Title:               req.Title,
+		ProjectID:            projectID,
+		ParentTaskID:         strings.TrimSpace(req.ParentTaskID),
+		DelegatedByAttemptID: strings.TrimSpace(req.DelegatedByAttemptID),
+		DelegatedRole:        strings.TrimSpace(req.DelegatedRole),
+		NotifyParentOnFinish: req.NotifyParent,
+		Title:                req.Title,
 		Goal:                req.Goal,
 		RequiredCapability:  route.Capability,
 		RequiredResources:   req.RequiredResources,
@@ -345,7 +380,11 @@ func (s *Server) createTaskInternalWithPA(
 		ActorID:             actorID,
 		ActorKind:           actorKind,
 		PAIdempotency:       paIdemp,
+		RunnerParentGuard:   runnerGuard,
 	})
+	if errors.Is(err, store.ErrForbidden) {
+		return resp, nil, http.StatusForbidden, "ERR_FORBIDDEN", err
+	}
 	if errors.Is(err, store.ErrNotFound) {
 		return resp, nil, http.StatusNotFound, "ERR_NOT_FOUND", err
 	}
@@ -367,6 +406,7 @@ func (s *Server) createTaskInternalWithPA(
 
 	if len(res.Events) > 0 {
 		s.broker.Broadcast(res.Events...)
+		s.notifyChildTaskProgressAsync(res.Events)
 	}
 
 	dispatched := false
@@ -508,7 +548,34 @@ func (s *Server) followupTaskWithExtra(
 	actorID string,
 	payloadExtra map[string]any,
 ) (protocol.FollowupTaskResponse, int, string, error) {
-	resp, _, status, code, err := s.followupTaskInternalWithPA(ctx, taskID, req, actorKind, actorID, payloadExtra, nil)
+	resp, _, status, code, err := s.followupTaskInternalWithTrigger(ctx, taskID, req, protocol.TriggerFollowup, actorKind, actorID, payloadExtra, nil, nil, nil)
+	return resp, status, code, err
+}
+
+func (s *Server) followupTaskWithRunnerGuard(
+	ctx context.Context,
+	taskID string,
+	req protocol.FollowupTaskRequest,
+	actorKind protocol.ActorKind,
+	actorID string,
+	payloadExtra map[string]any,
+	runnerGuard *store.RunnerParentControlGuard,
+) (protocol.FollowupTaskResponse, int, string, error) {
+	resp, _, status, code, err := s.followupTaskInternalWithTrigger(ctx, taskID, req, protocol.TriggerFollowup, actorKind, actorID, payloadExtra, nil, nil, runnerGuard)
+	return resp, status, code, err
+}
+
+func (s *Server) followupTaskWithTrigger(
+	ctx context.Context,
+	taskID string,
+	req protocol.FollowupTaskRequest,
+	triggerKind protocol.TriggerKind,
+	actorKind protocol.ActorKind,
+	actorID string,
+	payloadExtra map[string]any,
+	childNotif *store.ChildNotificationDelivery,
+) (protocol.FollowupTaskResponse, int, string, error) {
+	resp, _, status, code, err := s.followupTaskInternalWithTrigger(ctx, taskID, req, triggerKind, actorKind, actorID, payloadExtra, nil, childNotif, nil)
 	return resp, status, code, err
 }
 
@@ -520,6 +587,21 @@ func (s *Server) followupTaskInternalWithPA(
 	actorID string,
 	payloadExtra map[string]any,
 	paIdemp *store.PAActionIdempotencySpec,
+) (protocol.FollowupTaskResponse, *protocol.PAActionResult, int, string, error) {
+	return s.followupTaskInternalWithTrigger(ctx, taskID, req, protocol.TriggerFollowup, actorKind, actorID, payloadExtra, paIdemp, nil, nil)
+}
+
+func (s *Server) followupTaskInternalWithTrigger(
+	ctx context.Context,
+	taskID string,
+	req protocol.FollowupTaskRequest,
+	triggerKind protocol.TriggerKind,
+	actorKind protocol.ActorKind,
+	actorID string,
+	payloadExtra map[string]any,
+	paIdemp *store.PAActionIdempotencySpec,
+	childNotif *store.ChildNotificationDelivery,
+	runnerGuard *store.RunnerParentControlGuard,
 ) (protocol.FollowupTaskResponse, *protocol.PAActionResult, int, string, error) {
 	var resp protocol.FollowupTaskResponse
 	req.Message = strings.TrimSpace(req.Message)
@@ -645,6 +727,12 @@ func (s *Server) followupTaskInternalWithPA(
 	// seeded from task.LatestDeliveryID so the active session remains undisturbed.
 	// S2: Inherit parent task's effective DesiredConfig, RequiredResources, location, isolation, and refs.
 	if mode == protocol.FollowupModeForkNewSession && task.ActiveAttemptID != "" {
+		if req.Adapter == protocol.AdapterSSHDeploy {
+			return resp, nil, http.StatusForbidden, "ERR_DEPLOY_FORBIDDEN", errors.New("child sessions cannot use ssh_deploy adapter")
+		}
+		if err := enforceChildNoDeployGuard(task.TaskID, route); err != nil {
+			return resp, nil, http.StatusForbidden, "ERR_DEPLOY_FORBIDDEN", err
+		}
 		createdBy := protocol.TaskCreatedByHuman
 		if actorKind == protocol.ActorPA {
 			createdBy = protocol.TaskCreatedByPA
@@ -741,7 +829,9 @@ func (s *Server) followupTaskInternalWithPA(
 	// B9, B11, S2, NEW-3: Single BEGIN IMMEDIATE transaction decides busy vs idle, enforces needs_verification,
 	// persists steer cancellation intent, stores server-only route_json, and commits PA idempotency receipt.
 	src := protocol.PendingSourceHuman
-	if actorKind == protocol.ActorPA {
+	if triggerKind == protocol.TriggerChildResult || actorKind == protocol.ActorSystem {
+		src = protocol.PendingSourceSystem
+	} else if actorKind == protocol.ActorPA {
 		src = protocol.PendingSourcePA
 	}
 	subRes, err := s.store.SubmitFollowupAtomic(ctx, store.SubmitFollowupParams{
@@ -763,11 +853,17 @@ func (s *Server) followupTaskInternalWithPA(
 		VerifiedSite:      req.VerifiedSite,
 		VerifiedAttemptID: strings.TrimSpace(req.VerifiedAttemptID),
 		LeaseTTLMs:        s.leaseTTL.Milliseconds(),
+		TriggerKind:       triggerKind,
 		ActorKind:         actorKind,
 		ActorID:           actorID,
 		PayloadExtra:      effPayloadExtra,
 		PAIdempotency:     paIdemp,
+		ChildNotification: childNotif,
+		RunnerParentGuard: runnerGuard,
 	})
+	if errors.Is(err, store.ErrForbidden) {
+		return resp, nil, http.StatusForbidden, "ERR_FORBIDDEN", err
+	}
 	if errors.Is(err, store.ErrNotFound) {
 		return resp, nil, http.StatusNotFound, "ERR_TASK_NOT_FOUND", err
 	}
@@ -786,12 +882,18 @@ func (s *Server) followupTaskInternalWithPA(
 	if err != nil {
 		return resp, nil, http.StatusInternalServerError, "ERR_FOLLOWUP", err
 	}
+	if subRes.NotificationAlreadyHandled || subRes.NotificationSkipped {
+		return resp, nil, http.StatusOK, "", nil
+	}
 	if subRes.ReplayedReceipt != nil {
 		return resp, subRes.ReplayedReceipt, http.StatusOK, "", nil
 	}
 
 	if len(subRes.Events) > 0 {
 		s.broker.Broadcast(subRes.Events...)
+	}
+	if req.VerifiedSite {
+		s.triggerChildNotificationDrainAsync()
 	}
 
 	// If steer targeted a live dispatched attempt, send attempt.cancel immediately
@@ -858,15 +960,23 @@ func (s *Server) handleFollowupTask(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) cancelTaskInternal(ctx context.Context, taskID, actorID, reason string) (protocol.CancelTaskResponse, int, string, error) {
-	resp, _, status, code, err := s.cancelTaskInternalWithPA(ctx, taskID, actorID, reason, nil)
+	resp, _, status, code, err := s.cancelTaskInternalWithGuards(ctx, taskID, actorID, reason, nil, nil)
 	return resp, status, code, err
 }
 
 func (s *Server) cancelTaskInternalWithPA(ctx context.Context, taskID, actorID, reason string, paIdemp *store.PAActionIdempotencySpec) (protocol.CancelTaskResponse, *protocol.PAActionResult, int, string, error) {
+	return s.cancelTaskInternalWithGuards(ctx, taskID, actorID, reason, paIdemp, nil)
+}
+
+func (s *Server) cancelTaskInternalWithGuards(ctx context.Context, taskID, actorID, reason string, paIdemp *store.PAActionIdempotencySpec, runnerGuard *store.RunnerParentControlGuard) (protocol.CancelTaskResponse, *protocol.PAActionResult, int, string, error) {
 	var resp protocol.CancelTaskResponse
 	// B10 & NEW-3: Perform idempotency check + cancel_requested=1 persistence + receipt storage in ONE tx!
-	// Calling CancelTaskActiveAttemptWithIdempotency directly ensures replays succeed even after active_attempt_id is cleared.
-	res, err := s.store.CancelTaskActiveAttemptWithIdempotency(ctx, taskID, actorID, reason, false, paIdemp)
+	// Calling CancelTaskActiveAttemptWithGuard directly ensures replays succeed even after active_attempt_id is cleared,
+	// and enforces live runner parent control + descendant scope inside the write transaction.
+	res, err := s.store.CancelTaskActiveAttemptWithGuard(ctx, taskID, actorID, reason, false, paIdemp, runnerGuard)
+	if errors.Is(err, store.ErrForbidden) {
+		return resp, nil, http.StatusForbidden, "ERR_FORBIDDEN", err
+	}
 	if errors.Is(err, store.ErrNotFound) {
 		return resp, nil, http.StatusNotFound, "ERR_TASK_NOT_FOUND", err
 	}
@@ -881,6 +991,7 @@ func (s *Server) cancelTaskInternalWithPA(ctx context.Context, taskID, actorID, 
 	}
 	if len(res.Events) > 0 {
 		s.broker.Broadcast(res.Events...)
+		s.notifyChildTaskProgressAsync(res.Events)
 	}
 
 	cancelSent := false
@@ -996,6 +1107,9 @@ func (s *Server) handleRetryTask(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(events) > 0 {
 		s.broker.Broadcast(events...)
+	}
+	if req.VerifiedSite {
+		s.triggerChildNotificationDrainAsync()
 	}
 	dispatched := s.dispatchAttemptRecord(r.Context(), att, "", 0)
 	writeJSON(w, http.StatusCreated, protocol.RetryTaskResponse{
@@ -1263,6 +1377,10 @@ func (s *Server) handleDispatchAnnotations(w http.ResponseWriter, r *http.Reques
 
 	if len(res.Events) > 0 {
 		s.broker.Broadcast(res.Events...)
+		s.notifyChildTaskProgressAsync(res.Events)
+	}
+	if req.VerifiedSite {
+		s.triggerChildNotificationDrainAsync()
 	}
 
 	dispatched := false

@@ -21,7 +21,7 @@ export type TaskCreatedBy = (typeof TaskCreatedByValues)[number];
 export const SessionRuntimeStateValues = ["starting", "live", "closing", "idle_closed", "dead"] as const;
 export type SessionRuntimeState = (typeof SessionRuntimeStateValues)[number];
 
-export const TriggerKindValues = ["initial", "followup", "annotation_batch", "retry", "deploy", "workspace_import", "manual_import"] as const;
+export const TriggerKindValues = ["initial", "followup", "annotation_batch", "retry", "deploy", "workspace_import", "manual_import", "child_result"] as const;
 export type TriggerKind = (typeof TriggerKindValues)[number];
 
 export const DeployPhaseValues = ["awaiting_approval", "pushing", "switching", "verifying", "done"] as const;
@@ -84,7 +84,7 @@ export type InboxCategory = (typeof InboxCategoryValues)[number];
 export const InboxStateValues = ["open", "resolved", "dismissed"] as const;
 export type InboxState = (typeof InboxStateValues)[number];
 
-export const EventKindValues = ["task.created", "task.state_changed", "task.cancelled", "task.archived", "task.unarchived", "task.deleted", "attempt.started", "attempt.state_changed", "attempt.finished", "resource.waiting", "resource.acquired", "delivery.published", "delivery.verified", "delivery.ryugi_updated", "delivery.review_completed", "annotation.created", "annotation.addressed", "approval.requested", "approval.decided", "approval.expired", "approval.consumed", "deploy.started", "deploy.verified", "deploy.failed", "acp.message_batch", "acp.thought_batch", "acp.tool_call", "acp.unsolicited_update", "acp.usage", "pa.turn", "pa.action_executed", "pa.thread_created", "board.message_posted", "board.member_updated", "queue.updated", "task.project_bound", "task.source_added", "task.source_removed", "machine.state_changed", "pairing.updated", "machine.agents_updated", "project.changed", "network.settings_changed", "hebi8.folded"] as const;
+export const EventKindValues = ["task.created", "task.state_changed", "task.cancelled", "task.archived", "task.unarchived", "task.deleted", "attempt.started", "attempt.state_changed", "attempt.finished", "resource.waiting", "resource.acquired", "delivery.published", "delivery.verified", "delivery.ryugi_updated", "delivery.review_completed", "annotation.created", "annotation.addressed", "approval.requested", "approval.decided", "approval.expired", "approval.consumed", "deploy.started", "deploy.verified", "deploy.failed", "acp.message_batch", "acp.thought_batch", "acp.tool_call", "acp.unsolicited_update", "acp.usage", "pa.turn", "pa.action_executed", "pa.thread_created", "board.message_posted", "board.member_updated", "queue.updated", "task.project_bound", "task.source_added", "task.source_removed", "machine.state_changed", "pairing.updated", "machine.agents_updated", "project.changed", "network.settings_changed", "hebi8.folded", "task.child_spawned", "task.child_updated"] as const;
 export type EventKind = (typeof EventKindValues)[number];
 
 export const IDESchemeValues = ["cursor", "vscode", "zed", "antigravity"] as const;
@@ -501,6 +501,58 @@ export interface ReferencedTaskMeta {
   projectName?: string;
 }
 
+export interface ChildResultMeta {
+  childTaskId: string;
+  childTitle: string;
+  childRole?: string;
+  childProjectId?: string;
+  childState: AttemptState;
+  summary?: string;
+  errorDetail?: string;
+  deliveryId?: string;
+  filesChanged?: number;
+  insertions?: number;
+  deletions?: number;
+}
+
+export interface ParentTaskRef {
+  taskId: string;
+  projectId: string;
+  projectName?: string;
+  title: string;
+  state: TaskState;
+  isHebi8Main?: boolean;
+}
+
+export interface ChildTaskView {
+  taskId: string;
+  projectId: string;
+  projectName?: string;
+  parentTaskId: string;
+  delegatedByAttemptId?: string;
+  delegatedRole?: string;
+  title: string;
+  goal: string;
+  state: TaskState;
+  preferredAdapter?: Adapter;
+  machineId?: string;
+  model?: string;
+  activeAttemptId?: string;
+  latestDeliveryId?: string;
+  deliveryCount: number;
+  attemptCount: number;
+  openApprovalCount: number;
+  currentStep?: string;
+  lastMessagePreview?: string;
+  errorDetail?: string;
+  filesChanged?: number;
+  insertions?: number;
+  deletions?: number;
+  createdAt: number;
+  updatedAt: number;
+  archivedAt?: number | null;
+}
+
 export interface AttemptView {
   attemptId: string;
   taskId: string;
@@ -514,6 +566,7 @@ export interface AttemptView {
   triggerKind: TriggerKind;
   promptText?: string;
   refTasks?: ReferencedTaskMeta[];
+  childResult?: ChildResultMeta | null;
   worktreePath?: string;
   baseSha?: string;
   outputDeliveryId?: string;
@@ -530,6 +583,11 @@ export interface TaskSummary {
   taskId: string;
   projectId: string;
   parentTaskId?: string;
+  delegatedByAttemptId?: string;
+  delegatedRole?: string;
+  childCount?: number;
+  activeChildCount?: number;
+  pendingChildApprovals?: number;
   title: string;
   goal: string;
   requiredCapability: string;
@@ -646,6 +704,10 @@ export interface BoardMemberCursor {
   lastConsumedSeq: number;
   currentStep?: string;
   workerTaskId?: string;
+  sourceKind?: string;
+  role?: string;
+  brief?: string;
+  externalSessionId?: string;
   updatedAt: number;
 }
 
@@ -669,6 +731,9 @@ export interface WorkerStreamResponse {
 export interface TaskTimelineResponse {
   task: TaskSummary;
   runtimeConfig?: Record<string, string>;
+  parentSummary?: ParentTaskRef | null;
+  children?: ChildTaskView[];
+  siblingChildren?: ChildTaskView[];
   attempts: AttemptView[];
   deliveries: DeliveryView[];
   annotations: AnnotationView[];
@@ -854,6 +919,9 @@ export interface CreateTaskRequest {
   title?: string;
   goal: string;
   parentTaskId?: string;
+  delegatedByAttemptId?: string;
+  delegatedRole?: string;
+  notifyParent?: boolean | null;
   machineId?: string;
   partId?: string;
   locationId?: string;
@@ -868,6 +936,53 @@ export interface CreateTaskRequest {
   sources?: CreateTaskSourceInput[];
   idempotencyKey?: string;
   swarmIdleTimeoutMs?: number;
+}
+
+export interface CreateChildTaskRequest {
+  title?: string;
+  role?: string;
+  goal: string;
+  projectId?: string;
+  machineId?: string;
+  partId?: string;
+  locationId?: string;
+  useWorktree?: boolean | null;
+  requiredCapability?: string;
+  adapter?: Adapter;
+  config?: Record<string, string>;
+  delegatedByAttemptId?: string;
+  notifyParent?: boolean | null;
+  idempotencyKey?: string;
+}
+
+export interface ListChildrenResponse {
+  parentTaskId: string;
+  children: ChildTaskView[];
+}
+
+export interface TaskTranscriptTurn {
+  attemptId: string;
+  attemptNo: number;
+  triggerKind: TriggerKind;
+  state: AttemptState;
+  prompt?: string;
+  reply?: string;
+  toolCount: number;
+  errorDetail?: string;
+  deliveryId?: string;
+  filesChanged?: number;
+  startedAt: number;
+  finishedAt?: number | null;
+}
+
+export interface TaskTranscriptResponse {
+  taskId: string;
+  parentTaskId?: string;
+  projectId: string;
+  title: string;
+  state: TaskState;
+  openApprovalCount: number;
+  turns: TaskTranscriptTurn[];
 }
 
 export interface CreateTaskResponse {
@@ -1403,6 +1518,7 @@ export interface Hebi8LineResponse {
 export interface Hebi8RawTurn {
   attemptId: string;
   attemptNo: number;
+  triggerKind?: TriggerKind;
   state: AttemptState;
   userPrompt: string;
   assistantReply: string;

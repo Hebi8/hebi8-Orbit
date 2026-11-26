@@ -1,7 +1,14 @@
 import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { ArchiveRestore } from 'lucide-react';
-import type { BoardMemberCursor, BootstrapResponse, EventRecord, PendingInput, TaskTimelineResponse } from '../generated/protocol';
+import type {
+  BoardMemberCursor,
+  BootstrapResponse,
+  ChildTaskView,
+  EventRecord,
+  PendingInput,
+  TaskTimelineResponse,
+} from '../generated/protocol';
 import { api, errMsg } from '../lib/api';
 import { toast, useWorkbenchStore } from '../store/useWorkbenchStore';
 import { Composer } from './Composer';
@@ -85,9 +92,12 @@ export function SessionConversation({
   worker,
   drilledMember,
   compact = false,
+  inDrawer = false,
+  childrenList,
   emptySlot,
   onOpenReview,
   onOpenFoldNode,
+  onOpenChild,
 }: {
   taskId: string;
   tl: TaskTimelineResponse;
@@ -95,9 +105,12 @@ export function SessionConversation({
   worker?: string;
   drilledMember?: BoardMemberCursor;
   compact?: boolean;
+  inDrawer?: boolean;
+  childrenList?: ChildTaskView[];
   emptySlot?: ReactNode;
   onOpenReview?: () => void;
   onOpenFoldNode?: (nodeId: string) => void;
+  onOpenChild?: (childTaskId: string) => void;
 }) {
   const qc = useQueryClient();
   const remember = useWorkbenchStore((s) => s.rememberPrompt);
@@ -181,7 +194,7 @@ export function SessionConversation({
   }, [tl.events, tl.attempts]);
 
   return (
-    <div className={`sess-body ${compact ? 'compact' : ''}`}>
+    <div className={`sess-body ${compact ? 'compact' : ''} ${inDrawer ? 'in-drawer' : ''}`}>
       <div className="stage" ref={stageRef} onScroll={onScroll}>
         {worker ? (
           <div ref={tlRef}>
@@ -189,7 +202,7 @@ export function SessionConversation({
           </div>
         ) : (
           <>
-            {!compact && tl.attempts.length > 0 && <Minimap tl={tl} stageRef={stageRef} />}
+            {!compact && !inDrawer && tl.attempts.length > 0 && <Minimap tl={tl} stageRef={stageRef} />}
             <div className="tl" ref={tlRef}>
               {tl.attempts.length === 0 && (
                 emptySlot ? (
@@ -216,6 +229,9 @@ export function SessionConversation({
                       isLast={i === tl.attempts.length - 1}
                       tl={tl}
                       compact={compact}
+                      childrenList={childrenList}
+                      machines={boot?.machines}
+                      onOpenChild={onOpenChild}
                     />
                     {dividers.map((div) => (
                       <FoldDividerBar key={div.eventId} info={div} onOpenFoldNode={onOpenFoldNode} />
@@ -264,6 +280,7 @@ export function SessionConversation({
           projects={boot?.projects}
           machineId={lastAttempt?.machineId}
           compact={compact}
+          inDrawer={inDrawer}
           onOpenReview={onOpenReview}
         />
       )}

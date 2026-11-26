@@ -436,6 +436,29 @@ CREATE INDEX IF NOT EXISTS idx_board_members_task ON board_members(task_id, upda
 	)
 }
 
+// BuildMigrationV7DDL constructs the Phase 3 durable child_parent_notifications table and index.
+// Executed strictly inside applyMigrationV7Atomic so v6->v7 upgrades are 100% atomic.
+func BuildMigrationV7DDL() string {
+	return `
+CREATE TABLE IF NOT EXISTS child_parent_notifications (
+  notif_seq        INTEGER PRIMARY KEY AUTOINCREMENT,
+  child_attempt_id TEXT NOT NULL UNIQUE REFERENCES attempts(attempt_id),
+  child_task_id    TEXT NOT NULL REFERENCES tasks(task_id),
+  parent_task_id   TEXT NOT NULL REFERENCES tasks(task_id),
+  child_state      TEXT NOT NULL,
+  status           TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'delivered', 'skipped')),
+  retry_count      INTEGER NOT NULL DEFAULT 0,
+  next_retry_at    INTEGER NOT NULL DEFAULT 0,
+  last_error       TEXT,
+  created_at       INTEGER NOT NULL,
+  delivered_at     INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_child_parent_notif_pending
+  ON child_parent_notifications(status, next_retry_at, notif_seq);
+`
+}
+
 // BuildMigrationV3DDL constructs the Phase 1 review-hardening additive tables.
 func BuildMigrationV3DDL() string {
 	return `

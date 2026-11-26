@@ -204,6 +204,7 @@ type PendingInputRoute struct {
 	AnchorCapability  string                        `json:"anchorCapability,omitempty"`
 	Anchor            *protocol.ProjectAnchorConfig `json:"anchor,omitempty"`
 	ForceNewSession   bool                          `json:"forceNewSession,omitempty"`
+	TriggerKind       protocol.TriggerKind          `json:"triggerKind,omitempty"`
 	ActorKind         protocol.ActorKind            `json:"actorKind,omitempty"`
 	ActorID           string                        `json:"actorId,omitempty"`
 }
@@ -660,21 +661,26 @@ type SubmitFollowupParams struct {
 	VerifiedSite      bool
 	VerifiedAttemptID string
 	LeaseTTLMs        int64
+	TriggerKind       protocol.TriggerKind
 	ActorKind         protocol.ActorKind
 	ActorID           string
 	PayloadExtra      map[string]any
 	PAIdempotency     *PAActionIdempotencySpec
+	ChildNotification *ChildNotificationDelivery
+	RunnerParentGuard *RunnerParentControlGuard
 }
 
 // SubmitFollowupResult reports whether the follow-up started an Attempt directly, queued while busy,
 // or persisted a steer cancellation against an active attempt.
 type SubmitFollowupResult struct {
-	Task            protocol.TaskSummary
-	Attempt         *AttemptRecord
-	PendingInput    *protocol.PendingInput
-	ActiveToCancel  *AttemptRecord
-	ReplayedReceipt *protocol.PAActionResult
-	Events          []protocol.EventRecord
+	Task                       protocol.TaskSummary
+	Attempt                    *AttemptRecord
+	PendingInput               *protocol.PendingInput
+	ActiveToCancel             *AttemptRecord
+	ReplayedReceipt            *protocol.PAActionResult
+	Events                     []protocol.EventRecord
+	NotificationAlreadyHandled bool
+	NotificationSkipped        bool
 }
 
 // SubmitFollowupAtomic eliminates the check-vs-enqueue race (B9) by checking active_attempt_id,
@@ -704,6 +710,20 @@ func (s *Store) SubmitFollowupAtomic(ctx context.Context, p SubmitFollowupParams
 	}
 
 	err := s.WithWriteTx(ctx, func(tx *sql.Tx) error {
+		// P1-1: Atomically verify runner parent control + descendant scope inside the write tx.
+		if p.RunnerParentGuard != nil {
+			if err := verifyRunnerParentControlTx(ctx, tx, p.RunnerParentGuard); err != nil {
+				return err
+			}
+			isDesc, err := isDescendantTaskTx(ctx, tx, p.RunnerParentGuard.ParentTaskID, p.TaskID)
+			if err != nil {
+				return err
+			}
+			if !isDesc {
+				return fmt.Errorf("%w: task %s is not a descendant of %s", ErrForbidden, p.TaskID, p.RunnerParentGuard.ParentTaskID)
+			}
+		}
+
 		// NEW-3: Atomic PA idempotency check inside the SAME write transaction.
 		if prevReceipt, found, err := lookupPAActionReceiptTx(ctx, tx, p.PAIdempotency); err != nil {
 			return err
@@ -712,18 +732,79 @@ func (s *Store) SubmitFollowupAtomic(ctx context.Context, p SubmitFollowupParams
 			return nil
 		}
 
-		var projectID, prefAdapter, desiredCfgJSON, reqResJSON string
+		// P1 #5: When delivering a durable child_parent_notification, verify status='pending' AND parent task state
+		// inside this SAME BEGIN IMMEDIATE transaction so concurrent cancellation/archival never restarts the parent
+		// and delivery is never confirmed unless the parent enqueue/attempt commits atomically.
+		var notifChildAttemptID string
+		if p.ChildNotification != nil && strings.TrimSpace(p.ChildNotification.ChildAttemptID) != "" {
+			notifChildAttemptID = strings.TrimSpace(p.ChildNotification.ChildAttemptID)
+			var notifStatus string
+			nErr := tx.QueryRowContext(ctx, `
+				SELECT status FROM child_parent_notifications WHERE child_attempt_id = ?
+			`, notifChildAttemptID).Scan(&notifStatus)
+			if errors.Is(nErr, sql.ErrNoRows) || (nErr == nil && notifStatus != "pending") {
+				res.NotificationAlreadyHandled = true
+				return nil
+			}
+			if nErr != nil {
+				return nErr
+			}
+		}
+
+		markChildNotificationDeliveredTx := func() error {
+			if notifChildAttemptID == "" {
+				return nil
+			}
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE child_parent_notifications
+				SET status = 'delivered', delivered_at = ?, last_error = NULL
+				WHERE child_attempt_id = ? AND status = 'pending'
+			`, now, notifChildAttemptID); err != nil {
+				return err
+			}
+			_, _ = tx.ExecContext(ctx, `
+				UPDATE tasks SET parent_notified_attempt_id = ?
+				WHERE task_id = (SELECT child_task_id FROM child_parent_notifications WHERE child_attempt_id = ?)
+			`, notifChildAttemptID, notifChildAttemptID)
+			return nil
+		}
+
+		var projectID, prefAdapter, desiredCfgJSON, reqResJSON, taskStateStr string
 		var activeAtt, latestDlv sql.NullString
 		var archivedAt sql.NullInt64
 		err := tx.QueryRowContext(ctx, `
-			SELECT project_id, active_attempt_id, latest_delivery_id, preferred_adapter, desired_config_json, required_resources, archived_at
+			SELECT project_id, state, active_attempt_id, latest_delivery_id, preferred_adapter, desired_config_json, required_resources, archived_at
 			FROM tasks WHERE task_id = ?
-		`, p.TaskID).Scan(&projectID, &activeAtt, &latestDlv, &prefAdapter, &desiredCfgJSON, &reqResJSON, &archivedAt)
+		`, p.TaskID).Scan(&projectID, &taskStateStr, &activeAtt, &latestDlv, &prefAdapter, &desiredCfgJSON, &reqResJSON, &archivedAt)
 		if errors.Is(err, sql.ErrNoRows) {
+			if notifChildAttemptID != "" {
+				_, _ = tx.ExecContext(ctx, `
+					UPDATE child_parent_notifications
+					SET status = 'skipped', last_error = 'parent task deleted', delivered_at = ?
+					WHERE child_attempt_id = ? AND status = 'pending'
+				`, now, notifChildAttemptID)
+				res.NotificationSkipped = true
+				return nil
+			}
 			return fmt.Errorf("%w: task %s", ErrNotFound, p.TaskID)
 		}
 		if err != nil {
 			return err
+		}
+		if notifChildAttemptID != "" && (archivedAt.Valid || protocol.TaskState(taskStateStr) == protocol.TaskStateCancelled) {
+			reason := "parent task cancelled"
+			if archivedAt.Valid {
+				reason = "parent task archived"
+			}
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE child_parent_notifications
+				SET status = 'skipped', last_error = ?, delivered_at = ?
+				WHERE child_attempt_id = ? AND status = 'pending'
+			`, reason, now, notifChildAttemptID); err != nil {
+				return err
+			}
+			res.NotificationSkipped = true
+			return nil
 		}
 		if archivedAt.Valid {
 			return fmt.Errorf("%w: task %s", ErrTaskArchived, p.TaskID)
@@ -772,6 +853,7 @@ func (s *Store) SubmitFollowupAtomic(ctx context.Context, p SubmitFollowupParams
 			AnchorCapability:  p.AnchorCapability,
 			Anchor:            p.Anchor,
 			ForceNewSession:   p.Mode == protocol.FollowupModeForkNewSession,
+			TriggerKind:       p.TriggerKind,
 			ActorKind:         p.ActorKind,
 			ActorID:           p.ActorID,
 		}
@@ -940,6 +1022,9 @@ func (s *Store) SubmitFollowupAtomic(ctx context.Context, p SubmitFollowupParams
 				if err != nil {
 					return err
 				}
+				if err := markChildNotificationDeliveredTx(); err != nil {
+					return err
+				}
 				if p.PAIdempotency != nil && strings.TrimSpace(p.PAIdempotency.Key) != "" {
 					receipt := protocol.PAActionResult{
 						Action:  p.PAIdempotency.Action,
@@ -975,6 +1060,9 @@ func (s *Store) SubmitFollowupAtomic(ctx context.Context, p SubmitFollowupParams
 				WHERE inbox_id = ? AND state = 'open'
 			`, now, now, "inb:blk:"+lastAtt.AttemptID)
 			if lastAtt.State == protocol.AttemptNeedsVerification {
+				if err := resetParentChildNotificationBackoffTx(ctx, tx, p.TaskID); err != nil {
+					return err
+				}
 				if err := releaseQueuedAnnotationsTx(ctx, tx, lastAtt.AttemptID); err != nil {
 					return err
 				}
@@ -986,6 +1074,11 @@ func (s *Store) SubmitFollowupAtomic(ctx context.Context, p SubmitFollowupParams
 			userPayload["explicitFullPermission"] = true
 		}
 
+		triggerKind := p.TriggerKind
+		if triggerKind == "" || !triggerKind.IsValid() {
+			triggerKind = protocol.TriggerFollowup
+		}
+
 		att, evAtt, err := createAttemptInTx(ctx, tx, createAttemptTxParams{
 			TaskID:            p.TaskID,
 			ProjectID:         projectID,
@@ -995,7 +1088,7 @@ func (s *Store) SubmitFollowupAtomic(ctx context.Context, p SubmitFollowupParams
 			LocationID:        p.LocationID,
 			Isolation:         p.Isolation,
 			RouteExplicit:     p.RouteExplicit,
-			TriggerKind:       protocol.TriggerFollowup,
+			TriggerKind:       triggerKind,
 			TriggerPayload:    userPayload,
 			Prompt:            p.Body,
 			WorktreePath:      p.WorktreePath,
@@ -1032,6 +1125,9 @@ func (s *Store) SubmitFollowupAtomic(ctx context.Context, p SubmitFollowupParams
 
 		res.Task, err = loadTaskSummaryTx(ctx, tx, p.TaskID)
 		if err != nil {
+			return err
+		}
+		if err := markChildNotificationDeliveredTx(); err != nil {
 			return err
 		}
 		if p.PAIdempotency != nil && strings.TrimSpace(p.PAIdempotency.Key) != "" {
@@ -1252,6 +1348,9 @@ func (s *Store) DispatchAnnotations(ctx context.Context, p DispatchAnnotationsPa
 				return err
 			}
 			if lastAtt != nil && lastAtt.State == protocol.AttemptNeedsVerification {
+				if err := resetParentChildNotificationBackoffTx(ctx, tx, p.TaskID); err != nil {
+					return err
+				}
 				if err := releaseQueuedAnnotationsTx(ctx, tx, lastAtt.AttemptID); err != nil {
 					return err
 				}
@@ -1700,6 +1799,9 @@ func (s *Store) ConsumeNextPendingInput(ctx context.Context, p ConsumeNextPendin
 				anchor = rt.Anchor
 			}
 			forceNewSession = rt.ForceNewSession
+			if rt.TriggerKind != "" && rt.TriggerKind.IsValid() && pi.Kind != protocol.PendingInputAnnotationBatch {
+				triggerKind = rt.TriggerKind
+			}
 			if rt.ActorKind != "" {
 				actorKind = rt.ActorKind
 			}

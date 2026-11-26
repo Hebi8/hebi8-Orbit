@@ -23,6 +23,8 @@ export function useDecideApproval() {
       toast(`已提交：${opt?.label ?? v.optionId}`);
       void qc.invalidateQueries({ queryKey: ['approvals'] });
       void qc.invalidateQueries({ queryKey: ['task-timeline', v.approval.taskId] });
+      void qc.invalidateQueries({ queryKey: ['task-children'] });
+      void qc.invalidateQueries({ queryKey: ['all-tasks'] });
       void qc.invalidateQueries({ queryKey: ['bootstrap'] });
     },
     onError: (err) => toast(errMsg(err), 'err'),

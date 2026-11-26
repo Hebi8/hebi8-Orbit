@@ -473,7 +473,12 @@ func (s *Store) GetProject(ctx context.Context, projectID string) (protocol.Proj
 }
 
 const taskSummarySelectSQL = `
-		SELECT t.task_id, t.project_id, t.parent_task_id, t.title, t.goal,
+		SELECT t.task_id, t.project_id, t.parent_task_id,
+		       t.delegated_by_attempt_id, t.delegated_role,
+		       (SELECT COUNT(*) FROM tasks ct WHERE ct.parent_task_id = t.task_id AND ct.archived_at IS NULL) AS child_count,
+		       (SELECT COUNT(*) FROM tasks ct WHERE ct.parent_task_id = t.task_id AND ct.archived_at IS NULL AND ct.state IN ('queued', 'waiting_resource', 'running', 'waiting_approval')) AS active_child_count,
+		       (SELECT COUNT(*) FROM approvals ap JOIN tasks ct ON ct.task_id = ap.task_id WHERE ct.parent_task_id = t.task_id AND ct.archived_at IS NULL AND ap.state = 'pending') AS pending_child_approvals,
+		       t.title, t.goal,
 		       t.required_capability, t.preferred_adapter, t.state, t.waiting_reason,
 		       t.active_attempt_id, a.state, t.latest_delivery_id, d.head_sha,
 		       (SELECT COUNT(*) FROM annotations an WHERE an.task_id = t.task_id AND an.status = 'open') AS open_ann,
@@ -531,11 +536,14 @@ func (s *Store) ListProjectTasks(ctx context.Context, projectID string, archived
 
 func scanTaskSummary(scanner interface{ Scan(...any) error }) (protocol.TaskSummary, error) {
 	var ts protocol.TaskSummary
-	var parentID, waitingReason, activeAttID, activeAttState, latestDlvID, latestHead sql.NullString
+	var parentID, delegatedByAtt, delegatedRole, waitingReason, activeAttID, activeAttState, latestDlvID, latestHead sql.NullString
 	var archivedAt sql.NullInt64
 	var adapter, state, createdBy string
 	if err := scanner.Scan(
-		&ts.TaskID, &ts.ProjectID, &parentID, &ts.Title, &ts.Goal,
+		&ts.TaskID, &ts.ProjectID, &parentID,
+		&delegatedByAtt, &delegatedRole,
+		&ts.ChildCount, &ts.ActiveChildCount, &ts.PendingChildApprovals,
+		&ts.Title, &ts.Goal,
 		&ts.RequiredCapability, &adapter, &state, &waitingReason,
 		&activeAttID, &activeAttState, &latestDlvID, &latestHead,
 		&ts.OpenAnnotationCount, &ts.DeliveryCount,
@@ -549,6 +557,12 @@ func scanTaskSummary(scanner interface{ Scan(...any) error }) (protocol.TaskSumm
 	ts.CreatedBy = protocol.TaskCreatedBy(createdBy)
 	if parentID.Valid {
 		ts.ParentTaskID = parentID.String
+	}
+	if delegatedByAtt.Valid {
+		ts.DelegatedByAttemptID = delegatedByAtt.String
+	}
+	if delegatedRole.Valid {
+		ts.DelegatedRole = delegatedRole.String
 	}
 	if waitingReason.Valid {
 		ts.WaitingReason = waitingReason.String
@@ -784,6 +798,25 @@ func (s *Store) GetTaskTimeline(ctx context.Context, taskID string, beforeSeq in
 		}
 		resp.BoardMembers = boardMembers
 
+		// Delegated child sessions (live summary cards for this task)
+		children, err := listChildTasksTx(ctx, tx, taskID, false)
+		if err != nil {
+			return err
+		}
+		if len(children) > 0 {
+			resp.Children = children
+		}
+
+		// Parent & sibling context when viewing a delegated child task
+		if resp.Task.ParentTaskID != "" {
+			if pRef, pErr := loadParentTaskRefTx(ctx, tx, resp.Task.ParentTaskID); pErr == nil && pRef != nil {
+				resp.ParentSummary = pRef
+			}
+			if sibs, sErr := listChildTasksTx(ctx, tx, resp.Task.ParentTaskID, false); sErr == nil && len(sibs) > 0 {
+				resp.SiblingChildren = sibs
+			}
+		}
+
 		// Events: fetch newest page via ORDER BY seq DESC LIMIT 500, then reverse to ascending order
 		var evQuery string
 		args := []any{taskID}
@@ -854,6 +887,19 @@ func extractReferencedTasks(triggerPayloadJSON string) []protocol.ReferencedTask
 		return nil
 	}
 	return doc.RefTasks
+}
+
+func extractChildResultMeta(triggerPayloadJSON string) *protocol.ChildResultMeta {
+	if strings.TrimSpace(triggerPayloadJSON) == "" {
+		return nil
+	}
+	var doc struct {
+		ChildResult *protocol.ChildResultMeta `json:"childResult"`
+	}
+	if err := json.Unmarshal([]byte(triggerPayloadJSON), &doc); err != nil || doc.ChildResult == nil || doc.ChildResult.ChildTaskID == "" {
+		return nil
+	}
+	return doc.ChildResult
 }
 
 // ListRecentTasks returns recent non-archived tasks across all projects ordered by recency.
@@ -966,6 +1012,7 @@ func scanAttemptView(scanner interface{ Scan(...any) error }) (protocol.AttemptV
 	a.TriggerKind = protocol.TriggerKind(trigger)
 	a.PromptText = extractBoundedPromptText(triggerPayloadJSON)
 	a.RefTasks = extractReferencedTasks(triggerPayloadJSON)
+	a.ChildResult = extractChildResultMeta(triggerPayloadJSON)
 	a.State = protocol.AttemptState(state)
 	if worktree.Valid {
 		a.WorktreePath = worktree.String

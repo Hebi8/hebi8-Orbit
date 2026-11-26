@@ -510,12 +510,13 @@ func (s *Store) CommitHebi8Fold(ctx context.Context, p CommitHebi8FoldParams) (C
 
 // RawAttemptPromptRow holds the full, untruncated user prompt extracted from attempts.trigger_payload_json.
 type RawAttemptPromptRow struct {
-	AttemptID  string
-	AttemptNo  int
-	State      protocol.AttemptState
-	UserPrompt string
-	StartedAt  int64
-	FinishedAt *int64
+	AttemptID   string
+	AttemptNo   int
+	TriggerKind protocol.TriggerKind
+	State       protocol.AttemptState
+	UserPrompt  string
+	StartedAt   int64
+	FinishedAt  *int64
 }
 
 // ListTaskAttemptsFullPrompts returns terminal attempts in [minAttemptNo, maxAttemptNo] with FULL
@@ -532,7 +533,7 @@ func (s *Store) ListTaskAttemptsFullPrompts(ctx context.Context, taskID string, 
 		}
 		var sb strings.Builder
 		sb.WriteString(`
-			SELECT attempt_id, attempt_no, state, trigger_payload_json, started_at, finished_at
+			SELECT attempt_id, attempt_no, trigger_kind, state, trigger_payload_json, started_at, finished_at
 			FROM attempts
 			WHERE task_id = ?
 		`)
@@ -554,11 +555,12 @@ func (s *Store) ListTaskAttemptsFullPrompts(ctx context.Context, taskID string, 
 		defer rows.Close()
 		for rows.Next() {
 			var r RawAttemptPromptRow
-			var stStr, tpJSON string
+			var trigStr, stStr, tpJSON string
 			var finAt sql.NullInt64
-			if err := rows.Scan(&r.AttemptID, &r.AttemptNo, &stStr, &tpJSON, &r.StartedAt, &finAt); err != nil {
+			if err := rows.Scan(&r.AttemptID, &r.AttemptNo, &trigStr, &stStr, &tpJSON, &r.StartedAt, &finAt); err != nil {
 				return err
 			}
+			r.TriggerKind = protocol.TriggerKind(trigStr)
 			r.State = protocol.AttemptState(stStr)
 			if finAt.Valid {
 				v := finAt.Int64

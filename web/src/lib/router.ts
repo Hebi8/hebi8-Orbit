@@ -5,12 +5,12 @@ export type ProjectTab = 'threads' | 'deliveries' | 'settings';
 
 export type Route =
   | { name: 'home' }
-  | { name: 'pa'; threadId?: string }
+  | { name: 'pa'; threadId?: string; childId?: string }
   | { name: 'artifacts' }
   | { name: 'archived' }
   | { name: 'new'; mode?: NewMode; projectId?: string; machineId?: string; adapter?: string }
   | { name: 'project'; projectId: string; tab: ProjectTab }
-  | { name: 'session'; taskId: string; worker?: string }
+  | { name: 'session'; taskId: string; worker?: string; childId?: string }
   | { name: 'projects' }
   | { name: 'onboarding' }
   | { name: 'settings' }
@@ -44,7 +44,7 @@ export function parseHash(hash: string): Route {
       return { name: 'settings' };
     case 'pa':
     case 'hebi8':
-      return { name: 'pa', threadId: segs[1] };
+      return { name: 'pa', threadId: segs[1], childId: q.get('child') ?? undefined };
     case 'artifacts':
       return { name: 'artifacts' };
     case 'archived':
@@ -72,7 +72,12 @@ export function parseHash(hash: string): Route {
       return { name: 'projects' };
     case 't':
       if (segs[1]) {
-        return { name: 'session', taskId: segs[1], worker: segs[2] === 'w' && segs[3] ? segs[3] : undefined };
+        return {
+          name: 'session',
+          taskId: segs[1],
+          worker: segs[2] === 'w' && segs[3] ? segs[3] : undefined,
+          childId: q.get('child') ?? undefined,
+        };
       }
       return { name: 'home' };
     default:
@@ -86,8 +91,11 @@ export const paths = {
   home: () => '#/',
   onboarding: () => '#/onboarding',
   settings: () => '#/settings',
-  hebi8: () => '#/hebi8',
-  pa: (threadId?: string) => (threadId ? `#/pa/${e(threadId)}` : '#/hebi8'),
+  hebi8: (childId?: string) => (childId ? `#/hebi8?child=${e(childId)}` : '#/hebi8'),
+  pa: (threadId?: string, childId?: string) => {
+    const base = threadId ? `#/pa/${e(threadId)}` : '#/hebi8';
+    return childId ? `${base}?child=${e(childId)}` : base;
+  },
   artifacts: () => '#/artifacts',
   archived: () => '#/archived',
   newThread: (mode?: NewMode, projectId?: string, opts?: { machineId?: string; adapter?: string }) => {
@@ -102,8 +110,10 @@ export const paths = {
   project: (projectId: string, tab: ProjectTab = 'threads') =>
     tab === 'threads' ? `#/p/${e(projectId)}` : `#/p/${e(projectId)}?tab=${tab}`,
   projects: () => '#/projects',
-  session: (taskId: string, worker?: string) =>
-    worker ? `#/t/${e(taskId)}/w/${e(worker)}` : `#/t/${e(taskId)}`,
+  session: (taskId: string, worker?: string, childId?: string) => {
+    const base = worker ? `#/t/${e(taskId)}/w/${e(worker)}` : `#/t/${e(taskId)}`;
+    return childId ? `${base}?child=${e(childId)}` : base;
+  },
 };
 
 export function navigate(hash: string) {

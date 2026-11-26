@@ -496,6 +496,7 @@ func (s *Server) handleRunnerWS(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(recRes.Events) > 0 {
 		s.broker.Broadcast(recRes.Events...)
+		s.notifyChildTaskProgressAsync(recRes.Events)
 	}
 
 	initialAdapters := hello.Adapters
@@ -666,6 +667,9 @@ func (s *Server) handleRunnerWS(w http.ResponseWriter, r *http.Request) {
 				AckedOutboxSeq: ingestRes.AckedOutboxSeq,
 				AcceptedMode:   ingestRes.AcceptedMode,
 			})
+			if ingestRes.AcceptedMode == protocol.OutboxModeActive && len(ingestRes.Events) > 0 {
+				s.notifyChildTaskProgressAsync(ingestRes.Events)
+			}
 
 			// B10: If an active attempt sending outbox frames has persisted cancel_requested=1, re-send cancel.
 			if ingestRes.CancelRequested {

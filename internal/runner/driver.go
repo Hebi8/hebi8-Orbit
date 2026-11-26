@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -26,6 +27,125 @@ type PermissionWriteMeta struct {
 }
 
 type permWriteMetaContextKey struct{}
+type sessionMCPServersContextKey struct{}
+type sessionMCPAttachReportContextKey struct{}
+
+// WithSessionMCPServers attaches optional MCP servers to be injected into ACP NewSession/ResumeSession/LoadSession calls.
+func WithSessionMCPServers(ctx context.Context, servers []acp.McpServer) context.Context {
+	if len(servers) == 0 {
+		return ctx
+	}
+	cp := append([]acp.McpServer(nil), servers...)
+	return context.WithValue(ctx, sessionMCPServersContextKey{}, cp)
+}
+
+// SessionMCPServersFromContext returns MCP servers attached via WithSessionMCPServers, if any.
+func SessionMCPServersFromContext(ctx context.Context) []acp.McpServer {
+	if ctx == nil {
+		return nil
+	}
+	if servers, ok := ctx.Value(sessionMCPServersContextKey{}).([]acp.McpServer); ok && len(servers) > 0 {
+		return append([]acp.McpServer(nil), servers...)
+	}
+	return nil
+}
+
+// WithSessionMCPAttachReport attaches a bool pointer that ACP drivers set to true ONLY when
+// NewSession/ResumeSession/LoadSession succeeded with the requested Orbit MCP servers attached
+// (and false when omitted or downgraded via fallback).
+func WithSessionMCPAttachReport(ctx context.Context, attached *bool) context.Context {
+	if attached == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, sessionMCPAttachReportContextKey{}, attached)
+}
+
+// ReportSessionMCPAttached records whether Orbit MCP servers were actually attached to the opened session.
+func ReportSessionMCPAttached(ctx context.Context, attached bool) {
+	if ctx == nil {
+		return
+	}
+	if ptr, ok := ctx.Value(sessionMCPAttachReportContextKey{}).(*bool); ok && ptr != nil {
+		*ptr = attached
+	}
+}
+
+// isMCPUnsupportedError returns true ONLY when the upstream ACP agent explicitly rejected mcpServers
+// due to unsupported capability or invalid params — NEVER on timeouts, cancellations, EOF, transport errors,
+// or runtime MCP subprocess startup failures (e.g. failed to start / spawn / exit status / permission denied).
+func isMCPUnsupportedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, io.ErrClosedPipe) {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, nonCapabilitySignal := range []string{
+		"context canceled",
+		"context deadline exceeded",
+		"timed out",
+		"timeout",
+		"broken pipe",
+		"connection reset",
+		"connection closed",
+		"closed pipe",
+		"peer connection closed",
+		"eof",
+		"failed to start",
+		"failed to launch",
+		"failed to connect",
+		"failed to spawn",
+		"failed to initialize",
+		"spawn",
+		"exit status",
+		"exited",
+		"no such file",
+		"executable",
+		"permission denied",
+		"handshake",
+		"econnrefused",
+		"enoent",
+	} {
+		if strings.Contains(msg, nonCapabilitySignal) {
+			return false
+		}
+	}
+	hasParamReject := false
+	for _, rejectSignal := range []string{
+		"invalid params",
+		"-32602",
+		"unknown field",
+		"unrecognized",
+		"not supported",
+		"unsupported",
+	} {
+		if strings.Contains(msg, rejectSignal) {
+			hasParamReject = true
+			break
+		}
+	}
+	if !hasParamReject {
+		return false
+	}
+	if strings.Contains(msg, "mcpserver") ||
+		strings.Contains(msg, "mcp_server") ||
+		strings.Contains(msg, "mcp server") {
+		return true
+	}
+	for _, tok := range strings.FieldsFunc(msg, func(r rune) bool {
+		return !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '_')
+	}) {
+		if tok == "mcp" {
+			return true
+		}
+	}
+	return false
+}
 
 // WithPermissionWriteMeta attaches PermissionWriteMeta to a permission handler context.
 func WithPermissionWriteMeta(ctx context.Context, meta PermissionWriteMeta) context.Context {
@@ -546,9 +666,13 @@ func (d *AgyAcpDriver) NewSession(ctx context.Context, cwd, systemPromptAppend s
 	if err != nil {
 		return acp.NewSessionResponse{}, err
 	}
+	mcpServers := SessionMCPServersFromContext(ctx)
+	if mcpServers == nil {
+		mcpServers = []acp.McpServer{}
+	}
 	req := acp.NewSessionRequest{
 		Cwd:        absCWD,
-		McpServers: []acp.McpServer{}, // Empty list preserves 20k tool budget
+		McpServers: mcpServers,
 	}
 	if strings.TrimSpace(systemPromptAppend) != "" {
 		meta, err := acp.NewMeta(map[string]any{
@@ -565,9 +689,18 @@ func (d *AgyAcpDriver) NewSession(ctx context.Context, cwd, systemPromptAppend s
 	}
 
 	resp, err := conn.NewSession(ctx, req)
+	mcpAttached := err == nil && len(mcpServers) > 0
+	if err != nil && len(mcpServers) > 0 && isMCPUnsupportedError(err) {
+		log.Printf("runner: NewSession (%s) rejected Orbit MCP server (%v); retrying without MCP servers", d.cfg.Adapter, err)
+		req.McpServers = []acp.McpServer{}
+		resp, err = conn.NewSession(ctx, req)
+		mcpAttached = false
+	}
 	if err != nil {
+		ReportSessionMCPAttached(ctx, false)
 		return resp, err
 	}
+	ReportSessionMCPAttached(ctx, mcpAttached)
 	d.mu.Lock()
 	d.liveSessions[resp.SessionId] = true
 	d.mu.Unlock()
@@ -583,14 +716,28 @@ func (d *AgyAcpDriver) ResumeSession(ctx context.Context, sid acp.SessionId, cwd
 	if err != nil {
 		return acp.ResumeSessionResponse{}, err
 	}
-	resp, err := conn.ResumeSession(ctx, acp.ResumeSessionRequest{
+	mcpServers := SessionMCPServersFromContext(ctx)
+	if mcpServers == nil {
+		mcpServers = []acp.McpServer{}
+	}
+	req := acp.ResumeSessionRequest{
 		SessionId:  sid,
 		Cwd:        absCWD,
-		McpServers: []acp.McpServer{},
-	})
+		McpServers: mcpServers,
+	}
+	resp, err := conn.ResumeSession(ctx, req)
+	mcpAttached := err == nil && len(mcpServers) > 0
+	if err != nil && len(mcpServers) > 0 && isMCPUnsupportedError(err) {
+		log.Printf("runner: ResumeSession (%s) rejected Orbit MCP server (%v); retrying without MCP servers", d.cfg.Adapter, err)
+		req.McpServers = []acp.McpServer{}
+		resp, err = conn.ResumeSession(ctx, req)
+		mcpAttached = false
+	}
 	if err != nil {
+		ReportSessionMCPAttached(ctx, false)
 		return resp, err
 	}
+	ReportSessionMCPAttached(ctx, mcpAttached)
 	d.mu.Lock()
 	d.liveSessions[sid] = true
 	d.mu.Unlock()
@@ -616,14 +763,28 @@ func (d *AgyAcpDriver) LoadSession(ctx context.Context, sid acp.SessionId, cwd s
 		d.mu.Unlock()
 	}()
 
-	resp, err := conn.LoadSession(ctx, acp.LoadSessionRequest{
+	mcpServers := SessionMCPServersFromContext(ctx)
+	if mcpServers == nil {
+		mcpServers = []acp.McpServer{}
+	}
+	req := acp.LoadSessionRequest{
 		SessionId:  sid,
 		Cwd:        absCWD,
-		McpServers: []acp.McpServer{},
-	})
+		McpServers: mcpServers,
+	}
+	resp, err := conn.LoadSession(ctx, req)
+	mcpAttached := err == nil && len(mcpServers) > 0
+	if err != nil && len(mcpServers) > 0 && isMCPUnsupportedError(err) {
+		log.Printf("runner: LoadSession (%s) rejected Orbit MCP server (%v); retrying without MCP servers", d.cfg.Adapter, err)
+		req.McpServers = []acp.McpServer{}
+		resp, err = conn.LoadSession(ctx, req)
+		mcpAttached = false
+	}
 	if err != nil {
+		ReportSessionMCPAttached(ctx, false)
 		return resp, err
 	}
+	ReportSessionMCPAttached(ctx, mcpAttached)
 	d.mu.Lock()
 	d.liveSessions[sid] = true
 	d.mu.Unlock()

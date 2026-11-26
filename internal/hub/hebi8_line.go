@@ -628,6 +628,7 @@ func (s *Server) collectTaskRawTurns(ctx context.Context, taskID string, minAtte
 		turns = append(turns, protocol.Hebi8RawTurn{
 			AttemptID:      att.AttemptID,
 			AttemptNo:      att.AttemptNo,
+			TriggerKind:    att.TriggerKind,
 			State:          att.State,
 			UserPrompt:     strings.TrimSpace(att.UserPrompt),
 			AssistantReply: reply,
@@ -1374,6 +1375,9 @@ func (s *Server) buildHebi8FoldOpeningForAttempt(ctx context.Context, att store.
 	}
 	var recentUserPrompts []string
 	for _, t := range histTurns {
+		if t.TriggerKind == protocol.TriggerChildResult {
+			continue
+		}
 		if p := strings.TrimSpace(t.UserPrompt); p != "" {
 			recentUserPrompts = append(recentUserPrompts, p)
 		}
@@ -1386,6 +1390,26 @@ func (s *Server) buildHebi8FoldOpeningForAttempt(ctx context.Context, att store.
 		tailTurns = histTurns[len(histTurns)-2:]
 	} else {
 		tailTurns = histTurns
+	}
+	// If the last 2 turns are all automatic child_result wakeups, retain the most recent genuine
+	// user turn alongside the latest turn so the verbatim tail still preserves real user Q&A.
+	if len(tailTurns) > 0 {
+		allChildResults := true
+		for _, t := range tailTurns {
+			if t.TriggerKind != protocol.TriggerChildResult {
+				allChildResults = false
+				break
+			}
+		}
+		if allChildResults {
+			for i := len(histTurns) - 1; i >= 0; i-- {
+				if histTurns[i].TriggerKind != protocol.TriggerChildResult {
+					latest := histTurns[len(histTurns)-1]
+					tailTurns = []protocol.Hebi8RawTurn{histTurns[i], latest}
+					break
+				}
+			}
+		}
 	}
 
 	opening := BuildHebi8FoldOpening(Hebi8FoldOpeningInput{

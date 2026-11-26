@@ -54,6 +54,7 @@ export function Composer({
   projects = [],
   machineId,
   compact = false,
+  inDrawer = false,
   onOpenReview,
 }: {
   task: TaskSummary;
@@ -68,6 +69,7 @@ export function Composer({
   projects?: ProjectView[];
   machineId?: string;
   compact?: boolean;
+  inDrawer?: boolean;
   onOpenReview?: () => void;
 }) {
   const qc = useQueryClient();
@@ -82,6 +84,8 @@ export function Composer({
   const [refIds, setRefIds] = useState<string[]>([]);
   const stash = useRef<string | null>(null);
   const taRef = useRef<HTMLTextAreaElement | null>(null);
+  const activeTaskIdRef = useRef(task.taskId);
+  activeTaskIdRef.current = task.taskId;
   const busy = isTaskBusy(task);
   const isPA = task.projectId === PA_PROJECT_ID;
 
@@ -175,9 +179,14 @@ export function Composer({
     if (!editing) drafts.set(task.taskId, v);
   };
 
-  const refresh = () => {
-    void qc.invalidateQueries({ queryKey: ['task-timeline', task.taskId] });
-    void qc.invalidateQueries({ queryKey: ['project-tasks', task.projectId] });
+  const refresh = (targetTaskId = task.taskId, targetParentId = task.parentTaskId, targetProjectId = task.projectId) => {
+    void qc.invalidateQueries({ queryKey: ['task-timeline', targetTaskId] });
+    if (targetParentId) {
+      void qc.invalidateQueries({ queryKey: ['task-timeline', targetParentId] });
+      void qc.invalidateQueries({ queryKey: ['task-children', targetParentId] });
+    }
+    void qc.invalidateQueries({ queryKey: ['task-children', targetTaskId] });
+    void qc.invalidateQueries({ queryKey: ['project-tasks', targetProjectId] });
     void qc.invalidateQueries({ queryKey: ['all-tasks'] });
     void qc.invalidateQueries({ queryKey: ['delivery'] });
     void qc.invalidateQueries({ queryKey: ['global-artifacts'] });
@@ -206,18 +215,24 @@ export function Composer({
   };
 
   const saveEdit = useMutation({
-    mutationFn: (body: string) => api.updateQueueInput(task.taskId, editing!.inputId, body),
-    onSuccess: (pi) => {
+    mutationFn: (v: { submittedTaskId: string; submittedParentId?: string; submittedProjectId: string; inputId: string; body: string }) =>
+      api.updateQueueInput(v.submittedTaskId, v.inputId, v.body),
+    onSuccess: (pi, v) => {
       remember(`inp:${pi.inputId}`, pi.body);
       toast('已更新');
-      refresh();
-      finishEdit();
+      refresh(v.submittedTaskId, v.submittedParentId, v.submittedProjectId);
+      if (activeTaskIdRef.current === v.submittedTaskId) {
+        finishEdit();
+      }
     },
     onError: (e) => toast(errMsg(e), 'err'),
   });
 
   const followup = useMutation({
     mutationFn: (v: {
+      submittedTaskId: string;
+      submittedParentId?: string;
+      submittedProjectId: string;
       message: string;
       mode: FollowupMode;
       referencedTaskIds?: string[];
@@ -225,7 +240,7 @@ export function Composer({
       verifiedAttemptId?: string;
     }) => {
       const rt = buildRuntimePayload();
-      return api.followup(task.taskId, {
+      return api.followup(v.submittedTaskId, {
         message: v.message,
         mode: v.mode,
         adapter: rt.adapter,
@@ -241,40 +256,56 @@ export function Composer({
       if (res.pendingInput) remember(`inp:${res.pendingInput.inputId}`, v.message);
       if (res.pendingInput && v.mode === 'queue') toast('将在下一轮发出');
       if (v.mode === 'steer') toast('已打断当前轮，优先执行');
-      setDraft('');
-      setRefIds([]);
-      setSiteVerified(false);
-      setModeOverride((cur) => nextModeOverrideAfterSend(cur));
-      refresh();
+      drafts.set(v.submittedTaskId, '');
+      if (activeTaskIdRef.current === v.submittedTaskId) {
+        setText('');
+        setRefIds([]);
+        setSiteVerified(false);
+        setModeOverride((cur) => nextModeOverrideAfterSend(cur));
+      }
+      refresh(v.submittedTaskId, v.submittedParentId, v.submittedProjectId);
     },
     onError: (e) => toast(errMsg(e), 'err'),
   });
 
   const dispatchAnns = useMutation({
-    mutationFn: (v: { ids: string[]; message: string; mode: FollowupMode }) =>
-      api.dispatchAnnotations(task.taskId, {
+    mutationFn: (v: {
+      submittedTaskId: string;
+      submittedParentId?: string;
+      submittedProjectId: string;
+      ids: string[];
+      message: string;
+      mode: FollowupMode;
+    }) =>
+      api.dispatchAnnotations(v.submittedTaskId, {
         annotationIds: v.ids,
         message: v.message || undefined,
         mode: v.mode,
       }),
     onSuccess: (res, v) => {
-      clearDeselected(task.taskId);
-      setDraft('');
-      setSiteVerified(false);
+      clearDeselected(v.submittedTaskId);
+      drafts.set(v.submittedTaskId, '');
+      if (activeTaskIdRef.current === v.submittedTaskId) {
+        setText('');
+        setSiteVerified(false);
+      }
       if (res.attempt) toast(`已连同 ${v.ids.length} 条批注发出`);
       else if (res.pendingInput) toast(`已入队 · ${v.ids.length} 条批注`);
-      refresh();
+      refresh(v.submittedTaskId, v.submittedParentId, v.submittedProjectId);
     },
     onError: (e) => toast(errMsg(e), 'err'),
   });
 
   const boardPost = useMutation({
-    mutationFn: (v: { target: string; body: string }) =>
-      api.postBoardMessage(task.taskId, { authorName: 'human', targetMention: v.target, body: v.body }),
-    onSuccess: (msg) => {
+    mutationFn: (v: { submittedTaskId: string; target: string; body: string }) =>
+      api.postBoardMessage(v.submittedTaskId, { authorName: 'human', targetMention: v.target, body: v.body }),
+    onSuccess: (msg, v) => {
       toast(`已发给 @${msg.targetMention ?? ''}`);
-      setDraft('');
-      void qc.invalidateQueries({ queryKey: ['task-board', task.taskId] });
+      drafts.set(v.submittedTaskId, '');
+      if (activeTaskIdRef.current === v.submittedTaskId) {
+        setText('');
+      }
+      void qc.invalidateQueries({ queryKey: ['task-board', v.submittedTaskId] });
     },
     onError: (e) => toast(errMsg(e), 'err'),
   });
@@ -296,20 +327,29 @@ export function Composer({
   const submit = (steer: boolean) => {
     const msg = text.trim();
     if (pending) return;
+    const submittedTaskId = task.taskId;
+    const submittedParentId = task.parentTaskId;
+    const submittedProjectId = task.projectId;
     if (editing) {
       if (!msg) return;
-      saveEdit.mutate(msg);
+      saveEdit.mutate({
+        submittedTaskId,
+        submittedParentId,
+        submittedProjectId,
+        inputId: editing.inputId,
+        body: msg,
+      });
       return;
     }
     if (worker) {
       if (!msg) return;
-      boardPost.mutate({ target: worker, body: msg });
+      boardPost.mutate({ submittedTaskId, target: worker, body: msg });
       return;
     }
     if (msg) {
       const mention = parseMention(msg, members);
       if (mention) {
-        boardPost.mutate(mention);
+        boardPost.mutate({ submittedTaskId, ...mention });
         return;
       }
     }
@@ -321,6 +361,9 @@ export function Composer({
     const mode: FollowupMode = steer && busy ? 'steer' : 'queue';
     if (hasAttachments) {
       dispatchAnns.mutate({
+        submittedTaskId,
+        submittedParentId,
+        submittedProjectId,
         ids: openAnnotations.map((a) => a.annotationId),
         message: msg,
         mode,
@@ -328,6 +371,9 @@ export function Composer({
       return;
     }
     followup.mutate({
+      submittedTaskId,
+      submittedParentId,
+      submittedProjectId,
       message: msg,
       mode,
       referencedTaskIds: refIds.length > 0 ? refIds : undefined,
@@ -379,16 +425,30 @@ export function Composer({
 
     if (busy && hasPayload && !worker) {
       return (
-        <button
-          type="button"
-          className="send-icon-btn is-queue"
-          disabled={pending}
-          title="入队等待当前轮结束 (⌘↵ 立即插入)"
-          aria-label="入队发送"
-          onClick={() => submit(false)}
-        >
-          {pending ? <span className="spin" /> : <QueueSendIcon size={14} />}
-        </button>
+        <div className="cfoot-acts">
+          {inDrawer && (
+            <button
+              type="button"
+              className="send-icon-btn is-stop"
+              disabled={cancel.isPending}
+              title="停止当前轮"
+              aria-label="停止当前轮"
+              onClick={() => cancel.mutate()}
+            >
+              {cancel.isPending ? <span className="spin" /> : <StopSquareIcon size={12} />}
+            </button>
+          )}
+          <button
+            type="button"
+            className="send-icon-btn is-queue"
+            disabled={pending}
+            title="入队等待当前轮结束 (⌘↵ 立即插入)"
+            aria-label="入队发送"
+            onClick={() => submit(false)}
+          >
+            {pending ? <span className="spin" /> : <QueueSendIcon size={14} />}
+          </button>
+        </div>
       );
     }
 
@@ -408,8 +468,8 @@ export function Composer({
   };
 
   return (
-    <div className="cwrap">
-      <div className={`composer ${editing ? 'editing' : ''}`}>
+    <div className={`cwrap ${inDrawer ? 'in-drawer' : ''}`}>
+      <div className={`composer ${editing ? 'editing' : ''} ${inDrawer ? 'in-drawer' : ''}`}>
         {editing && (
           <div className="cbanner">
             <Pencil size={12} strokeWidth={1.6} /> 编辑中
@@ -527,7 +587,7 @@ export function Composer({
                   ))}
                 </select>
               </label>
-              {!compact && (
+              {(!compact || inDrawer) && (
                 <>
                   {effortChoices.length > 0 && (
                     <>

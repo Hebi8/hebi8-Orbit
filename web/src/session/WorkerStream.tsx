@@ -6,7 +6,17 @@ import { buildSegments, lastLiveStep } from '../lib/segments';
 import { Segments } from './Segments';
 
 /** Drill-down: reuses the main thin timeline vocabulary for one worker's full thought & tool stream. */
-export function WorkerStream({ taskId, worker, member }: { taskId: string; worker: string; member?: BoardMemberCursor }) {
+export function WorkerStream({
+  taskId,
+  worker,
+  member,
+  inDrawer = false,
+}: {
+  taskId: string;
+  worker: string;
+  member?: BoardMemberCursor;
+  inDrawer?: boolean;
+}) {
   const live = member?.state === 'working';
   const q = useWorkerStream(taskId, worker, live);
   const m = q.data?.member ?? member;
@@ -16,17 +26,19 @@ export function WorkerStream({ taskId, worker, member }: { taskId: string; worke
   const streamNotice = q.data?.streamNotice;
   return (
     <>
-      <div className="drill-banner">
-        <div className="in">
-          <span className={`sd ${live ? 'run' : 'done'}`} />
-          正在查看 <b>@{worker}</b> {hasPrivateStream ? '的完整思考与工具流' : '的共享消息板与投影记录'}
-          <span className="r">
-            {m ? `${memberStateLabel(m.state)} · 消费游标 #${m.lastConsumedSeq}${m.machineId ? ` · ${m.machineId}` : ''}` : ''}
-          </span>
+      {!inDrawer && (
+        <div className="drill-banner">
+          <div className="in">
+            <span className={`sd ${live ? 'run' : 'done'}`} />
+            正在查看 <b>@{worker}</b> {hasPrivateStream ? '的完整思考与工具流' : '的共享消息板与投影记录'}
+            <span className="r">
+              {m ? `${memberStateLabel(m.state)} · 消费游标 #${m.lastConsumedSeq}${m.machineId ? ` · ${m.machineId}` : ''}` : ''}
+            </span>
+          </div>
         </div>
-      </div>
-      <div className="tl">
-        {!q.isLoading && !hasPrivateStream && (
+      )}
+      <div className={`tl ${inDrawer ? 'tl-drawer-stream' : ''}`}>
+        {!inDrawer && !q.isLoading && !hasPrivateStream && (
           <div className="it nt">
             <div className="nt-h">
               <span className="lbl">原生 Swarm 成员视图</span>

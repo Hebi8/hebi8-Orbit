@@ -1,6 +1,13 @@
 import { useEffect, useRef } from 'react';
 import { useQueryClient, type QueryClient } from '@tanstack/react-query';
-import type { EventRecord, WSServerMessage } from '../generated/protocol';
+import type {
+  BootstrapResponse,
+  EventRecord,
+  ListChildrenResponse,
+  TaskSummary,
+  TaskTimelineResponse,
+  WSServerMessage,
+} from '../generated/protocol';
 import { api, getStoredClientToken, getStoredDevToken } from '../lib/api';
 import { useWorkbenchStore } from '../store/useWorkbenchStore';
 
@@ -15,11 +22,46 @@ const strListField = (payload: Record<string, unknown> | undefined, key: string)
   return v.filter((item): item is string => typeof item === 'string' && item.length > 0);
 };
 
+function findCachedParentTaskId(queryClient: QueryClient | undefined, taskId: string): string {
+  if (!queryClient || !taskId) return '';
+  const tl = queryClient.getQueryData<TaskTimelineResponse>(['task-timeline', taskId]);
+  if (tl?.task?.parentTaskId) return tl.task.parentTaskId;
+  if (tl?.parentSummary?.taskId) return tl.parentSummary.taskId;
+
+  const boot = queryClient.getQueryData<BootstrapResponse>(['bootstrap']);
+  const fromBoot = boot?.activeTasks?.find((t) => t.taskId === taskId);
+  if (fromBoot?.parentTaskId) return fromBoot.parentTaskId;
+
+  const childQueries = queryClient.getQueriesData<ListChildrenResponse>({ queryKey: ['task-children'] });
+  for (const [, data] of childQueries) {
+    if (data?.children?.some((c) => c.taskId === taskId)) {
+      return data.parentTaskId;
+    }
+  }
+
+  const allTaskQueries = queryClient.getQueriesData<TaskSummary[]>({ queryKey: ['all-tasks'] });
+  for (const [, list] of allTaskQueries) {
+    const match = list?.find((t) => t.taskId === taskId);
+    if (match?.parentTaskId) return match.parentTaskId;
+  }
+
+  const projTaskQueries = queryClient.getQueriesData<TaskSummary[]>({ queryKey: ['project-tasks'] });
+  for (const [, list] of projTaskQueries) {
+    const match = list?.find((t) => t.taskId === taskId);
+    if (match?.parentTaskId) return match.parentTaskId;
+  }
+
+  return '';
+}
+
 /**
  * Maps a batch of committed events to the precise set of TanStack Query keys that must be refreshed.
- * Exported separately so the mapping stays a pure function of the event list.
+ * Exported separately so the mapping stays a pure function of the event list (with optional parent resolver).
  */
-export function collectInvalidations(events: EventRecord[]): unknown[][] {
+export function collectInvalidations(
+  events: EventRecord[],
+  resolveParentTaskId?: (taskId: string) => string,
+): unknown[][] {
   const keys = new Map<string, unknown[]>();
   const add = (...key: unknown[]) => {
     if (key.some((k) => k === '' || k === undefined)) return;
@@ -32,12 +74,37 @@ export function collectInvalidations(events: EventRecord[]): unknown[][] {
     const aid = ev.attemptId ?? '';
     const p = ev.payload ?? {};
     const deliveryId = strField(p, 'deliveryId');
+    const childTaskId = strField(p, 'childTaskId');
+    const parentTaskId = strField(p, 'parentTaskId') || (tid && resolveParentTaskId ? resolveParentTaskId(tid) : '');
     const kind = ev.kind;
 
     if (ev.visibility === 'inbox') add('bootstrap');
 
+    if (kind === 'task.child_spawned' || kind === 'task.child_updated') {
+      add('task-timeline', tid);
+      add('task-children', tid);
+      if (childTaskId) {
+        add('task-timeline', childTaskId);
+        add('task-children', childTaskId);
+      }
+      if (parentTaskId) {
+        add('task-timeline', parentTaskId);
+        add('task-children', parentTaskId);
+      }
+      if (pid === '_pa' || strField(p, 'parentProjectId') === '_pa') add('hebi8-main');
+      add('all-tasks');
+      add('project-tasks');
+      add('bootstrap');
+      continue;
+    }
+
     if (kind.startsWith('task.')) {
       add('task-timeline', tid);
+      add('task-children', tid);
+      if (parentTaskId) {
+        add('task-timeline', parentTaskId);
+        add('task-children', parentTaskId);
+      }
       if (pid === '_pa') add('hebi8-main');
       if (kind === 'task.source_added' || kind === 'task.source_removed') continue;
       add('bootstrap');
@@ -53,8 +120,14 @@ export function collectInvalidations(events: EventRecord[]): unknown[][] {
     }
     if (kind.startsWith('attempt.')) {
       add('task-timeline', tid);
+      add('task-children', tid);
       add('attempt-raw', aid);
       add('project-tasks', pid);
+      add('all-tasks');
+      if (parentTaskId) {
+        add('task-timeline', parentTaskId);
+        add('task-children', parentTaskId);
+      }
       if (pid === '_pa') add('hebi8-main');
       add('bootstrap');
       for (const did of strListField(p, 'deliveryIds')) add('delivery', did);
@@ -65,12 +138,20 @@ export function collectInvalidations(events: EventRecord[]): unknown[][] {
       add('bootstrap');
       add('task-timeline', tid);
       add('project-tasks', pid);
+      if (parentTaskId) {
+        add('task-timeline', parentTaskId);
+        add('task-children', parentTaskId);
+      }
       continue;
     }
     if (kind.startsWith('delivery.')) {
       add('delivery', deliveryId);
       add('delivery-diff', deliveryId);
       add('task-timeline', tid);
+      if (parentTaskId) {
+        add('task-timeline', parentTaskId);
+        add('task-children', parentTaskId);
+      }
       add('project-tasks', pid);
       add('global-artifacts');
       add('bootstrap');
@@ -99,7 +180,13 @@ export function collectInvalidations(events: EventRecord[]): unknown[][] {
     if (kind.startsWith('approval.')) {
       add('approvals');
       add('task-timeline', tid);
+      add('task-children', tid);
       add('project-tasks', pid);
+      add('all-tasks');
+      if (parentTaskId) {
+        add('task-timeline', parentTaskId);
+        add('task-children', parentTaskId);
+      }
       add('bootstrap');
       continue;
     }
@@ -130,6 +217,7 @@ export function collectInvalidations(events: EventRecord[]): unknown[][] {
     if (kind === 'board.member_updated') {
       add('task-board', tid);
       add('task-timeline', tid);
+      add('task-children', tid);
       add('worker-stream', tid);
       add('project-tasks', pid);
       add('bootstrap');
@@ -206,7 +294,10 @@ export function useRealtimeSync(snapshotSeq: number | undefined) {
       }
       if (fresh.length === 0) return;
       setLastSeq(lastAppliedSeqRef.current);
-      applyInvalidations(queryClient, collectInvalidations(fresh));
+      applyInvalidations(
+        queryClient,
+        collectInvalidations(fresh, (taskId) => findCachedParentTaskId(queryClient, taskId)),
+      );
     };
 
     const scheduleReconnect = () => {

@@ -61,36 +61,40 @@ type AgentSessionRecord struct {
 
 // CreateTaskParams specifies validated parameters for atomic task (+ optional attempt) creation.
 type CreateTaskParams struct {
-	ProjectID          string
-	ParentTaskID       string
-	Title              string
-	Goal               string
-	RequiredCapability string
-	RequiredResources  []string
-	Adapter            protocol.Adapter
-	DesiredConfig      map[string]string
-	CreatedBy          protocol.TaskCreatedBy
-	IdempotencyKey     string
-	Sources            []protocol.CreateTaskSourceInput
-	MachineID           string
-	PartID              string
-	LocationID          string
-	Isolation           protocol.LocationIsolation
-	RouteExplicit       bool
-	ProjectGitIsolation protocol.LocationIsolation
-	Anchor              *protocol.ProjectAnchorConfig
-	AnchorCapability   string
-	WorktreePath       string
-	BaseSHA            string
-	InputDeliveryID    string
-	Prompt             string
-	TriggerKind        protocol.TriggerKind
-	TriggerPayload     map[string]any
-	CreateAttempt      bool
-	LeaseTTLMs         int64
-	ActorID            string
-	ActorKind          protocol.ActorKind
-	PAIdempotency      *PAActionIdempotencySpec
+	ProjectID            string
+	ParentTaskID         string
+	DelegatedByAttemptID string
+	DelegatedRole        string
+	NotifyParentOnFinish *bool
+	Title                string
+	Goal                 string
+	RequiredCapability   string
+	RequiredResources    []string
+	Adapter              protocol.Adapter
+	DesiredConfig        map[string]string
+	CreatedBy            protocol.TaskCreatedBy
+	IdempotencyKey       string
+	Sources              []protocol.CreateTaskSourceInput
+	MachineID            string
+	PartID               string
+	LocationID           string
+	Isolation            protocol.LocationIsolation
+	RouteExplicit        bool
+	ProjectGitIsolation  protocol.LocationIsolation
+	Anchor               *protocol.ProjectAnchorConfig
+	AnchorCapability     string
+	WorktreePath         string
+	BaseSHA              string
+	InputDeliveryID      string
+	Prompt               string
+	TriggerKind          protocol.TriggerKind
+	TriggerPayload       map[string]any
+	CreateAttempt        bool
+	LeaseTTLMs           int64
+	ActorID              string
+	ActorKind            protocol.ActorKind
+	PAIdempotency        *PAActionIdempotencySpec
+	RunnerParentGuard    *RunnerParentControlGuard
 }
 
 // CreateTaskResult returns created (or idempotently found) entities and events.
@@ -137,6 +141,13 @@ func (s *Store) CreateTask(ctx context.Context, p CreateTaskParams) (CreateTaskR
 	}
 
 	err := s.WithWriteTx(ctx, func(tx *sql.Tx) error {
+		// P1-1: Atomically verify runner's live control of parent attempt inside the write tx before any lookup/write.
+		if p.RunnerParentGuard != nil {
+			if err := verifyRunnerParentControlTx(ctx, tx, p.RunnerParentGuard); err != nil {
+				return err
+			}
+		}
+
 		// NEW-3: Atomic PA idempotency check inside the SAME write transaction.
 		if prevReceipt, found, err := lookupPAActionReceiptTx(ctx, tx, p.PAIdempotency); err != nil {
 			return err
@@ -155,7 +166,8 @@ func (s *Store) CreateTask(ctx context.Context, p CreateTaskParams) (CreateTaskR
 			return err
 		}
 
-		// Idempotency key check
+		// Idempotency key check: MUST match BOTH project_id AND parent_task_id so one parent can NEVER
+		// observe or replay another parent's task summary/attempt/sources under the same project!
 		if p.IdempotencyKey != "" {
 			var existingTaskID string
 			err := tx.QueryRowContext(ctx, `SELECT task_id FROM tasks WHERE idempotency_key = ?`, p.IdempotencyKey).Scan(&existingTaskID)
@@ -164,8 +176,8 @@ func (s *Store) CreateTask(ctx context.Context, p CreateTaskParams) (CreateTaskR
 				if err != nil {
 					return err
 				}
-				if task.ProjectID != p.ProjectID {
-					return fmt.Errorf("%w: idempotency key already bound to project %s", ErrConflict, task.ProjectID)
+				if task.ProjectID != p.ProjectID || task.ParentTaskID != p.ParentTaskID {
+					return fmt.Errorf("%w: idempotency key already bound to another task scope", ErrConflict)
 				}
 				res.Task = task
 				res.Created = false
@@ -192,12 +204,16 @@ func (s *Store) CreateTask(ctx context.Context, p CreateTaskParams) (CreateTaskR
 			}
 		}
 
-		// Verify parent task exists and is NOT archived if provided
+		// Verify parent task exists, is NOT archived, and satisfies depth & active-child caps.
 		var parentVal any
+		var parentProjectID string
+		delegationDepth := 0
 		if p.ParentTaskID != "" {
-			var pid string
 			var parentArchived sql.NullInt64
-			if err := tx.QueryRowContext(ctx, `SELECT project_id, archived_at FROM tasks WHERE task_id = ?`, p.ParentTaskID).Scan(&pid, &parentArchived); err != nil {
+			if err := tx.QueryRowContext(ctx, `
+				SELECT project_id, archived_at
+				FROM tasks WHERE task_id = ?
+			`, p.ParentTaskID).Scan(&parentProjectID, &parentArchived); err != nil {
 				if errors.Is(err, sql.ErrNoRows) {
 					return fmt.Errorf("%w: parent task %s", ErrNotFound, p.ParentTaskID)
 				}
@@ -205,6 +221,17 @@ func (s *Store) CreateTask(ctx context.Context, p CreateTaskParams) (CreateTaskR
 			}
 			if parentArchived.Valid {
 				return fmt.Errorf("%w: parent task %s is archived", ErrTaskArchived, p.ParentTaskID)
+			}
+			parentDepth, err := computeTaskDepthTx(ctx, tx, p.ParentTaskID)
+			if err != nil {
+				return err
+			}
+			delegationDepth = parentDepth + 1
+			if delegationDepth > maxDelegationDepth {
+				return fmt.Errorf("%w: delegation depth %d exceeds maximum %d", ErrInvalidInput, delegationDepth, maxDelegationDepth)
+			}
+			if err := checkActiveChildLimitTx(ctx, tx, p.ParentTaskID, ""); err != nil {
+				return err
 			}
 			parentVal = p.ParentTaskID
 		}
@@ -243,16 +270,31 @@ func (s *Store) CreateTask(ctx context.Context, p CreateTaskParams) (CreateTaskR
 		if strings.TrimSpace(p.LocationID) != "" {
 			locVal = strings.TrimSpace(p.LocationID)
 		}
+		var delegatedByVal, delegatedRoleVal any
+		if v := strings.TrimSpace(p.DelegatedByAttemptID); v != "" {
+			delegatedByVal = v
+		}
+		if v := strings.TrimSpace(p.DelegatedRole); v != "" {
+			delegatedRoleVal = v
+		}
+		notifyParent := 1
+		if p.NotifyParentOnFinish != nil && !*p.NotifyParentOnFinish {
+			notifyParent = 0
+		}
 
 		taskID := newID("tsk")
 		_, err = tx.ExecContext(ctx, `
 			INSERT INTO tasks (
-				task_id, project_id, parent_task_id, title, goal,
+				task_id, project_id, parent_task_id, delegated_by_attempt_id, delegated_role,
+				notify_parent_on_finish, delegation_depth,
+				title, goal,
 				required_capability, required_resources, preferred_adapter, desired_config_json,
 				part_id, location_id,
 				state, created_by, idempotency_key, version, created_at, updated_at
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, 1, ?, ?)
-		`, taskID, p.ProjectID, parentVal, title, p.Goal,
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, 1, ?, ?)
+		`, taskID, p.ProjectID, parentVal, delegatedByVal, delegatedRoleVal,
+			notifyParent, delegationDepth,
+			title, p.Goal,
 			p.RequiredCapability, string(reqResJSON), string(p.Adapter), string(cfgJSON),
 			partVal, locVal,
 			string(p.CreatedBy), idempVal, now, now)
@@ -346,6 +388,38 @@ func (s *Store) CreateTask(ctx context.Context, p CreateTaskParams) (CreateTaskR
 		task, err := loadTaskSummaryTx(ctx, tx, taskID)
 		if err != nil {
 			return err
+		}
+		if p.ParentTaskID != "" {
+			childMachineID := strings.TrimSpace(p.MachineID)
+			if res.Attempt != nil && res.Attempt.MachineID != "" {
+				childMachineID = res.Attempt.MachineID
+			}
+			spawnPayload := map[string]any{
+				"childTaskId":          taskID,
+				"projectId":            p.ProjectID,
+				"title":                title,
+				"role":                 strings.TrimSpace(p.DelegatedRole),
+				"delegatedByAttemptId": strings.TrimSpace(p.DelegatedByAttemptID),
+				"state":                task.State,
+				"adapter":              p.Adapter,
+				"machineId":            childMachineID,
+			}
+			evSpawn, err := insertEventTx(ctx, tx, eventInsert{
+				StreamID:   "task:" + p.ParentTaskID,
+				ProjectID:  parentProjectID,
+				TaskID:     p.ParentTaskID,
+				AttemptID:  strings.TrimSpace(p.DelegatedByAttemptID),
+				ActorKind:  p.ActorKind,
+				ActorID:    p.ActorID,
+				Kind:       protocol.EventTaskChildSpawned,
+				Visibility: protocol.VisibilityTimeline,
+				Payload:    spawnPayload,
+				CreatedAt:  now,
+			})
+			if err != nil {
+				return err
+			}
+			res.Events = append(res.Events, evSpawn)
 		}
 		res.Task = task
 		res.Created = true
@@ -682,6 +756,9 @@ func (s *Store) CreateNextAttempt(ctx context.Context, p CreateNextAttemptParams
 		// B11: Never leave queued annotations stranded on a terminal needs_verification attempt.
 		// On retry, carry them forward onto the new attempt; on other continuations, release them back to open.
 		if lastAtt != nil && lastAtt.State == protocol.AttemptNeedsVerification {
+			if err := resetParentChildNotificationBackoffTx(ctx, tx, p.TaskID); err != nil {
+				return err
+			}
 			if p.TriggerKind == protocol.TriggerRetry {
 				if _, err := tx.ExecContext(ctx, `
 					UPDATE annotations SET triggered_attempt_id = ?
@@ -747,6 +824,18 @@ func createAttemptInTx(ctx context.Context, tx *sql.Tx, p createAttemptTxParams)
 	if p.Prompt != "" {
 		if _, ok := p.TriggerPayload["prompt"]; !ok {
 			p.TriggerPayload["prompt"] = p.Prompt
+		}
+	}
+
+	// Enforce active child quota uniformly across ALL attempt creation & reactivation paths
+	// (CreateTask, follow-up, retry, queue dispatch, annotation dispatch).
+	var taskParentID sql.NullString
+	if err := tx.QueryRowContext(ctx, `SELECT parent_task_id FROM tasks WHERE task_id = ?`, p.TaskID).Scan(&taskParentID); err != nil {
+		return AttemptRecord{}, protocol.EventRecord{}, err
+	}
+	if taskParentID.Valid && strings.TrimSpace(taskParentID.String) != "" {
+		if err := checkActiveChildLimitTx(ctx, tx, strings.TrimSpace(taskParentID.String), p.TaskID); err != nil {
+			return AttemptRecord{}, protocol.EventRecord{}, err
 		}
 	}
 
@@ -1358,6 +1447,9 @@ func (s *Store) FailUndispatchedAttempt(ctx context.Context, attemptID, errorCod
 		if err := expirePendingApprovalsForAttemptTx(ctx, tx, att.AttemptID, now); err != nil {
 			return err
 		}
+		if err := enqueueChildParentNotificationTx(ctx, tx, att.TaskID, att.AttemptID, protocol.AttemptFailed, now); err != nil {
+			return err
+		}
 		ev1Payload := map[string]any{
 			"state":       protocol.AttemptFailed,
 			"errorCode":   errorCode,
@@ -1409,6 +1501,12 @@ func (s *Store) FailUndispatchedAttempt(ctx context.Context, attemptID, errorCod
 // CancelTaskActiveAttemptWithIdempotency performs cancel + PA idempotency receipt verification/storage
 // inside a single BEGIN IMMEDIATE transaction (NEW-3).
 func (s *Store) CancelTaskActiveAttemptWithIdempotency(ctx context.Context, taskID, actorID, reason string, forceImmediate bool, idemp *PAActionIdempotencySpec) (CancelTaskResult, error) {
+	return s.CancelTaskActiveAttemptWithGuard(ctx, taskID, actorID, reason, forceImmediate, idemp, nil)
+}
+
+// CancelTaskActiveAttemptWithGuard cancels a task's active attempt while optionally verifying
+// runner parent control + descendant scope atomically inside the same write transaction (P1-1).
+func (s *Store) CancelTaskActiveAttemptWithGuard(ctx context.Context, taskID, actorID, reason string, forceImmediate bool, idemp *PAActionIdempotencySpec, guard *RunnerParentControlGuard) (CancelTaskResult, error) {
 	var res CancelTaskResult
 	now := time.Now().UnixMilli()
 	if actorID == "" {
@@ -1416,6 +1514,18 @@ func (s *Store) CancelTaskActiveAttemptWithIdempotency(ctx context.Context, task
 	}
 
 	err := s.WithWriteTx(ctx, func(tx *sql.Tx) error {
+		if guard != nil {
+			if err := verifyRunnerParentControlTx(ctx, tx, guard); err != nil {
+				return err
+			}
+			isDesc, err := isDescendantTaskTx(ctx, tx, guard.ParentTaskID, taskID)
+			if err != nil {
+				return err
+			}
+			if !isDesc {
+				return fmt.Errorf("%w: task %s is not a descendant of %s", ErrForbidden, taskID, guard.ParentTaskID)
+			}
+		}
 		if prevReceipt, found, err := lookupPAActionReceiptTx(ctx, tx, idemp); err != nil {
 			return err
 		} else if found {
@@ -1516,6 +1626,9 @@ func cancelAttemptTx(ctx context.Context, tx *sql.Tx, att AttemptRecord, actorID
 		UPDATE inbox_items SET state = 'resolved', resolved_at = ?, updated_at = ?
 		WHERE inbox_id = ? AND state = 'open'
 	`, now, now, "inb:blk:"+att.AttemptID)
+	if err := enqueueChildParentNotificationTx(ctx, tx, att.TaskID, att.AttemptID, protocol.AttemptCancelled, now); err != nil {
+		return err
+	}
 
 	ev1Payload := map[string]any{
 		"state":  protocol.AttemptCancelled,
@@ -1622,6 +1735,9 @@ func expireAttemptInTx(ctx context.Context, tx *sql.Tx, att *AttemptRecord, nowM
 	}
 
 	if err := upsertBlockedInboxTx(ctx, tx, att.ProjectID, att.TaskID, att.AttemptID, "任务租约超时", reason, 2, nowMs); err != nil {
+		return err
+	}
+	if err := enqueueChildParentNotificationTx(ctx, tx, att.TaskID, att.AttemptID, newAttState, nowMs); err != nil {
 		return err
 	}
 
@@ -2447,6 +2563,16 @@ func (s *Store) DeleteTask(ctx context.Context, taskID, actorID string) (string,
 		}
 		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`DELETE FROM board_members WHERE task_id IN (%s)`, ph), idArgs...); err != nil {
 			return fmt.Errorf("delete board_members: %w", err)
+		}
+
+		// 9b. child_parent_notifications (must precede attempts & tasks deletion due to FKs)
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`
+			DELETE FROM child_parent_notifications
+			WHERE child_task_id IN (%s)
+			   OR parent_task_id IN (%s)
+			   OR child_attempt_id IN (SELECT attempt_id FROM attempts WHERE task_id IN (%s))
+		`, ph, ph, ph), append(append(append([]any(nil), idArgs...), idArgs...), idArgs...)...); err != nil {
+			return fmt.Errorf("delete child_parent_notifications: %w", err)
 		}
 
 		// 10. attempts

@@ -194,10 +194,11 @@ func scanBoardMessage(scanner interface{ Scan(...any) error }) (protocol.BoardMe
 
 func scanBoardMember(scanner interface{ Scan(...any) error }) (protocol.BoardMemberCursor, error) {
 	var bm protocol.BoardMemberCursor
-	var machID, adapter, state, step, workerTID sql.NullString
+	var machID, adapter, state, step, workerTID, sourceKind, role, brief, extSID sql.NullString
 	if err := scanner.Scan(
 		&bm.TaskID, &bm.ProjectID, &bm.MemberName, &machID, &adapter,
-		&state, &bm.LastConsumedSeq, &step, &workerTID, &bm.UpdatedAt,
+		&state, &bm.LastConsumedSeq, &step, &workerTID,
+		&sourceKind, &role, &brief, &extSID, &bm.UpdatedAt,
 	); err != nil {
 		return bm, err
 	}
@@ -213,6 +214,18 @@ func scanBoardMember(scanner interface{ Scan(...any) error }) (protocol.BoardMem
 	}
 	if workerTID.Valid {
 		bm.WorkerTaskID = workerTID.String
+	}
+	if sourceKind.Valid {
+		bm.SourceKind = sourceKind.String
+	}
+	if role.Valid {
+		bm.Role = role.String
+	}
+	if brief.Valid {
+		bm.Brief = brief.String
+	}
+	if extSID.Valid {
+		bm.ExternalSessionID = extSID.String
 	}
 	return bm, nil
 }
@@ -299,7 +312,7 @@ func upsertBoardMemberTx(ctx context.Context, tx *sql.Tx, bm protocol.BoardMembe
 	if bm.UpdatedAt == 0 {
 		bm.UpdatedAt = time.Now().UnixMilli()
 	}
-	var machVal, adpVal, stepVal, workerVal any
+	var machVal, adpVal, stepVal, workerVal, srcKindVal, roleVal, briefVal, extSIDVal any
 	if bm.MachineID != "" {
 		machVal = bm.MachineID
 	}
@@ -312,11 +325,24 @@ func upsertBoardMemberTx(ctx context.Context, tx *sql.Tx, bm protocol.BoardMembe
 	if bm.WorkerTaskID != "" {
 		workerVal = bm.WorkerTaskID
 	}
+	if bm.SourceKind != "" {
+		srcKindVal = bm.SourceKind
+	}
+	if bm.Role != "" {
+		roleVal = bm.Role
+	}
+	if bm.Brief != "" {
+		briefVal = bm.Brief
+	}
+	if bm.ExternalSessionID != "" {
+		extSIDVal = bm.ExternalSessionID
+	}
 	_, err := tx.ExecContext(ctx, `
 		INSERT INTO board_members (
 			task_id, project_id, member_name, machine_id, adapter, state,
-			last_consumed_seq, current_step, worker_task_id, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			last_consumed_seq, current_step, worker_task_id,
+			source_kind, role, brief, external_session_id, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(task_id, member_name) DO UPDATE SET
 			machine_id = COALESCE(excluded.machine_id, board_members.machine_id),
 			adapter = COALESCE(excluded.adapter, board_members.adapter),
@@ -324,11 +350,35 @@ func upsertBoardMemberTx(ctx context.Context, tx *sql.Tx, bm protocol.BoardMembe
 			last_consumed_seq = MAX(board_members.last_consumed_seq, excluded.last_consumed_seq),
 			current_step = COALESCE(excluded.current_step, board_members.current_step),
 			worker_task_id = COALESCE(excluded.worker_task_id, board_members.worker_task_id),
+			source_kind = COALESCE(excluded.source_kind, board_members.source_kind),
+			role = COALESCE(excluded.role, board_members.role),
+			brief = COALESCE(excluded.brief, board_members.brief),
+			external_session_id = COALESCE(excluded.external_session_id, board_members.external_session_id),
 			updated_at = excluded.updated_at
 	`, bm.TaskID, bm.ProjectID, bm.MemberName, machVal, adpVal, string(bm.State),
-		bm.LastConsumedSeq, stepVal, workerVal, bm.UpdatedAt)
+		bm.LastConsumedSeq, stepVal, workerVal,
+		srcKindVal, roleVal, briefVal, extSIDVal, bm.UpdatedAt)
 	if err != nil {
 		return nil, fmt.Errorf("upsert board_member %s: %w", bm.MemberName, err)
+	}
+	evPayload := map[string]any{
+		"memberName":      bm.MemberName,
+		"state":           bm.State,
+		"lastConsumedSeq": bm.LastConsumedSeq,
+		"currentStep":     bm.CurrentStep,
+		"workerTaskId":    bm.WorkerTaskID,
+	}
+	if bm.SourceKind != "" {
+		evPayload["sourceKind"] = bm.SourceKind
+	}
+	if bm.Role != "" {
+		evPayload["role"] = bm.Role
+	}
+	if bm.Brief != "" {
+		evPayload["brief"] = bm.Brief
+	}
+	if bm.ExternalSessionID != "" {
+		evPayload["externalSessionId"] = bm.ExternalSessionID
 	}
 	ev, err := insertEventTx(ctx, tx, eventInsert{
 		StreamID:   "task:" + bm.TaskID,
@@ -338,14 +388,8 @@ func upsertBoardMemberTx(ctx context.Context, tx *sql.Tx, bm protocol.BoardMembe
 		ActorID:    bm.MemberName,
 		Kind:       protocol.EventBoardMemberUpdated,
 		Visibility: protocol.VisibilityTimeline,
-		Payload: map[string]any{
-			"memberName":      bm.MemberName,
-			"state":           bm.State,
-			"lastConsumedSeq": bm.LastConsumedSeq,
-			"currentStep":     bm.CurrentStep,
-			"workerTaskId":    bm.WorkerTaskID,
-		},
-		CreatedAt: bm.UpdatedAt,
+		Payload:    evPayload,
+		CreatedAt:  bm.UpdatedAt,
 	})
 	if err != nil {
 		return nil, err
@@ -359,7 +403,8 @@ func listTaskBoardMembersTx(ctx context.Context, tx *sql.Tx, taskID string) ([]p
 	seenWorkerTaskIDs := map[string]bool{}
 
 	mRows, err := tx.QueryContext(ctx, `
-		SELECT task_id, project_id, member_name, machine_id, adapter, state, last_consumed_seq, current_step, worker_task_id, updated_at
+		SELECT task_id, project_id, member_name, machine_id, adapter, state, last_consumed_seq, current_step, worker_task_id,
+		       source_kind, role, brief, external_session_id, updated_at
 		FROM board_members
 		WHERE task_id = ?
 		ORDER BY member_name ASC
@@ -387,7 +432,7 @@ func listTaskBoardMembersTx(ctx context.Context, tx *sql.Tx, taskID string) ([]p
 	// B16: If a persisted board_members row already exists under the child task's display title with empty worker_task_id,
 	// enrich that row with childID rather than allowing a NULL-worker_task_id row to shadow the child task!
 	cRows, err := tx.QueryContext(ctx, `
-		SELECT t.task_id, t.project_id, t.title, t.preferred_adapter, t.state, t.updated_at, a.machine_id
+		SELECT t.task_id, t.project_id, t.title, t.goal, t.delegated_role, t.preferred_adapter, t.state, t.updated_at, a.machine_id
 		FROM tasks t
 		LEFT JOIN attempts a ON a.attempt_id = t.active_attempt_id
 		WHERE t.parent_task_id = ? AND t.archived_at IS NULL
@@ -398,10 +443,10 @@ func listTaskBoardMembersTx(ctx context.Context, tx *sql.Tx, taskID string) ([]p
 	}
 	defer cRows.Close()
 	for cRows.Next() {
-		var childID, childProj, title, adapter, tstate string
+		var childID, childProj, title, goal, adapter, tstate string
 		var updatedAt int64
-		var mach sql.NullString
-		if err := cRows.Scan(&childID, &childProj, &title, &adapter, &tstate, &updatedAt, &mach); err != nil {
+		var roleNull, mach sql.NullString
+		if err := cRows.Scan(&childID, &childProj, &title, &goal, &roleNull, &adapter, &tstate, &updatedAt, &mach); err != nil {
 			return nil, err
 		}
 		if seenWorkerTaskIDs[childID] {
@@ -412,6 +457,11 @@ func listTaskBoardMembersTx(ctx context.Context, tx *sql.Tx, taskID string) ([]p
 		if mach.Valid {
 			mid = mach.String
 		}
+		roleStr := ""
+		if roleNull.Valid {
+			roleStr = roleNull.String
+		}
+		briefStr := truncateRunes(strings.TrimSpace(goal), 240)
 		merged := false
 		for i := range members {
 			if members[i].WorkerTaskID == "" && (strings.EqualFold(members[i].MemberName, title) || members[i].MemberName == childID) {
@@ -421,6 +471,15 @@ func listTaskBoardMembersTx(ctx context.Context, tx *sql.Tx, taskID string) ([]p
 				}
 				if members[i].Adapter == "" {
 					members[i].Adapter = protocol.Adapter(adapter)
+				}
+				if members[i].SourceKind == "" {
+					members[i].SourceKind = "orbit_child"
+				}
+				if members[i].Role == "" && roleStr != "" {
+					members[i].Role = roleStr
+				}
+				if members[i].Brief == "" && briefStr != "" {
+					members[i].Brief = briefStr
 				}
 				seenWorkerTaskIDs[childID] = true
 				merged = true
@@ -438,6 +497,9 @@ func listTaskBoardMembersTx(ctx context.Context, tx *sql.Tx, taskID string) ([]p
 			Adapter:      protocol.Adapter(adapter),
 			State:        mState,
 			WorkerTaskID: childID,
+			SourceKind:   "orbit_child",
+			Role:         roleStr,
+			Brief:        briefStr,
 			UpdatedAt:    updatedAt,
 		})
 	}
@@ -766,7 +828,8 @@ func (s *Store) GetWorkerStream(ctx context.Context, taskID, workerName string) 
 
 		// 1. Check persisted board_members (matching member_name or worker_task_id)
 		row := tx.QueryRowContext(ctx, `
-			SELECT task_id, project_id, member_name, machine_id, adapter, state, last_consumed_seq, current_step, worker_task_id, updated_at
+			SELECT task_id, project_id, member_name, machine_id, adapter, state, last_consumed_seq, current_step, worker_task_id,
+			       source_kind, role, brief, external_session_id, updated_at
 			FROM board_members
 			WHERE task_id = ? AND (member_name = ? OR worker_task_id = ?)
 			LIMIT 1

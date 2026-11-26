@@ -738,6 +738,9 @@ func (s *Store) ReconcileRunnerHello(ctx context.Context, hello protocol.RunnerH
 				if err := upsertBlockedInboxTx(ctx, tx, att.ProjectID, att.TaskID, aid, "待核对现场 · 批准窗口崩溃", reason, 1, now); err != nil {
 					return err
 				}
+				if err := enqueueChildParentNotificationTx(ctx, tx, att.TaskID, aid, protocol.AttemptNeedsVerification, now); err != nil {
+					return err
+				}
 				ev, err := insertEventTx(ctx, tx, eventInsert{
 					StreamID:   "task:" + att.TaskID,
 					ProjectID:  att.ProjectID,
@@ -778,6 +781,9 @@ func (s *Store) ReconcileRunnerHello(ctx context.Context, hello protocol.RunnerH
 					return err
 				}
 				if err := upsertBlockedInboxTx(ctx, tx, att.ProjectID, att.TaskID, aid, "Runner 重启 · 可安全重跑", reason, 2, now); err != nil {
+					return err
+				}
+				if err := enqueueChildParentNotificationTx(ctx, tx, att.TaskID, aid, protocol.AttemptExpired, now); err != nil {
 					return err
 				}
 				ev, err := insertEventTx(ctx, tx, eventInsert{

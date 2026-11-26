@@ -281,6 +281,61 @@ type ReferencedTaskMeta struct {
 	ProjectName string `json:"projectName,omitempty"`
 }
 
+// ChildResultMeta carries structured completion metadata when a child session automatically wakes its parent.
+type ChildResultMeta struct {
+	ChildTaskID    string       `json:"childTaskId"`
+	ChildTitle     string       `json:"childTitle"`
+	ChildRole      string       `json:"childRole,omitempty"`
+	ChildProjectID string       `json:"childProjectId,omitempty"`
+	ChildState     AttemptState `json:"childState"`
+	Summary        string       `json:"summary,omitempty"`
+	ErrorDetail    string       `json:"errorDetail,omitempty"`
+	DeliveryID     string       `json:"deliveryId,omitempty"`
+	FilesChanged   int          `json:"filesChanged,omitempty"`
+	Insertions     int          `json:"insertions,omitempty"`
+	Deletions      int          `json:"deletions,omitempty"`
+}
+
+// ParentTaskRef summarizes a child task's parent session for breadcrumb and navigation UI.
+type ParentTaskRef struct {
+	TaskID      string    `json:"taskId"`
+	ProjectID   string    `json:"projectId"`
+	ProjectName string    `json:"projectName,omitempty"`
+	Title       string    `json:"title"`
+	State       TaskState `json:"state"`
+	IsHebi8Main bool      `json:"isHebi8Main,omitempty"`
+}
+
+// ChildTaskView provides rich live status and delivery stats for a delegated child session.
+type ChildTaskView struct {
+	TaskID               string    `json:"taskId"`
+	ProjectID            string    `json:"projectId"`
+	ProjectName          string    `json:"projectName,omitempty"`
+	ParentTaskID         string    `json:"parentTaskId"`
+	DelegatedByAttemptID string    `json:"delegatedByAttemptId,omitempty"`
+	DelegatedRole        string    `json:"delegatedRole,omitempty"`
+	Title                string    `json:"title"`
+	Goal                 string    `json:"goal"`
+	State                TaskState `json:"state"`
+	PreferredAdapter     Adapter   `json:"preferredAdapter,omitempty"`
+	MachineID            string    `json:"machineId,omitempty"`
+	Model                string    `json:"model,omitempty"`
+	ActiveAttemptID      string    `json:"activeAttemptId,omitempty"`
+	LatestDeliveryID     string    `json:"latestDeliveryId,omitempty"`
+	DeliveryCount        int       `json:"deliveryCount"`
+	AttemptCount         int       `json:"attemptCount"`
+	OpenApprovalCount    int       `json:"openApprovalCount"`
+	CurrentStep          string    `json:"currentStep,omitempty"`
+	LastMessagePreview   string    `json:"lastMessagePreview,omitempty"`
+	ErrorDetail          string    `json:"errorDetail,omitempty"`
+	FilesChanged         int       `json:"filesChanged,omitempty"`
+	Insertions           int       `json:"insertions,omitempty"`
+	Deletions            int       `json:"deletions,omitempty"`
+	CreatedAt            int64     `json:"createdAt"`
+	UpdatedAt            int64     `json:"updatedAt"`
+	ArchivedAt           *int64    `json:"archivedAt,omitempty"`
+}
+
 // AttemptView represents one execution attempt of a task.
 type AttemptView struct {
 	AttemptID        string                `json:"attemptId"`
@@ -295,6 +350,7 @@ type AttemptView struct {
 	TriggerKind      TriggerKind           `json:"triggerKind"`
 	PromptText       string                `json:"promptText,omitempty"`
 	RefTasks         []ReferencedTaskMeta  `json:"refTasks,omitempty"`
+	ChildResult      *ChildResultMeta      `json:"childResult,omitempty"`
 	WorktreePath     string                `json:"worktreePath,omitempty"`
 	BaseSHA          string                `json:"baseSha,omitempty"`
 	OutputDeliveryID string                `json:"outputDeliveryId,omitempty"`
@@ -309,27 +365,32 @@ type AttemptView struct {
 
 // TaskSummary represents a logical task in list & timeline headers.
 type TaskSummary struct {
-	TaskID              string        `json:"taskId"`
-	ProjectID           string        `json:"projectId"`
-	ParentTaskID        string        `json:"parentTaskId,omitempty"`
-	Title               string        `json:"title"`
-	Goal                string        `json:"goal"`
-	RequiredCapability  string        `json:"requiredCapability"`
-	PreferredAdapter    Adapter       `json:"preferredAdapter"`
-	State               TaskState     `json:"state"`
-	WaitingReason       string        `json:"waitingReason,omitempty"`
-	ActiveAttemptID     string        `json:"activeAttemptId,omitempty"`
-	ActiveAttemptState  *AttemptState `json:"activeAttemptState,omitempty"`
-	LatestDeliveryID    string        `json:"latestDeliveryId,omitempty"`
-	LatestDeliveryHead  string        `json:"latestDeliveryHead,omitempty"`
-	OpenAnnotationCount int           `json:"openAnnotationCount"`
-	DeliveryCount       int           `json:"deliveryCount"`
-	QueuedInputCount    int           `json:"queuedInputCount"`
-	WorkerCount         int           `json:"workerCount"`
-	CreatedBy           TaskCreatedBy `json:"createdBy"`
-	CreatedAt           int64         `json:"createdAt"`
-	UpdatedAt           int64         `json:"updatedAt"`
-	ArchivedAt          *int64        `json:"archivedAt,omitempty"`
+	TaskID                string        `json:"taskId"`
+	ProjectID             string        `json:"projectId"`
+	ParentTaskID          string        `json:"parentTaskId,omitempty"`
+	DelegatedByAttemptID  string        `json:"delegatedByAttemptId,omitempty"`
+	DelegatedRole         string        `json:"delegatedRole,omitempty"`
+	ChildCount            int           `json:"childCount,omitempty"`
+	ActiveChildCount      int           `json:"activeChildCount,omitempty"`
+	PendingChildApprovals int           `json:"pendingChildApprovals,omitempty"`
+	Title                 string        `json:"title"`
+	Goal                  string        `json:"goal"`
+	RequiredCapability    string        `json:"requiredCapability"`
+	PreferredAdapter      Adapter       `json:"preferredAdapter"`
+	State                 TaskState     `json:"state"`
+	WaitingReason         string        `json:"waitingReason,omitempty"`
+	ActiveAttemptID       string        `json:"activeAttemptId,omitempty"`
+	ActiveAttemptState    *AttemptState `json:"activeAttemptState,omitempty"`
+	LatestDeliveryID      string        `json:"latestDeliveryId,omitempty"`
+	LatestDeliveryHead    string        `json:"latestDeliveryHead,omitempty"`
+	OpenAnnotationCount   int           `json:"openAnnotationCount"`
+	DeliveryCount         int           `json:"deliveryCount"`
+	QueuedInputCount      int           `json:"queuedInputCount"`
+	WorkerCount           int           `json:"workerCount"`
+	CreatedBy             TaskCreatedBy `json:"createdBy"`
+	CreatedAt             int64         `json:"createdAt"`
+	UpdatedAt             int64         `json:"updatedAt"`
+	ArchivedAt            *int64        `json:"archivedAt,omitempty"`
 }
 
 // EventRecord is a single row from the unified append-only events log.
@@ -350,16 +411,19 @@ type EventRecord struct {
 
 // TaskTimelineResponse powers the center workbench timeline pane.
 type TaskTimelineResponse struct {
-	Task          TaskSummary         `json:"task"`
-	RuntimeConfig map[string]string   `json:"runtimeConfig,omitempty"`
-	Attempts      []AttemptView       `json:"attempts"`
-	Deliveries    []DeliveryView      `json:"deliveries"`
-	Annotations   []AnnotationView    `json:"annotations"`
-	PendingInputs []PendingInput      `json:"pendingInputs"`
-	Approvals     []ApprovalView      `json:"approvals"`
-	Sources       []TaskSource        `json:"sources"`
-	BoardMembers  []BoardMemberCursor `json:"boardMembers"`
-	Events        []EventRecord       `json:"events"`
+	Task            TaskSummary         `json:"task"`
+	RuntimeConfig   map[string]string   `json:"runtimeConfig,omitempty"`
+	ParentSummary   *ParentTaskRef      `json:"parentSummary,omitempty"`
+	Children        []ChildTaskView     `json:"children,omitempty"`
+	SiblingChildren []ChildTaskView     `json:"siblingChildren,omitempty"`
+	Attempts        []AttemptView       `json:"attempts"`
+	Deliveries      []DeliveryView      `json:"deliveries"`
+	Annotations     []AnnotationView    `json:"annotations"`
+	PendingInputs   []PendingInput      `json:"pendingInputs"`
+	Approvals       []ApprovalView      `json:"approvals"`
+	Sources         []TaskSource        `json:"sources"`
+	BoardMembers    []BoardMemberCursor `json:"boardMembers"`
+	Events          []EventRecord       `json:"events"`
 }
 
 // DiffFileStat summarizes one changed file in a delivery diff.
@@ -548,16 +612,20 @@ type BoardMessage struct {
 
 // BoardMemberCursor tracks a native swarm or cross-machine worker on a task's board.
 type BoardMemberCursor struct {
-	TaskID          string           `json:"taskId"`
-	ProjectID       string           `json:"projectId"`
-	MemberName      string           `json:"memberName"`
-	MachineID       string           `json:"machineId,omitempty"`
-	Adapter         Adapter          `json:"adapter,omitempty"`
-	State           BoardMemberState `json:"state"`
-	LastConsumedSeq int64            `json:"lastConsumedSeq"`
-	CurrentStep     string           `json:"currentStep,omitempty"`
-	WorkerTaskID    string           `json:"workerTaskId,omitempty"`
-	UpdatedAt       int64            `json:"updatedAt"`
+	TaskID            string           `json:"taskId"`
+	ProjectID         string           `json:"projectId"`
+	MemberName        string           `json:"memberName"`
+	MachineID         string           `json:"machineId,omitempty"`
+	Adapter           Adapter          `json:"adapter,omitempty"`
+	State             BoardMemberState `json:"state"`
+	LastConsumedSeq   int64            `json:"lastConsumedSeq"`
+	CurrentStep       string           `json:"currentStep,omitempty"`
+	WorkerTaskID      string           `json:"workerTaskId,omitempty"`
+	SourceKind        string           `json:"sourceKind,omitempty"`
+	Role              string           `json:"role,omitempty"`
+	Brief             string           `json:"brief,omitempty"`
+	ExternalSessionID string           `json:"externalSessionId,omitempty"`
+	UpdatedAt         int64            `json:"updatedAt"`
 }
 
 // TaskBoardResponse is returned by GET /api/tasks/:taskId/board.
@@ -713,23 +781,77 @@ type CreateTaskSourceInput struct {
 
 // CreateTaskRequest creates a new task under a real project or virtual _scratch/_pa project.
 type CreateTaskRequest struct {
-	Title                string                  `json:"title,omitempty"`
-	Goal                 string                  `json:"goal"`
-	ParentTaskID         string                  `json:"parentTaskId,omitempty"`
-	MachineID            string                  `json:"machineId,omitempty"`
-	PartID               string                  `json:"partId,omitempty"`
-	LocationID           string                  `json:"locationId,omitempty"`
-	UseWorktree          *bool                   `json:"useWorktree,omitempty"`
-	ReferencedTaskIDs    []string                `json:"referencedTaskIds,omitempty"`
-	RequiredCapability   string                  `json:"requiredCapability,omitempty"`
-	RequiredResources    []string                `json:"requiredResources,omitempty"`
+	Title                  string                  `json:"title,omitempty"`
+	Goal                   string                  `json:"goal"`
+	ParentTaskID           string                  `json:"parentTaskId,omitempty"`
+	DelegatedByAttemptID   string                  `json:"delegatedByAttemptId,omitempty"`
+	DelegatedRole          string                  `json:"delegatedRole,omitempty"`
+	NotifyParent           *bool                   `json:"notifyParent,omitempty"`
+	MachineID              string                  `json:"machineId,omitempty"`
+	PartID                 string                  `json:"partId,omitempty"`
+	LocationID             string                  `json:"locationId,omitempty"`
+	UseWorktree            *bool                   `json:"useWorktree,omitempty"`
+	ReferencedTaskIDs      []string                `json:"referencedTaskIds,omitempty"`
+	RequiredCapability     string                  `json:"requiredCapability,omitempty"`
+	RequiredResources      []string                `json:"requiredResources,omitempty"`
 	Adapter                Adapter                 `json:"adapter,omitempty"`
 	Config                 map[string]string       `json:"config,omitempty"`
 	ExplicitFullPermission bool                    `json:"explicitFullPermission,omitempty"`
 	ImportDirtyWorkspace   bool                    `json:"importDirtyWorkspace,omitempty"`
-	Sources              []CreateTaskSourceInput `json:"sources,omitempty"`
-	IdempotencyKey       string                  `json:"idempotencyKey,omitempty"`
-	SwarmIdleTimeoutMs   int64                   `json:"swarmIdleTimeoutMs,omitempty"`
+	Sources                []CreateTaskSourceInput `json:"sources,omitempty"`
+	IdempotencyKey         string                  `json:"idempotencyKey,omitempty"`
+	SwarmIdleTimeoutMs     int64                   `json:"swarmIdleTimeoutMs,omitempty"`
+}
+
+// CreateChildTaskRequest spawns a delegated child task under a parent session.
+type CreateChildTaskRequest struct {
+	Title                string            `json:"title,omitempty"`
+	Role                 string            `json:"role,omitempty"`
+	Goal                 string            `json:"goal"`
+	ProjectID            string            `json:"projectId,omitempty"`
+	MachineID            string            `json:"machineId,omitempty"`
+	PartID               string            `json:"partId,omitempty"`
+	LocationID           string            `json:"locationId,omitempty"`
+	UseWorktree          *bool             `json:"useWorktree,omitempty"`
+	RequiredCapability   string            `json:"requiredCapability,omitempty"`
+	Adapter              Adapter           `json:"adapter,omitempty"`
+	Config               map[string]string `json:"config,omitempty"`
+	DelegatedByAttemptID string            `json:"delegatedByAttemptId,omitempty"`
+	NotifyParent         *bool             `json:"notifyParent,omitempty"`
+	IdempotencyKey       string            `json:"idempotencyKey,omitempty"`
+}
+
+// ListChildrenResponse returns the child sessions belonging to a parent task.
+type ListChildrenResponse struct {
+	ParentTaskID string          `json:"parentTaskId"`
+	Children     []ChildTaskView `json:"children"`
+}
+
+// TaskTranscriptTurn summarizes one attempt turn in a compact, parent-consumable format.
+type TaskTranscriptTurn struct {
+	AttemptID    string       `json:"attemptId"`
+	AttemptNo    int          `json:"attemptNo"`
+	TriggerKind  TriggerKind  `json:"triggerKind"`
+	State        AttemptState `json:"state"`
+	Prompt       string       `json:"prompt,omitempty"`
+	Reply        string       `json:"reply,omitempty"`
+	ToolCount    int          `json:"toolCount"`
+	ErrorDetail  string       `json:"errorDetail,omitempty"`
+	DeliveryID   string       `json:"deliveryId,omitempty"`
+	FilesChanged int          `json:"filesChanged,omitempty"`
+	StartedAt    int64        `json:"startedAt"`
+	FinishedAt   *int64       `json:"finishedAt,omitempty"`
+}
+
+// TaskTranscriptResponse returns compact per-attempt turns for reading a child or task session.
+type TaskTranscriptResponse struct {
+	TaskID            string               `json:"taskId"`
+	ParentTaskID      string               `json:"parentTaskId,omitempty"`
+	ProjectID         string               `json:"projectId"`
+	Title             string               `json:"title"`
+	State             TaskState            `json:"state"`
+	OpenApprovalCount int                  `json:"openApprovalCount"`
+	Turns             []TaskTranscriptTurn `json:"turns"`
 }
 
 // CreateTaskResponse returns the newly created (or idempotently matched) task and initial attempt.
@@ -1337,6 +1459,7 @@ type Hebi8LineResponse struct {
 type Hebi8RawTurn struct {
 	AttemptID      string       `json:"attemptId"`
 	AttemptNo      int          `json:"attemptNo"`
+	TriggerKind    TriggerKind  `json:"triggerKind,omitempty"`
 	State          AttemptState `json:"state"`
 	UserPrompt     string       `json:"userPrompt"`
 	AssistantReply string       `json:"assistantReply"`

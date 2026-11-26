@@ -169,6 +169,7 @@ const (
 	TriggerDeploy          TriggerKind = "deploy"
 	TriggerWorkspaceImport TriggerKind = "workspace_import"
 	TriggerManualImport    TriggerKind = "manual_import"
+	TriggerChildResult     TriggerKind = "child_result"
 )
 
 var AllTriggerKinds = []TriggerKind{
@@ -179,6 +180,7 @@ var AllTriggerKinds = []TriggerKind{
 	TriggerDeploy,
 	TriggerWorkspaceImport,
 	TriggerManualImport,
+	TriggerChildResult,
 }
 
 func (v TriggerKind) IsValid() bool { return slices.Contains(AllTriggerKinds, v) }
@@ -600,6 +602,8 @@ const (
 	EventProjectChanged          EventKind = "project.changed"
 	EventNetworkSettingsChanged  EventKind = "network.settings_changed"
 	EventHebi8Folded             EventKind = "hebi8.folded"
+	EventTaskChildSpawned        EventKind = "task.child_spawned"
+	EventTaskChildUpdated        EventKind = "task.child_updated"
 )
 
 var AllEventKinds = []EventKind{
@@ -647,6 +651,8 @@ var AllEventKinds = []EventKind{
 	EventProjectChanged,
 	EventNetworkSettingsChanged,
 	EventHebi8Folded,
+	EventTaskChildSpawned,
+	EventTaskChildUpdated,
 }
 
 // IDEScheme defines supported URI schemes for one-click IDE jump.

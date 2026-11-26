@@ -102,6 +102,10 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return runBrief(ctx, args[1:], stdout, stderr)
 	case "tasks", "task", "ls":
 		return runTasks(ctx, args[1:], stdout, stderr)
+	case "child", "children":
+		return runChild(ctx, args[1:], stdout, stderr)
+	case "mcp-serve":
+		return runMCPServe(ctx, args[1:], os.Stdin, stdout, stderr)
 	case "approvals", "approval":
 		return runApprovals(ctx, args[1:], stdout, stderr)
 	case "hebi8", "pa":
@@ -131,6 +135,8 @@ func printUsage(w io.Writer) {
   orbit init [--connect <url> | --hub | --runner --hub-url <url> | --project [dir]]
   orbit status [--hub <url>] [--json]
   orbit tasks [list|new|show|followup|cancel|retry] ...
+  orbit child [spawn|ls|show|send|cancel] ...               Manage delegated child sessions
+  orbit mcp-serve                                           Run Orbit stdio MCP server (5 sub-session tools)
   orbit approvals [list|allow|reject] ...
   orbit hebi8 "<message>"                                   Send a turn to the single Hebi8 main conversation (alias: orbit pa)
   orbit hebi8 [fold|line|expand <nodeId>|pin <nodeId>]      Manage Hebi8 Fold-Rollover context tree

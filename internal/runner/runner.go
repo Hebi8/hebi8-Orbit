@@ -1,7 +1,9 @@
 package runner
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -12,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -44,6 +47,7 @@ type Config struct {
 	DataDir                 string
 	OutboxDBPath            string
 	SocketPath              string
+	OrbitBinPath            string
 	RunnerVersion           string
 	SupportedAdapters       []protocol.Adapter
 	MaxLiveWorkers          int
@@ -80,8 +84,19 @@ type sessionSlot struct {
 	runtimeState         protocol.SessionRuntimeState
 	inFlightPrompt       bool
 	promptOwnerAttemptID string
+	delegateToken        string
+	orbitMCPAttached     bool
+	orbitMCPServerName   string
 	locked               bool
 	lastActivityAt       time.Time
+}
+
+type delegateTokenEntry struct {
+	Token       string
+	WBSessionID string
+	TaskID      string
+	ProjectID   string
+	AttemptID   string
 }
 
 type pendingApprovalHandle struct {
@@ -164,6 +179,7 @@ type Runner struct {
 	slotMeta          map[string]liveSlotMeta
 	attempts          map[string]*attemptContext
 	sessionOwner      map[acp.SessionId]string
+	delegateTokens    map[string]*delegateTokenEntry
 	resourceLocks     map[string]string // resourceName -> attemptID
 	cancelledAttempts map[string]bool   // B10: attemptID cancelled before/during dispatch
 	reservedWorkers   int               // S1: atomic hard-cap reservation for global MaxLiveWorkers
@@ -288,6 +304,7 @@ func New(ctx context.Context, cfg Config) (*Runner, error) {
 		slotMeta:          map[string]liveSlotMeta{},
 		attempts:          map[string]*attemptContext{},
 		sessionOwner:      map[acp.SessionId]string{},
+		delegateTokens:    map[string]*delegateTokenEntry{},
 		resourceLocks:     map[string]string{},
 		cancelledAttempts: map[string]bool{},
 		reservedByAdapter: map[protocol.Adapter]int{},
@@ -488,7 +505,7 @@ func (r *Runner) Start(ctx context.Context) error {
 	}
 
 	if r.cfg.SocketPath != "" && r.cfg.SocketPath != "none" {
-		sockSrv, err := startLocalSocketServer(r.cfg.SocketPath, r.HandleLocalDeliver)
+		sockSrv, err := startLocalSocketServer(r.cfg.SocketPath, r.HandleLocalDeliver, r.HandleLocalDelegate)
 		if err != nil {
 			_ = r.closeAllDrivers(ctx)
 			return err
@@ -592,6 +609,10 @@ func (r *Runner) Close(ctx context.Context) error {
 
 	r.closeActiveWS(websocket.StatusGoingAway, "runner shutting down")
 	r.wg.Wait()
+
+	r.mu.Lock()
+	r.delegateTokens = map[string]*delegateTokenEntry{}
+	r.mu.Unlock()
 
 	var err1, err2, err3 error
 	if r.sockSrv != nil {
@@ -843,6 +864,8 @@ func (r *Runner) executeAttempt(ctx context.Context, att *attemptContext) {
 	sid, promptText, err := r.ensureSessionReadyLocked(ctx, att, slot)
 	if err != nil {
 		slot.runtimeState = protocol.SessionDead
+		slot.orbitMCPAttached = false
+		r.revokeSessionDelegateTokenLocked(slot)
 		slot.mu.Unlock()
 		r.releaseWorkerReservation(att)
 		errCode := "SESSION_PREPARE_FAILED"
@@ -1257,6 +1280,8 @@ func (r *Runner) isolateAndCloseSession(slot *sessionSlot, sid acp.SessionId) {
 		slot.mu.Lock()
 		slot.locked = true
 		slot.runtimeState = protocol.SessionDead
+		slot.orbitMCPAttached = false
+		r.revokeSessionDelegateTokenLocked(slot)
 		adapter = slot.adapter
 		pinnedDrv = slot.driver
 		isScoped = slot.scopedDriver
@@ -1265,6 +1290,7 @@ func (r *Runner) isolateAndCloseSession(slot *sessionSlot, sid acp.SessionId) {
 		slot.projectEnvHash = ""
 		slot.sessionOpts = nil
 		slot.sessionModes = nil
+		r.revokeSessionDelegateTokenLocked(slot)
 		if sid == "" {
 			sid = slot.providerSessionID
 		}
@@ -1471,16 +1497,19 @@ func (r *Runner) ensureSessionReadyLocked(ctx context.Context, att *attemptConte
 		filepath.Clean(expectedCWD) == filepath.Clean(worktreePath)
 
 	envChanged := slot.driver != nil && slot.projectEnvHash != desiredEnvHash
+	adapterChanged := slot.driver != nil && slot.adapter != "" && slot.adapter != adapter
 	needReplaceScoped := slot.scopedDriver && slot.driver != nil && (!canReuse || envChanged)
-	if envChanged || needReplaceScoped {
+	if envChanged || adapterChanged || needReplaceScoped {
 		oldDrv := slot.driver
 		oldScoped := slot.scopedDriver
 		oldSID := slot.providerSessionID
 		slot.driver = nil
 		slot.scopedDriver = false
 		slot.projectEnvHash = ""
+		slot.providerSessionID = ""
 		slot.sessionOpts = nil
 		slot.sessionModes = nil
+		r.revokeSessionDelegateTokenLocked(slot)
 		if oldSID != "" && oldDrv != nil {
 			cctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			_ = oldDrv.CloseSession(cctx, oldSID)
@@ -1563,18 +1592,40 @@ func (r *Runner) ensureSessionReadyLocked(ctx context.Context, att *attemptConte
 	promptText := d.Prompt
 	prependContract := false
 
+	reusingLiveInMemory := canReuse && !envChanged && drv.IsSessionLiveInMemory(expectedSID)
+	var (
+		delegateToken string
+		mcpServerName string
+		mcpServers    []acp.McpServer
+		mcpAttached   bool
+	)
+	// prepareFreshSessionMCP mints a brand-new delegateToken and per-session MCP server name
+	// for a single ACP session open/resume/load attempt, after revoking any prior token.
+	prepareFreshSessionMCP := func() context.Context {
+		r.revokeSessionDelegateTokenLocked(slot)
+		delegateToken = r.ensureSessionDelegateTokenLocked(slot, d)
+		mcpServerName = generateOrbitMCPServerName()
+		mcpServers = r.buildOrbitMCPServers(d, delegateToken, mcpServerName)
+		mcpAttached = false
+		return WithSessionMCPAttachReport(WithSessionMCPServers(ctx, mcpServers), &mcpAttached)
+	}
+
 	var sid acp.SessionId
 	sessionOpts := slot.sessionOpts
 	sessionModes := slot.sessionModes
+	openedSession := false
 	switch {
 	case !canReuse:
+		openedSession = true
 		sysAppend := d.SystemPromptAppend
 		if !drv.SupportsMetaSystemPrompt() && sysAppend != "" {
 			prependContract = true
 			sysAppend = ""
 		}
-		resp, err := drv.NewSession(ctx, worktreePath, sysAppend)
+		sessionCtx := prepareFreshSessionMCP()
+		resp, err := drv.NewSession(sessionCtx, worktreePath, sysAppend)
 		if err != nil {
+			r.revokeSessionDelegateTokenLocked(slot)
 			cleanupNewScoped()
 			return "", "", fmt.Errorf("new session (%s): %w", adapter, err)
 		}
@@ -1582,22 +1633,29 @@ func (r *Runner) ensureSessionReadyLocked(ctx context.Context, att *attemptConte
 		sessionOpts = resp.ConfigOptions
 		sessionModes = resp.Modes
 
-	case !drv.IsSessionLiveInMemory(expectedSID):
+	case !reusingLiveInMemory:
+		openedSession = true
 		resumed := false
 		if drv.SupportsResume() {
-			if resp, err := drv.ResumeSession(ctx, expectedSID, worktreePath); err == nil {
+			sessionCtx := prepareFreshSessionMCP()
+			if resp, err := drv.ResumeSession(sessionCtx, expectedSID, worktreePath); err == nil {
 				sid = expectedSID
 				sessionOpts = resp.ConfigOptions
 				sessionModes = resp.Modes
 				resumed = true
+			} else {
+				r.revokeSessionDelegateTokenLocked(slot)
 			}
 		}
 		if !resumed && drv.SupportsLoad() {
-			if resp, err := drv.LoadSession(ctx, expectedSID, worktreePath); err == nil {
+			sessionCtx := prepareFreshSessionMCP()
+			if resp, err := drv.LoadSession(sessionCtx, expectedSID, worktreePath); err == nil {
 				sid = expectedSID
 				sessionOpts = resp.ConfigOptions
 				sessionModes = resp.Modes
 				resumed = true
+			} else {
+				r.revokeSessionDelegateTokenLocked(slot)
 			}
 		}
 		if !resumed {
@@ -1606,8 +1664,10 @@ func (r *Runner) ensureSessionReadyLocked(ctx context.Context, att *attemptConte
 				prependContract = true
 				sysAppend = ""
 			}
-			resp, err := drv.NewSession(ctx, worktreePath, sysAppend)
+			sessionCtx := prepareFreshSessionMCP()
+			resp, err := drv.NewSession(sessionCtx, worktreePath, sysAppend)
 			if err != nil {
+				r.revokeSessionDelegateTokenLocked(slot)
 				cleanupNewScoped()
 				return "", "", fmt.Errorf("fallback new session (%s): %w", adapter, err)
 			}
@@ -1617,7 +1677,22 @@ func (r *Runner) ensureSessionReadyLocked(ctx context.Context, att *attemptConte
 		}
 
 	default:
+		if slot.orbitMCPAttached {
+			delegateToken = r.ensureSessionDelegateTokenLocked(slot, d)
+		} else {
+			r.revokeSessionDelegateTokenLocked(slot)
+		}
 		sid = expectedSID
+	}
+	if openedSession {
+		if len(mcpServers) > 0 && mcpAttached {
+			slot.orbitMCPAttached = true
+			slot.orbitMCPServerName = mcpServerName
+		} else {
+			// Driver either did not attach Orbit MCP or fell back internally to empty McpServers:
+			// immediately revoke the delegate token handed to the failed initial request.
+			r.revokeSessionDelegateTokenLocked(slot)
+		}
 	}
 	slot.sessionOpts = sessionOpts
 	slot.sessionModes = sessionModes
@@ -1625,7 +1700,10 @@ func (r *Runner) ensureSessionReadyLocked(ctx context.Context, att *attemptConte
 	// IRON LAW: Re-apply and strictly verify every desired config option before sending prompt
 	updatedOpts, appliedMode, err := r.applyAndVerifyConfig(ctx, drv, sid, d.DesiredConfig, sessionOpts, sessionModes)
 	if err != nil {
-		// S1: Close the leaked ACP session (and any newly created project-scoped driver) on config failure.
+		// S1: Close the leaked ACP session (and any newly created project-scoped driver) on config failure,
+		// and unconditionally revoke the session delegate token.
+		slot.orbitMCPAttached = false
+		r.revokeSessionDelegateTokenLocked(slot)
 		cctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		_ = drv.CloseSession(cctx, sid)
 		cancel()
@@ -1910,6 +1988,8 @@ func (r *Runner) CloseSessionSafely(ctx context.Context, wbSessionID string) (bo
 		return false, nil
 	}
 	if slot.providerSessionID == "" || slot.runtimeState == protocol.SessionIdleClosed || slot.runtimeState == protocol.SessionDead {
+		slot.orbitMCPAttached = false
+		r.revokeSessionDelegateTokenLocked(slot)
 		if slot.scopedDriver && slot.driver != nil {
 			drv := slot.driver
 			slot.driver = nil
@@ -1940,8 +2020,11 @@ func (r *Runner) CloseSessionSafely(ctx context.Context, wbSessionID string) (bo
 		}
 	}
 
-	// Mark 'closing' INSIDE the per-session lock before calling CloseSession
+	// Mark 'closing' INSIDE the per-session lock and revoke delegate token unconditionally
+	// so neither driverFor failure nor CloseSession failure can leave a live token behind.
 	slot.runtimeState = protocol.SessionClosing
+	slot.orbitMCPAttached = false
+	r.revokeSessionDelegateTokenLocked(slot)
 	drv := slot.driver
 	isScoped := slot.scopedDriver
 	slot.driver = nil
@@ -1951,6 +2034,7 @@ func (r *Runner) CloseSessionSafely(ctx context.Context, wbSessionID string) (bo
 		drv, err = r.driverFor(slot.adapter)
 		if err != nil {
 			slot.runtimeState = protocol.SessionDead
+			r.syncSlotMetaLocked(slot)
 			return false, err
 		}
 	}
@@ -1970,6 +2054,438 @@ func (r *Runner) CloseSessionSafely(ctx context.Context, wbSessionID string) (bo
 	r.syncSlotMetaLocked(slot)
 	go r.sweepRetiredDrivers()
 	return true, nil
+}
+
+// DelegateTokenForSession returns the active per-session delegate token for wbSessionID (for diagnostics/tests).
+func (r *Runner) DelegateTokenForSession(wbSessionID string) string {
+	r.mu.Lock()
+	slot, ok := r.sessions[wbSessionID]
+	r.mu.Unlock()
+	if !ok || slot == nil {
+		return ""
+	}
+	slot.mu.Lock()
+	defer slot.mu.Unlock()
+	return slot.delegateToken
+}
+
+// OrbitMCPServerNameForSession returns the active randomized Orbit MCP server name for wbSessionID (for diagnostics/tests).
+func (r *Runner) OrbitMCPServerNameForSession(wbSessionID string) string {
+	r.mu.Lock()
+	slot, ok := r.sessions[wbSessionID]
+	r.mu.Unlock()
+	if !ok || slot == nil {
+		return ""
+	}
+	slot.mu.Lock()
+	defer slot.mu.Unlock()
+	return slot.orbitMCPServerName
+}
+
+func generateOrbitMCPServerName() string {
+	var raw [4]byte
+	_, _ = rand.Read(raw[:])
+	return "orbit" + hex.EncodeToString(raw[:])
+}
+
+func isSupportedMCPNamespaceAdapter(adapter protocol.Adapter) bool {
+	switch adapter {
+	case protocol.AdapterAgy, protocol.AdapterClaude, protocol.AdapterCodex:
+		return true
+	default:
+		return false
+	}
+}
+
+func (r *Runner) ensureSessionDelegateTokenLocked(slot *sessionSlot, d protocol.AttemptDispatchFrame) string {
+	if slot == nil || d.TaskID == "" {
+		return ""
+	}
+	tok := slot.delegateToken
+	if tok == "" {
+		var raw [32]byte
+		_, _ = rand.Read(raw[:])
+		tok = hex.EncodeToString(raw[:])
+		slot.delegateToken = tok
+	}
+	r.mu.Lock()
+	if r.delegateTokens == nil {
+		r.delegateTokens = map[string]*delegateTokenEntry{}
+	}
+	r.delegateTokens[tok] = &delegateTokenEntry{
+		Token:       tok,
+		WBSessionID: slot.wbSessionID,
+		TaskID:      d.TaskID,
+		ProjectID:   d.ProjectID,
+		AttemptID:   d.AttemptID,
+	}
+	r.mu.Unlock()
+	return tok
+}
+
+func (r *Runner) revokeSessionDelegateTokenLocked(slot *sessionSlot) {
+	if slot == nil {
+		return
+	}
+	slot.orbitMCPAttached = false
+	slot.orbitMCPServerName = ""
+	if slot.delegateToken == "" {
+		return
+	}
+	tok := slot.delegateToken
+	slot.delegateToken = ""
+	r.mu.Lock()
+	delete(r.delegateTokens, tok)
+	r.mu.Unlock()
+}
+
+func (r *Runner) resolveOrbitBinaryPath() string {
+	if p := strings.TrimSpace(r.cfg.OrbitBinPath); p != "" {
+		if abs, err := filepath.Abs(p); err == nil {
+			if fi, err := os.Stat(abs); err == nil && !fi.IsDir() {
+				return abs
+			}
+		}
+	}
+	if exe, err := os.Executable(); err == nil && exe != "" {
+		cand := filepath.Join(filepath.Dir(exe), "orbit")
+		if runtime.GOOS == "windows" {
+			cand += ".exe"
+		}
+		if fi, err := os.Stat(cand); err == nil && !fi.IsDir() {
+			return cand
+		}
+	}
+	if p, err := exec.LookPath("orbit"); err == nil && p != "" {
+		if abs, err := filepath.Abs(p); err == nil {
+			return abs
+		}
+		return p
+	}
+	return ""
+}
+
+func (r *Runner) buildOrbitMCPServers(d protocol.AttemptDispatchFrame, delegateToken, serverName string) []acp.McpServer {
+	serverName = strings.TrimSpace(serverName)
+	if delegateToken == "" || serverName == "" || r.cfg.SocketPath == "" || r.cfg.SocketPath == "none" {
+		return nil
+	}
+	orbitBin := r.resolveOrbitBinaryPath()
+	if orbitBin == "" {
+		return nil
+	}
+	absSock := r.cfg.SocketPath
+	if r.sockSrv != nil && r.sockSrv.sockPath != "" {
+		absSock = r.sockSrv.sockPath
+	} else if p, err := filepath.Abs(absSock); err == nil {
+		absSock = p
+	}
+	return []acp.McpServer{
+		{
+			Stdio: &acp.McpServerStdio{
+				Name:    serverName,
+				Command: orbitBin,
+				Args:    []string{"mcp-serve"},
+				Env: []acp.EnvVariable{
+					{Name: "ORBIT_RUNNER_SOCK", Value: absSock},
+					{Name: "ORBIT_TASK_ID", Value: d.TaskID},
+					{Name: "ORBIT_PROJECT_ID", Value: d.ProjectID},
+					{Name: "ORBIT_DELEGATE_TOKEN", Value: delegateToken},
+				},
+			},
+		},
+	}
+}
+
+// Strict caller-side DTOs for local Runner Socket /delegate/* endpoints.
+// Deliberately omit parentTaskId / parentAttemptId / delegatedByAttemptId so DisallowUnknownFields
+// rejects any caller attempt to inject or shadow authoritative session identity (including case variants).
+type localDelegateSpawnInput struct {
+	Title              string            `json:"title,omitempty"`
+	Goal               string            `json:"goal"`
+	Role               string            `json:"role,omitempty"`
+	ProjectID          string            `json:"projectId,omitempty"`
+	MachineID          string            `json:"machineId,omitempty"`
+	PartID             string            `json:"partId,omitempty"`
+	LocationID         string            `json:"locationId,omitempty"`
+	UseWorktree        *bool             `json:"useWorktree,omitempty"`
+	RequiredCapability string            `json:"requiredCapability,omitempty"`
+	Adapter            protocol.Adapter  `json:"adapter,omitempty"`
+	Config             map[string]string `json:"config,omitempty"`
+	NotifyParent       *bool             `json:"notifyParent,omitempty"`
+	IdempotencyKey     string            `json:"idempotencyKey,omitempty"`
+}
+
+type localDelegateListInput struct {
+	IncludeArchived bool `json:"includeArchived,omitempty"`
+	IncludeTargets  bool `json:"includeTargets,omitempty"`
+}
+
+type localDelegateSendInput struct {
+	ChildTaskID string                `json:"childTaskId"`
+	Message     string                `json:"message"`
+	Mode        protocol.FollowupMode `json:"mode,omitempty"`
+}
+
+type localDelegateReadInput struct {
+	ChildTaskID string `json:"childTaskId"`
+	Limit       int    `json:"limit,omitempty"`
+}
+
+type localDelegateCancelInput struct {
+	ChildTaskID string `json:"childTaskId"`
+	Reason      string `json:"reason,omitempty"`
+}
+
+type hubDelegateSpawnPayload struct {
+	ParentTaskID    string `json:"parentTaskId"`
+	ParentAttemptID string `json:"parentAttemptId"`
+	protocol.CreateChildTaskRequest
+}
+
+type hubDelegateListPayload struct {
+	ParentTaskID    string `json:"parentTaskId"`
+	ParentAttemptID string `json:"parentAttemptId"`
+	IncludeArchived bool   `json:"includeArchived,omitempty"`
+	IncludeTargets  bool   `json:"includeTargets,omitempty"`
+}
+
+type hubDelegateSendPayload struct {
+	ParentTaskID    string                `json:"parentTaskId"`
+	ParentAttemptID string                `json:"parentAttemptId"`
+	ChildTaskID     string                `json:"childTaskId"`
+	Message         string                `json:"message"`
+	Mode            protocol.FollowupMode `json:"mode,omitempty"`
+}
+
+type hubDelegateReadPayload struct {
+	ParentTaskID    string `json:"parentTaskId"`
+	ParentAttemptID string `json:"parentAttemptId"`
+	ChildTaskID     string `json:"childTaskId"`
+	Limit           int    `json:"limit,omitempty"`
+}
+
+type hubDelegateCancelPayload struct {
+	ParentTaskID    string `json:"parentTaskId"`
+	ParentAttemptID string `json:"parentAttemptId"`
+	ChildTaskID     string `json:"childTaskId"`
+	Reason          string `json:"reason,omitempty"`
+}
+
+func decodeStrictLocalDelegateJSON(rawBody []byte, dst any) error {
+	trimmed := bytes.TrimSpace(rawBody)
+	if len(trimmed) == 0 {
+		return nil
+	}
+	// Reject duplicate keys at the top-level JSON object before strict typed decoding.
+	if err := rejectDuplicateTopLevelJSONKeys(trimmed); err != nil {
+		return err
+	}
+	dec := json.NewDecoder(bytes.NewReader(trimmed))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		return err
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		return errors.New("unexpected trailing JSON content")
+	}
+	return nil
+}
+
+func rejectDuplicateTopLevelJSONKeys(raw []byte) error {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	tok, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	delim, ok := tok.(json.Delim)
+	if !ok || delim != '{' {
+		return errors.New("request body must be a JSON object")
+	}
+	seen := map[string]bool{}
+	for dec.More() {
+		kTok, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		key, ok := kTok.(string)
+		if !ok {
+			return errors.New("invalid JSON object key")
+		}
+		lower := strings.ToLower(key)
+		if seen[lower] {
+			return fmt.Errorf("duplicate or conflicting JSON field %q", key)
+		}
+		seen[lower] = true
+		var skip json.RawMessage
+		if err := dec.Decode(&skip); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// HandleLocalDelegate validates the per-session delegate token and live session/attempt state
+// on ORBIT_RUNNER_SOCK, enforces plan/read-only write guards, strictly decodes caller fields,
+// and forwards a freshly constructed typed payload with authoritative parentTaskId/parentAttemptId to Hub.
+func (r *Runner) HandleLocalDelegate(ctx context.Context, action, delegateToken string, rawBody []byte) (int, []byte, error) {
+	delegateToken = strings.TrimSpace(delegateToken)
+	if delegateToken == "" {
+		return http.StatusUnauthorized, nil, errors.New("missing X-Orbit-Delegate-Token")
+	}
+	r.mu.Lock()
+	entry, ok := r.delegateTokens[delegateToken]
+	var snap delegateTokenEntry
+	var slot *sessionSlot
+	var att *attemptContext
+	if ok && entry != nil {
+		snap = *entry
+		slot = r.sessions[snap.WBSessionID]
+		att = r.attempts[snap.AttemptID]
+	}
+	r.mu.Unlock()
+	if !ok || snap.TaskID == "" || snap.AttemptID == "" || slot == nil || att == nil {
+		return http.StatusUnauthorized, nil, errors.New("invalid or expired delegate token")
+	}
+
+	slot.mu.Lock()
+	slotLive := slot.runtimeState != protocol.SessionDead &&
+		slot.runtimeState != protocol.SessionIdleClosed &&
+		slot.orbitMCPAttached &&
+		slot.delegateToken == delegateToken
+	slotMode := slot.appliedMode
+	slot.mu.Unlock()
+	if !slotLive {
+		return http.StatusUnauthorized, nil, errors.New("session is closed or dead")
+	}
+
+	att.mu.Lock()
+	attActive := !att.finalized && slices.Contains(protocol.ActiveAttemptStates, att.state)
+	attMode := att.appliedMode
+	desiredMode := att.dispatch.DesiredConfig["mode"]
+	att.mu.Unlock()
+	if !attActive {
+		return http.StatusUnauthorized, nil, errors.New("session has no active attempt")
+	}
+
+	// Independently enforce read-only/plan session mode at the Socket execution boundary for write actions.
+	effectiveMode := attMode
+	if effectiveMode == "" {
+		effectiveMode = slotMode
+	}
+	if effectiveMode == "" {
+		effectiveMode = desiredMode
+	}
+	if (action == "spawn" || action == "send" || action == "cancel") && isReadOnlySessionMode(effectiveMode) {
+		return http.StatusForbidden, nil, fmt.Errorf("delegate action %q is forbidden in %s mode", action, effectiveMode)
+	}
+
+	if strings.TrimSpace(r.cfg.HubHTTPURL) == "" {
+		return http.StatusServiceUnavailable, nil, errors.New("hub HTTP URL is not configured on runner")
+	}
+
+	var upstreamPayload any
+	switch action {
+	case "spawn":
+		var in localDelegateSpawnInput
+		if err := decodeStrictLocalDelegateJSON(rawBody, &in); err != nil {
+			return http.StatusBadRequest, nil, fmt.Errorf("invalid delegate spawn JSON: %w", err)
+		}
+		upstreamPayload = hubDelegateSpawnPayload{
+			ParentTaskID:    snap.TaskID,
+			ParentAttemptID: snap.AttemptID,
+			CreateChildTaskRequest: protocol.CreateChildTaskRequest{
+				Title:                in.Title,
+				Goal:                 in.Goal,
+				Role:                 in.Role,
+				DelegatedByAttemptID: snap.AttemptID,
+				ProjectID:            in.ProjectID,
+				MachineID:            in.MachineID,
+				PartID:               in.PartID,
+				LocationID:           in.LocationID,
+				UseWorktree:          in.UseWorktree,
+				RequiredCapability:   in.RequiredCapability,
+				Adapter:              in.Adapter,
+				Config:               in.Config,
+				NotifyParent:         in.NotifyParent,
+				IdempotencyKey:       in.IdempotencyKey,
+			},
+		}
+	case "list":
+		var in localDelegateListInput
+		if err := decodeStrictLocalDelegateJSON(rawBody, &in); err != nil {
+			return http.StatusBadRequest, nil, fmt.Errorf("invalid delegate list JSON: %w", err)
+		}
+		upstreamPayload = hubDelegateListPayload{
+			ParentTaskID:    snap.TaskID,
+			ParentAttemptID: snap.AttemptID,
+			IncludeArchived: in.IncludeArchived,
+			IncludeTargets:  in.IncludeTargets,
+		}
+	case "send":
+		var in localDelegateSendInput
+		if err := decodeStrictLocalDelegateJSON(rawBody, &in); err != nil {
+			return http.StatusBadRequest, nil, fmt.Errorf("invalid delegate send JSON: %w", err)
+		}
+		upstreamPayload = hubDelegateSendPayload{
+			ParentTaskID:    snap.TaskID,
+			ParentAttemptID: snap.AttemptID,
+			ChildTaskID:     in.ChildTaskID,
+			Message:         in.Message,
+			Mode:            in.Mode,
+		}
+	case "read":
+		var in localDelegateReadInput
+		if err := decodeStrictLocalDelegateJSON(rawBody, &in); err != nil {
+			return http.StatusBadRequest, nil, fmt.Errorf("invalid delegate read JSON: %w", err)
+		}
+		upstreamPayload = hubDelegateReadPayload{
+			ParentTaskID:    snap.TaskID,
+			ParentAttemptID: snap.AttemptID,
+			ChildTaskID:     in.ChildTaskID,
+			Limit:           in.Limit,
+		}
+	case "cancel":
+		var in localDelegateCancelInput
+		if err := decodeStrictLocalDelegateJSON(rawBody, &in); err != nil {
+			return http.StatusBadRequest, nil, fmt.Errorf("invalid delegate cancel JSON: %w", err)
+		}
+		upstreamPayload = hubDelegateCancelPayload{
+			ParentTaskID:    snap.TaskID,
+			ParentAttemptID: snap.AttemptID,
+			ChildTaskID:     in.ChildTaskID,
+			Reason:          in.Reason,
+		}
+	default:
+		return http.StatusNotFound, nil, fmt.Errorf("unknown delegate action %q", action)
+	}
+
+	forwarded, err := json.Marshal(upstreamPayload)
+	if err != nil {
+		return http.StatusInternalServerError, nil, err
+	}
+	targetURL := strings.TrimRight(r.cfg.HubHTTPURL, "/") + "/api/runner/delegate/" + action
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, bytes.NewReader(forwarded))
+	if err != nil {
+		return http.StatusInternalServerError, nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Orbit-Machine-Id", r.cfg.MachineID)
+	if tok := strings.TrimSpace(r.cfg.BearerToken); tok != "" {
+		req.Header.Set("Authorization", "Bearer "+tok)
+	}
+
+	resp, err := r.httpClient.Do(req)
+	if err != nil {
+		return http.StatusBadGateway, nil, fmt.Errorf("forward delegate %s to hub: %w", action, err)
+	}
+	defer resp.Body.Close()
+	respBytes, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if err != nil {
+		return http.StatusBadGateway, nil, fmt.Errorf("read hub delegate response: %w", err)
+	}
+	return resp.StatusCode, respBytes, nil
 }
 
 func (r *Runner) armSwarmIdleTimer(att *attemptContext, slot *sessionSlot) {
@@ -2957,7 +3473,19 @@ func (r *Runner) handlePermissionRequest(ctx context.Context, req acp.RequestPer
 	appliedMode := att.appliedMode
 	leaseToken := att.dispatch.LeaseToken
 	baseSHA := att.baseSHA
+	slot := att.slot
 	att.mu.Unlock()
+
+	hasOrbitMCP := false
+	orbitMCPServerName := ""
+	slotAdapter := protocol.Adapter("")
+	if slot != nil {
+		slot.mu.Lock()
+		hasOrbitMCP = slot.orbitMCPAttached && slot.delegateToken != "" && slot.orbitMCPServerName != ""
+		orbitMCPServerName = slot.orbitMCPServerName
+		slotAdapter = slot.adapter
+		slot.mu.Unlock()
+	}
 
 	// P0: Auto-approve ONLY when the current turn was explicitly authorized with ExplicitFullPermission
 	// AND the mode that actually took effect on the ACP session is a full-bypass mode (never inherited
@@ -2967,18 +3495,36 @@ func (r *Runner) handlePermissionRequest(ctx context.Context, req acp.RequestPer
 		policyMode = appliedMode
 	}
 
-	if autoOpt, allow := r.cfg.PermissionPolicy(worktreePath, policyMode, req); allow && autoOpt != "" {
+	autoOpt, allow := r.cfg.PermissionPolicy(worktreePath, policyMode, req)
+	orbitMCPTool := ""
+	if (!allow || autoOpt == "") && hasOrbitMCP && isSupportedMCPNamespaceAdapter(slotAdapter) {
+		if toolName, ok := matchOrbitBuiltinMCPTool(req, orbitMCPServerName); ok {
+			if isReadOnlyOrbitMCPTool(toolName) || !isReadOnlySessionMode(appliedMode) {
+				if optID, found := selectAllowPermissionOption(req.Options); found {
+					autoOpt = optID
+					allow = true
+					orbitMCPTool = toolName
+				}
+			}
+		}
+	}
+
+	if allow && autoOpt != "" {
 		r.coalescer.FlushAttempt(attemptID)
+		auditPayload := map[string]any{
+			"policyAutoAllowed": true,
+			"optionId":          autoOpt,
+			"toolCallId":        string(req.ToolCall.ToolCallId),
+		}
+		if orbitMCPTool != "" {
+			auditPayload["orbitBuiltinMcpTool"] = orbitMCPTool
+		}
 		_, _ = r.enqueueOutbox(r.runCtx, attemptID, leaseToken, protocol.OutboxFrameEvents, map[string]any{
 			"kind":       string(protocol.EventApprovalConsumed),
 			"visibility": string(protocol.VisibilityAudit),
 			"actorKind":  string(protocol.ActorRunner),
 			"actorId":    r.cfg.MachineID,
-			"payload": map[string]any{
-				"policyAutoAllowed": true,
-				"optionId":          autoOpt,
-				"toolCallId":        string(req.ToolCall.ToolCallId),
-			},
+			"payload":    auditPayload,
 		})
 		return acp.RequestPermissionResponse{
 			Outcome: acp.NewRequestPermissionOutcomeSelected(acp.PermissionOptionId(autoOpt)),
@@ -3271,6 +3817,90 @@ func isFullBypassMode(mode string) bool {
 	}
 }
 
+func isReadOnlySessionMode(mode string) bool {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "plan", "read-only", "readonly":
+		return true
+	default:
+		return false
+	}
+}
+
+var orbitBuiltinMCPTools = map[string]bool{
+	"orbit_spawn_child":   true,
+	"orbit_list_children": true,
+	"orbit_send_child":    true,
+	"orbit_read_child":    true,
+	"orbit_cancel_child":  true,
+}
+
+func isReadOnlyOrbitMCPTool(canonical string) bool {
+	return canonical == "orbit_list_children" || canonical == "orbit_read_child"
+}
+
+// matchOrbitBuiltinMCPTool recognizes ONLY Orbit's 5 first-party stdio MCP delegation tools
+// exposed by `orbit mcp-serve` under the session's randomized per-session server name
+// (e.g. "orbit7c4e91a2", across agy/claude/codex naming conventions).
+// Strictly inspects structured ToolCall.Name (never Title), requires the exact per-session
+// server namespace prefix (rejecting static "orbit" or foreign server names), and excludes
+// execute/edit/delete/move tool kinds.
+func matchOrbitBuiltinMCPTool(req acp.RequestPermissionRequest, serverName string) (string, bool) {
+	srv := strings.ToLower(strings.TrimSpace(serverName))
+	if srv == "" || srv == "orbit" {
+		return "", false
+	}
+	if kind, ok := req.ToolCall.Kind.Value(); ok {
+		switch kind {
+		case acp.ToolKindExecute, acp.ToolKindEdit, acp.ToolKindDelete, acp.ToolKindMove:
+			return "", false
+		}
+	}
+	raw, ok := req.ToolCall.Name.Value()
+	if !ok {
+		return "", false
+	}
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", false
+	}
+	lower := strings.ToLower(raw)
+	matchedPrefix := false
+	for _, prefix := range []string{
+		"mcp_" + srv + "_",
+		"mcp__" + srv + "__",
+		srv + ":",
+		srv + "/",
+		srv + ".",
+	} {
+		if strings.HasPrefix(lower, prefix) {
+			lower = strings.TrimPrefix(lower, prefix)
+			matchedPrefix = true
+			break
+		}
+	}
+	if !matchedPrefix {
+		return "", false
+	}
+	if orbitBuiltinMCPTools[lower] {
+		return lower, true
+	}
+	return "", false
+}
+
+func selectAllowPermissionOption(options []acp.PermissionOption) (string, bool) {
+	for _, opt := range options {
+		if opt.Kind == acp.PermissionOptionKindAllowOnce {
+			return string(opt.OptionId), true
+		}
+	}
+	for _, opt := range options {
+		if opt.Kind == acp.PermissionOptionKindAllowAlways {
+			return string(opt.OptionId), true
+		}
+	}
+	return "", false
+}
+
 // defaultPermissionPolicy defers permission gating to the ACP agent's own configured `mode`
 // (default, accept-edits, auto, agent, plan, read-only, workspace-write, bypassPermissions, agent-full-access).
 // Whenever the ACP agent sends `session/request_permission`, Orbit forwards the real request & options
@@ -3278,17 +3908,7 @@ func isFullBypassMode(mode string) bool {
 // actually took effect on the session.
 func defaultPermissionPolicy(_ string, effectiveFullMode string, req acp.RequestPermissionRequest) (string, bool) {
 	if isFullBypassMode(effectiveFullMode) {
-		for _, opt := range req.Options {
-			if opt.Kind == acp.PermissionOptionKindAllowOnce {
-				return string(opt.OptionId), true
-			}
-		}
-		for _, opt := range req.Options {
-			if opt.Kind == acp.PermissionOptionKindAllowAlways {
-				return string(opt.OptionId), true
-			}
-		}
-		return "", false
+		return selectAllowPermissionOption(req.Options)
 	}
 	return "", false
 }

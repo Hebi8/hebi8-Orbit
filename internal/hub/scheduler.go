@@ -513,7 +513,7 @@ func (s *Server) resolveWorktreeRoot(proj protocol.ProjectView, anchor protocol.
 	return filepath.Join(cfg.DataDir, "worktrees", proj.ProjectID)
 }
 
-func buildOrbitSystemPromptAppend(taskID, projectID, attemptID string, isPlainFolder bool, projectSystemPrompt string) string {
+func buildOrbitSystemPromptAppend(taskID, projectID, attemptID string, isPlainFolder bool, projectSystemPrompt, parentTaskID, delegatedRole string) string {
 	var base string
 	switch {
 	case projectID == protocol.ScratchProjectID:
@@ -545,6 +545,22 @@ func buildOrbitSystemPromptAppend(taskID, projectID, attemptID string, isPlainFo
 			projectID, taskID, attemptID,
 		)
 	}
+	base += "\n\nOrbit Sub-Session Delegation:\n" +
+		"- When splitting independent/parallel subtasks or delegating work to another machine, model, or project, prefer Orbit sub-session tools (`orbit_spawn_child`, or `orbit child spawn` in terminal).\n" +
+		"- Delegated sub-sessions are live-observable in the Orbit UI so the user can inspect, take over, steer, or approve them directly.\n" +
+		"- When a child session finishes, Orbit automatically delivers its summary back to you; do not poll in a loop."
+	if strings.TrimSpace(parentTaskID) != "" {
+		roleNote := ""
+		if r := strings.TrimSpace(delegatedRole); r != "" {
+			roleNote = fmt.Sprintf(" (role=%s)", r)
+		}
+		base += fmt.Sprintf(
+			"\n\nDelegated Child Context:\n"+
+				"- You are a delegated child session of parent task %s%s.\n"+
+				"- Stay focused on your assigned scope and summarize your findings/changes clearly in your final reply; Orbit will automatically report it back to the parent session.",
+			strings.TrimSpace(parentTaskID), roleNote,
+		)
+	}
 	if custom := strings.TrimSpace(projectSystemPrompt); custom != "" {
 		return base + "\n\nProject Instructions:\n" + custom
 	}
@@ -558,6 +574,8 @@ func (s *Server) buildAttemptDispatchFrame(
 	anchor protocol.ProjectAnchorConfig,
 	promptOverride string,
 	swarmIdleTimeoutMs int64,
+	parentTaskID string,
+	delegatedRole string,
 ) (protocol.AttemptDispatchFrame, error) {
 	prompt := strings.TrimSpace(promptOverride)
 	usedOverride := prompt != ""
@@ -713,7 +731,7 @@ func (s *Server) buildAttemptDispatchFrame(
 		DesiredConfig:          att.DesiredConfig,
 		ExplicitFullPermission: explicitFullPermission,
 		ProjectEnv:             projectEnv,
-		SystemPromptAppend: buildOrbitSystemPromptAppend(att.TaskID, att.ProjectID, att.AttemptID, isInPlace, proj.SystemPrompt),
+		SystemPromptAppend: buildOrbitSystemPromptAppend(att.TaskID, att.ProjectID, att.AttemptID, isInPlace, proj.SystemPrompt, parentTaskID, delegatedRole),
 		InputDelivery:      inputDlv,
 		Prompt:             prompt,
 		RequiredResources:  att.RequiredResources,
@@ -751,7 +769,7 @@ func (s *Server) dispatchAttemptRecord(ctx context.Context, att store.AttemptRec
 		}
 		anchor = route.Anchor
 	}
-	frame, err := s.buildAttemptDispatchFrame(ctx, att, proj, anchor, promptOverride, swarmIdleTimeoutMs)
+	frame, err := s.buildAttemptDispatchFrame(ctx, att, proj, anchor, promptOverride, swarmIdleTimeoutMs, task.ParentTaskID, task.DelegatedRole)
 	if err != nil {
 		log.Printf("hub scheduler: aborting dispatch for attempt %s due to prompt/opening build error: %v", att.AttemptID, err)
 		if failErr := s.failUndispatchedAttemptDetached(ctx, att.AttemptID, "ERR_HEBI8_OPENING", err.Error()); failErr != nil {
@@ -876,6 +894,7 @@ func (s *Server) StartMaintenance(ctx context.Context, wg *sync.WaitGroup) {
 			now := time.Now().UnixMilli()
 			if _, events, err := s.store.ScanExpiredAttempts(ctx, now); err == nil && len(events) > 0 {
 				s.broker.Broadcast(events...)
+				s.notifyChildTaskProgressAsync(events)
 			}
 			// B7: Proactively expire timed-out pending approvals even without human click, and unblock runners.
 			if notices, events, err := s.store.ScanExpiredApprovals(ctx, now); err == nil {
@@ -898,6 +917,8 @@ func (s *Server) StartMaintenance(ctx context.Context, wg *sync.WaitGroup) {
 			}
 			// B9: Recover any durable pending_queue_drain tasks across Hub restarts.
 			s.drainPendingQueues(ctx)
+			// P1 #5: Recover & retry any durable pending child_parent_notifications across restarts / transient errors.
+			s.ProcessPendingChildNotifications(ctx)
 		}
 		// Run an immediate startup recovery pass
 		runPass()

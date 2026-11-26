@@ -307,7 +307,11 @@ func BuildHebi8FoldOpening(in Hebi8FoldOpeningInput) string {
 				}
 				sb.WriteString(fmt.Sprintf("#### 第 %d 轮\n", t.AttemptNo))
 				if u := strings.TrimSpace(t.UserPrompt); u != "" {
-					sb.WriteString("用户：" + trimAtSentenceBoundary(u, uBudget) + "\n")
+					label := "用户："
+					if t.TriggerKind == protocol.TriggerChildResult {
+						label = "子会话回传："
+					}
+					sb.WriteString(label + trimAtSentenceBoundary(u, uBudget) + "\n")
 				}
 				if a := strings.TrimSpace(t.AssistantReply); a != "" {
 					sb.WriteString("Hebi8：" + trimAtSentenceBoundary(a, aBudget) + "\n")
