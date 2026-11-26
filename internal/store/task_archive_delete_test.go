@@ -538,3 +538,111 @@ func TestStoreDeleteTaskRefCountsAndArchivedBlocks(t *testing.T) {
 		t.Fatalf("Item 3 REGRESSION: Hebi8 main active attempt was modified! got %+v err=%v", reloadedMain, err)
 	}
 }
+
+func TestArchiveUnarchivePreservesUpdatedAtAndDistinctSortOrder(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	st, err := Open(ctx, filepath.Join(tmpDir, "orbit.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	if err := st.SyncRegistry(ctx, tmpDir, protocol.ProjectsConfig{
+		SchemaVersion: 1,
+		Projects: map[string]protocol.ProjectConfig{
+			"demo-proj": {
+				DisplayName:       "Demo Project",
+				RepoIdentity:      "git:demo",
+				DefaultBranch:     "main",
+				DefaultCapability: "primary-dev",
+				DefaultAdapter:    protocol.AdapterAgy,
+			},
+		},
+	}, protocol.MachinesConfig{
+		SchemaVersion: 1,
+		Machines: map[string]protocol.MachineConfig{
+			"hub-node": {
+				DisplayName:  "hub-node",
+				Transport:    protocol.TransportLocalWS,
+				Capabilities: []string{"primary-dev"},
+			},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	olderActive, err := st.CreateTask(ctx, CreateTaskParams{
+		ProjectID: "demo-proj", Title: "Older Active", Goal: "older", MachineID: "hub-node",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	newerActive, err := st.CreateTask(ctx, CreateTaskParams{
+		ProjectID: "demo-proj", Title: "Newer Active", Goal: "newer", MachineID: "hub-node",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Pin distinct historical updated_at timestamps
+	tsOlder := time.Now().UnixMilli() - 60_000
+	tsNewer := time.Now().UnixMilli() - 5_000
+	if _, err := st.WriteDB().ExecContext(ctx, `UPDATE tasks SET updated_at = ? WHERE task_id = ?`, tsOlder, olderActive.Task.TaskID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.WriteDB().ExecContext(ctx, `UPDATE tasks SET updated_at = ? WHERE task_id = ?`, tsNewer, newerActive.Task.TaskID); err != nil {
+		t.Fatal(err)
+	}
+
+	// Archive newerActive FIRST, then sleep briefly and archive olderActive SECOND
+	archNewer, _, err := st.ArchiveTask(ctx, newerActive.Task.TaskID, "human")
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(5 * time.Millisecond)
+	archOlder, _, err := st.ArchiveTask(ctx, olderActive.Task.TaskID, "human")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// updated_at MUST NOT be overwritten by ArchiveTask!
+	if archNewer.UpdatedAt != tsNewer {
+		t.Fatalf("ArchiveTask overwrote updated_at on newerActive: got %d, want %d", archNewer.UpdatedAt, tsNewer)
+	}
+	if archOlder.UpdatedAt != tsOlder {
+		t.Fatalf("ArchiveTask overwrote updated_at on olderActive: got %d, want %d", archOlder.UpdatedAt, tsOlder)
+	}
+	if archOlder.ArchivedAt == nil || archNewer.ArchivedAt == nil || *archOlder.ArchivedAt <= *archNewer.ArchivedAt {
+		t.Fatalf("expected olderActive archived AFTER newerActive: older=%v newer=%v", archOlder.ArchivedAt, archNewer.ArchivedAt)
+	}
+
+	// Default archived=only listing orders by archived_at DESC (olderActive first, newerActive second)
+	// while updatedAt remains strictly distinguishable (newerActive.UpdatedAt > olderActive.UpdatedAt).
+	recentOnly, err := st.ListRecentTasksFiltered(ctx, 20, "", "", "demo-proj", "only")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recentOnly) != 2 || recentOnly[0].TaskID != olderActive.Task.TaskID || recentOnly[1].TaskID != newerActive.Task.TaskID {
+		t.Fatalf("expected ListRecentTasksFiltered archived=only ordered by archived_at DESC [olderActive, newerActive], got %+v", recentOnly)
+	}
+	if recentOnly[0].UpdatedAt >= recentOnly[1].UpdatedAt {
+		t.Fatalf("expected preserved UpdatedAt to distinguish active order: [0]=%d [1]=%d", recentOnly[0].UpdatedAt, recentOnly[1].UpdatedAt)
+	}
+	projOnly, err := st.ListProjectTasks(ctx, "demo-proj", "only")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(projOnly) != 2 || projOnly[0].TaskID != olderActive.Task.TaskID || projOnly[1].TaskID != newerActive.Task.TaskID {
+		t.Fatalf("expected ListProjectTasks archived=only ordered by archived_at DESC, got %+v", projOnly)
+	}
+
+	// UnarchiveTask MUST ALSO preserve original updated_at!
+	restored, _, err := st.UnarchiveTask(ctx, olderActive.Task.TaskID, "human")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restored.UpdatedAt != tsOlder || restored.ArchivedAt != nil {
+		t.Fatalf("UnarchiveTask must preserve updated_at=%d and clear archivedAt, got updatedAt=%d archivedAt=%v", tsOlder, restored.UpdatedAt, restored.ArchivedAt)
+	}
+}

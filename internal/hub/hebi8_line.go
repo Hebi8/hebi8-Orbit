@@ -551,9 +551,13 @@ func (l *hebi8LineStore) FoldExcessLevels(now time.Time) ([]protocol.Hebi8LineNo
 }
 
 func summarizeLineState(nodes []protocol.Hebi8LineNode, pins []string, pendingTurns, pendingChars int) protocol.Hebi8LineSummary {
+	pt := pendingTurns
+	pc := pendingChars
 	sum := protocol.Hebi8LineSummary{
-		TotalNodes:  len(nodes),
-		PinnedCount: len(pins),
+		TotalNodes:   len(nodes),
+		PinnedCount:  len(pins),
+		PendingTurns: &pt,
+		PendingChars: &pc,
 	}
 	for _, n := range nodes {
 		if n.Kind == protocol.Hebi8NodeSegment {
@@ -822,6 +826,7 @@ func (s *Server) handleHebi8Main(w http.ResponseWriter, r *http.Request) {
 		pendingChars += runeLen(t.UserPrompt) + runeLen(t.AssistantReply)
 	}
 	lineSummary := summarizeLineState(nodes, pins, len(pendingTurns), pendingChars)
+	lastTurnAt, updatedTopLevelCount, _ := s.store.GetHebi8ActivitySummary(ctx, task.TaskID)
 
 	writeJSON(w, http.StatusOK, protocol.Hebi8MainResponse{
 		Task:                      task,
@@ -830,6 +835,8 @@ func (s *Server) handleHebi8Main(w http.ResponseWriter, r *http.Request) {
 		Pins:                      pins,
 		PendingTurnsSinceLastFold: len(pendingTurns),
 		PendingCharsSinceLastFold: pendingChars,
+		LastHebi8TurnAt:           lastTurnAt,
+		UpdatedTopLevelTaskCount:  updatedTopLevelCount,
 	})
 }
 
@@ -870,10 +877,12 @@ func (s *Server) handleHebi8Line(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, protocol.Hebi8LineResponse{
-		TaskID:      task.TaskID,
-		Nodes:       nodes,
-		Pins:        pins,
-		LineSummary: summarizeLineState(nodes, pins, len(pendingTurns), pendingChars),
+		TaskID:                    task.TaskID,
+		Nodes:                     nodes,
+		Pins:                      pins,
+		LineSummary:               summarizeLineState(nodes, pins, len(pendingTurns), pendingChars),
+		PendingTurnsSinceLastFold: len(pendingTurns),
+		PendingCharsSinceLastFold: pendingChars,
 	})
 }
 
@@ -1107,13 +1116,15 @@ func (s *Server) handleHebi8Fold(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusCreated, protocol.Hebi8FoldResponse{
-		TaskID:      task.TaskID,
-		Segment:     segResp,
-		Fold:        primaryFold,
-		Folds:       createdFolds,
-		Nodes:       allNodes,
-		Pins:        pins,
-		LineSummary: summarizeLineState(allNodes, pins, 0, 0),
+		TaskID:                    task.TaskID,
+		Segment:                   segResp,
+		Fold:                      primaryFold,
+		Folds:                     createdFolds,
+		Nodes:                     allNodes,
+		Pins:                      pins,
+		LineSummary:               summarizeLineState(allNodes, pins, 0, 0),
+		PendingTurnsSinceLastFold: 0,
+		PendingCharsSinceLastFold: 0,
 	})
 }
 

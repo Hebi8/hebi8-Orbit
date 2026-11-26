@@ -141,14 +141,14 @@ func ToolDefinitions() []mcpToolDef {
 	return []mcpToolDef{
 		{
 			Name:        "orbit_spawn_child",
-			Description: "Spawn an observable Orbit child session (same or different project/machine/adapter). Results are delivered back automatically when it finishes.",
+			Description: "Spawn an observable Orbit child session (max depth = 1; child sessions cannot spawn grandchildren, and PA/Hebi8 sessions cannot attach child sessions). Results are delivered back automatically when it finishes.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
 					"goal":          map[string]any{"type": "string", "description": "Clear goal and acceptance criteria for the child session"},
 					"title":         map[string]any{"type": "string", "description": "Short display title"},
 					"role":          map[string]any{"type": "string", "description": "Optional role label (e.g. reviewer, backend, researcher)"},
-					"project_id":    map[string]any{"type": "string", "description": "Target project ID (defaults to parent project or _scratch for Hebi8)"},
+					"project_id":    map[string]any{"type": "string", "description": "Target project ID (defaults to parent project)"},
 					"machine_id":    map[string]any{"type": "string", "description": "Optional target machine ID"},
 					"adapter":       map[string]any{"type": "string", "enum": []string{"agy", "claude", "codex"}, "description": "Optional agent adapter"},
 					"model":         map[string]any{"type": "string", "description": "Optional model override"},
@@ -162,22 +162,22 @@ func ToolDefinitions() []mcpToolDef {
 		},
 		{
 			Name:        "orbit_list_children",
-			Description: "List child sessions spawned from this session, with optional available machines and projects.",
+			Description: "List child sessions spawned from this top-level session, or peer sibling sessions sharing the same parent when called from a child session (with optional available machines and projects for top-level sessions).",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"include_archived": map[string]any{"type": "boolean", "description": "Include archived child sessions"},
-					"include_targets":  map[string]any{"type": "boolean", "description": "Also return compact available machines and projects"},
+					"include_archived": map[string]any{"type": "boolean", "description": "Include archived child or sibling sessions"},
+					"include_targets":  map[string]any{"type": "boolean", "description": "Also return compact available machines and projects (top-level sessions only)"},
 				},
 			},
 		},
 		{
 			Name:        "orbit_send_child",
-			Description: "Send a follow-up message to a descendant child session (queue behind active turn or steer immediately).",
+			Description: "Send a follow-up message to a child session (from its parent) or a same-parent sibling session (from a peer child); queue behind active turn or steer immediately.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"child_task_id": map[string]any{"type": "string", "description": "Target descendant child task ID"},
+					"child_task_id": map[string]any{"type": "string", "description": "Target child or same-parent sibling task ID"},
 					"message":       map[string]any{"type": "string", "description": "Instruction to send"},
 					"mode":          map[string]any{"type": "string", "enum": []string{"queue", "steer"}, "description": "Delivery mode (default queue)"},
 				},
@@ -186,11 +186,11 @@ func ToolDefinitions() []mcpToolDef {
 		},
 		{
 			Name:        "orbit_read_child",
-			Description: "Read compact per-turn transcript (prompts, replies, tool counts, delivery stats) of a descendant child session.",
+			Description: "Read compact per-turn transcript (prompts, replies, tool counts, delivery stats) of a child session or a same-parent sibling session.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"child_task_id": map[string]any{"type": "string", "description": "Target descendant child task ID"},
+					"child_task_id": map[string]any{"type": "string", "description": "Target child or same-parent sibling task ID"},
 					"limit":         map[string]any{"type": "integer", "description": "Max recent turns to return (default 10)"},
 				},
 				"required": []string{"child_task_id"},
@@ -198,11 +198,11 @@ func ToolDefinitions() []mcpToolDef {
 		},
 		{
 			Name:        "orbit_cancel_child",
-			Description: "Cancel an active attempt on a descendant child session.",
+			Description: "Cancel an active attempt on a direct child session (parent sessions only; sibling sessions cannot cancel each other).",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"child_task_id": map[string]any{"type": "string", "description": "Target descendant child task ID"},
+					"child_task_id": map[string]any{"type": "string", "description": "Target direct child task ID"},
 					"reason":        map[string]any{"type": "string", "description": "Optional cancellation reason"},
 				},
 				"required": []string{"child_task_id"},

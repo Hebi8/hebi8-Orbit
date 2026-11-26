@@ -204,16 +204,17 @@ func (s *Store) CreateTask(ctx context.Context, p CreateTaskParams) (CreateTaskR
 			}
 		}
 
-		// Verify parent task exists, is NOT archived, and satisfies depth & active-child caps.
+		// Verify parent task exists, is NOT archived, is NOT PA/Hebi8, and satisfies single-layer depth & active-child caps.
 		var parentVal any
 		var parentProjectID string
 		delegationDepth := 0
 		if p.ParentTaskID != "" {
+			var parentOfParent sql.NullString
 			var parentArchived sql.NullInt64
 			if err := tx.QueryRowContext(ctx, `
-				SELECT project_id, archived_at
+				SELECT project_id, parent_task_id, archived_at
 				FROM tasks WHERE task_id = ?
-			`, p.ParentTaskID).Scan(&parentProjectID, &parentArchived); err != nil {
+			`, p.ParentTaskID).Scan(&parentProjectID, &parentOfParent, &parentArchived); err != nil {
 				if errors.Is(err, sql.ErrNoRows) {
 					return fmt.Errorf("%w: parent task %s", ErrNotFound, p.ParentTaskID)
 				}
@@ -222,13 +223,19 @@ func (s *Store) CreateTask(ctx context.Context, p CreateTaskParams) (CreateTaskR
 			if parentArchived.Valid {
 				return fmt.Errorf("%w: parent task %s is archived", ErrTaskArchived, p.ParentTaskID)
 			}
+			if parentProjectID == protocol.PAProjectID {
+				return fmt.Errorf("%w: parent task %s belongs to %s", ErrPANoSubsessions, p.ParentTaskID, protocol.PAProjectID)
+			}
+			if parentOfParent.Valid && strings.TrimSpace(parentOfParent.String) != "" {
+				return fmt.Errorf("%w: child session %s cannot spawn grandchild sessions (max depth %d)", ErrMaxSubsessionDepth, p.ParentTaskID, maxDelegationDepth)
+			}
 			parentDepth, err := computeTaskDepthTx(ctx, tx, p.ParentTaskID)
 			if err != nil {
 				return err
 			}
 			delegationDepth = parentDepth + 1
 			if delegationDepth > maxDelegationDepth {
-				return fmt.Errorf("%w: delegation depth %d exceeds maximum %d", ErrInvalidInput, delegationDepth, maxDelegationDepth)
+				return fmt.Errorf("%w: delegation depth %d exceeds maximum %d", ErrMaxSubsessionDepth, delegationDepth, maxDelegationDepth)
 			}
 			if err := checkActiveChildLimitTx(ctx, tx, p.ParentTaskID, ""); err != nil {
 				return err
@@ -2235,8 +2242,8 @@ func (s *Store) ArchiveTask(ctx context.Context, taskID, actorID string) (protoc
 		}
 
 		if _, err := tx.ExecContext(ctx,
-			fmt.Sprintf(`UPDATE tasks SET archived_at = COALESCE(archived_at, ?), updated_at = ?, version = version + 1 WHERE task_id IN (%s)`, ph),
-			append([]any{now, now}, idArgs...)...,
+			fmt.Sprintf(`UPDATE tasks SET archived_at = COALESCE(archived_at, ?), version = version + 1 WHERE task_id IN (%s)`, ph),
+			append([]any{now}, idArgs...)...,
 		); err != nil {
 			return fmt.Errorf("archive tasks: %w", err)
 		}
@@ -2312,8 +2319,8 @@ func (s *Store) UnarchiveTask(ctx context.Context, taskID, actorID string) (prot
 		idArgs := toAnySlice(allIDs)
 
 		if _, err := tx.ExecContext(ctx,
-			fmt.Sprintf(`UPDATE tasks SET archived_at = NULL, updated_at = ?, version = version + 1 WHERE task_id IN (%s)`, ph),
-			append([]any{now}, idArgs...)...,
+			fmt.Sprintf(`UPDATE tasks SET archived_at = NULL, version = version + 1 WHERE task_id IN (%s)`, ph),
+			idArgs...,
 		); err != nil {
 			return fmt.Errorf("unarchive tasks: %w", err)
 		}

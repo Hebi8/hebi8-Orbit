@@ -573,6 +573,7 @@ const (
 	EventDeliveryVerified        EventKind = "delivery.verified"
 	EventDeliveryRyugiUpdated    EventKind = "delivery.ryugi_updated"
 	EventDeliveryReviewCompleted EventKind = "delivery.review_completed"
+	EventDeliveryReviewReopened  EventKind = "delivery.review_reopened"
 	EventAnnotationCreated       EventKind = "annotation.created"
 	EventAnnotationAddressed     EventKind = "annotation.addressed"
 	EventApprovalRequested       EventKind = "approval.requested"
@@ -622,6 +623,7 @@ var AllEventKinds = []EventKind{
 	EventDeliveryVerified,
 	EventDeliveryRyugiUpdated,
 	EventDeliveryReviewCompleted,
+	EventDeliveryReviewReopened,
 	EventAnnotationCreated,
 	EventAnnotationAddressed,
 	EventApprovalRequested,

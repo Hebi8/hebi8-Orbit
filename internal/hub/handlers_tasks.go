@@ -391,6 +391,12 @@ func (s *Server) createTaskInternalWithGuards(
 	if errors.Is(err, store.ErrTaskArchived) {
 		return resp, nil, http.StatusConflict, "ERR_TASK_ARCHIVED", err
 	}
+	if errors.Is(err, store.ErrPANoSubsessions) {
+		return resp, nil, http.StatusConflict, "ERR_PA_NO_SUBSESSIONS", err
+	}
+	if errors.Is(err, store.ErrMaxSubsessionDepth) {
+		return resp, nil, http.StatusConflict, "ERR_MAX_SUBSESSION_DEPTH", err
+	}
 	if errors.Is(err, store.ErrConflict) {
 		return resp, nil, http.StatusConflict, "ERR_CONFLICT", err
 	}
@@ -727,6 +733,12 @@ func (s *Server) followupTaskInternalWithTrigger(
 	// seeded from task.LatestDeliveryID so the active session remains undisturbed.
 	// S2: Inherit parent task's effective DesiredConfig, RequiredResources, location, isolation, and refs.
 	if mode == protocol.FollowupModeForkNewSession && task.ActiveAttemptID != "" {
+		if task.ProjectID == protocol.PAProjectID {
+			return resp, nil, http.StatusConflict, "ERR_PA_NO_SUBSESSIONS", fmt.Errorf("PA/Hebi8 session %s cannot spawn sub-sessions", task.TaskID)
+		}
+		if task.ParentTaskID != "" {
+			return resp, nil, http.StatusConflict, "ERR_MAX_SUBSESSION_DEPTH", fmt.Errorf("child session %s cannot fork grandchild sessions (maximum depth is 1)", task.TaskID)
+		}
 		if req.Adapter == protocol.AdapterSSHDeploy {
 			return resp, nil, http.StatusForbidden, "ERR_DEPLOY_FORBIDDEN", errors.New("child sessions cannot use ssh_deploy adapter")
 		}
@@ -796,6 +808,12 @@ func (s *Server) followupTaskInternalWithTrigger(
 			ActorKind:          actorKind,
 			PAIdempotency:      paIdemp,
 		})
+		if errors.Is(err, store.ErrPANoSubsessions) {
+			return resp, nil, http.StatusConflict, "ERR_PA_NO_SUBSESSIONS", err
+		}
+		if errors.Is(err, store.ErrMaxSubsessionDepth) {
+			return resp, nil, http.StatusConflict, "ERR_MAX_SUBSESSION_DEPTH", err
+		}
 		if errors.Is(err, store.ErrConflict) {
 			return resp, nil, http.StatusConflict, "ERR_IDEMPOTENCY_CONFLICT", err
 		}

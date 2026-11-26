@@ -412,6 +412,7 @@ func (s *Server) buildRouter() http.Handler {
 		api.Patch("/projects/{projectId}", s.handleUpdateProjectSettings)
 		api.Delete("/projects/{projectId}", s.handleDeleteProject)
 		api.Post("/projects/{projectId}/parts", s.handleCreateProjectPart)
+		api.Patch("/projects/{projectId}/parts/{partId}", s.handleUpdateProjectPart)
 		api.Delete("/projects/{projectId}/parts/{partId}", s.handleDeleteProjectPart)
 		api.Post("/projects/{projectId}/parts/{partId}/locations", s.handleCreateProjectLocation)
 		api.Patch("/projects/{projectId}/parts/{partId}/locations/{locationId}", s.handleUpdateProjectLocation)
@@ -491,6 +492,7 @@ func (s *Server) buildRouter() http.Handler {
 		api.Post("/deliveries/{deliveryId}/ryugi/open", s.handleOpenDeliveryRyugi)
 		api.Get("/deliveries/{deliveryId}/ryugi/{bindingId}/content", s.handleGetDeliveryRyugiContent)
 		api.Post("/deliveries/{deliveryId}/complete-review", s.handleCompleteDeliveryReview)
+		api.Post("/deliveries/{deliveryId}/reopen-review", s.handleReopenDeliveryReview)
 
 		api.Post("/admin/reload-config", s.handleReloadConfig)
 		api.Post("/admin/gc-pause", s.handleGCPause)
@@ -831,13 +833,17 @@ func (s *Server) handleGetDelivery(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		diffFiles = []protocol.DiffFileStat{}
 	}
+	reviewState, reviewResolvedAt, canUndoReview, _ := s.store.GetDeliveryReviewState(r.Context(), deliveryID)
 
 	writeJSON(w, http.StatusOK, protocol.DeliveryDetailResponse{
-		Delivery:      dlv,
-		RyugiBindings: bindings,
-		Annotations:   annotations,
-		DiffFiles:     diffFiles,
-		Project:       proj,
+		Delivery:         dlv,
+		RyugiBindings:    bindings,
+		Annotations:      annotations,
+		DiffFiles:        diffFiles,
+		Project:          proj,
+		ReviewState:      reviewState,
+		ReviewResolvedAt: reviewResolvedAt,
+		CanUndoReview:    canUndoReview,
 	})
 }
 
@@ -1021,6 +1027,35 @@ func (s *Server) handleCompleteDeliveryReview(w http.ResponseWriter, r *http.Req
 	}
 	if err != nil {
 		writeAPIError(w, http.StatusInternalServerError, "ERR_COMPLETE_REVIEW", err.Error())
+		return
+	}
+	if ev != nil {
+		s.broker.Broadcast(*ev)
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) handleReopenDeliveryReview(w http.ResponseWriter, r *http.Request) {
+	deliveryID := chi.URLParam(r, "deliveryId")
+	resp, ev, err := s.store.ReopenDeliveryReview(r.Context(), deliveryID, actorFromContext(r.Context()))
+	if errors.Is(err, store.ErrNotFound) {
+		writeAPIError(w, http.StatusNotFound, "ERR_DELIVERY_NOT_FOUND", "delivery not found")
+		return
+	}
+	if errors.Is(err, store.ErrTaskArchived) {
+		writeAPIError(w, http.StatusConflict, "ERR_TASK_ARCHIVED", err.Error())
+		return
+	}
+	if errors.Is(err, store.ErrCheckpointLocked) {
+		writeAPIError(w, http.StatusConflict, "ERR_CHECKPOINT_LOCKED", err.Error())
+		return
+	}
+	if errors.Is(err, store.ErrConflict) {
+		writeAPIError(w, http.StatusConflict, "ERR_REOPEN_REVIEW_CONFLICT", err.Error())
+		return
+	}
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, "ERR_REOPEN_REVIEW", err.Error())
 		return
 	}
 	if ev != nil {

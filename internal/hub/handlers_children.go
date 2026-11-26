@@ -57,14 +57,16 @@ func (s *Server) createChildTaskInternalWithGuard(
 	if parent.ArchivedAt != nil {
 		return resp, http.StatusConflict, "ERR_TASK_ARCHIVED", fmt.Errorf("parent task %s is archived", parentTaskID)
 	}
+	if parent.ProjectID == protocol.PAProjectID {
+		return resp, http.StatusConflict, "ERR_PA_NO_SUBSESSIONS", fmt.Errorf("PA/Hebi8 session %s cannot attach child sessions", parentTaskID)
+	}
+	if parent.ParentTaskID != "" {
+		return resp, http.StatusConflict, "ERR_MAX_SUBSESSION_DEPTH", fmt.Errorf("child session %s cannot spawn grandchild sessions (maximum depth is 1)", parentTaskID)
+	}
 
 	targetProjectID := strings.TrimSpace(req.ProjectID)
 	if targetProjectID == "" {
-		if parent.ProjectID == protocol.PAProjectID {
-			targetProjectID = protocol.ScratchProjectID
-		} else {
-			targetProjectID = parent.ProjectID
-		}
+		targetProjectID = parent.ProjectID
 	}
 
 	// Unconditionally reject routes resolving to ssh_deploy / ssh_outbound for child sessions,
@@ -189,10 +191,11 @@ type delegateProjectTarget struct {
 }
 
 type runnerDelegateListResponse struct {
-	ParentTaskID string                  `json:"parentTaskId"`
+	ParentTaskID string                   `json:"parentTaskId"`
+	Scope        string                   `json:"scope,omitempty"`
 	Children     []protocol.ChildTaskView `json:"children"`
-	Machines     []delegateMachineTarget `json:"machines,omitempty"`
-	Projects     []delegateProjectTarget `json:"projects,omitempty"`
+	Machines     []delegateMachineTarget  `json:"machines,omitempty"`
+	Projects     []delegateProjectTarget  `json:"projects,omitempty"`
 }
 
 type runnerDelegateSendRequest struct {
@@ -310,6 +313,43 @@ func (s *Server) handleRunnerDelegateList(w http.ResponseWriter, r *http.Request
 		writeAPIError(w, st, code, err.Error())
 		return
 	}
+	callerTask, err := s.store.GetTask(r.Context(), req.ParentTaskID)
+	if errors.Is(err, store.ErrNotFound) {
+		writeAPIError(w, http.StatusNotFound, "ERR_TASK_NOT_FOUND", err.Error())
+		return
+	}
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, "ERR_TASK_LOOKUP", err.Error())
+		return
+	}
+
+	// Child sessions (depth = 1) list peer siblings sharing the same parent (excluding self)
+	// and do not receive spawn targets because grandchild delegation is forbidden.
+	if callerTask.ParentTaskID != "" {
+		allSiblings, err := s.store.ListChildTasks(r.Context(), callerTask.ParentTaskID, req.IncludeArchived)
+		if errors.Is(err, store.ErrNotFound) {
+			writeAPIError(w, http.StatusNotFound, "ERR_TASK_NOT_FOUND", err.Error())
+			return
+		}
+		if err != nil {
+			writeAPIError(w, http.StatusInternalServerError, "ERR_LIST_CHILDREN", err.Error())
+			return
+		}
+		peers := make([]protocol.ChildTaskView, 0, len(allSiblings))
+		for _, sib := range allSiblings {
+			if sib.TaskID == callerTask.TaskID {
+				continue
+			}
+			peers = append(peers, sib)
+		}
+		writeJSON(w, http.StatusOK, runnerDelegateListResponse{
+			ParentTaskID: callerTask.ParentTaskID,
+			Scope:        "siblings",
+			Children:     peers,
+		})
+		return
+	}
+
 	children, err := s.store.ListChildTasks(r.Context(), req.ParentTaskID, req.IncludeArchived)
 	if errors.Is(err, store.ErrNotFound) {
 		writeAPIError(w, http.StatusNotFound, "ERR_TASK_NOT_FOUND", err.Error())
@@ -322,9 +362,10 @@ func (s *Server) handleRunnerDelegateList(w http.ResponseWriter, r *http.Request
 
 	out := runnerDelegateListResponse{
 		ParentTaskID: req.ParentTaskID,
+		Scope:        "children",
 		Children:     children,
 	}
-	if req.IncludeTargets {
+	if req.IncludeTargets && callerTask.ProjectID != protocol.PAProjectID {
 		s.mu.RLock()
 		yamlMachines := s.yamlMachines.Machines
 		s.mu.RUnlock()
@@ -378,6 +419,29 @@ func (s *Server) verifyDescendantScope(ctx context.Context, parentTaskID, childT
 	return http.StatusOK, "", nil
 }
 
+func (s *Server) verifyDelegateCollabScope(ctx context.Context, callerTaskID, targetTaskID string) (string, int, string, error) {
+	callerTaskID = strings.TrimSpace(callerTaskID)
+	targetTaskID = strings.TrimSpace(targetTaskID)
+	if callerTaskID == "" || targetTaskID == "" {
+		return "", http.StatusBadRequest, "ERR_INVALID_INPUT", errors.New("parentTaskId and childTaskId are required")
+	}
+	isDesc, err := s.store.IsDescendantTask(ctx, callerTaskID, targetTaskID)
+	if err != nil {
+		return "", http.StatusInternalServerError, "ERR_SCOPE_CHECK", err
+	}
+	if isDesc {
+		return "parent", http.StatusOK, "", nil
+	}
+	isSib, err := s.store.IsSiblingTask(ctx, callerTaskID, targetTaskID)
+	if err != nil {
+		return "", http.StatusInternalServerError, "ERR_SCOPE_CHECK", err
+	}
+	if isSib {
+		return "sibling", http.StatusOK, "", nil
+	}
+	return "", http.StatusForbidden, "ERR_FORBIDDEN", fmt.Errorf("task %s is neither a child nor a sibling of %s", targetTaskID, callerTaskID)
+}
+
 func (s *Server) handleRunnerDelegateSend(w http.ResponseWriter, r *http.Request) {
 	runnerMachineID := strings.TrimSpace(r.Header.Get("X-Orbit-Machine-Id"))
 	var req runnerDelegateSendRequest
@@ -389,7 +453,8 @@ func (s *Server) handleRunnerDelegateSend(w http.ResponseWriter, r *http.Request
 		writeAPIError(w, st, code, err.Error())
 		return
 	}
-	if st, code, err := s.verifyDescendantScope(r.Context(), req.ParentTaskID, req.ChildTaskID); err != nil {
+	relation, st, code, err := s.verifyDelegateCollabScope(r.Context(), req.ParentTaskID, req.ChildTaskID)
+	if err != nil {
 		writeAPIError(w, st, code, err.Error())
 		return
 	}
@@ -405,6 +470,7 @@ func (s *Server) handleRunnerDelegateSend(w http.ResponseWriter, r *http.Request
 		MachineID:       runnerMachineID,
 		ParentTaskID:    strings.TrimSpace(req.ParentTaskID),
 		ParentAttemptID: strings.TrimSpace(req.ParentAttemptID),
+		AllowSibling:    true,
 	}
 	resp, status, code, err := s.followupTaskWithRunnerGuard(
 		r.Context(),
@@ -415,7 +481,10 @@ func (s *Server) handleRunnerDelegateSend(w http.ResponseWriter, r *http.Request
 		},
 		protocol.ActorAgent,
 		"agent:"+runnerMachineID,
-		map[string]any{"delegatedFromTaskId": strings.TrimSpace(req.ParentTaskID)},
+		map[string]any{
+			"delegatedFromTaskId": strings.TrimSpace(req.ParentTaskID),
+			"delegatedRelation":   relation,
+		},
 		guard,
 	)
 	if err != nil {
@@ -436,7 +505,7 @@ func (s *Server) handleRunnerDelegateRead(w http.ResponseWriter, r *http.Request
 		writeAPIError(w, st, code, err.Error())
 		return
 	}
-	if st, code, err := s.verifyDescendantScope(r.Context(), req.ParentTaskID, req.ChildTaskID); err != nil {
+	if _, st, code, err := s.verifyDelegateCollabScope(r.Context(), req.ParentTaskID, req.ChildTaskID); err != nil {
 		writeAPIError(w, st, code, err.Error())
 		return
 	}

@@ -122,6 +122,17 @@ func TestMCPServer_EndToEnd5ToolsAndSocketRoundtrip(t *testing.T) {
 			t.Fatalf("tool[%d] = %q, want %q", i, listResp.Result.Tools[i].Name, w)
 		}
 	}
+	if !strings.Contains(listResp.Result.Tools[0].Description, "max depth = 1") || !strings.Contains(listResp.Result.Tools[0].Description, "PA/Hebi8") {
+		t.Fatalf("expected orbit_spawn_child description to document max depth = 1 and PA/Hebi8 restriction, got: %q", listResp.Result.Tools[0].Description)
+	}
+	for _, idx := range []int{1, 2, 3} {
+		if !strings.Contains(strings.ToLower(listResp.Result.Tools[idx].Description), "sibling") {
+			t.Fatalf("expected %s description to document sibling collaboration, got: %q", listResp.Result.Tools[idx].Name, listResp.Result.Tools[idx].Description)
+		}
+	}
+	if !strings.Contains(strings.ToLower(listResp.Result.Tools[4].Description), "parent sessions only") {
+		t.Fatalf("expected orbit_cancel_child description to document parent-only cancel, got: %q", listResp.Result.Tools[4].Description)
+	}
 
 	// Verify all 5 delegate actions reached the Unix socket with properly mapped fields
 	mu.Lock()

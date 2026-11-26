@@ -383,22 +383,30 @@ func syncProjectAnchorsMirrorTx(ctx context.Context, tx *sql.Tx, projectID strin
 		return err
 	}
 	parts := partsMap[projectID]
-	if len(parts) > 0 && len(parts[0].Locations) > 0 {
-		newAnchors := map[string]protocol.ProjectAnchorConfig{}
-		defaultLoc := parts[0].Locations[0]
-		for _, loc := range parts[0].Locations {
+	newAnchors := map[string]protocol.ProjectAnchorConfig{}
+	var primaryLoc *protocol.ProjectLocationView
+	for _, part := range parts {
+		if len(part.Locations) == 0 {
+			continue
+		}
+		picked := part.Locations[0]
+		for _, loc := range part.Locations {
 			if loc.IsDefault {
-				defaultLoc = loc
+				picked = loc
 				break
 			}
 		}
+		primaryLoc = &picked
+		break
+	}
+	if primaryLoc != nil {
 		newAnchors[cfg.DefaultCapability] = protocol.ProjectAnchorConfig{
-			Machine:  defaultLoc.MachineID,
-			RepoPath: defaultLoc.AbsPath,
+			Machine:  primaryLoc.MachineID,
+			RepoPath: primaryLoc.AbsPath,
 		}
 		for _, part := range parts {
 			for _, loc := range part.Locations {
-				if loc.MachineID == defaultLoc.MachineID && loc.AbsPath == defaultLoc.AbsPath {
+				if loc.MachineID == primaryLoc.MachineID && loc.AbsPath == primaryLoc.AbsPath {
 					continue
 				}
 				key := loc.MachineID
@@ -411,8 +419,8 @@ func syncProjectAnchorsMirrorTx(ctx context.Context, tx *sql.Tx, projectID strin
 				}
 			}
 		}
-		cfg.Anchors = newAnchors
 	}
+	cfg.Anchors = newAnchors
 	updatedCfg, err := json.Marshal(cfg)
 	if err != nil {
 		return err
@@ -636,6 +644,116 @@ func (s *Store) CreateProjectPart(
 	}
 	pv, err = s.GetProject(ctx, projectID)
 	return pv, createdPart, ev, err
+}
+
+// UpdateProjectPart updates mutable metadata (name, kind, sortOrder) on an existing project part.
+func (s *Store) UpdateProjectPart(
+	ctx context.Context,
+	projectID string,
+	partID string,
+	req protocol.UpdateProjectPartRequest,
+	actorID string,
+) (protocol.ProjectView, protocol.ProjectPartView, protocol.EventRecord, error) {
+	var pv protocol.ProjectView
+	var updatedPart protocol.ProjectPartView
+	var ev protocol.EventRecord
+	now := time.Now().UnixMilli()
+	projectID = strings.TrimSpace(projectID)
+	partID = strings.TrimSpace(partID)
+	if projectID == "" || protocol.IsVirtualProjectID(projectID) || partID == "" {
+		return pv, updatedPart, ev, fmt.Errorf("%w: invalid projectId or partId", ErrInvalidInput)
+	}
+	if req.Name == nil && req.Kind == nil && req.SortOrder == nil {
+		return pv, updatedPart, ev, fmt.Errorf("%w: at least one field (name, kind, sortOrder) is required", ErrInvalidInput)
+	}
+
+	err := s.WithWriteTx(ctx, func(tx *sql.Tx) error {
+		var curName, curKind string
+		var curSort int
+		err := tx.QueryRowContext(ctx, `
+			SELECT name, kind, sort_order
+			FROM project_parts
+			WHERE project_id = ? AND part_id = ?
+		`, projectID, partID).Scan(&curName, &curKind, &curSort)
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("%w: part %s", ErrNotFound, partID)
+		}
+		if err != nil {
+			return err
+		}
+
+		if req.Name != nil {
+			trimmed := strings.TrimSpace(*req.Name)
+			if trimmed == "" {
+				return fmt.Errorf("%w: part name cannot be empty", ErrInvalidInput)
+			}
+			curName = trimmed
+		}
+		kindChangedToFolder := false
+		if req.Kind != nil {
+			if !req.Kind.IsValid() {
+				return fmt.Errorf("%w: invalid part kind %q", ErrInvalidInput, *req.Kind)
+			}
+			if *req.Kind == protocol.ProjectPartFolder && curKind != string(protocol.ProjectPartFolder) {
+				kindChangedToFolder = true
+			}
+			curKind = string(*req.Kind)
+		}
+		if req.SortOrder != nil {
+			curSort = *req.SortOrder
+		}
+
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE project_parts
+			SET name = ?, kind = ?, sort_order = ?, updated_at = ?
+			WHERE project_id = ? AND part_id = ?
+		`, curName, curKind, curSort, now, projectID, partID); err != nil {
+			return err
+		}
+		if kindChangedToFolder {
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE project_locations
+				SET isolation = ?, updated_at = ?
+				WHERE project_id = ? AND part_id = ?
+			`, string(protocol.IsolationInPlace), now, projectID, partID); err != nil {
+				return err
+			}
+		}
+		if err := syncProjectAnchorsMirrorTx(ctx, tx, projectID, now); err != nil {
+			return err
+		}
+		ev, err = insertEventTx(ctx, tx, eventInsert{
+			StreamID:   "global",
+			ProjectID:  projectID,
+			ActorKind:  protocol.ActorHuman,
+			ActorID:    actorID,
+			Kind:       protocol.EventProjectChanged,
+			Visibility: protocol.VisibilityTimeline,
+			Payload: map[string]any{
+				"projectId": projectID,
+				"partId":    partID,
+				"name":      curName,
+				"kind":      curKind,
+				"action":    "part_updated",
+			},
+			CreatedAt: now,
+		})
+		return err
+	})
+	if err != nil {
+		return pv, updatedPart, ev, err
+	}
+	pv, err = s.GetProject(ctx, projectID)
+	if err != nil {
+		return pv, updatedPart, ev, err
+	}
+	for _, p := range pv.Parts {
+		if p.PartID == partID {
+			updatedPart = p
+			break
+		}
+	}
+	return pv, updatedPart, ev, nil
 }
 
 // DeleteProjectPart removes a part and its cascaded locations from a project.

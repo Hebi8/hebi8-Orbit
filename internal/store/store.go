@@ -30,6 +30,9 @@ var (
 	ErrTaskActive             = errors.New("task has an active attempt")
 	ErrTaskArchived           = errors.New("task is archived")
 	ErrDeliveryCleanupPending = errors.New("delivery snapshot cleanup pending")
+	ErrMaxSubsessionDepth     = errors.New("maximum sub-session depth exceeded")
+	ErrPANoSubsessions        = errors.New("PA/Hebi8 sessions cannot spawn sub-sessions")
+	ErrCheckpointLocked       = errors.New("delivery review checkpoint is locked after a subsequent message")
 )
 
 // Store manages the single-writer SQLite WAL pool and a separate read-only query pool.

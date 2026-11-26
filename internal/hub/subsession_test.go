@@ -190,7 +190,7 @@ func TestSubsession_HubAPIAndRunnerDelegateScopeGuards(t *testing.T) {
 	ctx := context.Background()
 	_, st, ts, runnerToken := setupSubsessionHub(t)
 
-	// 1. Ensure Hebi8 main task and verify default projectId for _pa child -> _scratch
+	// 1. Ensure Hebi8 main task and verify _pa CANNOT attach child sessions (409 ERR_PA_NO_SUBSESSIONS)
 	hebi8Task, _, err := st.EnsureHebi8MainTask(ctx, protocol.AdapterAgy)
 	if err != nil {
 		t.Fatal(err)
@@ -201,17 +201,44 @@ func TestSubsession_HubAPIAndRunnerDelegateScopeGuards(t *testing.T) {
 		Role:  "researcher",
 		Goal:  "Check architecture options",
 	}, nil)
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("expected 409 rejecting child under _pa, got %d: %s", resp.StatusCode, string(body))
+	}
+	var paErr protocol.APIError
+	_ = json.Unmarshal(body, &paErr)
+	if paErr.Code != "ERR_PA_NO_SUBSESSIONS" {
+		t.Fatalf("expected ERR_PA_NO_SUBSESSIONS, got %+v", paErr)
+	}
+
+	// Create a normal top-level root task to spawn children under
+	rootA, err := st.CreateTask(ctx, store.CreateTaskParams{
+		ProjectID:     "demo-app",
+		Title:         "Root A",
+		Goal:          "Main project work",
+		MachineID:     "hub-node",
+		CreateAttempt: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resp, body = doJSONReq(t, http.MethodPost, ts.URL+"/api/tasks/"+rootA.Task.TaskID+"/children", protocol.CreateChildTaskRequest{
+		Title:     "Root A Helper",
+		Role:      "researcher",
+		ProjectID: protocol.ScratchProjectID,
+		Goal:      "Check architecture options",
+	}, nil)
 	if resp.StatusCode != http.StatusCreated {
-		t.Fatalf("spawn child under _pa failed (%d): %s", resp.StatusCode, string(body))
+		t.Fatalf("spawn child under rootA failed (%d): %s", resp.StatusCode, string(body))
 	}
 	var spawned protocol.CreateTaskResponse
 	_ = json.Unmarshal(body, &spawned)
-	if spawned.Task.ProjectID != protocol.ScratchProjectID || spawned.Task.ParentTaskID != hebi8Task.TaskID || spawned.Task.DelegatedRole != "researcher" {
-		t.Fatalf("unexpected spawned child under _pa: %+v", spawned.Task)
+	if spawned.Task.ProjectID != protocol.ScratchProjectID || spawned.Task.ParentTaskID != rootA.Task.TaskID || spawned.Task.DelegatedRole != "researcher" {
+		t.Fatalf("unexpected spawned child under rootA: %+v", spawned.Task)
 	}
 
 	// 2. Reject ssh_deploy via client API (both explicit adapter and deploy-node capability)
-	resp, body = doJSONReq(t, http.MethodPost, ts.URL+"/api/tasks/"+hebi8Task.TaskID+"/children", protocol.CreateChildTaskRequest{
+	resp, body = doJSONReq(t, http.MethodPost, ts.URL+"/api/tasks/"+rootA.Task.TaskID+"/children", protocol.CreateChildTaskRequest{
 		ProjectID: "demo-app",
 		Adapter:   protocol.AdapterSSHDeploy,
 		Goal:      "Deploy prod",
@@ -219,7 +246,7 @@ func TestSubsession_HubAPIAndRunnerDelegateScopeGuards(t *testing.T) {
 	if resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("expected 403 for ssh_deploy child adapter, got %d: %s", resp.StatusCode, string(body))
 	}
-	resp, body = doJSONReq(t, http.MethodPost, ts.URL+"/api/tasks/"+hebi8Task.TaskID+"/children", protocol.CreateChildTaskRequest{
+	resp, body = doJSONReq(t, http.MethodPost, ts.URL+"/api/tasks/"+rootA.Task.TaskID+"/children", protocol.CreateChildTaskRequest{
 		ProjectID:          "demo-app",
 		RequiredCapability: "deploy-node",
 		Goal:               "Deploy prod via cap",
@@ -229,7 +256,7 @@ func TestSubsession_HubAPIAndRunnerDelegateScopeGuards(t *testing.T) {
 	}
 
 	// 3. List children & transcript endpoints
-	resp, body = doJSONReq(t, http.MethodGet, ts.URL+"/api/tasks/"+hebi8Task.TaskID+"/children", nil, nil)
+	resp, body = doJSONReq(t, http.MethodGet, ts.URL+"/api/tasks/"+rootA.Task.TaskID+"/children", nil, nil)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("list children failed (%d): %s", resp.StatusCode, string(body))
 	}
@@ -262,7 +289,7 @@ func TestSubsession_HubAPIAndRunnerDelegateScopeGuards(t *testing.T) {
 
 	// Runner spawn with mismatched parentAttemptId -> 403
 	resp, body = doJSONReq(t, http.MethodPost, ts.URL+"/api/runner/delegate/spawn", map[string]any{
-		"parentTaskId":    hebi8Task.TaskID,
+		"parentTaskId":    rootA.Task.TaskID,
 		"parentAttemptId": otherRes.Attempt.AttemptID,
 		"goal":            "Spoofed attempt",
 	}, runnerHeaders)
@@ -1349,11 +1376,21 @@ func TestSubsession_Hebi8ExcludesChildResultFromRecentUserPrompts(t *testing.T) 
 		t.Fatal("timed out waiting for post-fold Hebi8 dispatch")
 	}
 
-	// While Hebi8 is busy with the active attempt above, finish a child task -> queued pending input MUST have source='system'!
+	// While a normal parent task is busy with an active attempt, finish a child task -> queued pending input MUST have source='system'!
+	busyParent, err := st.CreateTask(ctx, store.CreateTaskParams{
+		ProjectID:     "demo-app",
+		Title:         "Busy Parent",
+		Goal:          "working",
+		MachineID:     "hub-node",
+		CreateAttempt: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	child, err := st.CreateTask(ctx, store.CreateTaskParams{
 		ProjectID:     protocol.ScratchProjectID,
-		ParentTaskID:  hebi8Task.TaskID,
-		Title:         "Hebi8 Child",
+		ParentTaskID:  busyParent.Task.TaskID,
+		Title:         "Parent Child",
 		Goal:          "check",
 		MachineID:     "hub-node",
 		CreateAttempt: true,
@@ -1372,10 +1409,212 @@ func TestSubsession_Hebi8ExcludesChildResultFromRecentUserPrompts(t *testing.T) 
 	var queuedSource string
 	if err := st.ReadDB().QueryRowContext(ctx, `
 		SELECT source FROM task_pending_inputs WHERE task_id = ? AND state = 'queued' ORDER BY created_at DESC LIMIT 1
-	`, hebi8Task.TaskID).Scan(&queuedSource); err != nil {
+	`, busyParent.Task.TaskID).Scan(&queuedSource); err != nil {
 		t.Fatalf("query queued child_result pending input: %v", err)
 	}
 	if queuedSource != string(protocol.PendingSourceSystem) {
 		t.Fatalf("expected queued child_result pending input source='system', got %q", queuedSource)
+	}
+}
+
+func TestSubsession_V4SingleLayerPANoSubsessionsAndSiblingCollaboration(t *testing.T) {
+	ctx := context.Background()
+	_, st, ts, runnerToken := setupSubsessionHub(t)
+
+	runnerHeaders := map[string]string{
+		"X-Orbit-Machine-Id": "hub-node",
+		"Authorization":      "Bearer " + runnerToken,
+	}
+
+	// 1. PA/Hebi8 cannot spawn children via client API, runner delegate API, or fork_new_session
+	hebi8Task, _, err := st.EnsureHebi8MainTask(ctx, protocol.AdapterAgy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, hebi8Att, _, err := st.CreateNextAttempt(ctx, store.CreateNextAttemptParams{
+		TaskID:      hebi8Task.TaskID,
+		MachineID:   "hub-node",
+		Adapter:     protocol.AdapterAgy,
+		TriggerKind: protocol.TriggerFollowup,
+		Prompt:      "active hebi8",
+		LeaseTTLMs:  60000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, body := doJSONReq(t, http.MethodPost, ts.URL+"/api/runner/delegate/spawn", map[string]any{
+		"parentTaskId":    hebi8Task.TaskID,
+		"parentAttemptId": hebi8Att.AttemptID,
+		"goal":            "blocked pa child",
+	}, runnerHeaders)
+	if resp.StatusCode != http.StatusConflict || !strings.Contains(string(body), "ERR_PA_NO_SUBSESSIONS") {
+		t.Fatalf("expected 409 ERR_PA_NO_SUBSESSIONS on runner delegate spawn from _pa, got %d: %s", resp.StatusCode, string(body))
+	}
+	resp, body = doJSONReq(t, http.MethodPost, ts.URL+"/api/tasks/"+hebi8Task.TaskID+"/followup", protocol.FollowupTaskRequest{
+		Message: "fork from hebi8",
+		Mode:    protocol.FollowupModeForkNewSession,
+	}, nil)
+	if resp.StatusCode != http.StatusConflict || !strings.Contains(string(body), "ERR_PA_NO_SUBSESSIONS") {
+		t.Fatalf("expected 409 ERR_PA_NO_SUBSESSIONS on fork_new_session from _pa, got %d: %s", resp.StatusCode, string(body))
+	}
+
+	// 2. Setup two parents (rootA with childA1 & childA2, rootB with childB1)
+	rootA, err := st.CreateTask(ctx, store.CreateTaskParams{
+		ProjectID:     "demo-app",
+		Title:         "Root A",
+		Goal:          "Root A goal",
+		MachineID:     "hub-node",
+		CreateAttempt: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	childA1, err := st.CreateTask(ctx, store.CreateTaskParams{
+		ProjectID:     "demo-app",
+		ParentTaskID:  rootA.Task.TaskID,
+		DelegatedRole: "backend",
+		Title:         "Child A1",
+		Goal:          "Backend work",
+		MachineID:     "hub-node",
+		CreateAttempt: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	childA2, err := st.CreateTask(ctx, store.CreateTaskParams{
+		ProjectID:     "demo-app",
+		ParentTaskID:  rootA.Task.TaskID,
+		DelegatedRole: "frontend",
+		Title:         "Child A2",
+		Goal:          "Frontend work",
+		MachineID:     "hub-node",
+		CreateAttempt: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootB, err := st.CreateTask(ctx, store.CreateTaskParams{
+		ProjectID:     "demo-app",
+		Title:         "Root B",
+		Goal:          "Root B goal",
+		MachineID:     "hub-node",
+		CreateAttempt: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	childB1, err := st.CreateTask(ctx, store.CreateTaskParams{
+		ProjectID:     "demo-app",
+		ParentTaskID:  rootB.Task.TaskID,
+		Title:         "Child B1",
+		Goal:          "Unrelated child",
+		MachineID:     "hub-node",
+		CreateAttempt: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 3. Max depth = 1: childA1 CANNOT spawn grandchild via client API, runner delegate spawn, OR fork_new_session
+	resp, body = doJSONReq(t, http.MethodPost, ts.URL+"/api/tasks/"+childA1.Task.TaskID+"/children", protocol.CreateChildTaskRequest{
+		Goal: "grandchild via client",
+	}, nil)
+	if resp.StatusCode != http.StatusConflict || !strings.Contains(string(body), "ERR_MAX_SUBSESSION_DEPTH") {
+		t.Fatalf("expected 409 ERR_MAX_SUBSESSION_DEPTH on client spawn grandchild, got %d: %s", resp.StatusCode, string(body))
+	}
+	resp, body = doJSONReq(t, http.MethodPost, ts.URL+"/api/runner/delegate/spawn", map[string]any{
+		"parentTaskId":    childA1.Task.TaskID,
+		"parentAttemptId": childA1.Attempt.AttemptID,
+		"goal":            "grandchild via runner",
+	}, runnerHeaders)
+	if resp.StatusCode != http.StatusConflict || !strings.Contains(string(body), "ERR_MAX_SUBSESSION_DEPTH") {
+		t.Fatalf("expected 409 ERR_MAX_SUBSESSION_DEPTH on runner spawn grandchild, got %d: %s", resp.StatusCode, string(body))
+	}
+	resp, body = doJSONReq(t, http.MethodPost, ts.URL+"/api/tasks/"+childA1.Task.TaskID+"/followup", protocol.FollowupTaskRequest{
+		Message: "fork grandchild",
+		Mode:    protocol.FollowupModeForkNewSession,
+	}, nil)
+	if resp.StatusCode != http.StatusConflict || !strings.Contains(string(body), "ERR_MAX_SUBSESSION_DEPTH") {
+		t.Fatalf("expected 409 ERR_MAX_SUBSESSION_DEPTH on fork_new_session from child, got %d: %s", resp.StatusCode, string(body))
+	}
+
+	// 4. Sibling list: childA1 sees childA2 (not self), scope="siblings", and NO spawn targets
+	resp, body = doJSONReq(t, http.MethodPost, ts.URL+"/api/runner/delegate/list", map[string]any{
+		"parentTaskId":    childA1.Task.TaskID,
+		"parentAttemptId": childA1.Attempt.AttemptID,
+		"includeTargets":  true,
+	}, runnerHeaders)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("sibling list failed (%d): %s", resp.StatusCode, string(body))
+	}
+	var sibList struct {
+		ParentTaskID string                   `json:"parentTaskId"`
+		Scope        string                   `json:"scope"`
+		Children     []protocol.ChildTaskView `json:"children"`
+		Machines     []map[string]any         `json:"machines"`
+		Projects     []map[string]any         `json:"projects"`
+	}
+	if err := json.Unmarshal(body, &sibList); err != nil {
+		t.Fatal(err)
+	}
+	if sibList.Scope != "siblings" || sibList.ParentTaskID != rootA.Task.TaskID || len(sibList.Children) != 1 || sibList.Children[0].TaskID != childA2.Task.TaskID {
+		t.Fatalf("unexpected sibling list response: %+v", sibList)
+	}
+	if len(sibList.Machines) != 0 || len(sibList.Projects) != 0 {
+		t.Fatalf("expected no spawn targets for child caller, got machines=%d projects=%d", len(sibList.Machines), len(sibList.Projects))
+	}
+
+	// 5. Sibling read: childA1 can read childA2 transcript
+	resp, body = doJSONReq(t, http.MethodPost, ts.URL+"/api/runner/delegate/read", map[string]any{
+		"parentTaskId":    childA1.Task.TaskID,
+		"parentAttemptId": childA1.Attempt.AttemptID,
+		"childTaskId":     childA2.Task.TaskID,
+		"limit":           5,
+	}, runnerHeaders)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("sibling read failed (%d): %s", resp.StatusCode, string(body))
+	}
+
+	// 6. Sibling send: childA1 can send a queued follow-up to childA2
+	resp, body = doJSONReq(t, http.MethodPost, ts.URL+"/api/runner/delegate/send", map[string]any{
+		"parentTaskId":    childA1.Task.TaskID,
+		"parentAttemptId": childA1.Attempt.AttemptID,
+		"childTaskId":     childA2.Task.TaskID,
+		"message":         "API contract is ready at /api/v4",
+		"mode":            "queue",
+	}, runnerHeaders)
+	if resp.StatusCode != http.StatusAccepted && resp.StatusCode != http.StatusCreated {
+		t.Fatalf("sibling send failed (%d): %s", resp.StatusCode, string(body))
+	}
+	queued, err := st.ListPendingInputs(ctx, childA2.Task.TaskID)
+	if err != nil || len(queued) != 1 || queued[0].Payload["delegatedFromTaskId"] != childA1.Task.TaskID || queued[0].Payload["delegatedRelation"] != "sibling" {
+		t.Fatalf("unexpected sibling queued input: %+v err=%v", queued, err)
+	}
+
+	// 7. Sibling cancel MUST be forbidden (403)
+	resp, body = doJSONReq(t, http.MethodPost, ts.URL+"/api/runner/delegate/cancel", map[string]any{
+		"parentTaskId":    childA1.Task.TaskID,
+		"parentAttemptId": childA1.Attempt.AttemptID,
+		"childTaskId":     childA2.Task.TaskID,
+		"reason":          "not allowed",
+	}, runnerHeaders)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 cancelling sibling task, got %d: %s", resp.StatusCode, string(body))
+	}
+
+	// 8. Cross-parent, parent, and self targets MUST all be forbidden (403)
+	for _, targetID := range []string{childB1.Task.TaskID, rootA.Task.TaskID, childA1.Task.TaskID} {
+		for _, path := range []string{"/api/runner/delegate/read", "/api/runner/delegate/send", "/api/runner/delegate/cancel"} {
+			payload := map[string]any{
+				"parentTaskId":    childA1.Task.TaskID,
+				"parentAttemptId": childA1.Attempt.AttemptID,
+				"childTaskId":     targetID,
+				"message":         "should fail",
+			}
+			resp, body = doJSONReq(t, http.MethodPost, ts.URL+path, payload, runnerHeaders)
+			if resp.StatusCode != http.StatusForbidden {
+				t.Fatalf("expected 403 for %s target=%s, got %d: %s", path, targetID, resp.StatusCode, string(body))
+			}
+		}
 	}
 }

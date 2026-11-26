@@ -336,6 +336,23 @@ type ChildTaskView struct {
 	ArchivedAt           *int64    `json:"archivedAt,omitempty"`
 }
 
+// TokenUsage summarizes per-attempt token counts reported by ACP PromptResponse.Usage.
+type TokenUsage struct {
+	Input      int64 `json:"input,omitempty"`
+	Output     int64 `json:"output,omitempty"`
+	CachedRead int64 `json:"cachedRead,omitempty"`
+	Thought    int64 `json:"thought,omitempty"`
+}
+
+// ContextUsage reports the latest live context window usage emitted by ACP acp.usage events
+// for the task's current session.
+type ContextUsage struct {
+	Used      int64  `json:"used"`
+	Size      int64  `json:"size"`
+	AttemptID string `json:"attemptId,omitempty"`
+	UpdatedAt int64  `json:"updatedAt"`
+}
+
 // AttemptView represents one execution attempt of a task.
 type AttemptView struct {
 	AttemptID        string                `json:"attemptId"`
@@ -355,6 +372,7 @@ type AttemptView struct {
 	BaseSHA          string                `json:"baseSha,omitempty"`
 	OutputDeliveryID string                `json:"outputDeliveryId,omitempty"`
 	FolderChanges    *FolderChangesSummary `json:"folderChanges,omitempty"`
+	TokenUsage       *TokenUsage           `json:"tokenUsage,omitempty"`
 	State            AttemptState          `json:"state"`
 	CompletionSource *CompletionSource     `json:"completionSource,omitempty"`
 	ErrorCode        string                `json:"errorCode,omitempty"`
@@ -413,6 +431,7 @@ type EventRecord struct {
 type TaskTimelineResponse struct {
 	Task            TaskSummary         `json:"task"`
 	RuntimeConfig   map[string]string   `json:"runtimeConfig,omitempty"`
+	ContextUsage    *ContextUsage       `json:"contextUsage,omitempty"`
 	ParentSummary   *ParentTaskRef      `json:"parentSummary,omitempty"`
 	Children        []ChildTaskView     `json:"children,omitempty"`
 	SiblingChildren []ChildTaskView     `json:"siblingChildren,omitempty"`
@@ -438,11 +457,14 @@ type DiffFileStat struct {
 
 // DeliveryDetailResponse is returned by GET /api/deliveries/:deliveryId.
 type DeliveryDetailResponse struct {
-	Delivery      DeliveryView       `json:"delivery"`
-	RyugiBindings []RyugiBindingView `json:"ryugiBindings"`
-	Annotations   []AnnotationView   `json:"annotations"`
-	DiffFiles     []DiffFileStat     `json:"diffFiles"`
-	Project       ProjectView        `json:"project"`
+	Delivery         DeliveryView       `json:"delivery"`
+	RyugiBindings    []RyugiBindingView `json:"ryugiBindings"`
+	Annotations      []AnnotationView   `json:"annotations"`
+	DiffFiles        []DiffFileStat     `json:"diffFiles"`
+	Project          ProjectView        `json:"project"`
+	ReviewState      InboxState         `json:"reviewState,omitempty"`
+	ReviewResolvedAt *int64             `json:"reviewResolvedAt,omitempty"`
+	CanUndoReview    bool               `json:"canUndoReview,omitempty"`
 }
 
 // DeliveryDiffResponse is returned by GET /api/deliveries/:deliveryId/diff.
@@ -1258,6 +1280,13 @@ type CreateProjectPartRequest struct {
 	AbsPath   string          `json:"absPath,omitempty"`
 }
 
+// UpdateProjectPartRequest updates mutable metadata on a logical project part.
+type UpdateProjectPartRequest struct {
+	Name      *string          `json:"name,omitempty"`
+	Kind      *ProjectPartKind `json:"kind,omitempty"`
+	SortOrder *int             `json:"sortOrder,omitempty"`
+}
+
 // CreateProjectLocationRequest binds an explicit directory on a device to a project part.
 type CreateProjectLocationRequest struct {
 	MachineID string            `json:"machineId"`
@@ -1414,6 +1443,8 @@ type Hebi8LineSummary struct {
 	FoldCount           int    `json:"foldCount"`
 	PinnedCount         int    `json:"pinnedCount"`
 	MaxLevel            int    `json:"maxLevel"`
+	PendingTurns        *int   `json:"pendingTurns,omitempty"`
+	PendingChars        *int   `json:"pendingChars,omitempty"`
 	LastFoldedAt        string `json:"lastFoldedAt,omitempty"`
 	LastFoldedAttemptNo int    `json:"lastFoldedAttemptNo,omitempty"`
 	ShouldSuggestFold   bool   `json:"shouldSuggestFold,omitempty"`
@@ -1427,6 +1458,8 @@ type Hebi8MainResponse struct {
 	Pins                      []string         `json:"pins"`
 	PendingTurnsSinceLastFold int              `json:"pendingTurnsSinceLastFold"`
 	PendingCharsSinceLastFold int              `json:"pendingCharsSinceLastFold"`
+	LastHebi8TurnAt           *int64           `json:"lastHebi8TurnAt,omitempty"`
+	UpdatedTopLevelTaskCount  int              `json:"updatedTopLevelTaskCount"`
 }
 
 // Hebi8FoldRequest optionally supplies a model- or user-authored summary/title/tags when folding.
@@ -1438,21 +1471,25 @@ type Hebi8FoldRequest struct {
 
 // Hebi8FoldResponse is returned by POST /api/hebi8/fold.
 type Hebi8FoldResponse struct {
-	TaskID      string           `json:"taskId"`
-	Segment     Hebi8LineNode    `json:"segment"`
-	Fold        *Hebi8LineNode   `json:"fold,omitempty"`
-	Folds       []Hebi8LineNode  `json:"folds,omitempty"`
-	Nodes       []Hebi8LineNode  `json:"nodes"`
-	Pins        []string         `json:"pins"`
-	LineSummary Hebi8LineSummary `json:"lineSummary"`
+	TaskID                    string           `json:"taskId"`
+	Segment                   Hebi8LineNode    `json:"segment"`
+	Fold                      *Hebi8LineNode   `json:"fold,omitempty"`
+	Folds                     []Hebi8LineNode  `json:"folds,omitempty"`
+	Nodes                     []Hebi8LineNode  `json:"nodes"`
+	Pins                      []string         `json:"pins"`
+	LineSummary               Hebi8LineSummary `json:"lineSummary"`
+	PendingTurnsSinceLastFold int              `json:"pendingTurnsSinceLastFold"`
+	PendingCharsSinceLastFold int              `json:"pendingCharsSinceLastFold"`
 }
 
 // Hebi8LineResponse is returned by GET /api/hebi8/line.
 type Hebi8LineResponse struct {
-	TaskID      string           `json:"taskId"`
-	Nodes       []Hebi8LineNode  `json:"nodes"`
-	Pins        []string         `json:"pins"`
-	LineSummary Hebi8LineSummary `json:"lineSummary"`
+	TaskID                    string           `json:"taskId"`
+	Nodes                     []Hebi8LineNode  `json:"nodes"`
+	Pins                      []string         `json:"pins"`
+	LineSummary               Hebi8LineSummary `json:"lineSummary"`
+	PendingTurnsSinceLastFold int              `json:"pendingTurnsSinceLastFold"`
+	PendingCharsSinceLastFold int              `json:"pendingCharsSinceLastFold"`
 }
 
 // Hebi8RawTurn is one raw user/assistant turn reconstructed from SQLite for segment expansion or opening.

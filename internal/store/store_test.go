@@ -626,3 +626,170 @@ func TestGetTaskTimeline_ReturnsLatestPageAscending(t *testing.T) {
 		t.Fatalf("expected older page 1..20, got len=%d", len(older.Events))
 	}
 }
+
+func TestDeliveryReviewCheckpointReopenBeforeSendAndLockAfterMessage(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	dlvID := "dlv_01CHECKPOINTUNDO0001"
+	res, err := s.CreateManualImportDelivery(ctx, store.ManualImportParams{
+		DeliveryID:      dlvID,
+		ProjectID:       "proj-a",
+		Title:           "Checkpoint Review Task",
+		Summary:         "Ready for review",
+		SourceMachineID: "hub-node",
+		BaseSHA:         "1111111111111111111111111111111111111111",
+		HeadSHA:         "2222222222222222222222222222222222222222",
+		GitRef:          "refs/orbit/deliveries/" + dlvID,
+		Kind:            protocol.DeliveryCodeDiff,
+		ActorID:         "human",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Initially open and not undoable
+	st0, resAt0, canUndo0, err := s.GetDeliveryReviewState(ctx, dlvID)
+	if err != nil || st0 != protocol.InboxOpen || resAt0 != nil || canUndo0 {
+		t.Fatalf("unexpected initial review state: st=%q resAt=%v canUndo=%v err=%v", st0, resAt0, canUndo0, err)
+	}
+
+	// Complete review -> resolved & undoable before sending a message
+	cr, ev1, err := s.CompleteDeliveryReview(ctx, dlvID, "human")
+	if err != nil || cr.InboxState != protocol.InboxResolved || ev1 == nil {
+		t.Fatalf("CompleteDeliveryReview failed: cr=%+v ev=%+v err=%v", cr, ev1, err)
+	}
+	st1, resAt1, canUndo1, err := s.GetDeliveryReviewState(ctx, dlvID)
+	if err != nil || st1 != protocol.InboxResolved || resAt1 == nil || !canUndo1 {
+		t.Fatalf("expected resolved & undoable before send: st=%q resAt=%v canUndo=%v err=%v", st1, resAt1, canUndo1, err)
+	}
+
+	// Undo Checkpoint before sending any message -> reopens cleanly & emits delivery.review_reopened
+	rr, ev2, err := s.ReopenDeliveryReview(ctx, dlvID, "human")
+	if err != nil || rr.InboxState != protocol.InboxOpen || ev2 == nil || ev2.Kind != protocol.EventDeliveryReviewReopened {
+		t.Fatalf("ReopenDeliveryReview failed: rr=%+v ev=%+v err=%v", rr, ev2, err)
+	}
+	boot, err := s.Bootstrap(ctx, nil)
+	if err != nil || len(boot.OpenInboxItems) != 1 {
+		t.Fatalf("expected open inbox item restored after reopen, got %d err=%v", len(boot.OpenInboxItems), err)
+	}
+
+	// Checkpoint again, then send a follow-up message -> Checkpoint is now locked!
+	if _, _, err := s.CompleteDeliveryReview(ctx, dlvID, "human"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.SubmitFollowupAtomic(ctx, store.SubmitFollowupParams{
+		TaskID:           res.Task.TaskID,
+		Body:             "Follow-up after checkpoint",
+		Mode:             protocol.FollowupModeQueue,
+		MachineID:        "hub-node",
+		Adapter:          protocol.AdapterAgy,
+		AnchorCapability: "primary-dev",
+		ActorKind:        protocol.ActorHuman,
+		ActorID:          "human",
+	}); err != nil {
+		t.Fatalf("SubmitFollowupAtomic failed: %v", err)
+	}
+
+	st2, _, canUndo2, err := s.GetDeliveryReviewState(ctx, dlvID)
+	if err != nil || st2 != protocol.InboxResolved || canUndo2 {
+		t.Fatalf("expected checkpoint locked after followup: st=%q canUndo=%v err=%v", st2, canUndo2, err)
+	}
+	if _, _, err := s.ReopenDeliveryReview(ctx, dlvID, "human"); !errors.Is(err, store.ErrCheckpointLocked) {
+		t.Fatalf("expected ErrCheckpointLocked after followup, got %v", err)
+	}
+}
+
+func TestTaskTimelineExposesRealTokenUsageAndContextUsage(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	created, err := s.CreateTask(ctx, store.CreateTaskParams{
+		ProjectID:     "proj-a",
+		Title:         "Usage Task",
+		Goal:          "Check usage fields",
+		MachineID:     "hub-node",
+		Adapter:       protocol.AdapterCodex,
+		CreateAttempt: true,
+		LeaseTTLMs:    60000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UnixMilli()
+	_, err = s.IngestOutboxBatch(ctx, "hub-node", "run-usage", protocol.AttemptOutboxBatchFrame{
+		AttemptID:  created.Attempt.AttemptID,
+		LeaseToken: created.Attempt.LeaseToken,
+		Items: []protocol.OutboxItem{
+			{
+				OutboxSeq: 1,
+				EventID:   "ev_u_start",
+				FrameType: protocol.OutboxFrameState,
+				TS:        now,
+				Payload: map[string]any{
+					"state":             string(protocol.AttemptRunning),
+					"providerSessionId": "prov_usage_1",
+				},
+			},
+			{
+				OutboxSeq: 2,
+				EventID:   "ev_u_ctx",
+				FrameType: protocol.OutboxFrameEvents,
+				TS:        now + 10,
+				Payload: map[string]any{
+					"kind":       string(protocol.EventACPUsage),
+					"visibility": string(protocol.VisibilityRawACP),
+					"actorKind":  string(protocol.ActorAgent),
+					"actorId":    "codex",
+					"payload":    map[string]any{"used": 18400, "size": 200000},
+				},
+			},
+			{
+				OutboxSeq: 3,
+				EventID:   "ev_u_done",
+				FrameType: protocol.OutboxFrameState,
+				TS:        now + 20,
+				Payload: map[string]any{
+					"state":            string(protocol.AttemptSucceeded),
+					"completionSource": string(protocol.CompletionPromptEndTurn),
+					"tokenUsage": map[string]any{
+						"input":      1200,
+						"output":     350,
+						"cachedRead": 400,
+						"thought":    150,
+					},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("ingest usage outbox: %v", err)
+	}
+
+	tl, err := s.GetTaskTimeline(ctx, created.Task.TaskID, 0, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tl.Attempts) != 1 || tl.Attempts[0].TokenUsage == nil {
+		t.Fatalf("expected AttemptView.TokenUsage populated, got %+v", tl.Attempts)
+	}
+	tu := tl.Attempts[0].TokenUsage
+	if tu.Input != 1200 || tu.Output != 350 || tu.CachedRead != 400 || tu.Thought != 150 {
+		t.Fatalf("unexpected TokenUsage: %+v", tu)
+	}
+	if tl.ContextUsage == nil || tl.ContextUsage.Used != 18400 || tl.ContextUsage.Size != 200000 || tl.ContextUsage.AttemptID != created.Attempt.AttemptID {
+		t.Fatalf("unexpected ContextUsage: %+v", tl.ContextUsage)
+	}
+
+	// Locking/killing agent_sessions (e.g. after fold-rollover) resets live ContextUsage to nil
+	if _, err := s.LockTaskAgentSessions(ctx, created.Task.TaskID); err != nil {
+		t.Fatal(err)
+	}
+	tlAfterLock, err := s.GetTaskTimeline(ctx, created.Task.TaskID, 0, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tlAfterLock.ContextUsage != nil {
+		t.Fatalf("expected ContextUsage=nil after session locked/dead, got %+v", tlAfterLock.ContextUsage)
+	}
+}

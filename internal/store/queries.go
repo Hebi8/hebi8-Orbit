@@ -514,11 +514,14 @@ func (s *Store) ListProjectTasks(ctx context.Context, projectID string, archived
 	if len(archivedFilter) > 0 && strings.TrimSpace(archivedFilter[0]) != "" {
 		filter = archivedFilter[0]
 	}
+	orderClause := `ORDER BY t.updated_at DESC`
+	if strings.EqualFold(strings.TrimSpace(filter), "only") {
+		orderClause = `ORDER BY COALESCE(t.archived_at, t.updated_at) DESC, t.updated_at DESC`
+	}
 	tasks := []protocol.TaskSummary{}
 	rows, err := s.ro.QueryContext(ctx, taskSummarySelectSQL+`
 		WHERE t.project_id = ? AND `+archivedFilterSQL(filter)+`
-		ORDER BY t.updated_at DESC
-	`, projectID)
+		`+orderClause, projectID)
 	if err != nil {
 		return nil, err
 	}
@@ -626,7 +629,7 @@ func (s *Store) GetTaskTimeline(ctx context.Context, taskID string, beforeSeq in
 		// Attempts
 		aRows, err := tx.QueryContext(ctx, `
 			SELECT attempt_id, task_id, project_id, attempt_no, machine_id, adapter,
-			       part_id, location_id, isolation, folder_changes_json,
+			       part_id, location_id, isolation, folder_changes_json, token_usage_json,
 			       trigger_kind, trigger_payload_json, worktree_path, base_sha, output_delivery_id,
 			       state, completion_source, error_code, error_detail, started_at, finished_at
 			FROM attempts
@@ -854,9 +857,96 @@ func (s *Store) GetTaskTimeline(ctx context.Context, taskID string, beforeSeq in
 		for i, j := 0, len(resp.Events)-1; i < j; i, j = i+1, j-1 {
 			resp.Events[i], resp.Events[j] = resp.Events[j], resp.Events[i]
 		}
+
+		// Real ACP context window usage scoped to the task's latest live session.
+		if cu, cuErr := loadTaskLatestContextUsageTx(ctx, tx, taskID); cuErr == nil && cu != nil {
+			resp.ContextUsage = cu
+		}
 		return nil
 	})
 	return resp, err
+}
+
+func loadTaskLatestContextUsageTx(ctx context.Context, tx *sql.Tx, taskID string) (*protocol.ContextUsage, error) {
+	var latestSessionID sql.NullString
+	err := tx.QueryRowContext(ctx, `
+		SELECT wb_session_id
+		FROM attempts
+		WHERE task_id = ?
+		ORDER BY attempt_no DESC
+		LIMIT 1
+	`, taskID).Scan(&latestSessionID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	var query string
+	var args []any
+	if latestSessionID.Valid && strings.TrimSpace(latestSessionID.String) != "" {
+		sessID := strings.TrimSpace(latestSessionID.String)
+		var runtimeState string
+		var locked int
+		if sErr := tx.QueryRowContext(ctx, `
+			SELECT runtime_state, locked FROM agent_sessions WHERE wb_session_id = ?
+		`, sessID).Scan(&runtimeState, &locked); sErr == nil {
+			if locked != 0 || runtimeState == string(protocol.SessionDead) {
+				// Session was rolled over or closed (e.g. Hebi8 manual fold); context resets until a new attempt runs.
+				return nil, nil
+			}
+		}
+		query = `
+			SELECT e.attempt_id, e.payload_json, e.created_at
+			FROM events e
+			JOIN attempts a ON a.attempt_id = e.attempt_id
+			WHERE e.task_id = ? AND e.kind = ? AND a.wb_session_id = ?
+			ORDER BY e.seq DESC
+			LIMIT 20
+		`
+		args = []any{taskID, string(protocol.EventACPUsage), sessID}
+	} else {
+		query = `
+			SELECT attempt_id, payload_json, created_at
+			FROM events
+			WHERE task_id = ? AND kind = ?
+			ORDER BY seq DESC
+			LIMIT 20
+		`
+		args = []any{taskID, string(protocol.EventACPUsage)}
+	}
+
+	rows, err := tx.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var attID sql.NullString
+		var payloadRaw string
+		var createdAt int64
+		if err := rows.Scan(&attID, &payloadRaw, &createdAt); err != nil {
+			return nil, err
+		}
+		var doc struct {
+			Used int64 `json:"used"`
+			Size int64 `json:"size"`
+		}
+		if json.Unmarshal([]byte(payloadRaw), &doc) != nil || doc.Size <= 0 {
+			continue
+		}
+		cu := &protocol.ContextUsage{
+			Used:      doc.Used,
+			Size:      doc.Size,
+			UpdatedAt: createdAt,
+		}
+		if attID.Valid {
+			cu.AttemptID = attID.String
+		}
+		return cu, nil
+	}
+	return nil, rows.Err()
 }
 
 func extractBoundedPromptText(triggerPayloadJSON string) string {
@@ -982,12 +1072,12 @@ func truncatePromptText(prompt string) string {
 func scanAttemptView(scanner interface{ Scan(...any) error }) (protocol.AttemptView, error) {
 	var a protocol.AttemptView
 	var adapter, trigger, triggerPayloadJSON, state string
-	var partID, locationID, isolation, folderChangesJSON sql.NullString
+	var partID, locationID, isolation, folderChangesJSON, tokenUsageJSON sql.NullString
 	var worktree, baseSHA, outDlv, compSrc, errCode, errDetail sql.NullString
 	var finishedAt sql.NullInt64
 	if err := scanner.Scan(
 		&a.AttemptID, &a.TaskID, &a.ProjectID, &a.AttemptNo, &a.MachineID, &adapter,
-		&partID, &locationID, &isolation, &folderChangesJSON,
+		&partID, &locationID, &isolation, &folderChangesJSON, &tokenUsageJSON,
 		&trigger, &triggerPayloadJSON, &worktree, &baseSHA, &outDlv,
 		&state, &compSrc, &errCode, &errDetail, &a.StartedAt, &finishedAt,
 	); err != nil {
@@ -1007,6 +1097,13 @@ func scanAttemptView(scanner interface{ Scan(...any) error }) (protocol.AttemptV
 		var fc protocol.FolderChangesSummary
 		if json.Unmarshal([]byte(folderChangesJSON.String), &fc) == nil {
 			a.FolderChanges = &fc
+		}
+	}
+	if tokenUsageJSON.Valid && strings.TrimSpace(tokenUsageJSON.String) != "" {
+		var tu protocol.TokenUsage
+		if json.Unmarshal([]byte(tokenUsageJSON.String), &tu) == nil &&
+			(tu.Input > 0 || tu.Output > 0 || tu.CachedRead > 0 || tu.Thought > 0) {
+			a.TokenUsage = &tu
 		}
 	}
 	a.TriggerKind = protocol.TriggerKind(trigger)
@@ -1483,7 +1580,7 @@ func loadManualImportExisting(ctx context.Context, tx *sql.Tx, taskID, attemptID
 
 	aRow := tx.QueryRowContext(ctx, `
 		SELECT attempt_id, task_id, project_id, attempt_no, machine_id, adapter,
-		       part_id, location_id, isolation, folder_changes_json,
+		       part_id, location_id, isolation, folder_changes_json, token_usage_json,
 		       trigger_kind, trigger_payload_json, worktree_path, base_sha, output_delivery_id,
 		       state, completion_source, error_code, error_detail, started_at, finished_at
 		FROM attempts WHERE attempt_id = ?
@@ -2216,6 +2313,7 @@ func (s *Store) CompleteDeliveryReview(ctx context.Context, deliveryID, actorID 
 		}
 		changed, _ := res.RowsAffected()
 
+		resolvedAt := now
 		if changed > 0 {
 			if actorID == "" {
 				actorID = "human"
@@ -2238,13 +2336,283 @@ func (s *Store) CompleteDeliveryReview(ctx context.Context, deliveryID, actorID 
 				return err
 			}
 			emitted = &ev
+		} else {
+			var existingResolved sql.NullInt64
+			if err := tx.QueryRowContext(ctx, `SELECT resolved_at FROM inbox_items WHERE inbox_id = ?`, inboxID).Scan(&existingResolved); err == nil && existingResolved.Valid {
+				resolvedAt = existingResolved.Int64
+			}
 		}
 
 		resp = protocol.CompleteReviewResponse{
 			DeliveryID: deliveryID,
 			InboxID:    inboxID,
 			InboxState: protocol.InboxResolved,
-			ResolvedAt: now,
+			ResolvedAt: resolvedAt,
+		}
+		return nil
+	})
+	return resp, emitted, err
+}
+
+func canUndoDeliveryReviewTx(ctx context.Context, tx *sql.Tx, taskID, deliveryID string, resolvedAt int64) (bool, error) {
+	var archivedAt sql.NullInt64
+	if err := tx.QueryRowContext(ctx, `SELECT archived_at FROM tasks WHERE task_id = ?`, taskID).Scan(&archivedAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	if archivedAt.Valid {
+		return false, nil
+	}
+
+	var laterAttempts int
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM attempts
+		WHERE task_id = ? AND started_at > ?
+	`, taskID, resolvedAt).Scan(&laterAttempts); err != nil {
+		return false, err
+	}
+	if laterAttempts > 0 {
+		return false, nil
+	}
+
+	var laterInputs int
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM task_pending_inputs
+		WHERE task_id = ? AND state IN ('queued', 'dispatched') AND created_at > ?
+	`, taskID, resolvedAt).Scan(&laterInputs); err != nil {
+		return false, err
+	}
+	if laterInputs > 0 {
+		return false, nil
+	}
+
+	// Same-millisecond tie-breaker using strictly monotonic events.seq.
+	var cpSeq int64
+	evRows, err := tx.QueryContext(ctx, `
+		SELECT seq, payload_json
+		FROM events
+		WHERE task_id = ? AND kind = ?
+		ORDER BY seq DESC
+		LIMIT 20
+	`, taskID, string(protocol.EventDeliveryReviewCompleted))
+	if err != nil {
+		return false, err
+	}
+	for evRows.Next() {
+		var seq int64
+		var raw string
+		if err := evRows.Scan(&seq, &raw); err != nil {
+			evRows.Close()
+			return false, err
+		}
+		var doc struct {
+			DeliveryID string `json:"deliveryId"`
+		}
+		if json.Unmarshal([]byte(raw), &doc) == nil && doc.DeliveryID == deliveryID {
+			cpSeq = seq
+			break
+		}
+	}
+	if err := evRows.Err(); err != nil {
+		evRows.Close()
+		return false, err
+	}
+	evRows.Close()
+
+	if cpSeq > 0 {
+		var postAttemptEvs int
+		if err := tx.QueryRowContext(ctx, `
+			SELECT COUNT(*) FROM events
+			WHERE task_id = ? AND seq > ? AND kind = ?
+		`, taskID, cpSeq, string(protocol.EventAttemptStarted)).Scan(&postAttemptEvs); err != nil {
+			return false, err
+		}
+		if postAttemptEvs > 0 {
+			return false, nil
+		}
+
+		qRows, err := tx.QueryContext(ctx, `
+			SELECT payload_json
+			FROM events
+			WHERE task_id = ? AND seq > ? AND kind = ?
+		`, taskID, cpSeq, string(protocol.EventQueueUpdated))
+		if err != nil {
+			return false, err
+		}
+		defer qRows.Close()
+		for qRows.Next() {
+			var raw string
+			if err := qRows.Scan(&raw); err != nil {
+				return false, err
+			}
+			var doc struct {
+				Action  string `json:"action"`
+				InputID string `json:"inputId"`
+			}
+			if json.Unmarshal([]byte(raw), &doc) != nil {
+				continue
+			}
+			switch doc.Action {
+			case "deleted", "cancelled", "reordered", "updated":
+				continue
+			default:
+				if strings.TrimSpace(doc.InputID) != "" {
+					var activeCount int
+					if err := tx.QueryRowContext(ctx, `
+						SELECT COUNT(*) FROM task_pending_inputs
+						WHERE input_id = ? AND state IN ('queued', 'dispatched')
+					`, doc.InputID).Scan(&activeCount); err == nil && activeCount > 0 {
+						return false, nil
+					}
+				} else {
+					return false, nil
+				}
+			}
+		}
+		if err := qRows.Err(); err != nil {
+			return false, err
+		}
+	}
+	return true, nil
+}
+
+// GetDeliveryReviewState returns the delivery_review inbox state, resolved timestamp (if resolved),
+// and whether the Checkpoint can still be undone (true only while resolved and before any subsequent message/attempt).
+func (s *Store) GetDeliveryReviewState(ctx context.Context, deliveryID string) (protocol.InboxState, *int64, bool, error) {
+	var state protocol.InboxState
+	var resolvedAtPtr *int64
+	var canUndo bool
+	err := s.WithReadTx(ctx, func(tx *sql.Tx) error {
+		var taskID string
+		if err := tx.QueryRowContext(ctx, `SELECT task_id FROM deliveries WHERE delivery_id = ?`, deliveryID).Scan(&taskID); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrNotFound
+			}
+			return err
+		}
+		var stateStr string
+		var resolvedAt sql.NullInt64
+		err := tx.QueryRowContext(ctx, `
+			SELECT state, resolved_at FROM inbox_items WHERE inbox_id = ?
+		`, "inb:dlv:"+deliveryID).Scan(&stateStr, &resolvedAt)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		state = protocol.InboxState(stateStr)
+		if resolvedAt.Valid {
+			v := resolvedAt.Int64
+			resolvedAtPtr = &v
+		}
+		if state == protocol.InboxResolved && resolvedAt.Valid {
+			ok, uErr := canUndoDeliveryReviewTx(ctx, tx, taskID, deliveryID, resolvedAt.Int64)
+			if uErr != nil {
+				return uErr
+			}
+			canUndo = ok
+		}
+		return nil
+	})
+	return state, resolvedAtPtr, canUndo, err
+}
+
+// ReopenDeliveryReview undoes a Checkpoint (reverts inbox_items from resolved back to open)
+// ONLY if no subsequent message or attempt was sent on the task after Checkpoint was clicked.
+func (s *Store) ReopenDeliveryReview(ctx context.Context, deliveryID, actorID string) (protocol.CompleteReviewResponse, *protocol.EventRecord, error) {
+	var resp protocol.CompleteReviewResponse
+	var emitted *protocol.EventRecord
+	now := time.Now().UnixMilli()
+
+	err := s.WithWriteTx(ctx, func(tx *sql.Tx) error {
+		var projectID, taskID string
+		if err := tx.QueryRowContext(ctx, `SELECT project_id, task_id FROM deliveries WHERE delivery_id = ?`, deliveryID).Scan(&projectID, &taskID); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrNotFound
+			}
+			return err
+		}
+
+		inboxID := "inb:dlv:" + deliveryID
+		var stateStr string
+		var resolvedAt sql.NullInt64
+		if err := tx.QueryRowContext(ctx, `SELECT state, resolved_at FROM inbox_items WHERE inbox_id = ?`, inboxID).Scan(&stateStr, &resolvedAt); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrNotFound
+			}
+			return err
+		}
+
+		curState := protocol.InboxState(stateStr)
+		if curState == protocol.InboxOpen {
+			resp = protocol.CompleteReviewResponse{
+				DeliveryID: deliveryID,
+				InboxID:    inboxID,
+				InboxState: protocol.InboxOpen,
+				ResolvedAt: 0,
+			}
+			return nil
+		}
+		if curState != protocol.InboxResolved {
+			return fmt.Errorf("%w: delivery review state is %s", ErrConflict, curState)
+		}
+
+		var taskArchived sql.NullInt64
+		if err := tx.QueryRowContext(ctx, `SELECT archived_at FROM tasks WHERE task_id = ?`, taskID).Scan(&taskArchived); err != nil {
+			return err
+		}
+		if taskArchived.Valid {
+			return fmt.Errorf("%w: task %s is archived", ErrTaskArchived, taskID)
+		}
+
+		canUndo, err := canUndoDeliveryReviewTx(ctx, tx, taskID, deliveryID, resolvedAt.Int64)
+		if err != nil {
+			return err
+		}
+		if !canUndo {
+			return fmt.Errorf("%w: checkpoint cannot be undone after sending a follow-up message", ErrCheckpointLocked)
+		}
+
+		res, err := tx.ExecContext(ctx, `
+			UPDATE inbox_items
+			SET state = 'open', resolved_at = NULL, updated_at = ?
+			WHERE inbox_id = ? AND state = 'resolved'
+		`, now, inboxID)
+		if err != nil {
+			return err
+		}
+		if changed, _ := res.RowsAffected(); changed > 0 {
+			if actorID == "" {
+				actorID = "human"
+			}
+			ev, err := insertEventTx(ctx, tx, eventInsert{
+				StreamID:   "task:" + taskID,
+				ProjectID:  projectID,
+				TaskID:     taskID,
+				ActorKind:  protocol.ActorHuman,
+				ActorID:    actorID,
+				Kind:       protocol.EventDeliveryReviewReopened,
+				Visibility: protocol.VisibilityInbox,
+				Payload: map[string]any{
+					"deliveryId": deliveryID,
+					"inboxId":    inboxID,
+				},
+				CreatedAt: now,
+			})
+			if err != nil {
+				return err
+			}
+			emitted = &ev
+		}
+
+		resp = protocol.CompleteReviewResponse{
+			DeliveryID: deliveryID,
+			InboxID:    inboxID,
+			InboxState: protocol.InboxOpen,
+			ResolvedAt: 0,
 		}
 		return nil
 	})

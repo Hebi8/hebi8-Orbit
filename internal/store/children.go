@@ -17,7 +17,7 @@ import (
 )
 
 const (
-	maxDelegationDepth         = 4
+	maxDelegationDepth         = 1
 	maxActiveChildrenPerParent = 12
 	childPreviewMaxRunes       = 240
 	transcriptReplyMaxRunes    = 4000
@@ -600,12 +600,52 @@ func isDescendantTaskTx(ctx context.Context, tx *sql.Tx, ancestorTaskID, targetT
 	return matched > 0, err
 }
 
+// IsSiblingTask reports whether taskA and taskB are distinct child tasks sharing the same non-empty parent_task_id.
+func (s *Store) IsSiblingTask(ctx context.Context, taskA, taskB string) (bool, error) {
+	var matched bool
+	err := s.WithReadTx(ctx, func(tx *sql.Tx) error {
+		var err error
+		matched, err = isSiblingTaskTx(ctx, tx, taskA, taskB)
+		return err
+	})
+	return matched, err
+}
+
+func isSiblingTaskTx(ctx context.Context, tx *sql.Tx, taskA, taskB string) (bool, error) {
+	taskA = strings.TrimSpace(taskA)
+	taskB = strings.TrimSpace(taskB)
+	if taskA == "" || taskB == "" || taskA == taskB {
+		return false, nil
+	}
+	var parentA, parentB sql.NullString
+	if err := tx.QueryRowContext(ctx, `SELECT parent_task_id FROM tasks WHERE task_id = ?`, taskA).Scan(&parentA); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	if !parentA.Valid || strings.TrimSpace(parentA.String) == "" {
+		return false, nil
+	}
+	if err := tx.QueryRowContext(ctx, `SELECT parent_task_id FROM tasks WHERE task_id = ?`, taskB).Scan(&parentB); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	if !parentB.Valid || strings.TrimSpace(parentB.String) == "" {
+		return false, nil
+	}
+	return parentA.String == parentB.String, nil
+}
+
 // RunnerParentControlGuard carries the runner machine & parent attempt identity to be verified
 // atomically INSIDE delegate write transactions (spawn, send, cancel).
 type RunnerParentControlGuard struct {
 	MachineID       string
 	ParentTaskID    string
 	ParentAttemptID string
+	AllowSibling    bool
 }
 
 func verifyRunnerParentControlTx(ctx context.Context, tx *sql.Tx, g *RunnerParentControlGuard) error {

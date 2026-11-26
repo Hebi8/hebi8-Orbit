@@ -481,3 +481,75 @@ func TestPackageCheckpoint_UnregisteredNestedGitRepoRejected(t *testing.T) {
 		t.Fatalf("expected error to name offending path vendor/nested-lib, got: %v", err)
 	}
 }
+
+func TestListSubdirsDefaultsAndStructuredErrors(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Skip("no home dir")
+	}
+	realHome, err := filepath.EvalSymlinks(home)
+	if err != nil {
+		realHome = filepath.Clean(home)
+	}
+
+	// Empty path and "~" both resolve cleanly to homePath when allowedRoots is empty
+	for _, raw := range []string{"", "~"} {
+		out, err := gitops.ListSubdirs(raw, nil, false)
+		if err != nil {
+			t.Fatalf("ListSubdirs(%q) failed: %v", raw, err)
+		}
+		if out.Path != realHome || out.HomePath != realHome {
+			t.Fatalf("ListSubdirs(%q) got path=%q home=%q want %q", raw, out.Path, out.HomePath, realHome)
+		}
+	}
+
+	// Restricted allowedRoots outside $HOME:
+	root := t.TempDir()
+	realRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		realRoot = filepath.Clean(root)
+	}
+	sub := filepath.Join(root, "alpha")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	filePath := filepath.Join(root, "file.txt")
+	if err := os.WriteFile(filePath, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Empty path lands on the first existing allowed root
+	out, err := gitops.ListSubdirs("", []string{root}, false)
+	if err != nil || out.Path != realRoot || len(out.Entries) != 1 || out.Entries[0].Name != "alpha" {
+		t.Fatalf("unexpected restricted ListSubdirs(''): out=%+v err=%v", out, err)
+	}
+
+	// Missing directory inside allowedRoot -> ErrDirNotFound (404)
+	_, err = gitops.ListSubdirs(filepath.Join(root, "no-such-dir"), []string{root}, false)
+	if !errors.Is(err, gitops.ErrDirNotFound) {
+		t.Fatalf("expected ErrDirNotFound, got %v", err)
+	}
+	if code, status := gitops.ClassifyBrowseError(err); code != "ERR_DIR_NOT_FOUND" || status != 404 {
+		t.Fatalf("unexpected ClassifyBrowseError for missing dir: code=%q status=%d", code, status)
+	}
+
+	// Non-directory file inside allowedRoot -> ErrNotADirectory (400)
+	_, err = gitops.ListSubdirs(filePath, []string{root}, false)
+	if !errors.Is(err, gitops.ErrNotADirectory) {
+		t.Fatalf("expected ErrNotADirectory, got %v", err)
+	}
+	if code, status := gitops.ClassifyBrowseError(err); code != "ERR_NOT_A_DIRECTORY" || status != 400 {
+		t.Fatalf("unexpected ClassifyBrowseError for file: code=%q status=%d", code, status)
+	}
+
+	// Path outside allowedRoot (including non-existent path outside root) -> ErrPathOutsideRoot (403)
+	for _, outside := range []string{"/etc", "/etc/orbit-nonexistent-xyz"} {
+		_, err = gitops.ListSubdirs(outside, []string{root}, false)
+		if !errors.Is(err, gitops.ErrPathOutsideRoot) {
+			t.Fatalf("expected ErrPathOutsideRoot for %q, got %v", outside, err)
+		}
+		if code, status := gitops.ClassifyBrowseError(err); code != "ERR_PATH_OUTSIDE_ROOT" || status != 403 {
+			t.Fatalf("unexpected ClassifyBrowseError for %q: code=%q status=%d", outside, code, status)
+		}
+	}
+}

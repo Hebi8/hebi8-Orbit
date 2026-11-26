@@ -298,6 +298,7 @@ func (s *Server) handleUpdateMachine(w http.ResponseWriter, r *http.Request) {
 			writeAPIError(w, http.StatusInternalServerError, "ERR_UPDATE_MACHINE", err.Error())
 			return
 		}
+		_ = s.refreshEffectiveRegistry(context.WithoutCancel(r.Context()))
 		s.broker.Broadcast(ev)
 	}
 	s.handleListMachines(w, r)
@@ -553,7 +554,8 @@ func (s *Server) handleListMachineDirs(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if !res.OK {
-			writeAPIError(w, http.StatusBadRequest, "ERR_LIST_DIRS", res.Error)
+			code, status := browseErrorFromRPCResult(res)
+			writeAPIError(w, status, code, res.Error)
 			return
 		}
 		var out protocol.ListDirsResponse
@@ -572,7 +574,8 @@ func (s *Server) handleListMachineDirs(w http.ResponseWriter, r *http.Request) {
 	if mCfg.Transport == protocol.TransportLocalWS {
 		out, err := gitops.ListSubdirs(reqPath, allowedRoots, false)
 		if err != nil {
-			writeAPIError(w, http.StatusBadRequest, "ERR_LIST_DIRS", err.Error())
+			code, status := gitops.ClassifyBrowseError(err)
+			writeAPIError(w, status, code, err.Error())
 			return
 		}
 		out.MachineID = machineID
@@ -581,6 +584,36 @@ func (s *Server) handleListMachineDirs(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeAPIError(w, http.StatusServiceUnavailable, "ERR_MACHINE_OFFLINE", "machine runner is not connected")
+}
+
+func browseErrorFromRPCResult(res protocol.RunnerRPCResultFrame) (code string, status int) {
+	if rawCode, ok := res.Data["errorCode"].(string); ok && strings.TrimSpace(rawCode) != "" {
+		switch strings.TrimSpace(rawCode) {
+		case "ERR_PATH_OUTSIDE_ROOT":
+			return "ERR_PATH_OUTSIDE_ROOT", http.StatusForbidden
+		case "ERR_DIR_NOT_FOUND":
+			return "ERR_DIR_NOT_FOUND", http.StatusNotFound
+		case "ERR_NOT_A_DIRECTORY":
+			return "ERR_NOT_A_DIRECTORY", http.StatusBadRequest
+		case "ERR_PERMISSION_DENIED":
+			return "ERR_PERMISSION_DENIED", http.StatusForbidden
+		default:
+			return strings.TrimSpace(rawCode), http.StatusBadRequest
+		}
+	}
+	lower := strings.ToLower(res.Error)
+	switch {
+	case strings.Contains(lower, "outside allowed root"):
+		return "ERR_PATH_OUTSIDE_ROOT", http.StatusForbidden
+	case strings.Contains(lower, "does not exist") || strings.Contains(lower, "no such file"):
+		return "ERR_DIR_NOT_FOUND", http.StatusNotFound
+	case strings.Contains(lower, "not a directory"):
+		return "ERR_NOT_A_DIRECTORY", http.StatusBadRequest
+	case strings.Contains(lower, "permission denied"):
+		return "ERR_PERMISSION_DENIED", http.StatusForbidden
+	default:
+		return "ERR_LIST_DIRS", http.StatusBadRequest
+	}
 }
 
 func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {

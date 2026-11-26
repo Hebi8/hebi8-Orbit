@@ -1043,3 +1043,153 @@ machines:
 		t.Fatalf("expected orphan seg_deadc0de.json cleaned up on fold, err=%v", err)
 	}
 }
+
+func TestHebi8ManualFoldResetsHeadAndTracksUpdatedTopLevelTasks(t *testing.T) {
+	ctx := context.Background()
+	srv, st, cfgDir, _ := setupTestHub(t, func(c *protocol.HubConfig) {
+		c.DevOpen = true
+	}, &fakeRyugiRunner{})
+
+	if err := os.WriteFile(filepath.Join(cfgDir, "machines.yaml"), []byte(`schemaVersion: 1
+machines:
+  hub-node:
+    displayName: "hub-node"
+    transport: local_ws
+    capabilities: [primary-dev]
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cfgDir, "projects.yaml"), []byte(`schemaVersion: 1
+projects:
+  demo-app:
+    displayName: "Demo App"
+    repoIdentity: "demo-app"
+    defaultBranch: "main"
+    defaultCapability: "primary-dev"
+    defaultAdapter: "agy"
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := srv.ReloadConfig(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	doReq := func(method, path string, body any) *httptest.ResponseRecorder {
+		t.Helper()
+		var buf bytes.Buffer
+		if body != nil {
+			_ = json.NewEncoder(&buf).Encode(body)
+		}
+		req := httptest.NewRequest(method, "http://127.0.0.1:4310"+path, &buf)
+		req.RemoteAddr = "127.0.0.1:50200"
+		req.Header.Set("X-Orbit-Request", "1")
+		if body != nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		rec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rec, req)
+		return rec
+	}
+
+	// Create 2 active top-level tasks, 1 child task, and 1 archived top-level task
+	t1, err := st.CreateTask(ctx, store.CreateTaskParams{ProjectID: "demo-app", Title: "Top 1", Goal: "g1", MachineID: "hub-node"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t2, err := st.CreateTask(ctx, store.CreateTaskParams{ProjectID: "demo-app", Title: "Top 2", Goal: "g2", MachineID: "hub-node"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	child1, err := st.CreateTask(ctx, store.CreateTaskParams{ProjectID: "demo-app", ParentTaskID: t1.Task.TaskID, Title: "Child 1", Goal: "gc", MachineID: "hub-node"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tArch, err := st.CreateTask(ctx, store.CreateTaskParams{ProjectID: "demo-app", Title: "Archived Top", Goal: "ga", MachineID: "hub-node"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.ArchiveTask(ctx, tArch.Task.TaskID, "human"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Before any Hebi8 turn: updatedTopLevelTaskCount == 2 (excludes child1 & tArch), pendingTurns == 0
+	rec := doReq(http.MethodGet, "/api/hebi8/main", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /api/hebi8/main failed: %d %s", rec.Code, rec.Body.String())
+	}
+	var main0 protocol.Hebi8MainResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &main0)
+	if main0.UpdatedTopLevelTaskCount != 2 || main0.LastHebi8TurnAt != nil || main0.PendingTurnsSinceLastFold != 0 || main0.LineSummary.PendingTurns == nil || *main0.LineSummary.PendingTurns != 0 {
+		t.Fatalf("unexpected initial hebi8/main: count=%d lastTurn=%v pending=%d summaryPending=%v",
+			main0.UpdatedTopLevelTaskCount, main0.LastHebi8TurnAt, main0.PendingTurnsSinceLastFold, main0.LineSummary.PendingTurns)
+	}
+
+	// Empty fold must be rejected with 400 ERR_NOTHING_TO_FOLD
+	rec = doReq(http.MethodPost, "/api/hebi8/fold", map[string]any{})
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "ERR_NOTHING_TO_FOLD") {
+		t.Fatalf("expected 400 ERR_NOTHING_TO_FOLD on empty fold, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// Seed 1 completed Hebi8 turn with finished_at AFTER t1/t2 updates -> pending=1, updatedTopLevelTaskCount=0
+	turnFinish := time.Now().UnixMilli() + 500
+	if _, err := st.WriteDB().ExecContext(ctx, `
+		INSERT INTO attempts (
+			attempt_id, task_id, project_id, attempt_no, machine_id, adapter,
+			trigger_kind, trigger_payload_json, state, lease_token, lease_expires_at, started_at, finished_at
+		) VALUES ('att_h_1', ?, ?, 1, 'hub-node', 'agy', 'followup', '{"prompt":"汇总一下"}', 'succeeded', 'lt', ?, ?, ?)
+	`, main0.Task.TaskID, protocol.PAProjectID, turnFinish+60000, turnFinish-10, turnFinish); err != nil {
+		t.Fatal(err)
+	}
+
+	rec = doReq(http.MethodGet, "/api/hebi8/main", nil)
+	var main1 protocol.Hebi8MainResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &main1)
+	if main1.PendingTurnsSinceLastFold != 1 || main1.LineSummary.PendingTurns == nil || *main1.LineSummary.PendingTurns != 1 || main1.LastHebi8TurnAt == nil || *main1.LastHebi8TurnAt != turnFinish || main1.UpdatedTopLevelTaskCount != 0 {
+		t.Fatalf("unexpected hebi8/main after 1 turn: %+v", main1)
+	}
+
+	// Updating child1 MUST NOT increment updatedTopLevelTaskCount; updating t2 increments it to 1
+	if _, err := st.WriteDB().ExecContext(ctx, `UPDATE tasks SET updated_at = ? WHERE task_id = ?`, turnFinish+100, child1.Task.TaskID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.WriteDB().ExecContext(ctx, `UPDATE tasks SET updated_at = ? WHERE task_id = ?`, turnFinish+200, t2.Task.TaskID); err != nil {
+		t.Fatal(err)
+	}
+	rec = doReq(http.MethodGet, "/api/hebi8/main", nil)
+	var mainAfterTopUpdate protocol.Hebi8MainResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &mainAfterTopUpdate)
+	if mainAfterTopUpdate.UpdatedTopLevelTaskCount != 1 {
+		t.Fatalf("expected updatedTopLevelTaskCount=1 (ignoring child updates), got %d", mainAfterTopUpdate.UpdatedTopLevelTaskCount)
+	}
+
+	// Manual fold -> resets HEAD pendingTurns to 0 across /fold, /main, and /line
+	rec = doReq(http.MethodPost, "/api/hebi8/fold", map[string]any{})
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("manual fold failed: %d %s", rec.Code, rec.Body.String())
+	}
+	var foldResp protocol.Hebi8FoldResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &foldResp)
+	if foldResp.PendingTurnsSinceLastFold != 0 || foldResp.LineSummary.PendingTurns == nil || *foldResp.LineSummary.PendingTurns != 0 {
+		t.Fatalf("expected pendingTurns=0 after fold, got pending=%d summary=%v", foldResp.PendingTurnsSinceLastFold, foldResp.LineSummary.PendingTurns)
+	}
+
+	rec = doReq(http.MethodGet, "/api/hebi8/line", nil)
+	var lineResp protocol.Hebi8LineResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &lineResp)
+	if lineResp.PendingTurnsSinceLastFold != 0 || lineResp.LineSummary.PendingTurns == nil || *lineResp.LineSummary.PendingTurns != 0 {
+		t.Fatalf("expected /hebi8/line pendingTurns=0 after fold, got pending=%d summary=%v", lineResp.PendingTurnsSinceLastFold, lineResp.LineSummary.PendingTurns)
+	}
+
+	rec = doReq(http.MethodGet, "/api/hebi8/main", nil)
+	var mainAfterFold protocol.Hebi8MainResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &mainAfterFold)
+	if mainAfterFold.PendingTurnsSinceLastFold != 0 || mainAfterFold.LineSummary.PendingTurns == nil || *mainAfterFold.LineSummary.PendingTurns != 0 {
+		t.Fatalf("expected /hebi8/main pendingTurns=0 after fold, got pending=%d summary=%v", mainAfterFold.PendingTurnsSinceLastFold, mainAfterFold.LineSummary.PendingTurns)
+	}
+
+	// Immediate second fold MUST be rejected with 400 ERR_NOTHING_TO_FOLD
+	rec = doReq(http.MethodPost, "/api/hebi8/fold", map[string]any{})
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "ERR_NOTHING_TO_FOLD") {
+		t.Fatalf("expected 400 ERR_NOTHING_TO_FOLD on repeat fold, got %d: %s", rec.Code, rec.Body.String())
+	}
+}

@@ -5053,7 +5053,9 @@ func (r *Runner) handleRunnerRPC(ctx context.Context, req protocol.RunnerRPCFram
 		pathArg, _ := req.Args["path"].(string)
 		out, err := gitops.ListSubdirs(pathArg, r.effectiveBrowseRoots(req.Args), false)
 		if err != nil {
+			code, _ := gitops.ClassifyBrowseError(err)
 			res.Error = err.Error()
+			res.Data = map[string]any{"errorCode": code}
 		} else {
 			res.OK = true
 			raw, _ := json.Marshal(out)

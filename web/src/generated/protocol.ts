@@ -84,7 +84,7 @@ export type InboxCategory = (typeof InboxCategoryValues)[number];
 export const InboxStateValues = ["open", "resolved", "dismissed"] as const;
 export type InboxState = (typeof InboxStateValues)[number];
 
-export const EventKindValues = ["task.created", "task.state_changed", "task.cancelled", "task.archived", "task.unarchived", "task.deleted", "attempt.started", "attempt.state_changed", "attempt.finished", "resource.waiting", "resource.acquired", "delivery.published", "delivery.verified", "delivery.ryugi_updated", "delivery.review_completed", "annotation.created", "annotation.addressed", "approval.requested", "approval.decided", "approval.expired", "approval.consumed", "deploy.started", "deploy.verified", "deploy.failed", "acp.message_batch", "acp.thought_batch", "acp.tool_call", "acp.unsolicited_update", "acp.usage", "pa.turn", "pa.action_executed", "pa.thread_created", "board.message_posted", "board.member_updated", "queue.updated", "task.project_bound", "task.source_added", "task.source_removed", "machine.state_changed", "pairing.updated", "machine.agents_updated", "project.changed", "network.settings_changed", "hebi8.folded", "task.child_spawned", "task.child_updated"] as const;
+export const EventKindValues = ["task.created", "task.state_changed", "task.cancelled", "task.archived", "task.unarchived", "task.deleted", "attempt.started", "attempt.state_changed", "attempt.finished", "resource.waiting", "resource.acquired", "delivery.published", "delivery.verified", "delivery.ryugi_updated", "delivery.review_completed", "delivery.review_reopened", "annotation.created", "annotation.addressed", "approval.requested", "approval.decided", "approval.expired", "approval.consumed", "deploy.started", "deploy.verified", "deploy.failed", "acp.message_batch", "acp.thought_batch", "acp.tool_call", "acp.unsolicited_update", "acp.usage", "pa.turn", "pa.action_executed", "pa.thread_created", "board.message_posted", "board.member_updated", "queue.updated", "task.project_bound", "task.source_added", "task.source_removed", "machine.state_changed", "pairing.updated", "machine.agents_updated", "project.changed", "network.settings_changed", "hebi8.folded", "task.child_spawned", "task.child_updated"] as const;
 export type EventKind = (typeof EventKindValues)[number];
 
 export const IDESchemeValues = ["cursor", "vscode", "zed", "antigravity"] as const;
@@ -553,6 +553,20 @@ export interface ChildTaskView {
   archivedAt?: number | null;
 }
 
+export interface TokenUsage {
+  input?: number;
+  output?: number;
+  cachedRead?: number;
+  thought?: number;
+}
+
+export interface ContextUsage {
+  used: number;
+  size: number;
+  attemptId?: string;
+  updatedAt: number;
+}
+
 export interface AttemptView {
   attemptId: string;
   taskId: string;
@@ -571,6 +585,7 @@ export interface AttemptView {
   baseSha?: string;
   outputDeliveryId?: string;
   folderChanges?: FolderChangesSummary | null;
+  tokenUsage?: TokenUsage | null;
   state: AttemptState;
   completionSource?: CompletionSource | null;
   errorCode?: string;
@@ -731,6 +746,7 @@ export interface WorkerStreamResponse {
 export interface TaskTimelineResponse {
   task: TaskSummary;
   runtimeConfig?: Record<string, string>;
+  contextUsage?: ContextUsage | null;
   parentSummary?: ParentTaskRef | null;
   children?: ChildTaskView[];
   siblingChildren?: ChildTaskView[];
@@ -759,6 +775,9 @@ export interface DeliveryDetailResponse {
   annotations: AnnotationView[];
   diffFiles: DiffFileStat[];
   project: ProjectView;
+  reviewState?: InboxState;
+  reviewResolvedAt?: number | null;
+  canUndoReview?: boolean;
 }
 
 export interface DeliveryDiffResponse {
@@ -1340,6 +1359,12 @@ export interface CreateProjectPartRequest {
   absPath?: string;
 }
 
+export interface UpdateProjectPartRequest {
+  name?: string | null;
+  kind?: ProjectPartKind | null;
+  sortOrder?: number | null;
+}
+
 export interface CreateProjectLocationRequest {
   machineId: string;
   absPath: string;
@@ -1478,6 +1503,8 @@ export interface Hebi8LineSummary {
   foldCount: number;
   pinnedCount: number;
   maxLevel: number;
+  pendingTurns?: number | null;
+  pendingChars?: number | null;
   lastFoldedAt?: string;
   lastFoldedAttemptNo?: number;
   shouldSuggestFold?: boolean;
@@ -1490,6 +1517,8 @@ export interface Hebi8MainResponse {
   pins: string[];
   pendingTurnsSinceLastFold: number;
   pendingCharsSinceLastFold: number;
+  lastHebi8TurnAt?: number | null;
+  updatedTopLevelTaskCount: number;
 }
 
 export interface Hebi8FoldRequest {
@@ -1506,6 +1535,8 @@ export interface Hebi8FoldResponse {
   nodes: Hebi8LineNode[];
   pins: string[];
   lineSummary: Hebi8LineSummary;
+  pendingTurnsSinceLastFold: number;
+  pendingCharsSinceLastFold: number;
 }
 
 export interface Hebi8LineResponse {
@@ -1513,6 +1544,8 @@ export interface Hebi8LineResponse {
   nodes: Hebi8LineNode[];
   pins: string[];
   lineSummary: Hebi8LineSummary;
+  pendingTurnsSinceLastFold: number;
+  pendingCharsSinceLastFold: number;
 }
 
 export interface Hebi8RawTurn {

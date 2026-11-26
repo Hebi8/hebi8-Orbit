@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -216,5 +217,121 @@ func TestV6MigrationAndThreeLevelProjects(t *testing.T) {
 	_ = stUp.Close()
 	if _, err := os.Stat(v5Path + ".pre-v6.bak"); err != nil {
 		t.Fatalf("expected .pre-v6.bak backup file: %v", err)
+	}
+}
+
+func TestProjectPartUpdateAndKeepEmptyPartOnDeleteLastLocation(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	st, err := Open(ctx, filepath.Join(tmpDir, "orbit.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	err = st.SyncRegistry(ctx, tmpDir, protocol.ProjectsConfig{
+		Projects: map[string]protocol.ProjectConfig{
+			"orbit": {
+				DisplayName:       "hebi8-Orbit",
+				RepoIdentity:      "github.com/hebi8/hebi8-orbit",
+				DefaultBranch:     "main",
+				DefaultCapability: "primary-dev",
+				DefaultAdapter:    protocol.AdapterAgy,
+				Anchors: map[string]protocol.ProjectAnchorConfig{
+					"primary-dev": {Machine: "hub-node", RepoPath: "/home/orbit/repo"},
+				},
+			},
+		},
+	}, protocol.MachinesConfig{
+		Machines: map[string]protocol.MachineConfig{
+			"hub-node": {
+				DisplayName:  "hub-node",
+				Transport:    protocol.TransportLocalWS,
+				Capabilities: []string{"primary-dev"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	proj, err := st.GetProject(ctx, "orbit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(proj.Parts) != 1 || len(proj.Parts[0].Locations) != 1 {
+		t.Fatalf("expected 1 part with 1 location, got %+v", proj.Parts)
+	}
+	part1 := proj.Parts[0]
+	loc1 := part1.Locations[0]
+
+	// Update part name & sort order independently
+	newName := "Core Backend"
+	newOrder := 5
+	proj, updatedPart, ev, err := st.UpdateProjectPart(ctx, "orbit", part1.PartID, protocol.UpdateProjectPartRequest{
+		Name:      &newName,
+		SortOrder: &newOrder,
+	}, "human")
+	if err != nil {
+		t.Fatalf("UpdateProjectPart failed: %v", err)
+	}
+	if updatedPart.Name != "Core Backend" || updatedPart.SortOrder != 5 || ev.Kind != protocol.EventProjectChanged {
+		t.Fatalf("unexpected updated part=%+v ev=%+v", updatedPart, ev)
+	}
+
+	// Empty name rejected with ErrInvalidInput; missing part returns ErrNotFound
+	blank := "   "
+	if _, _, _, err := st.UpdateProjectPart(ctx, "orbit", part1.PartID, protocol.UpdateProjectPartRequest{Name: &blank}, "human"); !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("expected ErrInvalidInput for blank part name, got %v", err)
+	}
+	if _, _, _, err := st.UpdateProjectPart(ctx, "orbit", "part_missing", protocol.UpdateProjectPartRequest{Name: &newName}, "human"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected ErrNotFound for unknown part, got %v", err)
+	}
+
+	// Add a second part with 1 location, then delete the last location of part1:
+	// part1 MUST remain with empty non-nil Locations slice, and anchors mirror shifts to part2.
+	proj, part2, _, err := st.CreateProjectPart(ctx, "orbit", "Design Docs", protocol.ProjectPartFolder, "", "hub-node", "/home/orbit/docs", nil, "human")
+	if err != nil {
+		t.Fatal(err)
+	}
+	proj, _, err = st.DeleteProjectLocation(ctx, "orbit", part1.PartID, loc1.LocationID, "human")
+	if err != nil {
+		t.Fatalf("delete last location of part1: %v", err)
+	}
+	if len(proj.Parts) != 2 {
+		t.Fatalf("deleting last location must retain part, got %d parts", len(proj.Parts))
+	}
+	var foundPart1 *protocol.ProjectPartView
+	for i := range proj.Parts {
+		if proj.Parts[i].PartID == part1.PartID {
+			foundPart1 = &proj.Parts[i]
+		}
+	}
+	if foundPart1 == nil || foundPart1.Locations == nil || len(foundPart1.Locations) != 0 {
+		t.Fatalf("expected part1 retained with empty non-nil locations slice, got %+v", foundPart1)
+	}
+	if proj.Anchors["primary-dev"].RepoPath != "/home/orbit/docs" {
+		t.Fatalf("expected anchors mirror to fall back to part2 location, got %+v", proj.Anchors)
+	}
+
+	// Delete last location of part2 as well -> both parts retained empty AND stale anchors cleared!
+	proj, _, err = st.DeleteProjectLocation(ctx, "orbit", part2.PartID, part2.Locations[0].LocationID, "human")
+	if err != nil {
+		t.Fatalf("delete last location of part2: %v", err)
+	}
+	if len(proj.Parts) != 2 {
+		t.Fatalf("expected both empty parts retained, got %d", len(proj.Parts))
+	}
+	if len(proj.Anchors) != 0 {
+		t.Fatalf("expected anchors mirror cleared when zero locations remain, got %+v", proj.Anchors)
+	}
+
+	// Explicit DeleteProjectPart removes the entire part
+	proj, _, err = st.DeleteProjectPart(ctx, "orbit", part1.PartID, "human")
+	if err != nil {
+		t.Fatalf("delete part1: %v", err)
+	}
+	if len(proj.Parts) != 1 || proj.Parts[0].PartID != part2.PartID {
+		t.Fatalf("expected only part2 remaining after DeleteProjectPart, got %+v", proj.Parts)
 	}
 }

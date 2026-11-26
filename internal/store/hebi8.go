@@ -129,6 +129,38 @@ func isHebi8MainTaskTx(ctx context.Context, tx *sql.Tx, taskID string) (bool, er
 	return strings.TrimSpace(doc.TaskID) != "" && strings.TrimSpace(doc.TaskID) == taskID, nil
 }
 
+// GetHebi8ActivitySummary returns the latest Hebi8 attempt timestamp (nil if none yet)
+// and the count of non-archived, non-PA top-level tasks updated since that timestamp.
+func (s *Store) GetHebi8ActivitySummary(ctx context.Context, hebi8TaskID string) (*int64, int, error) {
+	var lastTurnAt *int64
+	var updatedCount int
+	err := s.WithReadTx(ctx, func(tx *sql.Tx) error {
+		var lastTurn sql.NullInt64
+		if err := tx.QueryRowContext(ctx, `
+			SELECT MAX(COALESCE(finished_at, started_at))
+			FROM attempts
+			WHERE task_id = ?
+		`, hebi8TaskID).Scan(&lastTurn); err != nil {
+			return err
+		}
+		var since int64
+		if lastTurn.Valid && lastTurn.Int64 > 0 {
+			v := lastTurn.Int64
+			lastTurnAt = &v
+			since = v
+		}
+		return tx.QueryRowContext(ctx, `
+			SELECT COUNT(*)
+			FROM tasks
+			WHERE archived_at IS NULL
+			  AND project_id != ?
+			  AND (parent_task_id IS NULL OR parent_task_id = '')
+			  AND updated_at > ?
+		`, protocol.PAProjectID, since).Scan(&updatedCount)
+	})
+	return lastTurnAt, updatedCount, err
+}
+
 // GetHebi8MainTaskID returns the persisted main Hebi8 task ID if configured.
 func (s *Store) GetHebi8MainTaskID(ctx context.Context) (string, error) {
 	raw, ok, err := s.GetHubSetting(ctx, hebi8MainTaskSettingKey)

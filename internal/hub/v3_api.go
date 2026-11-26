@@ -318,6 +318,32 @@ func (s *Server) handleCreateProjectPart(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, http.StatusCreated, map[string]any{"project": pv, "part": part})
 }
 
+func (s *Server) handleUpdateProjectPart(w http.ResponseWriter, r *http.Request) {
+	projectID := chi.URLParam(r, "projectId")
+	partID := chi.URLParam(r, "partId")
+	var req protocol.UpdateProjectPartRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<16)).Decode(&req); err != nil {
+		writeAPIError(w, http.StatusBadRequest, "ERR_INVALID_JSON", "invalid request body")
+		return
+	}
+	pv, part, ev, err := s.store.UpdateProjectPart(r.Context(), projectID, partID, req, actorFromContext(r.Context()))
+	if errors.Is(err, store.ErrNotFound) {
+		writeAPIError(w, http.StatusNotFound, "ERR_PART_NOT_FOUND", err.Error())
+		return
+	}
+	if errors.Is(err, store.ErrInvalidInput) {
+		writeAPIError(w, http.StatusBadRequest, "ERR_INVALID_INPUT", err.Error())
+		return
+	}
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, "ERR_PART_UPDATE", err.Error())
+		return
+	}
+	_ = s.refreshEffectiveRegistry(context.WithoutCancel(r.Context()))
+	s.broker.Broadcast(ev)
+	writeJSON(w, http.StatusOK, map[string]any{"project": pv, "part": part})
+}
+
 func (s *Server) handleDeleteProjectPart(w http.ResponseWriter, r *http.Request) {
 	projectID := chi.URLParam(r, "projectId")
 	partID := chi.URLParam(r, "partId")

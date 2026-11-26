@@ -468,11 +468,13 @@ func TestDynamicProjectAndOnboardingFlow(t *testing.T) {
 		t.Fatalf("git init failed: %v %s", err, string(out))
 	}
 
-	// Path traversal outside $HOME must be rejected
+	// Path traversal outside $HOME must be rejected with structured 403 ERR_PATH_OUTSIDE_ROOT
 	badDir := doOnbJSONReq(t, ts, http.MethodGet, "/api/machines/primary-box/dirs?path=/etc", nil, devHdrs)
+	var badDirErr protocol.APIError
+	_ = json.NewDecoder(badDir.Body).Decode(&badDirErr)
 	badDir.Body.Close()
-	if badDir.StatusCode != http.StatusBadRequest {
-		t.Fatalf("expected 400 for /etc outside HOME, got %d", badDir.StatusCode)
+	if badDir.StatusCode != http.StatusForbidden || badDirErr.Code != "ERR_PATH_OUTSIDE_ROOT" {
+		t.Fatalf("expected 403 ERR_PATH_OUTSIDE_ROOT for /etc outside HOME, got %d %+v", badDir.StatusCode, badDirErr)
 	}
 
 	// Dynamic project create via API

@@ -86,6 +86,7 @@ import type {
   UpdateMachineRequest,
   UpdateNetworkSettingsRequest,
   UpdateProjectLocationRequest,
+  UpdateProjectPartRequest,
   UpdateProjectSettingsRequest,
   WSTicketResponse,
   WorkerStreamResponse,
@@ -560,6 +561,12 @@ export const api = {
     });
   },
 
+  reopenDeliveryReview(deliveryId: string): Promise<CompleteReviewResponse> {
+    return apiFetch<CompleteReviewResponse>(`/api/deliveries/${enc(deliveryId)}/reopen-review`, {
+      method: 'POST',
+    });
+  },
+
   deleteAnnotation(annotationId: string): Promise<DeleteAnnotationResponse> {
     return apiFetch<DeleteAnnotationResponse>(`/api/annotations/${enc(annotationId)}`, {
       method: 'DELETE',
@@ -786,6 +793,17 @@ export const api = {
   ): Promise<{ project: ProjectView; part: ProjectPartView }> {
     return apiFetch(`/api/projects/${enc(projectId)}/parts`, {
       method: 'POST',
+      json: req,
+    });
+  },
+
+  updateProjectPart(
+    projectId: string,
+    partId: string,
+    req: UpdateProjectPartRequest,
+  ): Promise<{ project: ProjectView; part: ProjectPartView }> {
+    return apiFetch(`/api/projects/${enc(projectId)}/parts/${enc(partId)}`, {
+      method: 'PATCH',
       json: req,
     });
   },

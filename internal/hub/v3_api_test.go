@@ -3,15 +3,22 @@ package hub
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/coder/websocket"
+
+	"github.com/Hebi8/hebi8-Orbit/internal/gitops"
 	"github.com/Hebi8/hebi8-Orbit/internal/protocol"
 	"github.com/Hebi8/hebi8-Orbit/internal/store"
 )
@@ -289,5 +296,301 @@ machines:
 	}
 	if isLoopbackOrigin("https://example.ts.net") {
 		t.Fatalf("tailnet origin must not be classified as loopback")
+	}
+}
+
+func TestV4ProjectPartPatchEmptyPartWorkerAllowedRootsAndDirs(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	cfgDir := filepath.Join(tmpDir, "cfg")
+	dataDir := filepath.Join(tmpDir, "data")
+	workRoot := filepath.Join(tmpDir, "worker-root")
+	subDir := filepath.Join(workRoot, "app-service")
+	sampleFile := filepath.Join(workRoot, "readme.txt")
+	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(subDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(sampleFile, []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	remoteTok := "worker-rpc-tok-v4"
+	tokSum := sha256.Sum256([]byte(remoteTok))
+	tokHash := "sha256:" + hex.EncodeToString(tokSum[:])
+
+	if err := os.WriteFile(filepath.Join(cfgDir, "machines.yaml"), []byte(`schemaVersion: 1
+machines:
+  hub-node:
+    displayName: "hub-node"
+    transport: "local_ws"
+    capabilities: ["primary-dev"]
+  aux-node:
+    displayName: "aux-node"
+    transport: "remote_ws"
+    tokenHash: "`+tokHash+`"
+    capabilities: ["worker"]
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := store.Open(ctx, filepath.Join(dataDir, "orbit.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	srv, err := NewServer(ctx, ServerOptions{
+		Store: st,
+		HubConfig: protocol.HubConfig{
+			ListenAddr: "127.0.0.1:4310",
+			DataDir:    dataDir,
+			ConfigDir:  cfgDir,
+			DevToken:   "v4-test-tok",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Shutdown()
+
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	doReq := func(method, path string, body any) *http.Response {
+		t.Helper()
+		var buf bytes.Buffer
+		if body != nil {
+			if err := json.NewEncoder(&buf).Encode(body); err != nil {
+				t.Fatal(err)
+			}
+		}
+		req, err := http.NewRequest(method, ts.URL+path, &buf)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Orbit-Request", "1")
+		req.Header.Set("X-Orbit-Dev-Token", "v4-test-tok")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp
+	}
+
+	// 1. Local hub-node without allowedRoots: path="" and path="~" both land on homePath
+	for _, q := range []string{"", "?path=~"} {
+		resp := doReq(http.MethodGet, "/api/machines/hub-node/dirs"+q, nil)
+		var dirs protocol.ListDirsResponse
+		_ = json.NewDecoder(resp.Body).Decode(&dirs)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK || dirs.Path == "" || dirs.Path != dirs.HomePath {
+			t.Fatalf("expected dirs(%q) to land on homePath, got status=%d %+v", q, resp.StatusCode, dirs)
+		}
+	}
+
+	// 2. PATCH /api/machines/aux-node: set role=worker + allowedRoots=[workRoot] and verify returned
+	workerRole := protocol.MachineRoleWorker
+	resp := doReq(http.MethodPatch, "/api/machines/aux-node", protocol.UpdateMachineRequest{
+		Role:         &workerRole,
+		AllowedRoots: []string{workRoot},
+	})
+	var machList protocol.ListMachinesResponse
+	_ = json.NewDecoder(resp.Body).Decode(&machList)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("PATCH worker machine failed: %d", resp.StatusCode)
+	}
+	foundAux := false
+	for _, m := range machList.Machines {
+		if m.MachineID == "aux-node" {
+			foundAux = true
+			if m.Role != protocol.MachineRoleWorker || len(m.AllowedRoots) != 1 || m.AllowedRoots[0] != workRoot {
+				t.Fatalf("unexpected aux-node after PATCH: %+v", m)
+			}
+		}
+	}
+	if !foundAux {
+		t.Fatalf("aux-node missing from PATCH response")
+	}
+
+	// 3. Connect a mock remote runner WS for aux-node implementing list_dirs RPC using gitops.ListSubdirs + ClassifyBrowseError
+	wsCtx, wsCancel := context.WithTimeout(ctx, 15*time.Second)
+	defer wsCancel()
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/ws/runner?machineId=aux-node"
+	conn, _, err := websocket.Dial(wsCtx, wsURL, &websocket.DialOptions{
+		HTTPHeader: http.Header{"Authorization": []string{"Bearer " + remoteTok}},
+	})
+	if err != nil {
+		t.Fatalf("dial aux-node runner ws: %v", err)
+	}
+	defer conn.CloseNow()
+
+	hello, _ := json.Marshal(protocol.RunnerHelloFrame{
+		Type:             protocol.RunnerMsgHello,
+		ProtocolVersion:  1,
+		MachineID:        "aux-node",
+		RunnerInstanceID: "ri_aux_1",
+		RunnerVersion:    "0.4.0-test",
+		Capabilities:     []string{"worker", protocol.RunnerCapFSV1, protocol.RunnerCapFSPlainV1},
+	})
+	if err := conn.Write(wsCtx, websocket.MessageText, hello); err != nil {
+		t.Fatal(err)
+	}
+	// Read welcome frame
+	if _, _, err := conn.Read(wsCtx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Serve runner RPC frames in background
+	go func() {
+		for {
+			_, raw, err := conn.Read(wsCtx)
+			if err != nil {
+				return
+			}
+			var env struct {
+				Type protocol.RunnerWSMessageType `json:"type"`
+			}
+			if json.Unmarshal(raw, &env) != nil || env.Type != protocol.RunnerMsgRPC {
+				continue
+			}
+			var rpc protocol.RunnerRPCFrame
+			if json.Unmarshal(raw, &rpc) != nil {
+				continue
+			}
+			res := protocol.RunnerRPCResultFrame{
+				Type:      protocol.RunnerMsgRPCResult,
+				RequestID: rpc.RequestID,
+			}
+			if rpc.Op == "list_dirs" {
+				pathArg, _ := rpc.Args["path"].(string)
+				var roots []string
+				if rawRoots, ok := rpc.Args["allowedRoots"].([]any); ok {
+					for _, item := range rawRoots {
+						if s, ok := item.(string); ok {
+							roots = append(roots, s)
+						}
+					}
+				}
+				out, lErr := gitops.ListSubdirs(pathArg, roots, false)
+				if lErr != nil {
+					code, _ := gitops.ClassifyBrowseError(lErr)
+					res.Error = lErr.Error()
+					res.Data = map[string]any{"errorCode": code}
+				} else {
+					res.OK = true
+					b, _ := json.Marshal(out)
+					_ = json.Unmarshal(b, &res.Data)
+				}
+			}
+			b, _ := json.Marshal(res)
+			_ = conn.Write(wsCtx, websocket.MessageText, b)
+		}
+	}()
+
+	// Remote worker with allowedRoots=[workRoot]:
+	// - empty path lands cleanly on workRoot (does NOT fail with 403!)
+	resp = doReq(http.MethodGet, "/api/machines/aux-node/dirs", nil)
+	var workerDirs protocol.ListDirsResponse
+	_ = json.NewDecoder(resp.Body).Decode(&workerDirs)
+	resp.Body.Close()
+	realWorkRoot, _ := filepath.EvalSymlinks(workRoot)
+	if resp.StatusCode != http.StatusOK || workerDirs.Path != realWorkRoot || len(workerDirs.Entries) != 1 || workerDirs.Entries[0].Name != "app-service" {
+		t.Fatalf("expected remote worker empty path to land on %s, got status=%d %+v", realWorkRoot, resp.StatusCode, workerDirs)
+	}
+
+	// - non-existent path inside allowed root -> 404 ERR_DIR_NOT_FOUND
+	missingPath := filepath.Join(workRoot, "does-not-exist")
+	resp = doReq(http.MethodGet, "/api/machines/aux-node/dirs?path="+url.QueryEscape(missingPath), nil)
+	var errBody protocol.APIError
+	_ = json.NewDecoder(resp.Body).Decode(&errBody)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound || errBody.Code != "ERR_DIR_NOT_FOUND" {
+		t.Fatalf("expected 404 ERR_DIR_NOT_FOUND, got %d %+v", resp.StatusCode, errBody)
+	}
+
+	// - file path inside allowed root -> 400 ERR_NOT_A_DIRECTORY
+	resp = doReq(http.MethodGet, "/api/machines/aux-node/dirs?path="+url.QueryEscape(sampleFile), nil)
+	errBody = protocol.APIError{}
+	_ = json.NewDecoder(resp.Body).Decode(&errBody)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest || errBody.Code != "ERR_NOT_A_DIRECTORY" {
+		t.Fatalf("expected 400 ERR_NOT_A_DIRECTORY, got %d %+v", resp.StatusCode, errBody)
+	}
+
+	// - out-of-root path -> 403 ERR_PATH_OUTSIDE_ROOT
+	resp = doReq(http.MethodGet, "/api/machines/aux-node/dirs?path=/etc", nil)
+	errBody = protocol.APIError{}
+	_ = json.NewDecoder(resp.Body).Decode(&errBody)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden || errBody.Code != "ERR_PATH_OUTSIDE_ROOT" {
+		t.Fatalf("expected 403 ERR_PATH_OUTSIDE_ROOT, got %d %+v", resp.StatusCode, errBody)
+	}
+
+	// - clearing allowedRoots via PATCH {"allowedRoots": []} persists empty list
+	resp = doReq(http.MethodPatch, "/api/machines/aux-node", map[string]any{"allowedRoots": []string{}})
+	machList = protocol.ListMachinesResponse{}
+	_ = json.NewDecoder(resp.Body).Decode(&machList)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("clear allowedRoots failed: %d", resp.StatusCode)
+	}
+	for _, m := range machList.Machines {
+		if m.MachineID == "aux-node" && len(m.AllowedRoots) != 0 {
+			t.Fatalf("expected cleared allowedRoots, got %+v", m.AllowedRoots)
+		}
+	}
+
+	// 4. PATCH /api/projects/{projectId}/parts/{partId} & DELETE last location keeps empty part
+	if _, err := st.UpdateMachineMetadata(ctx, "hub-node", protocol.UpdateMachineRequest{
+		AllowedRoots: []string{workRoot},
+	}, "human"); err != nil {
+		t.Fatal(err)
+	}
+	resp = doReq(http.MethodPost, "/api/projects", protocol.CreateProjectRequest{
+		MachineID:   "hub-node",
+		RepoPath:    subDir,
+		DisplayName: "V4 Proj",
+		AllowFolder: true,
+	})
+	var createdProj protocol.CreateProjectResponse
+	_ = json.NewDecoder(resp.Body).Decode(&createdProj)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create project failed: %d", resp.StatusCode)
+	}
+	projID := createdProj.Project.ProjectID
+	partID := createdProj.Project.Parts[0].PartID
+	locID := createdProj.Project.Parts[0].Locations[0].LocationID
+
+	renamed := "Renamed Service Part"
+	order := 2
+	resp = doReq(http.MethodPatch, "/api/projects/"+projID+"/parts/"+partID, protocol.UpdateProjectPartRequest{
+		Name:      &renamed,
+		SortOrder: &order,
+	})
+	var patchPartResp struct {
+		Project protocol.ProjectView     `json:"project"`
+		Part    protocol.ProjectPartView `json:"part"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&patchPartResp)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || patchPartResp.Part.Name != renamed || patchPartResp.Part.SortOrder != 2 {
+		t.Fatalf("PATCH part failed: status=%d %+v", resp.StatusCode, patchPartResp)
+	}
+
+	// Delete the only location in the part -> part MUST survive with empty locations array
+	resp = doReq(http.MethodDelete, "/api/projects/"+projID+"/parts/"+partID+"/locations/"+locID, nil)
+	var delLocResp struct {
+		Project protocol.ProjectView `json:"project"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&delLocResp)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || len(delLocResp.Project.Parts) != 1 || len(delLocResp.Project.Parts[0].Locations) != 0 {
+		t.Fatalf("expected empty part preserved after deleting last location, got status=%d %+v", resp.StatusCode, delLocResp.Project.Parts)
 	}
 }

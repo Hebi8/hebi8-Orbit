@@ -710,17 +710,23 @@ func (s *Store) SubmitFollowupAtomic(ctx context.Context, p SubmitFollowupParams
 	}
 
 	err := s.WithWriteTx(ctx, func(tx *sql.Tx) error {
-		// P1-1: Atomically verify runner parent control + descendant scope inside the write tx.
+		// P1-1: Atomically verify runner caller control + delegate scope (descendant, or same-parent sibling when AllowSibling is set) inside the write tx.
 		if p.RunnerParentGuard != nil {
 			if err := verifyRunnerParentControlTx(ctx, tx, p.RunnerParentGuard); err != nil {
 				return err
 			}
-			isDesc, err := isDescendantTaskTx(ctx, tx, p.RunnerParentGuard.ParentTaskID, p.TaskID)
+			allowed, err := isDescendantTaskTx(ctx, tx, p.RunnerParentGuard.ParentTaskID, p.TaskID)
 			if err != nil {
 				return err
 			}
-			if !isDesc {
-				return fmt.Errorf("%w: task %s is not a descendant of %s", ErrForbidden, p.TaskID, p.RunnerParentGuard.ParentTaskID)
+			if !allowed && p.RunnerParentGuard.AllowSibling {
+				allowed, err = isSiblingTaskTx(ctx, tx, p.RunnerParentGuard.ParentTaskID, p.TaskID)
+				if err != nil {
+					return err
+				}
+			}
+			if !allowed {
+				return fmt.Errorf("%w: task %s is not within delegate scope of %s", ErrForbidden, p.TaskID, p.RunnerParentGuard.ParentTaskID)
 			}
 		}
 

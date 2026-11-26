@@ -1388,3 +1388,127 @@ func TestRyugiBridge_StartupCalibrationReadyReplayMissingMsgIDAndGCPauseDrain(t 
 		t.Fatalf("expected comments.json preserved across startup calibration, got %q err=%v", string(raw), err)
 	}
 }
+
+func TestHubDeliveryCheckpointUndoAndLockHTTP(t *testing.T) {
+	ctx := context.Background()
+	srv, st, cfgDir, _ := setupTestHub(t, func(c *protocol.HubConfig) {
+		c.DevOpen = true
+	}, &fakeRyugiRunner{})
+
+	if err := os.WriteFile(filepath.Join(cfgDir, "machines.yaml"), []byte(`schemaVersion: 1
+machines:
+  hub-node:
+    displayName: "hub-node"
+    transport: local_ws
+    capabilities: [primary-dev]
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cfgDir, "projects.yaml"), []byte(`schemaVersion: 1
+projects:
+  demo-app:
+    displayName: "Demo App"
+    repoIdentity: "demo-app"
+    defaultBranch: "main"
+    defaultCapability: "primary-dev"
+    defaultAdapter: "agy"
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := srv.ReloadConfig(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	dlvID := "dlv_01HUBCHECKPOINT00001"
+	imp, err := st.CreateManualImportDelivery(ctx, store.ManualImportParams{
+		DeliveryID:      dlvID,
+		ProjectID:       "demo-app",
+		Title:           "HTTP Checkpoint Test",
+		Summary:         "Review checkpoint undo",
+		SourceMachineID: "hub-node",
+		BaseSHA:         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		HeadSHA:         "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+		GitRef:          "refs/orbit/deliveries/" + dlvID,
+		Kind:            protocol.DeliveryCodeDiff,
+		ActorID:         "human",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	doReq := func(method, path string, body any) *http.Response {
+		t.Helper()
+		var buf bytes.Buffer
+		if body != nil {
+			_ = json.NewEncoder(&buf).Encode(body)
+		}
+		req, _ := http.NewRequest(method, ts.URL+path, &buf)
+		req.Header.Set("X-Orbit-Request", "1")
+		if body != nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp
+	}
+
+	// 1. GET /api/deliveries/{id} shows open & not undoable
+	resp := doReq(http.MethodGet, "/api/deliveries/"+dlvID, nil)
+	var detail protocol.DeliveryDetailResponse
+	_ = json.NewDecoder(resp.Body).Decode(&detail)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || detail.ReviewState != protocol.InboxOpen || detail.CanUndoReview {
+		t.Fatalf("unexpected initial delivery detail review state: status=%d state=%q canUndo=%v", resp.StatusCode, detail.ReviewState, detail.CanUndoReview)
+	}
+
+	// 2. POST complete-review -> resolved & canUndoReview=true
+	resp = doReq(http.MethodPost, "/api/deliveries/"+dlvID+"/complete-review", nil)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("complete-review failed: %d", resp.StatusCode)
+	}
+	resp = doReq(http.MethodGet, "/api/deliveries/"+dlvID, nil)
+	detail = protocol.DeliveryDetailResponse{}
+	_ = json.NewDecoder(resp.Body).Decode(&detail)
+	resp.Body.Close()
+	if detail.ReviewState != protocol.InboxResolved || !detail.CanUndoReview || detail.ReviewResolvedAt == nil {
+		t.Fatalf("expected resolved & undoable detail, got state=%q canUndo=%v resolvedAt=%v", detail.ReviewState, detail.CanUndoReview, detail.ReviewResolvedAt)
+	}
+
+	// 3. POST reopen-review before send -> 200 open
+	resp = doReq(http.MethodPost, "/api/deliveries/"+dlvID+"/reopen-review", nil)
+	var reopenResp protocol.CompleteReviewResponse
+	_ = json.NewDecoder(resp.Body).Decode(&reopenResp)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || reopenResp.InboxState != protocol.InboxOpen {
+		t.Fatalf("reopen-review failed: status=%d %+v", resp.StatusCode, reopenResp)
+	}
+
+	// 4. Complete review again, then send a follow-up message -> reopen-review returns 409 ERR_CHECKPOINT_LOCKED
+	resp = doReq(http.MethodPost, "/api/deliveries/"+dlvID+"/complete-review", nil)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("second complete-review failed: %d", resp.StatusCode)
+	}
+	resp = doReq(http.MethodPost, "/api/tasks/"+imp.Task.TaskID+"/followup", protocol.FollowupTaskRequest{
+		Message: "Proceed to step 2",
+		Mode:    protocol.FollowupModeQueue,
+	})
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("followup failed: %d", resp.StatusCode)
+	}
+
+	resp = doReq(http.MethodPost, "/api/deliveries/"+dlvID+"/reopen-review", nil)
+	var errResp protocol.APIError
+	_ = json.NewDecoder(resp.Body).Decode(&errResp)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict || errResp.Code != "ERR_CHECKPOINT_LOCKED" {
+		t.Fatalf("expected 409 ERR_CHECKPOINT_LOCKED after followup, got %d %+v", resp.StatusCode, errResp)
+	}
+}

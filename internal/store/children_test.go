@@ -69,56 +69,87 @@ func TestSubsession_DepthAndActiveChildLimits(t *testing.T) {
 		t.Fatalf("create root: %v", err)
 	}
 
-	// Chain depth 1..4 should succeed, depth 5 should fail with ErrInvalidInput
-	parentID := rootRes.Task.TaskID
-	for depth := 1; depth <= 4; depth++ {
-		childRes, err := st.CreateTask(ctx, store.CreateTaskParams{
-			ProjectID:     "demo-app",
-			ParentTaskID:  parentID,
-			DelegatedRole: fmt.Sprintf("level-%d", depth),
-			Title:         fmt.Sprintf("Child L%d", depth),
-			Goal:          fmt.Sprintf("Goal L%d", depth),
-		})
-		if err != nil {
-			t.Fatalf("depth %d should succeed, got: %v", depth, err)
-		}
-		// Verify EventTaskChildSpawned emitted to parent stream
-		foundSpawn := false
-		for _, ev := range childRes.Events {
-			if ev.Kind == protocol.EventTaskChildSpawned && ev.TaskID == parentID {
-				foundSpawn = true
-				if ev.Payload["childTaskId"] != childRes.Task.TaskID {
-					t.Fatalf("unexpected childTaskId in spawn event: %+v", ev.Payload)
-				}
-				if ev.Payload["role"] != fmt.Sprintf("level-%d", depth) {
-					t.Fatalf("unexpected role in spawn event: %+v", ev.Payload)
-				}
+	// Depth 1 must succeed and emit EventTaskChildSpawned; depth 2 (grandchild) must fail with ErrMaxSubsessionDepth.
+	child1Res, err := st.CreateTask(ctx, store.CreateTaskParams{
+		ProjectID:     "demo-app",
+		ParentTaskID:  rootRes.Task.TaskID,
+		DelegatedRole: "level-1",
+		Title:         "Child L1",
+		Goal:          "Goal L1",
+	})
+	if err != nil {
+		t.Fatalf("depth 1 should succeed, got: %v", err)
+	}
+	foundSpawn := false
+	for _, ev := range child1Res.Events {
+		if ev.Kind == protocol.EventTaskChildSpawned && ev.TaskID == rootRes.Task.TaskID {
+			foundSpawn = true
+			if ev.Payload["childTaskId"] != child1Res.Task.TaskID {
+				t.Fatalf("unexpected childTaskId in spawn event: %+v", ev.Payload)
+			}
+			if ev.Payload["role"] != "level-1" {
+				t.Fatalf("unexpected role in spawn event: %+v", ev.Payload)
 			}
 		}
-		if !foundSpawn {
-			t.Fatalf("expected task.child_spawned event on parent %s", parentID)
-		}
-		parentID = childRes.Task.TaskID
+	}
+	if !foundSpawn {
+		t.Fatalf("expected task.child_spawned event on parent %s", rootRes.Task.TaskID)
 	}
 
-	// Depth 5 must be rejected with ErrInvalidInput
+	// Depth 2 (grandchild) must be rejected with ErrMaxSubsessionDepth
 	if _, err := st.CreateTask(ctx, store.CreateTaskParams{
 		ProjectID:    "demo-app",
-		ParentTaskID: parentID,
+		ParentTaskID: child1Res.Task.TaskID,
 		Title:        "Too Deep",
 		Goal:         "Should fail",
-	}); !errors.Is(err, store.ErrInvalidInput) {
-		t.Fatalf("expected ErrInvalidInput for depth 5, got: %v", err)
+	}); !errors.Is(err, store.ErrMaxSubsessionDepth) {
+		t.Fatalf("expected ErrMaxSubsessionDepth for depth 2, got: %v", err)
 	}
 
-	// Verify IsDescendantTask across full chain
-	descOK, err := st.IsDescendantTask(ctx, rootRes.Task.TaskID, parentID)
+	// PA/Hebi8 parent must be rejected with ErrPANoSubsessions
+	hebi8Task, _, err := st.EnsureHebi8MainTask(ctx, protocol.AdapterAgy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CreateTask(ctx, store.CreateTaskParams{
+		ProjectID:    protocol.ScratchProjectID,
+		ParentTaskID: hebi8Task.TaskID,
+		Title:        "PA Child Blocked",
+		Goal:         "Should fail",
+	}); !errors.Is(err, store.ErrPANoSubsessions) {
+		t.Fatalf("expected ErrPANoSubsessions for _pa parent, got: %v", err)
+	}
+
+	// Sibling child under same root succeeds; verify IsDescendantTask & IsSiblingTask
+	child2Res, err := st.CreateTask(ctx, store.CreateTaskParams{
+		ProjectID:     "demo-app",
+		ParentTaskID:  rootRes.Task.TaskID,
+		DelegatedRole: "peer",
+		Title:         "Child Peer",
+		Goal:          "Goal Peer",
+	})
+	if err != nil {
+		t.Fatalf("sibling child should succeed: %v", err)
+	}
+	descOK, err := st.IsDescendantTask(ctx, rootRes.Task.TaskID, child1Res.Task.TaskID)
 	if err != nil || !descOK {
-		t.Fatalf("expected %s to be descendant of %s (ok=%v err=%v)", parentID, rootRes.Task.TaskID, descOK, err)
+		t.Fatalf("expected %s to be descendant of %s (ok=%v err=%v)", child1Res.Task.TaskID, rootRes.Task.TaskID, descOK, err)
 	}
 	selfOK, err := st.IsDescendantTask(ctx, rootRes.Task.TaskID, rootRes.Task.TaskID)
 	if err != nil || selfOK {
 		t.Fatalf("task must not be descendant of itself (ok=%v err=%v)", selfOK, err)
+	}
+	sibOK, err := st.IsSiblingTask(ctx, child1Res.Task.TaskID, child2Res.Task.TaskID)
+	if err != nil || !sibOK {
+		t.Fatalf("expected child1 and child2 to be siblings (ok=%v err=%v)", sibOK, err)
+	}
+	sibSelf, err := st.IsSiblingTask(ctx, child1Res.Task.TaskID, child1Res.Task.TaskID)
+	if err != nil || sibSelf {
+		t.Fatalf("task must not be sibling of itself (ok=%v err=%v)", sibSelf, err)
+	}
+	sibParent, err := st.IsSiblingTask(ctx, rootRes.Task.TaskID, child1Res.Task.TaskID)
+	if err != nil || sibParent {
+		t.Fatalf("parent and child must not be siblings (ok=%v err=%v)", sibParent, err)
 	}
 
 	// Active child cap: 12 allowed, 13th rejected with ErrConflict
@@ -172,16 +203,22 @@ func TestSubsession_TimelineChildrenTranscriptAndClaimNotification(t *testing.T)
 	ctx := context.Background()
 	st := setupSubsessionStore(t)
 
-	// Ensure Hebi8 main task as parent
-	hebi8Task, _, err := st.EnsureHebi8MainTask(ctx, protocol.AdapterAgy)
+	// Create top-level project task as parent (PA/Hebi8 cannot attach sub-sessions)
+	parentRes, err := st.CreateTask(ctx, store.CreateTaskParams{
+		ProjectID: "demo-app",
+		Title:     "Main Coordinator",
+		Goal:      "Coordinate feature work",
+		MachineID: "hub-node",
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
+	parentTask := parentRes.Task
 
-	// Spawn 2 children under Hebi8
+	// Spawn 2 children under parentTask
 	c1, err := st.CreateTask(ctx, store.CreateTaskParams{
 		ProjectID:     "demo-app",
-		ParentTaskID:  hebi8Task.TaskID,
+		ParentTaskID:  parentTask.TaskID,
 		DelegatedRole: "backend",
 		Title:         "Build API",
 		Goal:          "Implement backend API",
@@ -196,7 +233,7 @@ func TestSubsession_TimelineChildrenTranscriptAndClaimNotification(t *testing.T)
 	}
 	c2, err := st.CreateTask(ctx, store.CreateTaskParams{
 		ProjectID:     protocol.ScratchProjectID,
-		ParentTaskID:  hebi8Task.TaskID,
+		ParentTaskID:  parentTask.TaskID,
 		DelegatedRole: "researcher",
 		Title:         "Research",
 		Goal:          "Investigate design",
@@ -276,7 +313,7 @@ func TestSubsession_TimelineChildrenTranscriptAndClaimNotification(t *testing.T)
 	}
 
 	// Verify parent TaskSummary counters
-	parentSummary, err := st.GetTask(ctx, hebi8Task.TaskID)
+	parentSummary, err := st.GetTask(ctx, parentTask.TaskID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -286,7 +323,7 @@ func TestSubsession_TimelineChildrenTranscriptAndClaimNotification(t *testing.T)
 	}
 
 	// Verify parent GetTaskTimeline populates Children
-	parentTL, err := st.GetTaskTimeline(ctx, hebi8Task.TaskID, 0, false)
+	parentTL, err := st.GetTaskTimeline(ctx, parentTask.TaskID, 0, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -302,12 +339,12 @@ func TestSubsession_TimelineChildrenTranscriptAndClaimNotification(t *testing.T)
 		t.Fatalf("expected preview truncated <= 240 runes + ellipsis, got %d", len([]rune(child1View.LastMessagePreview)))
 	}
 
-	// Verify child GetTaskTimeline populates ParentSummary (IsHebi8Main=true) and SiblingChildren
+	// Verify child GetTaskTimeline populates ParentSummary and SiblingChildren
 	childTL, err := st.GetTaskTimeline(ctx, c1.Task.TaskID, 0, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if childTL.ParentSummary == nil || !childTL.ParentSummary.IsHebi8Main || childTL.ParentSummary.TaskID != hebi8Task.TaskID {
+	if childTL.ParentSummary == nil || childTL.ParentSummary.IsHebi8Main || childTL.ParentSummary.TaskID != parentTask.TaskID {
 		t.Fatalf("unexpected ParentSummary: %+v", childTL.ParentSummary)
 	}
 	if len(childTL.SiblingChildren) != 2 {
@@ -342,7 +379,7 @@ func TestSubsession_TimelineChildrenTranscriptAndClaimNotification(t *testing.T)
 				return
 			}
 			if claimed {
-				if pid != hebi8Task.TaskID {
+				if pid != parentTask.TaskID {
 					t.Errorf("unexpected parentTaskID %q", pid)
 				}
 				wins.Add(1)
@@ -358,7 +395,7 @@ func TestSubsession_TimelineChildrenTranscriptAndClaimNotification(t *testing.T)
 	f := false
 	cSilent, err := st.CreateTask(ctx, store.CreateTaskParams{
 		ProjectID:            "demo-app",
-		ParentTaskID:         hebi8Task.TaskID,
+		ParentTaskID:         parentTask.TaskID,
 		Title:                "Silent child",
 		Goal:                 "No wakeup",
 		NotifyParentOnFinish: &f,
@@ -372,10 +409,14 @@ func TestSubsession_TimelineChildrenTranscriptAndClaimNotification(t *testing.T)
 		t.Fatalf("expected silent child not to claim notification (claimed=%v err=%v)", claimed, err)
 	}
 
-	// Sibling isolation: c2 is not descendant of c1
+	// Sibling relationship: c2 is NOT descendant of c1, IS sibling of c1
 	ok, err := st.IsDescendantTask(ctx, c1.Task.TaskID, c2.Task.TaskID)
 	if err != nil || ok {
 		t.Fatalf("sibling must not be descendant (ok=%v err=%v)", ok, err)
+	}
+	sib, err := st.IsSiblingTask(ctx, c1.Task.TaskID, c2.Task.TaskID)
+	if err != nil || !sib {
+		t.Fatalf("expected c1 and c2 to be siblings (sib=%v err=%v)", sib, err)
 	}
 }
 
@@ -791,8 +832,8 @@ func TestSubsession_ActiveChildQuotaOnReactivationAndLegacyDepthBackfill(t *test
 		Title:        "Level 5 Blocked",
 		Goal:         "must fail",
 		MachineID:    "hub-node",
-	}); !errors.Is(err, store.ErrInvalidInput) {
-		t.Fatalf("expected ErrInvalidInput creating level 5 under legacy 4-level tree, got: %v", err)
+	}); !errors.Is(err, store.ErrMaxSubsessionDepth) {
+		t.Fatalf("expected ErrMaxSubsessionDepth creating child under legacy nested tree, got: %v", err)
 	}
 }
 
