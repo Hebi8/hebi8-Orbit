@@ -1,11 +1,13 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
-import { ArrowUpRight, ChevronDown, Layers, MessageSquare, PanelRightClose, PanelRightOpen, X } from 'lucide-react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
+import { ChevronDown, Layers, MessageSquare, X } from 'lucide-react';
 import type { BootstrapResponse } from '../generated/protocol';
 import { DiffIcon } from '../components/Icons';
+import { StatusMark } from '../components/StatusMark';
 import { useTimeline } from '../hooks/queries';
 import { collectSessionArtifacts } from '../lib/artifacts';
-import { artifactShortLabel, taskTitle } from '../lib/format';
-import { navigate, paths, useRoute } from '../lib/router';
+import { artifactShortLabel, indexInboxByTask, sessionMark, taskTitle } from '../lib/format';
+import { useAnchoredPopover } from '../lib/popover';
 import { SessionConversation } from '../session/SessionConversation';
 import { useWorkbenchStore } from '../store/useWorkbenchStore';
 import { ArtifactsPane } from './ArtifactsPane';
@@ -14,48 +16,50 @@ import { CodeReviewPane } from './CodeReviewPane';
 const CODE_KINDS = new Set(['code_diff', 'mixed', 'workspace_snapshot']);
 
 /**
- * Fixed centered split overlay:
- *   - Left pane: Single-title dropdown switcher + Source Review or Artifact viewer (full vertical height, zero bottom bar)
- *   - Right pane: Compact live Session conversation with pending Review comments pill in composer
+ * Fixed centered split overlay (Orbit v4):
+ *   - Left pane: Single-title dropdown switcher + Source Review (Unified/Split + revocable Checkpoint) or Artifact viewer
+ *   - Right pane: Compact live Session conversation with intuitive `×` close button returning to full-width session
  */
 export function ReviewOverlay({ boot }: { boot: BootstrapResponse }) {
   const review = useWorkbenchStore((s) => s.review);
   const reviewRatios = useWorkbenchStore((s) => s.reviewRatios);
   const setRatio = useWorkbenchStore((s) => s.setReviewRatio);
-  const sessionHidden = useWorkbenchStore((s) => s.reviewSessionHidden);
-  const setSessionHidden = useWorkbenchStore((s) => s.setReviewSessionHidden);
   const close = useWorkbenchStore((s) => s.closeReview);
   const openReview = useWorkbenchStore((s) => s.openReview);
   const setDelivery = useWorkbenchStore((s) => s.setReviewDelivery);
-  const route = useRoute();
+
   const [mobilePane, setMobilePane] = useState<'artifact' | 'session'>('artifact');
   const [switcherOpen, setSwitcherOpen] = useState(false);
-  const switcherRef = useRef<HTMLDivElement | null>(null);
+  const switcherBtnRef = useRef<HTMLButtonElement | null>(null);
+  const switcherMenuRef = useRef<HTMLDivElement | null>(null);
   const bodyRef = useRef<HTMLDivElement | null>(null);
+  const closeSwitcher = useCallback(() => setSwitcherOpen(false), []);
 
   const tlq = useTimeline(review?.taskId);
   const tl = tlq.data;
   const sessionArtifacts = useMemo(() => collectSessionArtifacts(tl), [tl]);
+  const inboxByTask = useMemo(() => indexInboxByTask(boot.openInboxItems), [boot.openInboxItems]);
 
   useEffect(() => {
     setMobilePane('artifact');
     setSwitcherOpen(false);
   }, [review?.taskId, review?.tab, review?.artifactId]);
 
-  useEffect(() => {
-    if (!switcherOpen) return;
-    const onDown = (e: MouseEvent) => {
-      if (switcherRef.current && !switcherRef.current.contains(e.target as Node)) {
-        setSwitcherOpen(false);
-      }
-    };
-    window.addEventListener('mousedown', onDown);
-    return () => window.removeEventListener('mousedown', onDown);
-  }, [switcherOpen]);
+  const switcherStyle = useAnchoredPopover({
+    open: switcherOpen && !!review,
+    anchorRef: switcherBtnRef,
+    popRef: switcherMenuRef,
+    width: 296,
+    align: 'left',
+    placement: 'down',
+    gap: 6,
+    onClose: closeSwitcher,
+  });
 
   if (!review) return null;
 
   const task = tl?.task;
+  const taskMark = task ? sessionMark(task, inboxByTask.get(task.taskId) ?? []) : null;
   const deliveries = tl?.deliveries ?? [];
   const formalCode = deliveries.filter((d) => !d.lateArrival && CODE_KINDS.has(d.kind));
   const latestCode =
@@ -71,7 +75,6 @@ export function ReviewOverlay({ boot }: { boot: BootstrapResponse }) {
         sessionArtifacts[0]
       : undefined;
 
-  const alreadyOnSession = route.name === 'session' && route.taskId === review.taskId && !route.worker;
   const ratio = reviewRatios[review.tab];
 
   const fromPointer = (clientX: number) => {
@@ -83,12 +86,13 @@ export function ReviewOverlay({ boot }: { boot: BootstrapResponse }) {
   const canSwitch = (latestCode ? 1 : 0) + sessionArtifacts.length > 1 || (review.tab === 'art' && !!latestCode);
 
   const titleSwitcher = (
-    <div className="ov-switcher-wrap" ref={switcherRef}>
+    <div className="ov-switcher-wrap">
       <button
+        ref={switcherBtnRef}
         type="button"
         className={`ov-switcher-btn ${switcherOpen ? 'open' : ''}`}
-        aria-haspopup="menu"
-        aria-expanded={switcherOpen}
+        aria-haspopup={canSwitch ? 'menu' : undefined}
+        aria-expanded={canSwitch ? switcherOpen : undefined}
         onClick={() => canSwitch && setSwitcherOpen((v) => !v)}
         style={!canSwitch ? { cursor: 'default' } : undefined}
       >
@@ -97,71 +101,71 @@ export function ReviewOverlay({ boot }: { boot: BootstrapResponse }) {
         {canSwitch && <ChevronDown size={13} strokeWidth={1.7} className="faint" />}
       </button>
 
-      {switcherOpen && (
-        <div className="ov-switcher-menu" role="menu">
-          {latestCode && (
-            <>
-              <div className="ov-menu-sec">代码</div>
-              <button
-                type="button"
-                role="menuitem"
-                className={`ov-menu-item ${review.tab === 'code' ? 'active' : ''}`}
-                onClick={() => {
-                  setSwitcherOpen(false);
-                  openReview('code', review.taskId, latestCode.deliveryId);
-                }}
-              >
-                <DiffIcon size={13} />
-                <span className="ell" style={{ flex: 1 }}>
-                  Source Review
-                </span>
-                <span className="mono" style={{ fontSize: 11 }}>
-                  <span className="add">+{latestCode.manifest.insertions}</span>{' '}
-                  <span className="del">−{latestCode.manifest.deletions}</span>
-                </span>
-                {openDiffComments > 0 && (
-                  <span className="ov-menu-badge">
-                    <MessageSquare size={10} strokeWidth={1.8} />
-                    {openDiffComments}
+      {switcherOpen &&
+        canSwitch &&
+        switcherStyle &&
+        createPortal(
+          <div ref={switcherMenuRef} className="ov-switcher-menu ov-switcher-portal" style={switcherStyle} role="menu">
+            {latestCode && (
+              <>
+                <div className="ov-menu-sec">代码</div>
+                <button
+                  type="button"
+                  role="menuitem"
+                  className={`ov-menu-item ${review.tab === 'code' ? 'active' : ''}`}
+                  onClick={() => {
+                    closeSwitcher();
+                    openReview('code', review.taskId, latestCode.deliveryId);
+                  }}
+                >
+                  <DiffIcon size={13} />
+                  <span className="ell grow">Source Review</span>
+                  <span className="mono" style={{ fontSize: 11 }}>
+                    <span className="add">+{latestCode.manifest.insertions}</span>{' '}
+                    <span className="del">−{latestCode.manifest.deletions}</span>
                   </span>
-                )}
-              </button>
-            </>
-          )}
-
-          {sessionArtifacts.length > 0 && (
-            <>
-              <div className="ov-menu-sec">Artifacts</div>
-              {sessionArtifacts.map((art) => {
-                const isOn = review.tab === 'art' && activeArtifact?.artifactId === art.artifactId;
-                return (
-                  <button
-                    type="button"
-                    role="menuitem"
-                    key={art.artifactId}
-                    className={`ov-menu-item ${isOn ? 'active' : ''}`}
-                    onClick={() => {
-                      setSwitcherOpen(false);
-                      openReview('art', review.taskId, art.deliveryId, art.artifactId);
-                    }}
-                  >
-                    <span className="dlv-kind-tag">{artifactShortLabel(art.kind)}</span>
-                    <span className="ell" style={{ flex: 1 }}>
-                      {art.title}
+                  {openDiffComments > 0 && (
+                    <span className="ov-menu-badge">
+                      <MessageSquare size={10} strokeWidth={1.8} />
+                      {openDiffComments}
                     </span>
-                    {art.openAnnotations > 0 && (
-                      <span className="ov-menu-badge">
-                        <MessageSquare size={10} strokeWidth={1.8} />
-                        {art.openAnnotations}
-                      </span>
-                    )}
-                  </button>
-                );
-              })}
-            </>
-          )}
-        </div>
-      )}
+                  )}
+                </button>
+              </>
+            )}
+
+            {sessionArtifacts.length > 0 && (
+              <>
+                <div className="ov-menu-sec">Artifacts</div>
+                {sessionArtifacts.map((art) => {
+                  const isOn = review.tab === 'art' && activeArtifact?.artifactId === art.artifactId;
+                  return (
+                    <button
+                      type="button"
+                      role="menuitem"
+                      key={art.artifactId}
+                      className={`ov-menu-item ${isOn ? 'active' : ''}`}
+                      onClick={() => {
+                        closeSwitcher();
+                        openReview('art', review.taskId, art.deliveryId, art.artifactId);
+                      }}
+                    >
+                      <span className="dlv-kind-tag">{artifactShortLabel(art.kind)}</span>
+                      <span className="ell grow">{art.title}</span>
+                      {art.openAnnotations > 0 && (
+                        <span className="ov-menu-badge">
+                          <MessageSquare size={10} strokeWidth={1.8} />
+                          {art.openAnnotations}
+                        </span>
+                      )}
+                    </button>
+                  );
+                })}
+              </>
+            )}
+          </div>,
+          document.body,
+        )}
     </div>
   );
 
@@ -175,22 +179,7 @@ export function ReviewOverlay({ boot }: { boot: BootstrapResponse }) {
           会话
         </button>
       </div>
-      {sessionHidden && (
-        <>
-          <button
-            type="button"
-            className="ib no-mobile"
-            title="显示右侧会话"
-            onClick={() => setSessionHidden(false)}
-          >
-            <PanelRightOpen size={14} strokeWidth={1.6} />
-          </button>
-          <button type="button" className="ib no-mobile" title="关闭 (Esc)" onClick={close}>
-            <X size={14} strokeWidth={1.6} />
-          </button>
-        </>
-      )}
-      <button type="button" className="ib only-mobile" title="关闭" onClick={close}>
+      <button type="button" className="ib only-mobile" title="关闭审阅返回会话" aria-label="关闭审阅返回会话" onClick={close}>
         <X size={14} strokeWidth={1.6} />
       </button>
     </>
@@ -202,12 +191,8 @@ export function ReviewOverlay({ boot }: { boot: BootstrapResponse }) {
       <section className="rev-dialog" role="dialog" aria-modal="true" aria-label="审阅浮层" data-review-overlay="true">
         <div
           ref={bodyRef}
-          className={`rev-grid ${sessionHidden ? 'session-hidden' : ''} mobile-${mobilePane}`}
-          style={
-            sessionHidden
-              ? undefined
-              : { gridTemplateColumns: `minmax(0, ${ratio}fr) 1px minmax(0, ${100 - ratio}fr)` }
-          }
+          className={`rev-grid mobile-${mobilePane}`}
+          style={{ gridTemplateColumns: `minmax(0, ${ratio}fr) 1px minmax(0, ${100 - ratio}fr)` }}
         >
           {/* Left: Source Review or Artifacts */}
           <div className="rev-pane rev-left">
@@ -236,91 +221,74 @@ export function ReviewOverlay({ boot }: { boot: BootstrapResponse }) {
           </div>
 
           {/* Resizable 1px split divider */}
-          {!sessionHidden && (
-            <div className="rev-div no-mobile">
-              <div
-                role="separator"
-                aria-orientation="vertical"
-                aria-label="调整审阅与会话比例"
-                aria-valuemin={36}
-                aria-valuemax={78}
-                aria-valuenow={Math.round(ratio)}
-                tabIndex={0}
-                className="rev-handle"
-                onPointerDown={(e) => {
-                  if (e.button !== 0) return;
-                  e.preventDefault();
-                  e.currentTarget.setPointerCapture(e.pointerId);
-                }}
-                onPointerMove={(e) => {
-                  if (e.currentTarget.hasPointerCapture(e.pointerId)) fromPointer(e.clientX);
-                }}
-                onPointerUp={(e) => {
-                  if (e.currentTarget.hasPointerCapture(e.pointerId)) e.currentTarget.releasePointerCapture(e.pointerId);
-                }}
-                onKeyDown={(e) => {
-                  const step = e.key === 'ArrowLeft' ? -4 : e.key === 'ArrowRight' ? 4 : 0;
-                  if (step === 0) return;
-                  e.preventDefault();
-                  setRatio(review.tab, ratio + step);
-                }}
-              />
-            </div>
-          )}
+          <div className="rev-div no-mobile">
+            <div
+              role="separator"
+              aria-orientation="vertical"
+              aria-label="调整审阅与会话比例"
+              aria-valuemin={36}
+              aria-valuemax={78}
+              aria-valuenow={Math.round(ratio)}
+              tabIndex={0}
+              className="rev-handle"
+              onPointerDown={(e) => {
+                if (e.button !== 0) return;
+                e.preventDefault();
+                e.currentTarget.setPointerCapture(e.pointerId);
+              }}
+              onPointerMove={(e) => {
+                if (e.currentTarget.hasPointerCapture(e.pointerId)) fromPointer(e.clientX);
+              }}
+              onPointerUp={(e) => {
+                if (e.currentTarget.hasPointerCapture(e.pointerId)) e.currentTarget.releasePointerCapture(e.pointerId);
+              }}
+              onKeyDown={(e) => {
+                const step = e.key === 'ArrowLeft' ? -4 : e.key === 'ArrowRight' ? 4 : 0;
+                if (step === 0) return;
+                e.preventDefault();
+                setRatio(review.tab, ratio + step);
+              }}
+            />
+          </div>
 
           {/* Right: Live Session */}
-          {!sessionHidden && (
-            <div className="rev-pane rev-right">
-              <div className="rev-h">
+          <div className="rev-pane rev-right">
+            <div className="rev-h">
+              <div className="rev-sttl-wrap">
                 <span className="rev-sttl ell" title={task?.goal}>
                   {task ? taskTitle(task) : '会话'}
                 </span>
-
-                <div className="seg only-mobile" style={{ marginLeft: 'auto' }}>
-                  <button type="button" className={mobilePane === 'artifact' ? 'on' : ''} onClick={() => setMobilePane('artifact')}>
-                    审阅
-                  </button>
-                  <button type="button" className={mobilePane === 'session' ? 'on' : ''} onClick={() => setMobilePane('session')}>
-                    会话
-                  </button>
-                </div>
-
-                <div className="rev-h-acts">
-                  {!alreadyOnSession && (
-                    <button
-                      type="button"
-                      className="ib no-mobile"
-                      title="进入完整会话页"
-                      onClick={() => {
-                        const tid = review.taskId;
-                        close();
-                        navigate(paths.session(tid));
-                      }}
-                    >
-                      <ArrowUpRight size={14} strokeWidth={1.6} />
-                    </button>
-                  )}
-                  <button
-                    type="button"
-                    className="ib no-mobile"
-                    title="收起会话"
-                    onClick={() => setSessionHidden(true)}
-                  >
-                    <PanelRightClose size={14} strokeWidth={1.6} />
-                  </button>
-                  <button type="button" className="ib" title="关闭 (Esc)" onClick={close}>
-                    <X size={14} strokeWidth={1.6} />
-                  </button>
-                </div>
+                {taskMark && <StatusMark mark={taskMark} />}
               </div>
 
-              {tl ? (
-                <SessionConversation taskId={review.taskId} tl={tl} boot={boot} compact />
-              ) : (
-                <div className="empty">载入会话…</div>
-              )}
+              <div className="seg only-mobile" style={{ marginLeft: 'auto' }}>
+                <button type="button" className={mobilePane === 'artifact' ? 'on' : ''} onClick={() => setMobilePane('artifact')}>
+                  审阅
+                </button>
+                <button type="button" className={mobilePane === 'session' ? 'on' : ''} onClick={() => setMobilePane('session')}>
+                  会话
+                </button>
+              </div>
+
+              <div className="rev-h-acts">
+                <button
+                  type="button"
+                  className="ib"
+                  title="关闭审阅返回会话 (Esc)"
+                  aria-label="关闭审阅返回会话"
+                  onClick={close}
+                >
+                  <X size={14} strokeWidth={1.7} />
+                </button>
+              </div>
             </div>
-          )}
+
+            {tl ? (
+              <SessionConversation taskId={review.taskId} tl={tl} boot={boot} compact />
+            ) : (
+              <div className="empty">载入会话…</div>
+            )}
+          </div>
         </div>
       </section>
     </div>

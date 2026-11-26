@@ -1,63 +1,201 @@
-import { useState } from 'react';
+import { useState, type ReactNode } from 'react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { Brain, FileText, Link2, Plus, X } from 'lucide-react';
+import { Brain, Check, ChevronDown, ChevronRight, FileText, Link2, MessageSquare, Plus, X } from 'lucide-react';
 import type {
   BoardMemberCursor,
+  ChildTaskView,
+  InboxItemView,
   MachineView,
   ProjectView,
   TaskBoardResponse,
   TaskSourceKind,
   TaskTimelineResponse,
 } from '../generated/protocol';
-import { ArtIcon, CursorIcon, DiffIcon, SwarmIcon } from '../components/Icons';
+import { ArtIcon, DiffIcon, SwarmIcon } from '../components/Icons';
+import { StatusMark } from '../components/StatusMark';
+import { useDelivery } from '../hooks/queries';
 import { api, errMsg } from '../lib/api';
 import { collectSessionArtifacts } from '../lib/artifacts';
-import { artifactShortLabel, memberDot, memberStateLabel } from '../lib/format';
-import { buildIDEJump, launchIDE } from '../lib/ide';
+import {
+  PA_PROJECT_ID,
+  SCRATCH_PROJECT_ID,
+  artifactShortLabel,
+  childSessionMark,
+  cleanMachineName,
+  memberStateLabel,
+  taskTitle,
+  type SessionMark,
+} from '../lib/format';
 import { navigate, paths } from '../lib/router';
 import { toast, useWorkbenchStore } from '../store/useWorkbenchStore';
 
 const CODE_KINDS = new Set(['code_diff', 'mixed', 'workspace_snapshot']);
+const COLLAPSED_STORAGE_KEY = 'orbit.rightCardCollapsed';
 
-function SourceIcon({ kind }: { kind: TaskSourceKind }) {
-  if (kind === 'link') return <Link2 size={13} strokeWidth={1.6} className="faint" />;
-  if (kind === 'nmem') return <Brain size={13} strokeWidth={1.6} className="faint" />;
-  return <FileText size={13} strokeWidth={1.6} className="faint" />;
+function readCollapsedMap(): Record<string, boolean> {
+  try {
+    const raw = localStorage.getItem(COLLAPSED_STORAGE_KEY);
+    return raw ? (JSON.parse(raw) as Record<string, boolean>) : {};
+  } catch {
+    return {};
+  }
 }
 
-/** Compact floating context card: blocks appear only when backed by real data. */
+function writeCollapsedMap(next: Record<string, boolean>) {
+  try {
+    localStorage.setItem(COLLAPSED_STORAGE_KEY, JSON.stringify(next));
+  } catch {
+    // ignore storage errors
+  }
+}
+
+function nativeMemberMark(m: BoardMemberCursor): SessionMark {
+  switch (m.state) {
+    case 'working':
+      return 'running';
+    case 'waiting':
+      return 'needs-you';
+    case 'killed':
+      return 'failed';
+    default:
+      return null;
+  }
+}
+
+function SourceIcon({ kind }: { kind: TaskSourceKind }) {
+  if (kind === 'link') return <Link2 size={12.5} strokeWidth={1.6} className="faint" />;
+  if (kind === 'nmem') return <Brain size={12.5} strokeWidth={1.6} className="faint" />;
+  return <FileText size={12.5} strokeWidth={1.6} className="faint" />;
+}
+
+function RightSection({
+  secKey,
+  title,
+  count,
+  collapsed,
+  onToggle,
+  action,
+  children,
+}: {
+  secKey: string;
+  title: string;
+  count?: number;
+  collapsed: boolean;
+  onToggle: (key: string) => void;
+  action?: ReactNode;
+  children: ReactNode;
+}) {
+  return (
+    <div className={`fsec ${collapsed ? 'is-collapsed' : ''}`}>
+      <div className="fsec-hd-row">
+        <button
+          type="button"
+          className="fsec-toggle"
+          aria-expanded={!collapsed}
+          onClick={() => onToggle(secKey)}
+        >
+          {collapsed ? (
+            <ChevronRight size={12} strokeWidth={1.8} className="fsec-chev" aria-hidden="true" />
+          ) : (
+            <ChevronDown size={12} strokeWidth={1.8} className="fsec-chev" aria-hidden="true" />
+          )}
+          <span>{title}</span>
+          {count !== undefined && <span className="fsec-cnt">{count}</span>}
+        </button>
+        {action}
+      </div>
+      {!collapsed && <div className="fsec-body">{children}</div>}
+    </div>
+  );
+}
+
+/**
+ * Compact, collapsible right context panel (Orbit v4):
+ * - Top section: Code Changes (`+N −M` / `Checkpoint` opening Source Review)
+ * - Artifacts, Child Sessions (top-level only, max depth = 1), Workspace & Sources
+ * - Every section header clicks cleanly to collapse/expand with `⌄ / ›`.
+ */
 export function RightCard({
   tl,
   project,
   machines,
   board,
+  childrenList,
+  inboxByTask,
   onOpenBoard,
+  onOpenChild,
   onSelectMember,
 }: {
   tl: TaskTimelineResponse;
   project?: ProjectView;
   machines: MachineView[];
   board?: TaskBoardResponse;
+  childrenList?: ChildTaskView[];
+  inboxByTask?: ReadonlyMap<string, InboxItemView[]>;
   onOpenBoard: () => void;
+  onOpenChild?: (childTaskId: string) => void;
   onSelectMember?: (member: BoardMemberCursor) => void;
 }) {
   const qc = useQueryClient();
   const openReview = useWorkbenchStore((s) => s.openReview);
-  const localMachineId = useWorkbenchStore((s) => s.localMachineId);
+  const [collapsedMap, setCollapsedMap] = useState<Record<string, boolean>>(readCollapsedMap);
   const [adding, setAdding] = useState(false);
   const [kind, setKind] = useState<TaskSourceKind>('link');
   const [label, setLabel] = useState('');
   const [uri, setUri] = useState('');
   const taskId = tl.task.taskId;
+  const isChildSession = !!tl.task.parentTaskId;
+  const isScratch = tl.task.projectId === SCRATCH_PROJECT_ID;
+  const isPA = tl.task.projectId === PA_PROJECT_ID;
+
+  const toggleSec = (key: string) => {
+    setCollapsedMap((prev) => {
+      const next = { ...prev, [key]: !prev[key] };
+      writeCollapsedMap(next);
+      return next;
+    });
+  };
 
   const formalDeliveries = tl.deliveries.filter((d) => !d.lateArrival);
+  const codeDeliveries = tl.deliveries.filter((d) => CODE_KINDS.has(d.kind));
   const formalCodeDeliveries = formalDeliveries.filter((d) => CODE_KINDS.has(d.kind) && d.manifest.filesChanged > 0);
   const latestCode =
     formalCodeDeliveries.find((d) => d.deliveryId === tl.task.latestDeliveryId) ??
-    formalCodeDeliveries[formalCodeDeliveries.length - 1];
+    formalCodeDeliveries[formalCodeDeliveries.length - 1] ??
+    codeDeliveries[codeDeliveries.length - 1];
+
+  const deliveryQ = useDelivery(latestCode?.deliveryId);
+  const isCheckpointed = deliveryQ.data?.reviewState === 'resolved';
+  const hasCodeDiff =
+    !!latestCode &&
+    (latestCode.manifest.insertions > 0 || latestCode.manifest.deletions > 0 || latestCode.manifest.filesChanged > 0);
+  const openDiffComments = tl.annotations.filter((a) => a.status === 'open' && a.source !== 'ryugi').length;
+
   const sessionArtifacts = collectSessionArtifacts(tl);
-  const members = board?.members ?? tl.boardMembers;
-  const showWorkers = members.length > 0 || tl.task.workerCount > 0;
+  const allMembers = board?.members ?? tl.boardMembers;
+  const nativeMembers = allMembers.filter((m) => !m.workerTaskId);
+  const effectiveChildren = isChildSession ? [] : (childrenList ?? tl.children ?? []);
+  const totalSubs = effectiveChildren.length + nativeMembers.length;
+  const showSubsSection = !isChildSession && (totalSubs > 0 || tl.task.workerCount > 0);
+
+  const lastAttempt = tl.attempts[tl.attempts.length - 1];
+  const matchedPart = lastAttempt?.partId ? project?.parts?.find((p) => p.partId === lastAttempt.partId) : project?.parts?.[0];
+  const matchedLoc = lastAttempt?.locationId
+    ? matchedPart?.locations?.find((l) => l.locationId === lastAttempt.locationId)
+    : matchedPart?.locations?.find((l) => l.isDefault) ?? matchedPart?.locations?.[0];
+  const anchorRepo = project
+    ? project.anchors[tl.task.requiredCapability || project.defaultCapability]?.repoPath
+    : '';
+  const workspacePath =
+    lastAttempt?.worktreePath ||
+    latestCode?.manifest?.worktreePath ||
+    matchedLoc?.absPath ||
+    anchorRepo ||
+    (isScratch ? '自由对话' : isPA ? 'Hebi8' : '');
+
+  const hostMachineId = latestCode?.sourceMachineId || lastAttempt?.machineId || matchedLoc?.machineId || '';
+  const hostMachine = hostMachineId ? machines.find((m) => m.machineId === hostMachineId) : undefined;
+  const hostLabel = hostMachine ? hostMachine.displayAlias?.trim() || cleanMachineName(hostMachine) : hostMachineId;
 
   const addSrc = useMutation({
     mutationFn: () => api.addSource(taskId, { kind, label: label.trim() || uri.trim(), uriOrRef: uri.trim() }),
@@ -75,52 +213,61 @@ export function RightCard({
     onError: (e) => toast(errMsg(e), 'err'),
   });
 
-  const ide =
-    latestCode && project
-      ? buildIDEJump({ scheme: project.ideScheme, localMachineId, delivery: latestCode, project, machines })
-      : null;
-
   return (
-    <aside className="fcard" aria-label="会话上下文">
+    <aside className="fcard" aria-label={isChildSession ? '子会话上下文浮卡' : '会话上下文'}>
       {latestCode && (
-        <div className="fsec">
-          <div className="fsec-h">改动</div>
-          <div
-            className="frow"
-            role="button"
-            tabIndex={0}
+        <RightSection
+          secKey="diff"
+          title="代码变动"
+          collapsed={!!collapsedMap.diff}
+          onToggle={toggleSec}
+        >
+          <button
+            type="button"
+            className={`frow ${isCheckpointed || !hasCodeDiff ? 'is-clean' : ''}`}
             onClick={() => openReview('code', taskId, latestCode.deliveryId)}
-            onKeyDown={(e) => e.key === 'Enter' && openReview('code', taskId, latestCode.deliveryId)}
-            title="打开代码审阅"
+            title={isCheckpointed ? '已标记 Checkpoint · 点击打开 Source Review' : '打开 Source Review'}
           >
-            <DiffIcon size={13} />
-            <span className="ell" style={{ flex: 1 }}>
-              {latestCode.manifest.filesChanged} 个文件
-            </span>
-            <span className="fx mono hide-on-hover">
-              <span className="add">+{latestCode.manifest.insertions}</span>{' '}
-              <span className="del">−{latestCode.manifest.deletions}</span>
-            </span>
-            {ide && (
-              <button
-                type="button"
-                className="ib hov"
-                title={`在 Cursor 打开 · ${ide.targetLabel}`}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  launchIDE(ide.uri);
-                }}
-              >
-                <CursorIcon size={13} />
-              </button>
+            {isCheckpointed || !hasCodeDiff ? (
+              <Check size={12.5} strokeWidth={2} className="ok-t" />
+            ) : (
+              <DiffIcon size={12.5} />
             )}
-          </div>
-        </div>
+            <span className="ell grow">
+              {isCheckpointed
+                ? '已标记 Checkpoint'
+                : hasCodeDiff
+                  ? latestCode.manifest.filesChanged > 0
+                    ? `${latestCode.manifest.filesChanged} 个文件`
+                    : 'Source Review'
+                  : 'Checkpoint'}
+            </span>
+            {openDiffComments > 0 && (
+              <span className="comment-count-badge" title={`${openDiffComments} 条待发批注`}>
+                <MessageSquare size={10} strokeWidth={1.8} />
+                {openDiffComments}
+              </span>
+            )}
+            {hasCodeDiff ? (
+              <span className="fx mono">
+                <span className="add">+{latestCode.manifest.insertions}</span>{' '}
+                <span className="del">−{latestCode.manifest.deletions}</span>
+              </span>
+            ) : isCheckpointed ? (
+              <span className="fx mono ok-t">✓</span>
+            ) : null}
+          </button>
+        </RightSection>
       )}
 
       {sessionArtifacts.length > 0 && (
-        <div className="fsec">
-          <div className="fsec-h">Artifacts</div>
+        <RightSection
+          secKey="artifacts"
+          title="Artifacts"
+          count={sessionArtifacts.length}
+          collapsed={!!collapsedMap.artifacts}
+          onToggle={toggleSec}
+        >
           {sessionArtifacts.map((art) => (
             <button
               type="button"
@@ -129,113 +276,159 @@ export function RightCard({
               onClick={() => openReview('art', taskId, art.deliveryId, art.artifactId)}
               title={art.locator}
             >
-              <ArtIcon size={13} />
-              <span className="ell" style={{ flex: 1 }}>
-                {art.title}
-              </span>
+              <ArtIcon size={12.5} />
+              <span className="ell grow">{art.title}</span>
               <span className="dlv-kind-tag">{artifactShortLabel(art.kind)}</span>
             </button>
           ))}
-        </div>
+        </RightSection>
       )}
 
-      {showWorkers && (
-        <div className="fsec">
-          <div className="fsec-h">协作</div>
-          {members.map((m) => (
+      {showSubsSection && (
+        <RightSection
+          secKey="subs"
+          title="协作子会话"
+          count={totalSubs || undefined}
+          collapsed={!!collapsedMap.subs}
+          onToggle={toggleSec}
+        >
+          {effectiveChildren.map((c) => {
+            const mark = childSessionMark(c, inboxByTask?.get(c.taskId));
+            return (
+              <button
+                type="button"
+                key={c.taskId}
+                className="frow"
+                onClick={() => {
+                  if (onOpenChild) onOpenChild(c.taskId);
+                  else navigate(paths.session(taskId, undefined, c.taskId));
+                }}
+                title={c.goal || taskTitle(c)}
+              >
+                <span className="ell grow">{taskTitle(c)}</span>
+                <StatusMark mark={mark} />
+              </button>
+            );
+          })}
+          {nativeMembers.map((m) => (
             <button
               type="button"
-              key={m.memberName}
+              key={`native:${m.memberName}`}
               className="frow"
               onClick={() => {
                 if (onSelectMember) onSelectMember(m);
-                else if (m.workerTaskId) navigate(paths.session(taskId, undefined, m.workerTaskId));
                 else navigate(paths.session(taskId, m.memberName));
               }}
               title={`${memberStateLabel(m.state)}${m.currentStep ? ` · ${m.currentStep}` : ''}`}
             >
-              <span className={`sd ${memberDot(m.state)}`} />
-              <span className="ell" style={{ flex: 1 }}>
-                {m.role ? `${m.role} · ` : ''}
-                {m.memberName}
+              <span className="ell grow">@{m.memberName}</span>
+              <span className="faint" style={{ fontSize: 10.5, flex: 'none' }}>
+                内置
               </span>
+              <StatusMark mark={nativeMemberMark(m)} />
             </button>
           ))}
-          {members.length === 0 && <div className="fsub">有协作子任务</div>}
-          <button type="button" className="flink" onClick={onOpenBoard}>
-            <SwarmIcon size={12} /> 消息板 →
-          </button>
-        </div>
+          {totalSubs === 0 && <div className="fsub">有协作子任务</div>}
+          {(nativeMembers.length > 0 || (board?.messages?.length ?? 0) > 0) && (
+            <button type="button" className="flink" onClick={onOpenBoard}>
+              <SwarmIcon size={12} /> 消息板 →
+            </button>
+          )}
+        </RightSection>
       )}
 
-      {(tl.sources.length > 0 || adding) && (
-        <div className="fsec">
-          <div className="fsec-h">
-            参考
-            <span className="r">
-              <button type="button" className="ib" title="添加参考" onClick={() => setAdding(!adding)}>
-                <Plus size={12} strokeWidth={1.6} />
-              </button>
-            </span>
+      <RightSection
+        secKey="workspace"
+        title="工作区与来源"
+        count={tl.sources.length > 0 ? tl.sources.length : undefined}
+        collapsed={!!collapsedMap.workspace}
+        onToggle={toggleSec}
+        action={
+          <button
+            type="button"
+            className="ib fsec-add-btn"
+            title="添加参考来源"
+            aria-label="添加参考来源"
+            onClick={() => {
+              if (collapsedMap.workspace) toggleSec('workspace');
+              setAdding((v) => !v);
+            }}
+          >
+            <Plus size={12} strokeWidth={1.7} />
+          </button>
+        }
+      >
+        {workspacePath && (
+          <div className="frow is-static" title={workspacePath}>
+            <div className="fdir-meta">
+              <span className="fdir-lbl">
+                执行目录{hostLabel ? ` · ${hostLabel}` : ''}
+              </span>
+              <span className="fdir-val mono">{workspacePath}</span>
+            </div>
           </div>
-          {tl.sources.map((s) => (
-            <div className="frow" key={s.sourceId} title={s.uriOrRef}>
-              <SourceIcon kind={s.kind} />
-              {s.kind === 'link' && /^https?:\/\//.test(s.uriOrRef) ? (
-                <a className="ell" style={{ flex: 1 }} href={s.uriOrRef} target="_blank" rel="noopener noreferrer">
-                  {s.label}
-                </a>
-              ) : (
-                <span className="ell" style={{ flex: 1 }}>
-                  {s.label}
-                </span>
-              )}
-              <button type="button" className="ib hov" title="移除" disabled={delSrc.isPending} onClick={() => delSrc.mutate(s.sourceId)}>
-                <X size={12} strokeWidth={1.6} />
+        )}
+
+        {tl.sources.map((s) => (
+          <div className="frow" key={s.sourceId} title={s.uriOrRef}>
+            <SourceIcon kind={s.kind} />
+            {s.kind === 'link' && /^https?:\/\//.test(s.uriOrRef) ? (
+              <a className="ell grow" href={s.uriOrRef} target="_blank" rel="noopener noreferrer">
+                {s.label}
+              </a>
+            ) : (
+              <span className="ell grow">{s.label}</span>
+            )}
+            <button
+              type="button"
+              className="ib hov"
+              title="移除"
+              disabled={delSrc.isPending}
+              onClick={() => delSrc.mutate(s.sourceId)}
+            >
+              <X size={12} strokeWidth={1.6} />
+            </button>
+          </div>
+        ))}
+
+        {adding ? (
+          <form
+            className="srcform"
+            onSubmit={(e) => {
+              e.preventDefault();
+              if (uri.trim()) addSrc.mutate();
+            }}
+          >
+            <select className="field" value={kind} onChange={(e) => setKind(e.target.value as TaskSourceKind)}>
+              <option value="link">链接</option>
+              <option value="file">文件</option>
+              <option value="nmem">nmem 记忆</option>
+            </select>
+            <input className="field" placeholder="标题（可选）" value={label} onChange={(e) => setLabel(e.target.value)} />
+            <input
+              className="field"
+              placeholder={kind === 'link' ? 'https://…' : kind === 'file' ? '仓库内路径' : 'nmem 引用'}
+              value={uri}
+              onChange={(e) => setUri(e.target.value)}
+              autoFocus
+            />
+            <div className="row">
+              <button type="button" className="btn ghost sm" onClick={() => setAdding(false)}>
+                取消
+              </button>
+              <button type="submit" className="btn pri sm" disabled={!uri.trim() || addSrc.isPending}>
+                添加
               </button>
             </div>
-          ))}
-          {adding && (
-            <form
-              className="srcform"
-              onSubmit={(e) => {
-                e.preventDefault();
-                if (uri.trim()) addSrc.mutate();
-              }}
-            >
-              <select className="field" value={kind} onChange={(e) => setKind(e.target.value as TaskSourceKind)}>
-                <option value="link">链接</option>
-                <option value="file">文件</option>
-                <option value="nmem">nmem 记忆</option>
-              </select>
-              <input className="field" placeholder="标题（可选）" value={label} onChange={(e) => setLabel(e.target.value)} />
-              <input
-                className="field"
-                placeholder={kind === 'link' ? 'https://…' : kind === 'file' ? '仓库内路径' : 'nmem 引用'}
-                value={uri}
-                onChange={(e) => setUri(e.target.value)}
-                autoFocus
-              />
-              <div className="row">
-                <button type="button" className="btn ghost" onClick={() => setAdding(false)}>
-                  取消
-                </button>
-                <button type="submit" className="btn pri" disabled={!uri.trim() || addSrc.isPending}>
-                  添加
-                </button>
-              </div>
-            </form>
-          )}
-        </div>
-      )}
-
-      {tl.sources.length === 0 && !adding && (
-        <div className="fsec fsec-add">
-          <button type="button" className="flink faint" onClick={() => setAdding(true)}>
-            <Plus size={12} strokeWidth={1.6} /> 参考
-          </button>
-        </div>
-      )}
+          </form>
+        ) : (
+          tl.sources.length === 0 && (
+            <button type="button" className="flink faint" onClick={() => setAdding(true)}>
+              <Plus size={11.5} strokeWidth={1.6} /> 添加参考来源
+            </button>
+          )
+        )}
+      </RightSection>
     </aside>
   );
 }

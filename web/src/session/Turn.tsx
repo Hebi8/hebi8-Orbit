@@ -2,22 +2,28 @@ import { useEffect, useMemo, useState } from 'react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   ArrowUpRight,
-  ChevronDown,
   ChevronRight,
-  CornerDownRight,
+  CornerDownLeft,
   FileSpreadsheet,
   FileText,
   Layers,
   Link2,
-  PanelRightOpen,
   Presentation,
-  Square,
   Table,
 } from 'lucide-react';
-import type { AttemptView, ChildTaskView, MachineView, TaskTimelineResponse } from '../generated/protocol';
+import type {
+  AttemptView,
+  BoardMemberCursor,
+  ChildTaskView,
+  InboxItemView,
+  MachineView,
+  TaskSummary,
+  TaskTimelineResponse,
+} from '../generated/protocol';
 import { ApprovalNotice } from '../components/ApprovalNotice';
 import { FolderChangesCard } from '../components/FolderChangesCard';
-import { CaretIcon } from '../components/Icons';
+import { Md } from '../components/Md';
+import { StatusMark } from '../components/StatusMark';
 import { useAttemptRaw } from '../hooks/queries';
 import { ADAPTER_LABELS } from '../lib/agentCaps';
 import { api, errMsg } from '../lib/api';
@@ -28,15 +34,14 @@ import {
   artifactShortLabel,
   attemptStateLabel,
   basename,
-  childStateDot,
-  childStateLabel,
+  childSessionMark,
   cleanMachineName,
   hhmm,
   isAttemptLive,
-  isChildStateLive,
   shortSha,
   taskTitle,
   triggerLabel,
+  type SessionMark,
 } from '../lib/format';
 import { navigate, paths } from '../lib/router';
 import { buildSegments, lastLiveStep } from '../lib/segments';
@@ -44,6 +49,45 @@ import { toast, useWorkbenchStore } from '../store/useWorkbenchStore';
 import { Segments } from './Segments';
 
 const CODE_KINDS = new Set(['code_diff', 'mixed', 'workspace_snapshot']);
+
+function nativeMemberMark(m: BoardMemberCursor): SessionMark {
+  switch (m.state) {
+    case 'working':
+      return 'running';
+    case 'waiting':
+      return 'needs-you';
+    case 'killed':
+      return 'failed';
+    default:
+      return null;
+  }
+}
+
+function extractOneLineGist(md: string): string {
+  const line = md
+    .split('\n')
+    .map((l) => l.replace(/^[#>*\-\d.\s]+/, '').replace(/[`*_~]/g, '').trim())
+    .find((l) => l.length > 0);
+  return line ?? '';
+}
+
+function stripSystemWakeupBoilerplate(raw: string): string {
+  const trimmed = raw.trim();
+  if (!trimmed) return '';
+  // Remove leading system wakeup metadata headers (e.g. "[Orbit 子会话回传] ...") if present.
+  const lines = trimmed.split('\n');
+  let start = 0;
+  while (start < lines.length) {
+    const l = lines[start].trim();
+    if (!l || /^\[Orbit[^\]]*\]/i.test(l) || /^(子会话|任务|状态|Delivery|TaskID|ChildTaskID)[:：]/i.test(l)) {
+      start++;
+      continue;
+    }
+    break;
+  }
+  const body = lines.slice(start).join('\n').trim();
+  return body || trimmed;
+}
 
 function AuthedInlineImage({ sha256, name }: { sha256: string; name: string }) {
   const [src, setSrc] = useState<string>('');
@@ -207,212 +251,218 @@ function RetryNotice({ attempt, taskId, needsVerify }: { attempt: AttemptView; t
   );
 }
 
-function ChildResultSystemCard({
-  attempt,
-  onOpenChild,
+/**
+ * Unified minimal inbound communication rail (`↵`, 1.5px muted accent left rail):
+ * Default collapsed with 1-line summary; expands clean formatted Markdown via `<Md />` (never raw `<pre>`).
+ * Drops verbose boilerplate labels ("来自子会话" / "同级会话通信" / "已回传摘要").
+ */
+function InboundCommRail({
+  title,
+  bodyMd,
+  time,
+  isFailed = false,
+  insertions = 0,
+  deletions = 0,
+  targetTaskId,
+  openLinkLabel,
+  onOpenTarget,
 }: {
-  attempt: AttemptView;
-  onOpenChild?: (childTaskId: string) => void;
+  title: string;
+  bodyMd: string;
+  time?: string;
+  isFailed?: boolean;
+  insertions?: number;
+  deletions?: number;
+  targetTaskId?: string;
+  openLinkLabel?: string;
+  onOpenTarget?: (taskId: string) => void;
 }) {
-  const [expanded, setExpanded] = useState(false);
-  const cr = attempt.childResult;
-  const rawPrompt = attempt.promptText?.trim() ?? '';
-  const summaryText = cr?.summary?.trim() || cr?.errorDetail?.trim() || rawPrompt;
-  const hasLongDetails = !!rawPrompt && (rawPrompt.length > 180 || rawPrompt.includes('\n') || rawPrompt !== summaryText);
-
-  const stateTone =
-    cr?.childState === 'succeeded'
-      ? 'ok'
-      : cr?.childState === 'failed' || cr?.childState === 'expired' || cr?.childState === 'cancelled'
-        ? 'bad'
-        : 'muted';
-
-  const hasDiff =
-    (cr?.filesChanged ?? 0) > 0 || (cr?.insertions ?? 0) > 0 || (cr?.deletions ?? 0) > 0;
-
-  const openTarget = () => {
-    if (!cr?.childTaskId) return;
-    if (onOpenChild) onOpenChild(cr.childTaskId);
-    else navigate(paths.session(cr.childTaskId));
-  };
+  const gist = extractOneLineGist(bodyMd);
+  const hasDiff = insertions > 0 || deletions > 0;
 
   return (
-    <div className="it child-res-card">
-      <div className="child-res-hd">
-        <span className="child-res-k">
-          <CornerDownRight size={12} strokeWidth={1.8} />
-          <span>子会话回传</span>
+    <details className={`it comm-in ${isFailed ? 'is-failed' : ''}`}>
+      <summary className="comm-row is-in">
+        <span className="comm-dir-ico is-in" aria-hidden="true">
+          <CornerDownLeft size={13} strokeWidth={1.75} />
         </span>
-        {cr?.childRole && <span className="csd-role-pill">{cr.childRole}</span>}
-        {cr?.childTaskId ? (
-          <button
-            type="button"
-            className="child-res-title ell"
-            title={`分屏查看子会话「${cr.childTitle}」`}
-            onClick={openTarget}
-          >
-            {cr.childTitle || cr.childTaskId}
-          </button>
-        ) : (
-          <span className="child-res-title ell">子会话已完成</span>
-        )}
-        {cr && <span className={`child-res-state is-${stateTone}`}>{attemptStateLabel(cr.childState)}</span>}
-        {hasDiff && (
-          <span className="child-res-diff mono">
-            <span className="add">+{cr?.insertions ?? 0}</span> <span className="del">−{cr?.deletions ?? 0}</span>
+        <span className="comm-ttl" title={title}>
+          {title}
+        </span>
+        <span className="comm-meta">{gist}</span>
+        <span className="comm-trail">
+          {hasDiff && (
+            <span className="sub-ret-diff mono">
+              {insertions > 0 && <span className="add">+{insertions}</span>}
+              {deletions > 0 && <span className="del">−{deletions}</span>}
+            </span>
+          )}
+          {isFailed && <StatusMark mark="failed" />}
+          <span className="comm-chev" aria-hidden="true">
+            <ChevronRight size={12} strokeWidth={1.7} />
           </span>
-        )}
-        <span className="child-res-time">{hhmm(attempt.startedAt)}</span>
-      </div>
-
-      {summaryText && !expanded && <div className="child-res-preview">{summaryText}</div>}
-      {expanded && rawPrompt && <pre className="child-res-raw">{rawPrompt}</pre>}
-
-      <div className="child-res-acts">
-        {cr?.childTaskId && (
-          <>
-            <button type="button" className="child-act-btn" onClick={openTarget}>
-              <PanelRightOpen size={11.5} strokeWidth={1.7} />
-              <span>分屏查看</span>
-            </button>
+        </span>
+      </summary>
+      <div className="comm-in-body">
+        <Md text={bodyMd || '已完成'} />
+        <div className="comm-in-foot">
+          <span>{time || ''}</span>
+          {targetTaskId && (
             <button
               type="button"
-              className="child-act-btn"
-              onClick={() => navigate(paths.session(cr.childTaskId))}
+              className="sub-ret-link"
+              onClick={() => {
+                if (onOpenTarget) onOpenTarget(targetTaskId);
+                else navigate(paths.session(targetTaskId));
+              }}
             >
-              <span>完整页</span>
-              <ArrowUpRight size={11.5} strokeWidth={1.7} />
+              <span>{openLinkLabel || '分屏查看'}</span>
+              <ChevronRight size={11.5} strokeWidth={1.8} />
             </button>
-          </>
-        )}
-        {hasLongDetails && (
-          <button type="button" className="child-act-btn faint" onClick={() => setExpanded((v) => !v)}>
-            {expanded ? <ChevronDown size={11.5} strokeWidth={1.8} /> : <ChevronRight size={11.5} strokeWidth={1.8} />}
-            <span>{expanded ? '收起回传原文' : '展开完整回传'}</span>
-          </button>
-        )}
+          )}
+        </div>
       </div>
-    </div>
+    </details>
   );
 }
 
-function InlineDispatchedChildren({
+/**
+ * Unified minimal outbound communication rail (`↗`, 1.5px neutral gray left rail):
+ * - Orbit child sessions & native subagent/swarm members (native members carry faint plain text "内置" at end of meta).
+ * - Trailing single-slot StatusMark only.
+ * - Naturally folds into a single quiet disclosure when every item in the batch is resting.
+ */
+function OutboundCommTrack({
   parentTaskId,
   parentProjectId,
   children,
+  nativeMembers = [],
   machines,
+  inboxByTask,
+  activeChildId,
+  activeNativeMember,
   onOpenChild,
+  onOpenNativeMember,
 }: {
   parentTaskId: string;
   parentProjectId: string;
   children: ChildTaskView[];
+  nativeMembers?: BoardMemberCursor[];
   machines?: MachineView[];
+  inboxByTask?: ReadonlyMap<string, InboxItemView[]>;
+  activeChildId?: string;
+  activeNativeMember?: string;
   onOpenChild?: (childTaskId: string) => void;
+  onOpenNativeMember?: (member: BoardMemberCursor) => void;
 }) {
-  const qc = useQueryClient();
-  const stopMut = useMutation({
-    mutationFn: (childId: string) => api.cancelTask(childId, 'stopped from inline dispatch card'),
-    onSuccess: (res, childId) => {
-      toast(res.cancelSent || res.immediateState ? '已请求停止子会话' : '停止请求已记录');
-      void qc.invalidateQueries({ queryKey: ['task-timeline', parentTaskId] });
-      void qc.invalidateQueries({ queryKey: ['task-timeline', childId] });
-      void qc.invalidateQueries({ queryKey: ['task-children', parentTaskId] });
-      void qc.invalidateQueries({ queryKey: ['all-tasks'] });
-      void qc.invalidateQueries({ queryKey: ['bootstrap'] });
-    },
-    onError: (e) => toast(errMsg(e), 'err'),
-  });
+  const totalCount = children.length + nativeMembers.length;
+  if (totalCount === 0) return null;
 
-  if (children.length === 0) return null;
+  const allResting =
+    children.every((c) => !childSessionMark(c, inboxByTask?.get(c.taskId))) &&
+    nativeMembers.every((m) => !nativeMemberMark(m));
 
-  return (
-    <div className="it child-dispatch-list" aria-label="派发的子会话">
+  const rows = (
+    <div className="comm-track is-out">
       {children.map((c) => {
-        const live = isChildStateLive(c.state);
-        const dot = childStateDot(c.state, c.openApprovalCount);
-        const needsApproval = c.openApprovalCount > 0 || c.state === 'waiting_approval';
+        const mark = childSessionMark(c, inboxByTask?.get(c.taskId));
         const mach = machines?.find((m) => m.machineId === c.machineId);
         const machName = mach ? mach.displayAlias?.trim() || cleanMachineName(mach) : c.machineId || '';
         const adpLabel = c.preferredAdapter ? ADAPTER_LABELS[c.preferredAdapter] ?? c.preferredAdapter : '';
-        const hasDiff = (c.filesChanged ?? 0) > 0 || (c.insertions ?? 0) > 0 || (c.deletions ?? 0) > 0;
-        const preview =
-          (live && c.currentStep?.trim()) ||
-          c.errorDetail?.trim() ||
-          c.lastMessagePreview?.trim() ||
-          '';
+        const isCrossProject = !!c.projectId && c.projectId !== parentProjectId && !!c.projectName;
+        const metaParts = [
+          isCrossProject ? c.projectName : '',
+          machName,
+          adpLabel,
+          mark && c.currentStep?.trim() ? c.currentStep.trim() : '',
+        ].filter(Boolean);
         const title = taskTitle(c);
-        const isCrossProject = c.projectId && c.projectId !== parentProjectId && c.projectName;
-
-        const openSplit = () => {
-          if (onOpenChild) onOpenChild(c.taskId);
-          else navigate(paths.session(parentTaskId, undefined, c.taskId));
-        };
+        const isOpen = !!activeChildId && activeChildId === c.taskId;
 
         return (
-          <div key={c.taskId} className={`child-dcard ${needsApproval ? 'is-ap' : ''} ${live ? 'is-live' : ''}`}>
-            <div className="child-dcard-hd">
-              <span className={`sub-dot is-${dot}`} aria-hidden="true" />
-              {c.delegatedRole && <span className="csd-role-pill">{c.delegatedRole}</span>}
-              <button type="button" className="child-dcard-ttl ell" onClick={openSplit} title={c.goal || title}>
-                {title}
-              </button>
-              <span className="child-dcard-state">{childStateLabel(c.state, c.openApprovalCount)}</span>
-            </div>
+          <button
+            type="button"
+            key={c.taskId}
+            className={`comm-row is-out ${isOpen ? 'is-open' : ''} ${!mark ? 'is-resting' : ''}`}
+            title={c.goal || title}
+            onClick={() => {
+              if (onOpenChild) onOpenChild(c.taskId);
+              else navigate(paths.session(parentTaskId, undefined, c.taskId));
+            }}
+          >
+            <span className="comm-dir-ico is-out" aria-hidden="true">
+              <ArrowUpRight size={13} strokeWidth={1.75} />
+            </span>
+            <span className="comm-ttl">{title}</span>
+            <span className="comm-meta">{metaParts.join(' · ')}</span>
+            <span className="comm-trail">
+              <StatusMark mark={mark} />
+              <span className="comm-chev" aria-hidden="true">
+                <ChevronRight size={12} strokeWidth={1.7} />
+              </span>
+            </span>
+          </button>
+        );
+      })}
 
-            <div className="child-dcard-meta">
-              {isCrossProject && <span className="child-dcard-proj">{c.projectName}</span>}
-              {machName && <span className="mono">{machName}</span>}
-              {adpLabel && (
-                <>
-                  {machName && <span className="topbar-meta-dot">·</span>}
-                  <span>{adpLabel}</span>
-                </>
-              )}
-              {hasDiff && (
-                <>
-                  <span className="topbar-meta-dot">·</span>
-                  <span className="mono">
-                    <span className="add">+{c.insertions ?? 0}</span> <span className="del">−{c.deletions ?? 0}</span>
-                  </span>
-                </>
-              )}
-              {needsApproval && (
-                <span className="sub-chip-ap">
-                  待审批{c.openApprovalCount > 1 ? ` ${c.openApprovalCount}` : ''}
-                </span>
-              )}
-            </div>
+      {nativeMembers.map((m) => {
+        const mark = nativeMemberMark(m);
+        const mach = machines?.find((x) => x.machineId === m.machineId);
+        const machName = mach ? mach.displayAlias?.trim() || cleanMachineName(mach) : m.machineId || '';
+        const adpLabel = m.adapter ? ADAPTER_LABELS[m.adapter] ?? m.adapter : '';
+        const metaParts = [machName, adpLabel, '内置'].filter(Boolean);
+        const isOpen = !activeChildId && activeNativeMember === m.memberName;
 
-            {preview && (
-              <div className={`child-dcard-preview ${c.state === 'failed' ? 'is-err' : ''}`}>{preview}</div>
-            )}
-
-            <div className="child-dcard-acts">
-              <button type="button" className="child-act-btn is-pri" onClick={openSplit}>
-                <PanelRightOpen size={11.5} strokeWidth={1.7} />
-                <span>分屏查看/接管</span>
-              </button>
-              <button type="button" className="child-act-btn" onClick={() => navigate(paths.session(c.taskId))}>
-                <span>完整页</span>
-                <ArrowUpRight size={11.5} strokeWidth={1.7} />
-              </button>
-              {live && (
-                <button
-                  type="button"
-                  className="child-act-btn is-stop"
-                  disabled={stopMut.isPending && stopMut.variables === c.taskId}
-                  onClick={() => stopMut.mutate(c.taskId)}
-                >
-                  <Square size={9} fill="currentColor" strokeWidth={0} />
-                  <span>停止</span>
-                </button>
-              )}
-            </div>
-          </div>
+        return (
+          <button
+            type="button"
+            key={`native:${m.memberName}`}
+            className={`comm-row is-out ${isOpen ? 'is-open' : ''} ${!mark ? 'is-resting' : ''}`}
+            title={`@${m.memberName} · ${metaParts.join(' · ')}`}
+            onClick={() => {
+              if (onOpenNativeMember) onOpenNativeMember(m);
+              else navigate(paths.session(parentTaskId, m.memberName));
+            }}
+          >
+            <span className="comm-dir-ico is-out" aria-hidden="true">
+              <ArrowUpRight size={13} strokeWidth={1.75} />
+            </span>
+            <span className="comm-ttl">@{m.memberName}</span>
+            <span className="comm-meta">{metaParts.join(' · ')}</span>
+            <span className="comm-trail">
+              <StatusMark mark={mark} />
+              <span className="comm-chev" aria-hidden="true">
+                <ChevronRight size={12} strokeWidth={1.7} />
+              </span>
+            </span>
+          </button>
         );
       })}
     </div>
   );
+
+  if (allResting) {
+    const previewTitles = [
+      ...children.map((c) => taskTitle(c).slice(0, 14)),
+      ...nativeMembers.map((m) => `@${m.memberName}`),
+    ]
+      .slice(0, 3)
+      .join('、');
+
+    return (
+      <details className="it sub-quiet-details">
+        <summary className="proc-summary">
+          <ChevronRight size={12} strokeWidth={1.8} className="proc-chev" aria-hidden="true" />
+          <span>
+            {totalCount} 个子会话{previewTitles ? ` · ${previewTitles}` : ''}
+          </span>
+        </summary>
+        {rows}
+      </details>
+    );
+  }
+
+  return <div className="it">{rows}</div>;
 }
 
 export function Turn({
@@ -422,8 +472,15 @@ export function Turn({
   tl,
   compact = false,
   childrenList,
+  nativeMembers,
+  siblingChildren,
+  allTasks,
   machines,
+  inboxByTask,
+  activeChildId,
+  activeNativeMember,
   onOpenChild,
+  onOpenNativeMember,
 }: {
   attempt: AttemptView;
   index: number;
@@ -431,19 +488,29 @@ export function Turn({
   tl: TaskTimelineResponse;
   compact?: boolean;
   childrenList?: ChildTaskView[];
+  nativeMembers?: BoardMemberCursor[];
+  siblingChildren?: ChildTaskView[];
+  allTasks?: TaskSummary[];
   machines?: MachineView[];
+  inboxByTask?: ReadonlyMap<string, InboxItemView[]>;
+  activeChildId?: string;
+  activeNativeMember?: string;
   onOpenChild?: (childTaskId: string) => void;
+  onOpenNativeMember?: (member: BoardMemberCursor) => void;
 }) {
   const live = isAttemptLive(attempt.state);
-  const [expanded, setExpanded] = useState(false);
-  const loadRaw = expanded || isLast || live;
-  const raw = useAttemptRaw(attempt.attemptId, { enabled: loadRaw, live });
+  // Every turn loads its raw ACP events once so historical turns' final prose is NEVER hidden or folded away.
+  const raw = useAttemptRaw(attempt.attemptId, { enabled: true, live });
   const segs = useMemo(() => buildSegments(raw.data ?? []), [raw.data]);
   const prompt = usePromptFor(attempt, tl);
   const openReview = useWorkbenchStore((s) => s.openReview);
 
-  const approvals = tl.approvals.filter((a) => a.attemptId === attempt.attemptId).sort((a, b) => a.createdAt - b.createdAt);
-  const deliveryIdx = attempt.outputDeliveryId ? tl.deliveries.findIndex((d) => d.deliveryId === attempt.outputDeliveryId) : -1;
+  const approvals = tl.approvals
+    .filter((a) => a.attemptId === attempt.attemptId)
+    .sort((a, b) => a.createdAt - b.createdAt);
+  const deliveryIdx = attempt.outputDeliveryId
+    ? tl.deliveries.findIndex((d) => d.deliveryId === attempt.outputDeliveryId)
+    : -1;
   const delivery = deliveryIdx >= 0 ? tl.deliveries[deliveryIdx] : undefined;
   const taskIdle = !tl.task.activeAttemptId;
   const step = live ? lastLiveStep(segs) : null;
@@ -453,15 +520,83 @@ export function Turn({
   const artifacts = delivery ? deliveryReusableArtifacts(delivery, tl.annotations) : [];
   const hasCodeDiff = !!delivery && CODE_KINDS.has(delivery.kind) && delivery.manifest.filesChanged > 0;
   const isChildResult = attempt.triggerKind === 'child_result' || !!attempt.childResult;
-  const dispatchedChildren = useMemo(
-    () => (childrenList ?? tl.children ?? []).filter((c) => c.delegatedByAttemptId === attempt.attemptId),
-    [childrenList, tl.children, attempt.attemptId],
-  );
+
+  // Detect inbound delegated sibling/parent followup from timeline events (if recorded by runner delegate send).
+  const delegatedInbound = useMemo(() => {
+    if (isChildResult) return null;
+    const matchEv = tl.events.find((e) => {
+      if (e.kind === 'attempt.started' && e.attemptId === attempt.attemptId) {
+        return typeof e.payload?.delegatedFromTaskId === 'string' && e.payload.delegatedFromTaskId.length > 0;
+      }
+      if (e.kind === 'queue.updated' && e.payload?.dispatchedAttemptId === attempt.attemptId) {
+        return typeof e.payload?.delegatedFromTaskId === 'string' && e.payload.delegatedFromTaskId.length > 0;
+      }
+      return false;
+    });
+    const fromId = typeof matchEv?.payload?.delegatedFromTaskId === 'string' ? matchEv.payload.delegatedFromTaskId : '';
+    if (!fromId) return null;
+    const relation = typeof matchEv?.payload?.delegatedRelation === 'string' ? matchEv.payload.delegatedRelation : '';
+    const sibMatch = (siblingChildren ?? tl.siblingChildren ?? []).find((s) => s.taskId === fromId);
+    const parentMatch = tl.parentSummary?.taskId === fromId ? tl.parentSummary : undefined;
+    const taskMatch = allTasks?.find((t) => t.taskId === fromId);
+    const senderTitle =
+      (sibMatch && taskTitle(sibMatch)) ||
+      parentMatch?.title ||
+      (taskMatch && taskTitle(taskMatch)) ||
+      fromId;
+    return { fromId, relation, senderTitle };
+  }, [isChildResult, tl.events, tl.siblingChildren, tl.parentSummary, attempt.attemptId, siblingChildren, allTasks]);
+
+  const isTopLevel = !tl.task.parentTaskId;
+  const dispatchedChildren = useMemo(() => {
+    if (!isTopLevel) return [];
+    const pool = childrenList ?? tl.children ?? [];
+    const direct = pool.filter((c) => c.delegatedByAttemptId === attempt.attemptId);
+    if (!isLast) return direct;
+    // Attach any child without a matching attempt id onto the last turn so none are orphaned.
+    const knownAttemptIds = new Set(tl.attempts.map((a) => a.attemptId));
+    const orphans = pool.filter((c) => !c.delegatedByAttemptId || !knownAttemptIds.has(c.delegatedByAttemptId));
+    const seen = new Set(direct.map((c) => c.taskId));
+    return [...direct, ...orphans.filter((c) => !seen.has(c.taskId))];
+  }, [isTopLevel, childrenList, tl.children, tl.attempts, attempt.attemptId, isLast]);
+
+  const turnNativeMembers = isTopLevel && isLast ? (nativeMembers ?? []) : [];
+
+  const childResultMd = useMemo(() => {
+    if (!isChildResult) return '';
+    const cr = attempt.childResult;
+    if (cr?.summary?.trim()) return cr.summary.trim();
+    if (cr?.errorDetail?.trim()) return cr.errorDetail.trim();
+    return stripSystemWakeupBoilerplate(attempt.promptText ?? '');
+  }, [isChildResult, attempt.childResult, attempt.promptText]);
 
   return (
     <div className="turn" id={`turn-${attempt.attemptId}`} data-turn={index}>
       {isChildResult ? (
-        <ChildResultSystemCard attempt={attempt} onOpenChild={onOpenChild} />
+        <InboundCommRail
+          title={attempt.childResult?.childTitle || attempt.childResult?.childTaskId || '子会话'}
+          bodyMd={childResultMd}
+          time={hhmm(attempt.startedAt)}
+          isFailed={
+            attempt.childResult?.childState === 'failed' ||
+            attempt.childResult?.childState === 'expired' ||
+            attempt.childResult?.childState === 'cancelled'
+          }
+          insertions={attempt.childResult?.insertions ?? 0}
+          deletions={attempt.childResult?.deletions ?? 0}
+          targetTaskId={attempt.childResult?.childTaskId}
+          openLinkLabel={onOpenChild ? '分屏查看' : '打开会话'}
+          onOpenTarget={onOpenChild}
+        />
+      ) : delegatedInbound ? (
+        <InboundCommRail
+          title={delegatedInbound.senderTitle}
+          bodyMd={stripSystemWakeupBoilerplate(prompt.text)}
+          time={hhmm(attempt.startedAt)}
+          targetTaskId={delegatedInbound.fromId}
+          openLinkLabel={delegatedInbound.relation === 'sibling' && onOpenChild ? '切换查看' : '打开会话'}
+          onOpenTarget={delegatedInbound.relation === 'sibling' ? onOpenChild : undefined}
+        />
       ) : (
         <div className="it u">
           {attempt.refTasks && attempt.refTasks.length > 0 && (
@@ -507,21 +642,12 @@ export function Turn({
         </div>
       )}
 
-      {loadRaw ? (
-        raw.isLoading ? (
-          <div className="it running">
-            <span className="spin" /> 载入过程…
-          </div>
-        ) : (
-          <Segments segs={segs} live={live} compact={compact} />
-        )
-      ) : (
-        <div className="it">
-          <button type="button" className="lazy-turn" onClick={() => setExpanded(true)}>
-            <CaretIcon className="i" />
-            展开历史过程
-          </button>
+      {raw.isLoading && !raw.data ? (
+        <div className="it running">
+          <span className="spin" /> 载入过程…
         </div>
+      ) : (
+        <Segments segs={segs} live={live} compact={compact} />
       )}
 
       {approvals.map((ap) => (
@@ -530,13 +656,18 @@ export function Turn({
         </div>
       ))}
 
-      {dispatchedChildren.length > 0 && (
-        <InlineDispatchedChildren
+      {(dispatchedChildren.length > 0 || turnNativeMembers.length > 0) && (
+        <OutboundCommTrack
           parentTaskId={tl.task.taskId}
           parentProjectId={tl.task.projectId}
           children={dispatchedChildren}
+          nativeMembers={turnNativeMembers}
           machines={machines}
+          inboxByTask={inboxByTask}
+          activeChildId={activeChildId}
+          activeNativeMember={activeNativeMember}
           onOpenChild={onOpenChild}
+          onOpenNativeMember={onOpenNativeMember}
         />
       )}
 
@@ -584,7 +715,7 @@ export function Turn({
         </div>
       )}
 
-      {/* Plain-folder in-place changes card (no shadow Git) */}
+      {/* Plain-folder in-place changes strip (full prose width, airy border + left rail) */}
       {!compact && attempt.folderChanges && attempt.folderChanges.files.length > 0 && (
         <FolderChangesCard
           taskId={tl.task.taskId}

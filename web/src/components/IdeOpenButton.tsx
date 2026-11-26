@@ -1,5 +1,6 @@
-import { useEffect, useMemo, useState } from 'react';
-import { Check, ChevronDown, RotateCcw } from 'lucide-react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
+import { Check, ChevronDown, Pencil, RotateCcw, X } from 'lucide-react';
 import type { DeliveryView, IDEScheme, MachineView, ProjectView } from '../generated/protocol';
 import { useMachineSSHCandidates } from '../hooks/queries';
 import {
@@ -13,6 +14,7 @@ import {
   setCustomSshAlias,
   type SSHHostSource,
 } from '../lib/ide';
+import { useAnchoredPopover } from '../lib/popover';
 import { toast, useWorkbenchStore } from '../store/useWorkbenchStore';
 import { IdeGlyph } from './Icons';
 
@@ -32,12 +34,12 @@ function sshSourceBadge(source?: SSHHostSource): string {
 }
 
 /**
- * Clean, low-noise IDE opener:
- * - Main button ALWAYS shows only `<IdeGlyph />` + `在 <IDE> 打开` (full SSH target & path in title tooltip).
- * - Dropdown splits into:
+ * Clean, low-noise IDE opener (Orbit v4):
+ * - Main button shows only `<IdeGlyph />` + `<IDE name>` (never prints `ssh <alias>` inline; full target in title tooltip).
+ * - Dropdown renders via viewport-clamped portal:
  *   1. Editor picker (Cursor / VS Code / Antigravity / Zed)
- *   2. (Remote machines only) Active SSH alias & provenance, clickable ~/.ssh/config candidates,
- *      and inline custom SSH alias editor saved to localStorage (`orbit.sshAlias.<machineId>`).
+ *   2. (Remote machines only) Single `SSH · <name>` row with an inline pencil icon; clicking the pencil
+ *      switches that row in-place into an inline input (Save / Cancel) and collapses immediately on save/cancel.
  */
 export function IdeOpenButton({
   project,
@@ -57,16 +59,24 @@ export function IdeOpenButton({
   line?: number;
 }) {
   const [open, setOpen] = useState(false);
+  const [editingSsh, setEditingSsh] = useState(false);
+  const splitRef = useRef<HTMLDivElement | null>(null);
+  const menuRef = useRef<HTMLDivElement | null>(null);
+
   const preferredIDE = useWorkbenchStore((s) => s.preferredIDE);
   const setPreferredIDE = useWorkbenchStore((s) => s.setPreferredIDE);
   const storedLocalId = useWorkbenchStore((s) => s.localMachineId);
   const sshAliasRev = useWorkbenchStore((s) => s.sshAliasRev);
   const bumpSshAliasRev = useWorkbenchStore((s) => s.bumpSshAliasRev);
 
+  const closeMenu = useCallback(() => {
+    setOpen(false);
+    setEditingSsh(false);
+  }, []);
+
   const scheme: IDEScheme = preferredIDE || project?.ideScheme || 'cursor';
   const effectiveLocalId = resolveEffectiveLocalMachineId(machines, storedLocalId);
 
-  // Determine target machine upfront so we can query local ~/.ssh/config candidates for remote machines.
   const baseJump = useMemo(
     () =>
       delivery
@@ -102,7 +112,6 @@ export function IdeOpenButton({
   const sshQ = useMachineSSHCandidates(targetMachine, isRemote && !!targetMachine);
   const recommendedAlias = sshQ.data?.recommended ?? '';
 
-  // Re-read localStorage custom alias whenever sshAliasRev or targetMachineId changes.
   const customAlias = useMemo(() => {
     void sshAliasRev;
     return getCustomSshAlias(targetMachineId);
@@ -110,10 +119,8 @@ export function IdeOpenButton({
 
   const [draftAlias, setDraftAlias] = useState('');
   useEffect(() => {
-    if (open) {
-      setDraftAlias(customAlias);
-    }
-  }, [open, customAlias]);
+    if (!open) setEditingSsh(false);
+  }, [open]);
 
   const jump = useMemo(
     () =>
@@ -156,6 +163,19 @@ export function IdeOpenButton({
     ],
   );
 
+  const isSsh = jump?.mode === 'ssh';
+
+  const popStyle = useAnchoredPopover({
+    open,
+    anchorRef: splitRef,
+    popRef: menuRef,
+    width: isSsh ? 264 : 196,
+    align: 'right',
+    placement: 'down',
+    gap: 6,
+    onClose: closeMenu,
+  });
+
   const candidates = sshQ.data?.candidates ?? [];
   const allHosts = sshQ.data?.allHosts ?? [];
   const fallbackHosts = useMemo(() => {
@@ -165,7 +185,6 @@ export function IdeOpenButton({
 
   if (!jump) return null;
 
-  const isSsh = jump.mode === 'ssh';
   const hostShort = jump.sshHost || jump.targetMachine;
   const label = ideLabel(scheme);
   const tooltip = isSsh
@@ -173,13 +192,13 @@ export function IdeOpenButton({
     : `在 ${label} 打开 · ${jump.resolvedPath}`;
 
   const handleLaunch = () => {
-    setOpen(false);
+    closeMenu();
     launchIDE(jump.uri);
   };
 
   const handlePick = (next: IDEScheme) => {
     setPreferredIDE(next);
-    setOpen(false);
+    closeMenu();
     toast(`默认编辑器已切换为 ${ideLabel(next)}`);
   };
 
@@ -191,15 +210,23 @@ export function IdeOpenButton({
       setCustomSshAlias(targetMachineId, alias);
     }
     bumpSshAliasRev();
-    setDraftAlias(alias === recommendedAlias ? '' : alias);
+    setEditingSsh(false);
     toast(`SSH 别名已设为 ${alias}`);
   };
 
   const handleSaveCustom = () => {
     if (!targetMachineId) return;
     const trimmed = draftAlias.trim();
+    if (recommendedAlias && trimmed === recommendedAlias) {
+      setCustomSshAlias(targetMachineId, '');
+      bumpSshAliasRev();
+      setEditingSsh(false);
+      toast(`SSH 别名已设为 ${trimmed}`);
+      return;
+    }
     setCustomSshAlias(targetMachineId, trimmed);
     bumpSshAliasRev();
+    setEditingSsh(false);
     if (trimmed) {
       toast(`已保存自定义 SSH 别名：${trimmed}`);
     } else {
@@ -212,32 +239,35 @@ export function IdeOpenButton({
     setCustomSshAlias(targetMachineId, '');
     setDraftAlias('');
     bumpSshAliasRev();
+    setEditingSsh(false);
     toast('已恢复自动匹配 SSH 别名');
   };
 
   return (
-    <div className="ide-split relpos">
+    <div className="ide-split relpos" ref={splitRef}>
       <button type="button" className="ide-main" onClick={handleLaunch} title={tooltip}>
         <IdeGlyph scheme={scheme} size={13} />
-        <span>在 {label} 打开</span>
+        <span>{label}</span>
       </button>
       <button
         type="button"
         className="ide-drop-btn"
         aria-label="选择 IDE 或 SSH 别名"
+        aria-haspopup="menu"
         aria-expanded={open}
-        onClick={() => setOpen((v) => !v)}
+        onClick={() => (open ? closeMenu() : setOpen(true))}
       >
         <ChevronDown size={11} strokeWidth={1.7} />
       </button>
-      {open && (
-        <>
+      {open &&
+        popStyle &&
+        createPortal(
           <div
-            className="scrim"
-            style={{ background: 'transparent', backdropFilter: 'none', zIndex: 49 }}
-            onClick={() => setOpen(false)}
-          />
-          <div className={`ide-menu ${isSsh ? 'has-ssh' : ''}`} role="menu">
+            ref={menuRef}
+            className={`ide-menu ide-menu-portal ${isSsh ? 'has-ssh' : ''}`}
+            style={popStyle}
+            role="menu"
+          >
             <div className="ide-menu-sec">编辑器</div>
             {IDE_OPTIONS.map((opt) => (
               <button
@@ -257,12 +287,74 @@ export function IdeOpenButton({
             {isSsh && (
               <>
                 <div className="ide-menu-div" />
-                <div className="ide-ssh-head">
-                  <span className="mono ell" title={hostShort}>
-                    SSH: {hostShort}
-                  </span>
-                  <span className="ide-ssh-src">{sshSourceBadge(jump.sshSource)}</span>
-                </div>
+                {editingSsh ? (
+                  <div className="ide-ssh-inline-edit">
+                    <span className="ide-ssh-prefix">SSH ·</span>
+                    <input
+                      type="text"
+                      autoFocus
+                      className="field mono ide-ssh-input"
+                      placeholder="SSH 别名"
+                      value={draftAlias}
+                      onChange={(e) => setDraftAlias(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') {
+                          e.preventDefault();
+                          handleSaveCustom();
+                        } else if (e.key === 'Escape') {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          setEditingSsh(false);
+                        }
+                      }}
+                    />
+                    <button type="button" className="btn pri sm ide-ssh-save" onClick={handleSaveCustom}>
+                      保存
+                    </button>
+                    {customAlias && (
+                      <button
+                        type="button"
+                        className="ide-ssh-edit-btn"
+                        title="恢复自动匹配 SSH 别名"
+                        aria-label="恢复自动匹配"
+                        onClick={handleClearCustom}
+                      >
+                        <RotateCcw size={11.5} strokeWidth={1.7} />
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      className="ide-ssh-edit-btn"
+                      title="取消"
+                      aria-label="取消"
+                      onClick={() => setEditingSsh(false)}
+                    >
+                      <X size={12} strokeWidth={1.7} />
+                    </button>
+                  </div>
+                ) : (
+                  <div className="ide-ssh-head">
+                    <div className="ide-ssh-head-main">
+                      <span className="ide-ssh-prefix">SSH ·</span>
+                      <span className="ide-ssh-name" title={`当前 SSH 别名：${hostShort}`}>
+                        {hostShort}
+                      </span>
+                      <button
+                        type="button"
+                        className="ide-ssh-edit-btn"
+                        title="修改 SSH 别名"
+                        aria-label="修改 SSH 别名"
+                        onClick={() => {
+                          setDraftAlias(customAlias || hostShort);
+                          setEditingSsh(true);
+                        }}
+                      >
+                        <Pencil size={11.5} strokeWidth={1.7} />
+                      </button>
+                    </div>
+                    <span className="ide-ssh-src">{sshSourceBadge(jump.sshSource)}</span>
+                  </div>
+                )}
 
                 {candidates.length > 0 && (
                   <div className="ide-ssh-list">
@@ -308,46 +400,11 @@ export function IdeOpenButton({
                     })}
                   </div>
                 )}
-
-                <div className="ide-ssh-custom">
-                  <input
-                    type="text"
-                    className="field mono ide-ssh-input"
-                    placeholder="自定义 SSH 别名…"
-                    value={draftAlias}
-                    onChange={(e) => setDraftAlias(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter') {
-                        e.preventDefault();
-                        handleSaveCustom();
-                      }
-                    }}
-                  />
-                  <button
-                    type="button"
-                    className="btn ghost sm"
-                    disabled={draftAlias.trim() === customAlias}
-                    onClick={handleSaveCustom}
-                  >
-                    保存
-                  </button>
-                  {customAlias && (
-                    <button
-                      type="button"
-                      className="ib"
-                      title="清空自定义并恢复自动匹配"
-                      aria-label="恢复自动匹配"
-                      onClick={handleClearCustom}
-                    >
-                      <RotateCcw size={12} strokeWidth={1.7} />
-                    </button>
-                  )}
-                </div>
               </>
             )}
-          </div>
-        </>
-      )}
+          </div>,
+          document.body,
+        )}
     </div>
   );
 }

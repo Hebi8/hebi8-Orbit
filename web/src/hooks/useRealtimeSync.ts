@@ -130,6 +130,9 @@ export function collectInvalidations(
       }
       if (pid === '_pa') add('hebi8-main');
       add('bootstrap');
+      if (kind === 'attempt.started') {
+        add('delivery');
+      }
       for (const did of strListField(p, 'deliveryIds')) add('delivery', did);
       for (const did of strListField(p, 'revertedDeliveryIds')) add('delivery', did);
       continue;
@@ -144,6 +147,19 @@ export function collectInvalidations(
       }
       continue;
     }
+    if (kind === 'delivery.review_reopened' || kind === 'delivery.review_completed') {
+      if (deliveryId) add('delivery', deliveryId);
+      else add('delivery');
+      add('task-timeline', tid);
+      if (parentTaskId) {
+        add('task-timeline', parentTaskId);
+        add('task-children', parentTaskId);
+      }
+      add('project-tasks', pid);
+      add('all-tasks');
+      add('bootstrap');
+      continue;
+    }
     if (kind.startsWith('delivery.')) {
       add('delivery', deliveryId);
       add('delivery-diff', deliveryId);
@@ -153,6 +169,7 @@ export function collectInvalidations(
         add('task-children', parentTaskId);
       }
       add('project-tasks', pid);
+      add('all-tasks');
       add('global-artifacts');
       add('bootstrap');
       continue;
@@ -207,6 +224,10 @@ export function collectInvalidations(
       add('task-timeline', tid);
       add('project-tasks', pid);
       add('bootstrap');
+      const action = strField(p, 'action');
+      if (action === 'enqueued' || action === 'steered' || action === 'annotation_batch_queued') {
+        add('delivery');
+      }
       for (const did of strListField(p, 'deliveryIds')) add('delivery', did);
       const dispatchedAttempt = strField(p, 'dispatchedAttemptId');
       if (dispatchedAttempt) add('attempt-raw', dispatchedAttempt);

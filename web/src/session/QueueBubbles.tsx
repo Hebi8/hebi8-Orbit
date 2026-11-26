@@ -1,24 +1,28 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { ArrowDown, ArrowUp, Pencil, Undo2 } from 'lucide-react';
+import { ArrowDown, ArrowUp, CornerDownLeft, Pencil, Undo2 } from 'lucide-react';
 import type { PendingInput } from '../generated/protocol';
 import { SteerIcon } from '../components/Icons';
 import { api, errMsg } from '../lib/api';
 import { sourceLabel } from '../lib/format';
 import { toast } from '../store/useWorkbenchStore';
 
-/** Human -> Agent pending inputs rendered as calm dashed bubbles at the tail of the conversation. */
+/** Human / Delegated Agent pending inputs rendered at the tail of the conversation. */
 export function QueueBubbles({
   taskId,
   items,
   busy,
   editingId,
   onEdit,
+  resolveTaskTitle,
+  onOpenTask,
 }: {
   taskId: string;
   items: PendingInput[];
   busy: boolean;
   editingId: string | null;
   onEdit: (item: PendingInput) => void;
+  resolveTaskTitle?: (taskId: string) => string;
+  onOpenTask?: (taskId: string) => void;
 }) {
   const qc = useQueryClient();
   const refresh = () => {
@@ -50,10 +54,36 @@ export function QueueBubbles({
   return (
     <div className="queue it" aria-label="待发送消息">
       {items.map((it, i) => {
-        const showSource = it.source !== 'human';
+        const delegatedFromId =
+          typeof it.payload?.delegatedFromTaskId === 'string' ? it.payload.delegatedFromTaskId : '';
+        const senderTitle = delegatedFromId
+          ? resolveTaskTitle?.(delegatedFromId) || delegatedFromId
+          : '';
+        const showSource = !delegatedFromId && it.source !== 'human';
         return (
-          <div key={it.inputId} className={`qb ${editingId === it.inputId ? 'editing' : ''}`}>
-            {showSource && <div className="src">{sourceLabel(it.source)}</div>}
+          <div
+            key={it.inputId}
+            className={`qb ${delegatedFromId ? 'is-delegated' : ''} ${editingId === it.inputId ? 'editing' : ''}`}
+          >
+            {delegatedFromId ? (
+              <div className="src qb-delegated-src">
+                <CornerDownLeft size={11} strokeWidth={1.8} className="comm-dir-ico is-in" aria-hidden="true" />
+                {onOpenTask ? (
+                  <button
+                    type="button"
+                    className="qb-delegated-link ell"
+                    title={senderTitle}
+                    onClick={() => onOpenTask(delegatedFromId)}
+                  >
+                    {senderTitle}
+                  </button>
+                ) : (
+                  <span className="ell">{senderTitle}</span>
+                )}
+              </div>
+            ) : showSource ? (
+              <div className="src">{sourceLabel(it.source)}</div>
+            ) : null}
             <div className="bub">{editingId === it.inputId ? '正在下方编辑…' : it.body}</div>
             <div className="qb-foot">
               <span className="qb-note">下一轮发出</span>

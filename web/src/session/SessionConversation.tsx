@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { ArchiveRestore } from 'lucide-react';
 import type {
@@ -10,6 +10,8 @@ import type {
   TaskTimelineResponse,
 } from '../generated/protocol';
 import { api, errMsg } from '../lib/api';
+import { indexInboxByTask, taskTitle } from '../lib/format';
+import { navigate, paths } from '../lib/router';
 import { toast, useWorkbenchStore } from '../store/useWorkbenchStore';
 import { Composer } from './Composer';
 import { Minimap } from './Minimap';
@@ -83,7 +85,7 @@ function FoldDividerBar({
 
 /**
  * Reusable live conversation stream + composer shared between the full SessionPage,
- * the single infinite Hebi8 main conversation, and the split ReviewOverlay.
+ * the split ChildSessionDrawer, the infinite Hebi8 conversation, and the split ReviewOverlay.
  */
 export function SessionConversation({
   taskId,
@@ -94,12 +96,17 @@ export function SessionConversation({
   compact = false,
   inDrawer = false,
   childrenList,
+  nativeMembers,
+  siblingChildren,
+  activeChildId,
+  activeNativeMember,
   emptySlot,
   composerTopSlot,
   composerDraftInsert,
   onOpenReview,
   onOpenFoldNode,
   onOpenChild,
+  onOpenNativeMember,
 }: {
   taskId: string;
   tl: TaskTimelineResponse;
@@ -109,12 +116,17 @@ export function SessionConversation({
   compact?: boolean;
   inDrawer?: boolean;
   childrenList?: ChildTaskView[];
+  nativeMembers?: BoardMemberCursor[];
+  siblingChildren?: ChildTaskView[];
+  activeChildId?: string;
+  activeNativeMember?: string;
   emptySlot?: ReactNode;
   composerTopSlot?: ReactNode;
   composerDraftInsert?: { id: number; text: string } | null;
   onOpenReview?: () => void;
   onOpenFoldNode?: (nodeId: string) => void;
   onOpenChild?: (childTaskId: string) => void;
+  onOpenNativeMember?: (member: BoardMemberCursor) => void;
 }) {
   const qc = useQueryClient();
   const remember = useWorkbenchStore((s) => s.rememberPrompt);
@@ -171,6 +183,33 @@ export function SessionConversation({
   const needsVerifyAttemptId = !task.activeAttemptId && lastAttempt?.state === 'needs_verification' ? lastAttempt.attemptId : undefined;
   const pendingInputs = [...tl.pendingInputs].sort((a, b) => a.position - b.position || a.createdAt - b.createdAt);
   const openAnnotations = useMemo(() => tl.annotations.filter((a) => a.status === 'open'), [tl.annotations]);
+  const inboxByTask = useMemo(() => indexInboxByTask(boot?.openInboxItems ?? []), [boot?.openInboxItems]);
+
+  const effectiveSiblings = siblingChildren ?? tl.siblingChildren ?? [];
+  const resolveTaskTitle = useCallback(
+    (id: string) => {
+      const sib = effectiveSiblings.find((c) => c.taskId === id);
+      if (sib) return taskTitle(sib);
+      if (tl.parentSummary?.taskId === id) return tl.parentSummary.title;
+      const ch = (childrenList ?? tl.children ?? []).find((c) => c.taskId === id);
+      if (ch) return taskTitle(ch);
+      const act = boot?.activeTasks?.find((t) => t.taskId === id);
+      if (act) return taskTitle(act);
+      return id;
+    },
+    [effectiveSiblings, tl.parentSummary, tl.children, childrenList, boot?.activeTasks],
+  );
+
+  const handleOpenDelegatedTask = useCallback(
+    (targetId: string) => {
+      if (inDrawer && onOpenChild && effectiveSiblings.some((c) => c.taskId === targetId)) {
+        onOpenChild(targetId);
+        return;
+      }
+      navigate(paths.session(targetId));
+    },
+    [inDrawer, onOpenChild, effectiveSiblings],
+  );
 
   const { foldDividersByAttemptId, orphanFoldDividers } = useMemo(() => {
     const byId = new Map<string, FoldDividerInfo[]>();
@@ -234,8 +273,15 @@ export function SessionConversation({
                       tl={tl}
                       compact={compact}
                       childrenList={childrenList}
+                      nativeMembers={nativeMembers}
+                      siblingChildren={effectiveSiblings}
+                      allTasks={boot?.activeTasks}
                       machines={boot?.machines}
+                      inboxByTask={inboxByTask}
+                      activeChildId={activeChildId}
+                      activeNativeMember={activeNativeMember}
                       onOpenChild={onOpenChild}
+                      onOpenNativeMember={onOpenNativeMember}
                     />
                     {dividers.map((div) => (
                       <FoldDividerBar key={div.eventId} info={div} onOpenFoldNode={onOpenFoldNode} />
@@ -252,6 +298,8 @@ export function SessionConversation({
                 busy={!!task.activeAttemptId}
                 editingId={editing?.inputId ?? null}
                 onEdit={setEditing}
+                resolveTaskTitle={resolveTaskTitle}
+                onOpenTask={handleOpenDelegatedTask}
               />
             </div>
           </>

@@ -1,10 +1,10 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import { Archive, ArchiveRestore, ArrowLeft, Check, Layers, MessageSquare, MoreHorizontal, Trash2 } from 'lucide-react';
+import { Archive, ArchiveRestore, ArrowLeft, Layers, MessageSquare, MoreHorizontal, Trash2 } from 'lucide-react';
 import type { BoardMemberCursor, BootstrapResponse } from '../generated/protocol';
-import { CardIcon, DiffIcon } from '../components/Icons';
+import { CardIcon } from '../components/Icons';
 import { IdeOpenButton } from '../components/IdeOpenButton';
-import { PageHeader } from '../components/PageHeader';
+import { PageHeader, type PageHeaderCrumb } from '../components/PageHeader';
 import { StatusMark } from '../components/StatusMark';
 import { useBoard, useTaskChildren, useTimeline } from '../hooks/queries';
 import { ApiError, api, errMsg } from '../lib/api';
@@ -13,7 +13,6 @@ import {
   PA_PROJECT_ID,
   SCRATCH_PROJECT_ID,
   artifactShortLabel,
-  childStateDot,
   indexInboxByTask,
   isVirtualProject,
   memberStateLabel,
@@ -29,9 +28,30 @@ import { BoardPanel } from './BoardPanel';
 import { ChildSessionDrawer } from './ChildSessionDrawer';
 import { RightCard } from './RightCard';
 import { SessionConversation } from './SessionConversation';
-import { SubsessionStrip } from './SubsessionStrip';
 
 const CODE_KINDS = new Set(['code_diff', 'mixed', 'workspace_snapshot']);
+const SUB_DRAWER_WIDTH_KEY = 'orbit.subDrawerWidth';
+const SUB_DRAWER_MIN = 340;
+const SUB_DRAWER_MAX = 680;
+const SUB_DRAWER_DEFAULT = 468;
+
+function readDrawerWidth(): number {
+  try {
+    const n = Number(localStorage.getItem(SUB_DRAWER_WIDTH_KEY));
+    if (Number.isFinite(n)) return Math.min(SUB_DRAWER_MAX, Math.max(SUB_DRAWER_MIN, Math.round(n)));
+  } catch {
+    // ignore storage errors
+  }
+  return SUB_DRAWER_DEFAULT;
+}
+
+function writeDrawerWidth(w: number) {
+  try {
+    localStorage.setItem(SUB_DRAWER_WIDTH_KEY, String(Math.round(w)));
+  } catch {
+    // ignore storage errors
+  }
+}
 
 export function SessionPage({
   boot,
@@ -61,7 +81,9 @@ export function SessionPage({
   const setMobileDock = useWorkbenchStore((s) => s.setMobileDockOpen);
   const expandedProjects = useWorkbenchStore((s) => s.expandedProjects);
   const setProjectExpanded = useWorkbenchStore((s) => s.setProjectExpanded);
+  const ensureParentExpanded = useWorkbenchStore((s) => s.ensureParentExpanded);
   const openReview = useWorkbenchStore((s) => s.openReview);
+
   const [manualCardOpen, setManualCardOpen] = useState(false);
   const [artMenuOpen, setArtMenuOpen] = useState(false);
   const [moreMenuOpen, setMoreMenuOpen] = useState(false);
@@ -69,29 +91,45 @@ export function SessionPage({
   const [confirmDeleteBanner, setConfirmDeleteBanner] = useState(false);
   const [actionBusy, setActionBusy] = useState(false);
   const [activeNativeMemberName, setActiveNativeMemberName] = useState<string | null>(null);
+  const [drawerWidth, setDrawerWidth] = useState<number>(readDrawerWidth);
+  const [draggingSash, setDraggingSash] = useState(false);
+
   const artMenuRef = useRef<HTMLDivElement | null>(null);
   const moreMenuRef = useRef<HTMLDivElement | null>(null);
+  const sessRef = useRef<HTMLDivElement | null>(null);
+  const drawerWidthRef = useRef(drawerWidth);
+  drawerWidthRef.current = drawerWidth;
+
+  const parentSummary = tl?.parentSummary;
+  const parentTaskId = parentSummary?.taskId || task?.parentTaskId || '';
+  const isChildSession = !!parentTaskId;
 
   const members = tl?.boardMembers ?? [];
-  const hasSwarm = members.length > 0 || (task?.workerCount ?? 0) > 0;
-  const boardQ = useBoard(taskId, hasSwarm || boardOpen || !!worker);
-  const childrenQ = useTaskChildren(taskId, !!tl);
-  const allMembers = boardQ.data?.members ?? members;
-  const childrenList = childrenQ.data?.children ?? tl?.children ?? [];
+  const hasSwarm = !isChildSession && (members.length > 0 || (task?.workerCount ?? 0) > 0);
+  const boardQ = useBoard(taskId, !isChildSession && (hasSwarm || boardOpen || !!worker));
+  const childrenQ = useTaskChildren(taskId, !!tl && !isChildSession);
+  const allMembers = isChildSession ? [] : (boardQ.data?.members ?? members);
+  const childrenList = isChildSession ? [] : (childrenQ.data?.children ?? tl?.children ?? []);
   const nativeMembers = useMemo(() => allMembers.filter((m) => !m.workerTaskId), [allMembers]);
 
-  // Upgrade legacy #/t/<parent>/w/<worker> route to ChildSessionDrawer whenever worker maps to a real Orbit child task.
-  const matchedWorkerMember = worker ? allMembers.find((m) => m.memberName === worker) : undefined;
+  // Max depth = 1: child sessions never open a grandchild drawer.
+  const matchedWorkerMember = !isChildSession && worker ? allMembers.find((m) => m.memberName === worker) : undefined;
   const upgradedChildId = matchedWorkerMember?.workerTaskId || undefined;
-  const effectiveChildId = childId || upgradedChildId;
-  const effectiveWorker = upgradedChildId ? undefined : worker;
-  const activeNativeMember = !effectiveChildId && activeNativeMemberName
-    ? nativeMembers.find((m) => m.memberName === activeNativeMemberName)
-    : undefined;
-  const childDrawerOpen = !!effectiveChildId || !!activeNativeMember;
+  const effectiveChildId = isChildSession ? undefined : (childId || upgradedChildId);
+  const effectiveWorker = isChildSession || upgradedChildId ? undefined : worker;
+  const activeNativeMember =
+    !isChildSession && !effectiveChildId && activeNativeMemberName
+      ? nativeMembers.find((m) => m.memberName === activeNativeMemberName)
+      : undefined;
+  const childDrawerOpen = !isChildSession && (!!effectiveChildId || !!activeNativeMember);
 
   const sessionArtifacts = useMemo(() => collectSessionArtifacts(tl), [tl]);
   const inboxByTask = useMemo(() => indexInboxByTask(boot.openInboxItems), [boot.openInboxItems]);
+
+  // Entering a full child-session page auto-expands its parent branch in the sidebar (never auto-collapses when leaving).
+  useEffect(() => {
+    if (parentTaskId) ensureParentExpanded(parentTaskId);
+  }, [parentTaskId, ensureParentExpanded]);
 
   useEffect(() => {
     setMobileDock(false);
@@ -113,7 +151,7 @@ export function SessionPage({
     if (effectiveWorker) setBoardOpen(true);
   }, [effectiveWorker, setBoardOpen]);
 
-  // Mutual exclusion: opening ChildSessionDrawer collapses RightCard / BoardPanel / mobileDock.
+  // Mutual exclusion: opening ChildSessionDrawer collapses BoardPanel / mobileDock.
   useEffect(() => {
     if (childDrawerOpen) {
       setBoardOpen(false);
@@ -129,6 +167,26 @@ export function SessionPage({
   useEffect(() => {
     if (task && !isVirtual && expandedProjects[task.projectId] === undefined) setProjectExpanded(task.projectId, true);
   }, [task, isVirtual, expandedProjects, setProjectExpanded]);
+
+  // Keep `--composer-dock-h` synchronized with the main Composer dock height so the sash's
+  // continuous 1px top divider line bridges both Composer borders with 0px vertical drift.
+  useLayoutEffect(() => {
+    const root = sessRef.current;
+    if (!root || !childDrawerOpen) return;
+    const dockEl = root.querySelector('.session-main-col .cwrap') as HTMLElement | null;
+    if (!dockEl) return;
+    const sync = () => {
+      const h = Math.round(dockEl.getBoundingClientRect().height);
+      if (h > 0) root.style.setProperty('--composer-dock-h', `${h}px`);
+    };
+    sync();
+    const ro = new ResizeObserver(sync);
+    ro.observe(dockEl);
+    return () => {
+      ro.disconnect();
+      root.style.removeProperty('--composer-dock-h');
+    };
+  }, [childDrawerOpen, taskId]);
 
   useEffect(() => {
     if (!artMenuOpen && !moreMenuOpen) return;
@@ -279,14 +337,21 @@ export function SessionPage({
       ? shortSha(latestCode.headSha)
       : project?.defaultBranch || '';
 
-  const hasCardContent = formalCodeDeliveries.length > 0 || sessionArtifacts.length > 0 || hasSwarm || tl.sources.length > 0;
+  const hasCardContent =
+    !!latestCode ||
+    sessionArtifacts.length > 0 ||
+    (!isChildSession && (childrenList.length > 0 || hasSwarm)) ||
+    tl.sources.length > 0 ||
+    (!isVirtual && !!project);
   const cardVisible = hasCardContent ? cardOpen : manualCardOpen;
   const drilledMember = effectiveWorker ? allMembers.find((m) => m.memberName === effectiveWorker) : undefined;
   const dockMode: 'board' | 'card' | null = childDrawerOpen ? null : boardOpen ? 'board' : cardVisible ? 'card' : null;
-  const hasCodeDiff = !!latestCode && (latestCode.manifest.insertions > 0 || latestCode.manifest.deletions > 0 || latestCode.manifest.filesChanged > 0);
-  const openDiffComments = tl.annotations.filter((a) => a.status === 'open' && a.source !== 'ryugi').length;
 
   const openChildDrawer = (cid: string) => {
+    if (isChildSession) {
+      navigate(paths.session(cid));
+      return;
+    }
     setActiveNativeMemberName(null);
     setBoardOpen(false);
     setMobileDock(false);
@@ -294,6 +359,7 @@ export function SessionPage({
   };
 
   const openNativeMemberDrawer = (member: BoardMemberCursor) => {
+    if (isChildSession) return;
     if (member.workerTaskId) {
       openChildDrawer(member.workerTaskId);
       return;
@@ -309,20 +375,130 @@ export function SessionPage({
     if (childId || worker) navigate(paths.session(taskId));
   };
 
-  const parentSummary = tl.parentSummary;
-  const parentTaskId = parentSummary?.taskId || task.parentTaskId;
   const parentTitle = parentSummary?.title || (parentSummary?.isHebi8Main ? 'Hebi8 主对话' : parentTaskId || '');
   const parentReturnHash = parentSummary?.isHebi8Main
     ? paths.hebi8()
     : parentTaskId
       ? paths.session(parentTaskId)
       : fallbackReturnHash;
-  const siblingChildren = tl.siblingChildren ?? [];
+
+  const headerBreadcrumb: PageHeaderCrumb[] | undefined = effectiveWorker
+    ? undefined
+    : parentTaskId
+      ? [
+          {
+            label: parentTitle,
+            title: `返回父会话：${parentTitle}`,
+            onClick: () => navigate(parentReturnHash),
+          },
+          {
+            label: taskTitle(task),
+            title: task.goal,
+          },
+        ]
+      : [
+          {
+            label: taskTitle(task),
+            title: task.goal,
+          },
+        ];
+
+  const titleTrail = effectiveWorker ? undefined : (
+    <>
+      {sessionArtifacts.length > 0 && (
+        <div className="topbar-art-wrap" ref={artMenuRef}>
+          <button
+            type="button"
+            className={`topbar-art-icon ${artMenuOpen ? 'open' : ''}`}
+            title="本会话 Artifacts"
+            aria-label="本会话 Artifacts"
+            aria-expanded={artMenuOpen}
+            onClick={() => setArtMenuOpen((v) => !v)}
+          >
+            <Layers size={13} strokeWidth={1.7} />
+            <span>{sessionArtifacts.length}</span>
+          </button>
+          {artMenuOpen && (
+            <div className="topbar-art-menu" role="menu">
+              <div className="ov-menu-sec">本会话 Artifacts</div>
+              {sessionArtifacts.map((art) => (
+                <button
+                  type="button"
+                  role="menuitem"
+                  key={art.artifactId}
+                  className="ov-menu-item"
+                  onClick={() => {
+                    setArtMenuOpen(false);
+                    openReview('art', taskId, art.deliveryId, art.artifactId);
+                  }}
+                >
+                  <span className="dlv-kind-tag">{artifactShortLabel(art.kind)}</span>
+                  <span className="ell grow">{art.title}</span>
+                  {art.openAnnotations > 0 && (
+                    <span className="ov-menu-badge">
+                      <MessageSquare size={10} strokeWidth={1.8} />
+                      {art.openAnnotations}
+                    </span>
+                  )}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+      {mark && <StatusMark mark={mark} />}
+    </>
+  );
+
+  const headerSubtitle = effectiveWorker ? undefined : isScratch ? (
+    <span>自由对话</span>
+  ) : isPA ? (
+    <button type="button" onClick={() => navigate(paths.hebi8())}>
+      Hebi8
+    </button>
+  ) : (
+    <>
+      <button type="button" onClick={() => project && navigate(paths.project(project.projectId))}>
+        {project?.displayName ?? task.projectId}
+      </button>
+      {lastAttempt?.isolation === 'worktree' ? (
+        <>
+          <span className="topbar-meta-dot">·</span>
+          <span>Worktree</span>
+        </>
+      ) : !isPlainFolderTask ? (
+        <>
+          <span className="topbar-meta-dot">·</span>
+          <span>目录同步</span>
+        </>
+      ) : null}
+      {gitMeta && (
+        <>
+          <span className="topbar-meta-dot">·</span>
+          <span className="mono">{gitMeta}</span>
+        </>
+      )}
+      {hostLabel && boot.machines.filter((m) => m.transportMode !== 'ssh_outbound').length > 1 && (
+        <>
+          <span className="topbar-meta-dot">·</span>
+          <span className="mono faint">{hostLabel}</span>
+        </>
+      )}
+    </>
+  );
+
+  const clampDrawerWidth = (rawW: number) => {
+    const stageW = sessRef.current?.getBoundingClientRect().width ?? 0;
+    const maxAllowed = stageW > 0 ? Math.min(SUB_DRAWER_MAX, Math.max(SUB_DRAWER_MIN, stageW - 310)) : SUB_DRAWER_MAX;
+    return Math.round(Math.min(maxAllowed, Math.max(SUB_DRAWER_MIN, rawW)));
+  };
 
   return (
     <main className="main">
       <PageHeader
-        className={!effectiveWorker ? 'thead-session' : undefined}
+        breadcrumb={headerBreadcrumb}
+        titleTrail={titleTrail}
+        subtitle={headerSubtitle}
         right={
           <>
             {!effectiveWorker && project && !isVirtual && (
@@ -330,37 +506,11 @@ export function SessionPage({
                 <IdeOpenButton project={project} delivery={latestCode} machines={boot.machines} />
               </div>
             )}
-            {!effectiveWorker && latestCode && (
-              <button
-                type="button"
-                className={`diff-entry-btn ${hasCodeDiff ? '' : 'is-clean'}`}
-                title="打开 Source Review"
-                onClick={() => openReview('code', taskId, latestCode.deliveryId)}
-              >
-                {hasCodeDiff ? (
-                  <>
-                    <DiffIcon size={13} />
-                    <span className="add">+{latestCode.manifest.insertions}</span>
-                    <span className="del">−{latestCode.manifest.deletions}</span>
-                    {openDiffComments > 0 && (
-                      <span className="comment-count-badge">
-                        <MessageSquare size={10} strokeWidth={1.8} />
-                        {openDiffComments}
-                      </span>
-                    )}
-                  </>
-                ) : (
-                  <>
-                    <Check size={12} strokeWidth={2} />
-                    <span>Checkpoint</span>
-                  </>
-                )}
-              </button>
-            )}
             <button
               type="button"
               className={`ib ${!childDrawerOpen && cardVisible && !boardOpen ? 'on' : ''} no-mobile`}
               title="右侧浮卡"
+              aria-label="右侧浮卡"
               onClick={() => {
                 if (childDrawerOpen) {
                   closeChildDrawer();
@@ -385,6 +535,7 @@ export function SessionPage({
               type="button"
               className="ib only-mobile"
               title="会话上下文"
+              aria-label="会话上下文"
               onClick={() => {
                 if (childDrawerOpen) closeChildDrawer();
                 setBoardOpen(false);
@@ -463,7 +614,7 @@ export function SessionPage({
           </>
         }
       >
-        {effectiveWorker ? (
+        {effectiveWorker && (
           <>
             <button type="button" className="backbtn" onClick={() => navigate(paths.session(taskId))}>
               <ArrowLeft size={13} strokeWidth={1.6} /> 返回主会话
@@ -478,153 +629,8 @@ export function SessionPage({
               )}
             </div>
           </>
-        ) : (
-          <div className="topbar-left">
-            <div className="topbar-title-row">
-              {task.delegatedRole && <span className="csd-role-pill">{task.delegatedRole}</span>}
-              <span className="topbar-title" title={task.goal}>
-                {taskTitle(task)}
-              </span>
-              {sessionArtifacts.length > 0 && (
-                <div className="topbar-art-wrap" ref={artMenuRef}>
-                  <button
-                    type="button"
-                    className={`topbar-art-icon ${artMenuOpen ? 'open' : ''}`}
-                    title="本会话 Artifacts"
-                    aria-label="本会话 Artifacts"
-                    aria-expanded={artMenuOpen}
-                    onClick={() => setArtMenuOpen((v) => !v)}
-                  >
-                    <Layers size={13} strokeWidth={1.7} />
-                    <span>{sessionArtifacts.length}</span>
-                  </button>
-                  {artMenuOpen && (
-                    <div className="topbar-art-menu" role="menu">
-                      <div className="ov-menu-sec">本会话 Artifacts</div>
-                      {sessionArtifacts.map((art) => (
-                        <button
-                          type="button"
-                          role="menuitem"
-                          key={art.artifactId}
-                          className="ov-menu-item"
-                          onClick={() => {
-                            setArtMenuOpen(false);
-                            openReview('art', taskId, art.deliveryId, art.artifactId);
-                          }}
-                        >
-                          <span className="dlv-kind-tag">{artifactShortLabel(art.kind)}</span>
-                          <span className="ell" style={{ flex: 1 }}>
-                            {art.title}
-                          </span>
-                          {art.openAnnotations > 0 && (
-                            <span className="ov-menu-badge">
-                              <MessageSquare size={10} strokeWidth={1.8} />
-                              {art.openAnnotations}
-                            </span>
-                          )}
-                        </button>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              )}
-              {mark && <StatusMark mark={mark} />}
-            </div>
-            <div className="topbar-meta">
-              {isScratch ? (
-                <span>自由对话</span>
-              ) : isPA ? (
-                <button type="button" onClick={() => navigate(paths.hebi8())}>
-                  Hebi8
-                </button>
-              ) : (
-                <>
-                  <button type="button" onClick={() => project && navigate(paths.project(project.projectId))}>
-                    {project?.displayName ?? task.projectId}
-                  </button>
-                  {lastAttempt?.isolation === 'worktree' ? (
-                    <>
-                      <span className="topbar-meta-dot">·</span>
-                      <span>Worktree</span>
-                    </>
-                  ) : !isPlainFolderTask ? (
-                    <>
-                      <span className="topbar-meta-dot">·</span>
-                      <span>目录同步</span>
-                    </>
-                  ) : null}
-                  {gitMeta && (
-                    <>
-                      <span className="topbar-meta-dot">·</span>
-                      <span className="mono">{gitMeta}</span>
-                    </>
-                  )}
-                  {hostLabel && boot.machines.filter((m) => m.transportMode !== 'ssh_outbound').length > 1 && (
-                    <>
-                      <span className="topbar-meta-dot">·</span>
-                      <span className="mono faint">{hostLabel}</span>
-                    </>
-                  )}
-                </>
-              )}
-            </div>
-          </div>
         )}
       </PageHeader>
-
-      {!effectiveWorker && parentTaskId && (
-        <div className="parent-crumb-bar" role="navigation" aria-label="父子会话导航">
-          <button
-            type="button"
-            className="parent-back-btn"
-            onClick={() => navigate(parentReturnHash)}
-            title={`返回父会话「${parentTitle}」`}
-          >
-            <ArrowLeft size={12.5} strokeWidth={1.8} />
-            <span className="ell">返回父会话「{parentTitle}」</span>
-          </button>
-          {parentSummary?.projectName && !parentSummary.isHebi8Main && parentSummary.projectId !== task.projectId && (
-            <span className="parent-proj-pill no-mobile">{parentSummary.projectName}</span>
-          )}
-          {siblingChildren.length > 1 && (
-            <div className="sibling-switch-wrap">
-              <span className="sibling-switch-lbl no-mobile">同级子会话</span>
-              <div className="sibling-pills">
-                {siblingChildren.map((sib) => {
-                  const isCurrent = sib.taskId === task.taskId;
-                  const dot = childStateDot(sib.state, sib.openApprovalCount);
-                  return (
-                    <button
-                      type="button"
-                      key={sib.taskId}
-                      className={`sibling-pill ${isCurrent ? 'is-current' : ''}`}
-                      onClick={() => !isCurrent && navigate(paths.session(sib.taskId))}
-                      title={`${sib.delegatedRole ? `[${sib.delegatedRole}] ` : ''}${taskTitle(sib)}`}
-                    >
-                      <span className={`sub-dot is-${dot}`} aria-hidden="true" />
-                      {sib.delegatedRole && <span className="sibling-role">{sib.delegatedRole}</span>}
-                      <span className="ell">{taskTitle(sib)}</span>
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-          )}
-        </div>
-      )}
-
-      {!effectiveWorker && (
-        <SubsessionStrip
-          parentTaskId={taskId}
-          childrenList={childrenList}
-          boardMembers={allMembers}
-          machines={boot.machines}
-          activeChildId={effectiveChildId}
-          activeNativeMember={activeNativeMember?.memberName}
-          onSelectChild={openChildDrawer}
-          onSelectNativeMember={openNativeMemberDrawer}
-        />
-      )}
 
       {isArchived && !effectiveWorker && (
         <div className="sess-archived-bar">
@@ -671,33 +677,83 @@ export function SessionPage({
         </div>
       )}
 
-      <div className={`sess ${childDrawerOpen ? 'has-child-drawer' : ''}`}>
-        <SessionConversation
-          taskId={taskId}
-          tl={tl}
-          boot={boot}
-          worker={effectiveWorker}
-          drilledMember={drilledMember}
-          childrenList={childrenList}
-          onOpenChild={openChildDrawer}
-          onOpenReview={() => {
-            if (latestCode) openReview('code', taskId, latestCode.deliveryId);
-            else if (sessionArtifacts[0]) openReview('art', taskId, sessionArtifacts[0].deliveryId, sessionArtifacts[0].artifactId);
-          }}
-        />
-        {childDrawerOpen ? (
-          <ChildSessionDrawer
+      <div ref={sessRef} className={`sess ${childDrawerOpen ? 'has-child-drawer' : ''}`}>
+        <div className="session-main-col">
+          <SessionConversation
+            taskId={taskId}
+            tl={tl}
             boot={boot}
-            parentTaskId={taskId}
-            parentProjectId={task.projectId}
-            childTaskId={effectiveChildId}
-            nativeMember={activeNativeMember}
+            worker={effectiveWorker}
+            drilledMember={drilledMember}
             childrenList={childrenList}
             nativeMembers={nativeMembers}
-            onSelectChild={openChildDrawer}
-            onSelectNativeMember={openNativeMemberDrawer}
-            onClose={closeChildDrawer}
+            siblingChildren={tl.siblingChildren}
+            activeChildId={effectiveChildId}
+            activeNativeMember={activeNativeMember?.memberName}
+            onOpenChild={openChildDrawer}
+            onOpenNativeMember={isChildSession ? undefined : openNativeMemberDrawer}
+            onOpenReview={() => {
+              if (latestCode) openReview('code', taskId, latestCode.deliveryId);
+              else if (sessionArtifacts[0]) openReview('art', taskId, sessionArtifacts[0].deliveryId, sessionArtifacts[0].artifactId);
+            }}
           />
+        </div>
+
+        {childDrawerOpen ? (
+          <>
+            <div
+              role="separator"
+              aria-orientation="vertical"
+              aria-label="拖拽调整子会话分屏宽度"
+              aria-valuemin={SUB_DRAWER_MIN}
+              aria-valuemax={SUB_DRAWER_MAX}
+              aria-valuenow={drawerWidth}
+              tabIndex={0}
+              className={`sub-resize-handle no-mobile ${draggingSash ? 'is-dragging' : ''}`}
+              title="拖拽调整分屏宽度"
+              onPointerDown={(e) => {
+                if (e.button !== 0) return;
+                e.preventDefault();
+                e.currentTarget.setPointerCapture(e.pointerId);
+                setDraggingSash(true);
+              }}
+              onPointerMove={(e) => {
+                if (!e.currentTarget.hasPointerCapture(e.pointerId)) return;
+                const rect = sessRef.current?.getBoundingClientRect();
+                if (!rect) return;
+                setDrawerWidth(clampDrawerWidth(rect.right - e.clientX));
+              }}
+              onPointerUp={(e) => {
+                if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+                  e.currentTarget.releasePointerCapture(e.pointerId);
+                }
+                setDraggingSash(false);
+                writeDrawerWidth(drawerWidthRef.current);
+              }}
+              onPointerCancel={() => setDraggingSash(false)}
+              onKeyDown={(e) => {
+                const delta = e.key === 'ArrowLeft' ? 24 : e.key === 'ArrowRight' ? -24 : 0;
+                if (delta === 0) return;
+                e.preventDefault();
+                const next = clampDrawerWidth(drawerWidth + delta);
+                setDrawerWidth(next);
+                writeDrawerWidth(next);
+              }}
+            />
+            <ChildSessionDrawer
+              boot={boot}
+              parentTaskId={taskId}
+              parentProjectId={task.projectId}
+              childTaskId={effectiveChildId}
+              nativeMember={activeNativeMember}
+              childrenList={childrenList}
+              nativeMembers={nativeMembers}
+              width={drawerWidth}
+              onSelectChild={openChildDrawer}
+              onSelectNativeMember={openNativeMemberDrawer}
+              onClose={closeChildDrawer}
+            />
+          </>
         ) : (
           (dockMode || mobileDock) && (
             <div
@@ -724,7 +780,10 @@ export function SessionPage({
                   project={project}
                   machines={boot.machines}
                   board={boardQ.data}
+                  childrenList={childrenList}
+                  inboxByTask={inboxByTask}
                   onOpenBoard={() => setBoardOpen(true)}
+                  onOpenChild={openChildDrawer}
                   onSelectMember={openNativeMemberDrawer}
                 />
               )}

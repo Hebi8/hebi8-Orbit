@@ -15,11 +15,11 @@ import {
   type RenderToken,
   type ViewType,
 } from 'react-diff-view';
-import { Check, ChevronUp, Columns2, MessageSquare, PanelLeft, Rows2, Trash2 } from 'lucide-react';
+import { Check, ChevronUp, MessageSquare, PanelLeft, Trash2 } from 'lucide-react';
 import type { AnnotationView, BootstrapResponse, DiffFileStat, TaskTimelineResponse } from '../generated/protocol';
 import { IdeOpenButton } from '../components/IdeOpenButton';
 import { useDelivery } from '../hooks/queries';
-import { api, errMsg, makeIdempotencyKey } from '../lib/api';
+import { ApiError, api, errMsg, makeIdempotencyKey } from '../lib/api';
 import { shortSha } from '../lib/format';
 import { tokenizeHunksWithShiki } from '../lib/shikiDiff';
 import { toast, useWorkbenchStore } from '../store/useWorkbenchStore';
@@ -177,6 +177,7 @@ export function CodeReviewPane({
     void qc.invalidateQueries({ queryKey: ['delivery'] });
     void qc.invalidateQueries({ queryKey: ['task-timeline', taskId] });
     void qc.invalidateQueries({ queryKey: ['project-tasks'] });
+    void qc.invalidateQueries({ queryKey: ['all-tasks'] });
     void qc.invalidateQueries({ queryKey: ['bootstrap'] });
   };
 
@@ -221,10 +222,26 @@ export function CodeReviewPane({
   const checkpoint = useMutation({
     mutationFn: () => api.completeDeliveryReview(effectiveDeliveryId),
     onSuccess: () => {
-      toast('已确认 Checkpoint');
+      toast('已标记 Checkpoint（发送消息前可再次点击撤销）');
       refresh();
     },
     onError: (e) => toast(errMsg(e), 'err'),
+  });
+
+  const undoCheckpoint = useMutation({
+    mutationFn: () => api.reopenDeliveryReview(effectiveDeliveryId),
+    onSuccess: () => {
+      toast('已撤销 Checkpoint 标记');
+      refresh();
+    },
+    onError: (e) => {
+      if (e instanceof ApiError && e.code === 'ERR_CHECKPOINT_LOCKED') {
+        toast('已发送新消息，该 Checkpoint 已锁定不可撤销', 'err');
+        refresh();
+      } else {
+        toast(errMsg(e), 'err');
+      }
+    },
   });
 
   // Lookup maps for mapping line numbers <-> change keys
@@ -301,7 +318,7 @@ export function CodeReviewPane({
     setBody('');
   };
 
-  // Highlight selected line range for active draft AND for open range comments
+  // Highlight selected line range for active draft AND for open range comments (works across Unified and Split views)
   const selectedChanges = useMemo<string[]>(() => {
     if (!parsed) return [];
     const keys = new Set<string>();
@@ -324,7 +341,7 @@ export function CodeReviewPane({
     return [...keys];
   }, [parsed, draft, effectiveDeliveryId, activeFile, fileAnns, lineIndex]);
 
-  // Handle mouseup text selection inside code cells for inline quote commenting
+  // Handle mouseup text selection inside code cells for inline quote commenting (Split & Unified aware)
   const handleCodeMouseUp = () => {
     const sel = window.getSelection();
     if (!sel || sel.isCollapsed || !diffPaneRef.current || !parsed) {
@@ -339,7 +356,10 @@ export function CodeReviewPane({
     const anchorEl =
       sel.anchorNode instanceof HTMLElement ? sel.anchorNode : sel.anchorNode?.parentElement ?? null;
     const rowEl = anchorEl?.closest('tr.diff-line') as HTMLElement | null;
-    const gutterBtn = rowEl?.querySelector('button[data-diff-line]') as HTMLButtonElement | null;
+    const codeCell = anchorEl?.closest('td.diff-code') as HTMLElement | null;
+    // In split mode, each row has two code cells; check the immediately preceding gutter cell first.
+    const adjacentGutter = codeCell?.previousElementSibling?.querySelector('button[data-diff-line]') as HTMLButtonElement | null;
+    const gutterBtn = adjacentGutter ?? (rowEl?.querySelector('button[data-diff-line]') as HTMLButtonElement | null);
     if (!rowEl || !gutterBtn) {
       setTextSel(null);
       return;
@@ -498,6 +518,11 @@ export function CodeReviewPane({
   const d = detail?.delivery;
   const openCountForFile = (p: string) => openAnnotations.filter((a) => a.anchor.path === p).length;
 
+  const isCheckpointed = detail?.reviewState === 'resolved';
+  const canUndoCheckpoint = isCheckpointed && !!detail?.canUndoReview;
+  const isCheckpointLocked = isCheckpointed && !detail?.canUndoReview;
+  const checkpointBusy = checkpoint.isPending || undoCheckpoint.isPending;
+
   return (
     <>
       <div className="rev-h">
@@ -532,14 +557,22 @@ export function CodeReviewPane({
           </span>
         )}
         <div className="rev-h-acts">
-          <button
-            type="button"
-            className="ib no-mobile"
-            title={viewType === 'unified' ? '切换为分栏 Diff' : '切换为统一 Diff'}
-            onClick={() => setViewType(viewType === 'unified' ? 'split' : 'unified')}
-          >
-            {viewType === 'unified' ? <Columns2 size={14} strokeWidth={1.6} /> : <Rows2 size={14} strokeWidth={1.6} />}
-          </button>
+          <div className="seg no-mobile" role="group" aria-label="Diff 视图模式">
+            <button
+              type="button"
+              className={viewType === 'unified' ? 'on' : ''}
+              onClick={() => setViewType('unified')}
+            >
+              统一
+            </button>
+            <button
+              type="button"
+              className={viewType === 'split' ? 'on' : ''}
+              onClick={() => setViewType('split')}
+            >
+              分栏
+            </button>
+          </div>
           {project && d && (
             <div className="no-mobile">
               <IdeOpenButton
@@ -554,13 +587,24 @@ export function CodeReviewPane({
           {d && (
             <button
               type="button"
-              className="btn-checkpoint"
-              disabled={checkpoint.isPending}
-              title="标记当前变更为已确认 Checkpoint"
-              onClick={() => checkpoint.mutate()}
+              className={`btn-checkpoint ${isCheckpointed ? 'is-checked' : ''} ${isCheckpointLocked ? 'is-locked' : ''}`}
+              disabled={checkpointBusy || isCheckpointLocked}
+              title={
+                canUndoCheckpoint
+                  ? '已标记 Checkpoint（发送消息前再次点击可撤销）'
+                  : isCheckpointLocked
+                    ? '已发送新消息，该 Checkpoint 已确认锁定不可撤销'
+                    : '确认无误并记为 Checkpoint（发送消息前可再次点击撤销）'
+              }
+              onClick={() => {
+                if (canUndoCheckpoint) undoCheckpoint.mutate();
+                else if (!isCheckpointed) checkpoint.mutate();
+              }}
             >
               <Check size={12} strokeWidth={2.2} />
-              <span>Checkpoint</span>
+              <span>
+                {canUndoCheckpoint ? '已 Check · 撤销' : isCheckpointLocked ? '已 Checkpoint' : 'Checkpoint'}
+              </span>
             </button>
           )}
           {headerEnd}

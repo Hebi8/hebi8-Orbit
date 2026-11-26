@@ -1,14 +1,13 @@
 import { useState } from 'react';
-import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { Check, ChevronDown, ChevronRight, Download, Layers } from 'lucide-react';
+import { ChevronDown, ChevronRight, Download, Folder } from 'lucide-react';
 import type { FolderChangesSummary } from '../generated/protocol';
 import { api, errMsg } from '../lib/api';
 import { toast } from '../store/useWorkbenchStore';
 
 /**
- * Compact plain-folder in-place change card (no shadow Git):
- * - Header: `变更 N 个文件   +A −D   [收进 Artifacts]`
- * - Expandable 27px file list with status letter (`A`/`M`/`D`), line delta, and direct download.
+ * Full-width (100%), airy plain-folder in-place change strip (no shadow Git, no gray fill, no "收进 Artifacts"):
+ * - Header: `[chevron] [folder] 已修改 N 个文件       +A −D`
+ * - Expandable 27px file rows with status letter (`A`/`M`/`D`), line delta, and direct download icon.
  */
 export function FolderChangesCard({
   taskId,
@@ -19,25 +18,11 @@ export function FolderChangesCard({
   attemptId: string;
   changes: FolderChangesSummary;
 }) {
-  const qc = useQueryClient();
   const [open, setOpen] = useState(true);
   const [downloadingPath, setDownloadingPath] = useState('');
 
-  const promote = useMutation({
-    mutationFn: () => api.promoteFolderChanges(taskId, attemptId),
-    onSuccess: () => {
-      toast('已收进 Artifacts');
-      void qc.invalidateQueries({ queryKey: ['task-timeline', taskId] });
-      void qc.invalidateQueries({ queryKey: ['global-artifacts'] });
-      void qc.invalidateQueries({ queryKey: ['bootstrap'] });
-    },
-    onError: (e) => toast(errMsg(e), 'err'),
-  });
-
   const files = changes.files ?? [];
   if (files.length === 0) return null;
-
-  const hasDownloadable = files.some((f) => f.kind !== 'del');
 
   const handleDownload = async (relPath: string) => {
     setDownloadingPath(relPath);
@@ -53,42 +38,22 @@ export function FolderChangesCard({
   return (
     <div className="it">
       <div className="fc-card">
-        <div className="fc-hd">
-          <button
-            type="button"
-            className="fc-toggle"
-            onClick={() => setOpen((v) => !v)}
-            aria-expanded={open}
-          >
-            {open ? <ChevronDown size={13} strokeWidth={1.8} /> : <ChevronRight size={13} strokeWidth={1.8} />}
-            <span className="fc-title">变更 {files.length} 个文件</span>
-            {(changes.totalAdds > 0 || changes.totalDels > 0) && (
-              <span className="fc-delta mono">
-                {changes.totalAdds > 0 && <span className="add">+{changes.totalAdds}</span>}
-                {changes.totalDels > 0 && <span className="del">−{changes.totalDels}</span>}
-              </span>
-            )}
-          </button>
-
-          {hasDownloadable && (
-            changes.promoted ? (
-              <span className="fc-promoted">
-                <Check size={11.5} strokeWidth={2.2} />
-                已收进 Artifacts
-              </span>
-            ) : (
-              <button
-                type="button"
-                className="fc-promote-btn"
-                disabled={promote.isPending}
-                onClick={() => promote.mutate()}
-              >
-                <Layers size={11.5} strokeWidth={1.7} />
-                {promote.isPending ? '归档中…' : '收进 Artifacts'}
-              </button>
-            )
+        <button
+          type="button"
+          className="fc-hd"
+          onClick={() => setOpen((v) => !v)}
+          aria-expanded={open}
+        >
+          {open ? <ChevronDown size={13} strokeWidth={1.8} className="muted" /> : <ChevronRight size={13} strokeWidth={1.8} className="muted" />}
+          <Folder size={12.5} strokeWidth={1.7} className="muted" />
+          <span className="fc-title">已修改 {files.length} 个文件</span>
+          {(changes.totalAdds > 0 || changes.totalDels > 0) && (
+            <span className="fc-delta mono">
+              {changes.totalAdds > 0 && <span className="add">+{changes.totalAdds}</span>}
+              {changes.totalDels > 0 && <span className="del">−{changes.totalDels}</span>}
+            </span>
           )}
-        </div>
+        </button>
 
         {open && (
           <div className="fc-list">
