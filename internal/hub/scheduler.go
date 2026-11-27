@@ -65,6 +65,16 @@ func (s *Server) resolveExecutionRouteWithLocation(
 	explicitLoc := strings.TrimSpace(reqLocationID)
 
 	// 3-level Part -> Location resolution when explicit part/location is requested, or for standard non-deploy tasks with bound parts.
+	if !protocol.IsVirtualProjectID(proj.ProjectID) && strings.TrimSpace(reqCap) != "deploy-node" {
+		if len(proj.Parts) == 0 {
+			if explicitLoc != "" {
+				return resolvedRoute{}, fmt.Errorf("location %q not found in project %q", explicitLoc, proj.ProjectID)
+			}
+			if explicitPart != "" {
+				return resolvedRoute{}, fmt.Errorf("part %q not found in project %q", explicitPart, proj.ProjectID)
+			}
+		}
+	}
 	if !protocol.IsVirtualProjectID(proj.ProjectID) && len(proj.Parts) > 0 && strings.TrimSpace(reqCap) != "deploy-node" {
 		var matchedPart *protocol.ProjectPartView
 		var matchedLoc *protocol.ProjectLocationView
@@ -850,6 +860,28 @@ func (s *Server) drainPendingQueues(ctx context.Context) {
 	}
 	for _, n := range notices {
 		s.consumeAndDispatchNextPendingInput(ctx, n.TaskID, n.SteerInputID)
+	}
+}
+
+func (s *Server) reconcileTaskQueueAfterEdit(ctx context.Context, taskID string) {
+	task, err := s.store.GetTask(ctx, taskID)
+	if err != nil || task.ArchivedAt != nil || task.ActiveAttemptID != "" {
+		return
+	}
+	headPI, _, err := s.store.PeekNextPendingInput(ctx, taskID, "")
+	if err != nil {
+		return
+	}
+	if headPI == nil {
+		if task.State == protocol.TaskStateWaitingResource {
+			if ev, rErr := s.store.RecoverIdleBlockedTask(ctx, taskID); rErr == nil && ev != nil {
+				s.broker.Broadcast(*ev)
+			}
+		}
+		return
+	}
+	if task.State == protocol.TaskStateWaitingResource {
+		s.consumeAndDispatchNextPendingInput(ctx, taskID, "")
 	}
 }
 

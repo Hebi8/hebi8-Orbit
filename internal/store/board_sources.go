@@ -235,15 +235,7 @@ func scopeBoardExternalKey(boardTaskID, rawKey string) string {
 	if rawKey == "" {
 		return ""
 	}
-	boardTaskID = strings.TrimSpace(boardTaskID)
-	prefix := "board:" + boardTaskID + ":"
-	if strings.HasPrefix(rawKey, prefix) {
-		return rawKey
-	}
-	if strings.HasPrefix(rawKey, "board:") {
-		return prefix + strings.TrimPrefix(rawKey, "board:")
-	}
-	return prefix + rawKey
+	return "board:" + strings.TrimSpace(boardTaskID) + ":" + rawKey
 }
 
 func insertBoardMessageTx(
@@ -676,13 +668,13 @@ func (s *Store) MarkBoardMessageConsumed(ctx context.Context, taskID, messageID 
 	now := time.Now().UnixMilli()
 	err := s.WithWriteTx(ctx, func(tx *sql.Tx) error {
 		var err error
-		emitted, err = markBoardMessageConsumedTx(ctx, tx, taskID, messageID, seq, memberName, now)
+		emitted, err = markBoardMessageConsumedTx(ctx, tx, taskID, messageID, seq, memberName, "", now)
 		return err
 	})
 	return emitted, err
 }
 
-func markBoardMessageConsumedTx(ctx context.Context, tx *sql.Tx, taskID, messageID string, seq int64, memberName string, now int64) (*protocol.EventRecord, error) {
+func markBoardMessageConsumedTx(ctx context.Context, tx *sql.Tx, taskID, messageID string, seq int64, memberName, explicitWorkerTaskID string, now int64) (*protocol.EventRecord, error) {
 	if now == 0 {
 		now = time.Now().UnixMilli()
 	}
@@ -706,22 +698,49 @@ func markBoardMessageConsumedTx(ctx context.Context, tx *sql.Tx, taskID, message
 		}
 	}
 	member := strings.TrimPrefix(strings.TrimSpace(memberName), "@")
+	explicitWorkerTaskID = strings.TrimSpace(explicitWorkerTaskID)
+	if member == "" && explicitWorkerTaskID != "" {
+		member = explicitWorkerTaskID
+	}
 	if member != "" && seq > 0 {
-		// B16: Preserve existing worker_task_id/state, and if absent check whether this member corresponds
-		// to a virtual child task (parent_task_id = taskID) so worker_task_id is persisted permanently!
 		var existingState, existingWorker, existingMachine, existingAdapter sql.NullString
-		_ = tx.QueryRowContext(ctx, `
-			SELECT state, worker_task_id, machine_id, adapter FROM board_members WHERE task_id = ? AND member_name = ?
-		`, taskID, member).Scan(&existingState, &existingWorker, &existingMachine, &existingAdapter)
-		workerTaskID := existingWorker.String
-		if workerTaskID == "" {
-			var childTaskID string
+		workerTaskID := explicitWorkerTaskID
+		if explicitWorkerTaskID != "" {
+			var existingMemberName string
 			if err := tx.QueryRowContext(ctx, `
-				SELECT task_id FROM tasks
-				WHERE parent_task_id = ? AND archived_at IS NULL AND (task_id = ? OR LOWER(title) = LOWER(?))
-				ORDER BY created_at ASC LIMIT 1
-			`, taskID, member, member).Scan(&childTaskID); err == nil && childTaskID != "" {
-				workerTaskID = childTaskID
+				SELECT member_name, state, machine_id, adapter FROM board_members
+				WHERE task_id = ? AND worker_task_id = ? LIMIT 1
+			`, taskID, explicitWorkerTaskID).Scan(&existingMemberName, &existingState, &existingMachine, &existingAdapter); err == nil && existingMemberName != "" {
+				member = existingMemberName
+			} else {
+				_ = tx.QueryRowContext(ctx, `
+					SELECT state, worker_task_id, machine_id, adapter FROM board_members
+					WHERE task_id = ? AND member_name = ?
+				`, taskID, member).Scan(&existingState, &existingWorker, &existingMachine, &existingAdapter)
+				// Same-titled sibling already owns this member_name row -> key this child's cursor by its exact taskId.
+				if existingWorker.Valid && existingWorker.String != "" && existingWorker.String != explicitWorkerTaskID {
+					member = explicitWorkerTaskID
+					existingState = sql.NullString{}
+					existingMachine = sql.NullString{}
+					existingAdapter = sql.NullString{}
+				}
+			}
+		} else {
+			// B16: Preserve existing worker_task_id/state, and if absent check whether this member corresponds
+			// to a virtual child task (parent_task_id = taskID) so worker_task_id is persisted permanently!
+			_ = tx.QueryRowContext(ctx, `
+				SELECT state, worker_task_id, machine_id, adapter FROM board_members WHERE task_id = ? AND member_name = ?
+			`, taskID, member).Scan(&existingState, &existingWorker, &existingMachine, &existingAdapter)
+			workerTaskID = existingWorker.String
+			if workerTaskID == "" {
+				var childTaskID string
+				if err := tx.QueryRowContext(ctx, `
+					SELECT task_id FROM tasks
+					WHERE parent_task_id = ? AND archived_at IS NULL AND (task_id = ? OR LOWER(title) = LOWER(?))
+					ORDER BY created_at ASC LIMIT 1
+				`, taskID, member, member).Scan(&childTaskID); err == nil && childTaskID != "" {
+					workerTaskID = childTaskID
+				}
 			}
 		}
 		st := protocol.BoardMemberWorking

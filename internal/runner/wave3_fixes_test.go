@@ -209,6 +209,88 @@ func TestRunner_ConcurrentInPlaceDoesNotMisattributeToReadOnlyAttempt(t *testing
 	if fcSolo.ConcurrentSharedDir || fcSolo.ConcurrentNotice != "" {
 		t.Fatalf("non-overlapping attempt should not set ConcurrentSharedDir/ConcurrentNotice, got %+v", fcSolo)
 	}
+
+	// Nested in-place directories (parent repo dir vs child subdir) MUST also be treated as overlapping.
+	subDir := filepath.Join(sharedDir, "subpkg")
+	if err := os.MkdirAll(subDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var nestedEntered atomic.Int32
+	nestedBoth := make(chan struct{})
+	var nestedOnce sync.Once
+	nestedWrote := make(chan struct{})
+	drv.OnPrompt = func(pctx context.Context, d *FakeAcpDriver, sid acp.SessionId, promptText string) (acp.PromptResponse, error) {
+		if nestedEntered.Add(1) == 2 {
+			nestedOnce.Do(func() { close(nestedBoth) })
+		}
+		select {
+		case <-nestedBoth:
+		case <-time.After(4 * time.Second):
+			t.Errorf("nested concurrent attempts did not overlap")
+			return acp.PromptResponse{StopReason: acp.StopReasonEndTurn}, nil
+		}
+		if strings.Contains(promptText, "PARENT_RO") {
+			_ = d.EmitUpdate(pctx, sid, acp.SessionUpdate{
+				ToolCall: &acp.SessionUpdateToolCall{
+					ToolCallId: "tc_nested_ro",
+					Name:       acp.Ptr("read_file"),
+					Kind:       acp.ToolKindRead,
+					Status:     acp.ToolCallStatusCompleted,
+				},
+			})
+			<-nestedWrote
+			return acp.PromptResponse{StopReason: acp.StopReasonEndTurn}, nil
+		}
+		_ = d.EmitUpdate(pctx, sid, acp.SessionUpdate{
+			ToolCall: &acp.SessionUpdateToolCall{
+				ToolCallId: "tc_nested_wr",
+				Name:       acp.Ptr("write_file"),
+				Kind:       acp.ToolKindEdit,
+				Status:     acp.ToolCallStatusCompleted,
+			},
+		})
+		_ = os.WriteFile(filepath.Join(subDir, "nested.txt"), []byte("nested\n"), 0o644)
+		close(nestedWrote)
+		return acp.PromptResponse{StopReason: acp.StopReasonEndTurn}, nil
+	}
+	r.HandleDispatch(protocol.AttemptDispatchFrame{
+		AttemptID:     "att_nested_ro",
+		TaskID:        "tsk_nested_ro",
+		ProjectID:     "proj_shared",
+		LeaseToken:    "lease_nested_ro",
+		Adapter:       protocol.AdapterAgy,
+		WBSessionID:   "ses_nested_ro",
+		Isolation:     protocol.IsolationInPlace,
+		IsPlainFolder: true,
+		RepoPath:      sharedDir,
+		WorktreePath:  sharedDir,
+		Prompt:        "PARENT_RO",
+	})
+	r.HandleDispatch(protocol.AttemptDispatchFrame{
+		AttemptID:     "att_nested_wr",
+		TaskID:        "tsk_nested_wr",
+		ProjectID:     "proj_shared",
+		LeaseToken:    "lease_nested_wr",
+		Adapter:       protocol.AdapterAgy,
+		WBSessionID:   "ses_nested_wr",
+		Isolation:     protocol.IsolationInPlace,
+		IsPlainFolder: true,
+		RepoPath:      subDir,
+		WorktreePath:  subDir,
+		Prompt:        "SUB_WR",
+	})
+	if err := r.WaitAttemptDone(ctx, "att_nested_ro"); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.WaitAttemptDone(ctx, "att_nested_wr"); err != nil {
+		t.Fatal(err)
+	}
+	if fc := findFolderChanges("att_nested_ro"); fc != nil {
+		t.Fatalf("nested parent pure read-only attempt must not receive child subdir writes: %+v", fc)
+	}
+	if fc := findFolderChanges("att_nested_wr"); fc == nil || !fc.ConcurrentSharedDir {
+		t.Fatalf("nested child writer expected ConcurrentSharedDir=true, got %+v", fc)
+	}
 }
 
 func TestRunner_ProbeQuotasRPCDoesNotSendDuplicateQuotasReport(t *testing.T) {

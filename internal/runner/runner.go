@@ -3940,6 +3940,22 @@ func (att *attemptContext) markNonReadOnlyTool() {
 	att.mu.Unlock()
 }
 
+func inPlaceDirsOverlap(a, b string) bool {
+	if a == "" || b == "" {
+		return false
+	}
+	if a == b {
+		return true
+	}
+	if rel, err := filepath.Rel(a, b); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel) {
+		return true
+	}
+	if rel, err := filepath.Rel(b, a); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel) {
+		return true
+	}
+	return false
+}
+
 func (r *Runner) registerInPlaceAttempt(att *attemptContext, worktreePath string) {
 	if att == nil || strings.TrimSpace(worktreePath) == "" {
 		return
@@ -3953,15 +3969,20 @@ func (r *Runner) registerInPlaceAttempt(att *attemptContext, worktreePath string
 	if r.inPlaceActive == nil {
 		r.inPlaceActive = map[string]map[string]*attemptContext{}
 	}
+	for activeKey, bucket := range r.inPlaceActive {
+		if !inPlaceDirsOverlap(key, activeKey) {
+			continue
+		}
+		for id, other := range bucket {
+			if id != att.dispatch.AttemptID && other != nil {
+				others = append(others, other)
+			}
+		}
+	}
 	bucket := r.inPlaceActive[key]
 	if bucket == nil {
 		bucket = map[string]*attemptContext{}
 		r.inPlaceActive[key] = bucket
-	}
-	for id, other := range bucket {
-		if id != att.dispatch.AttemptID && other != nil {
-			others = append(others, other)
-		}
 	}
 	bucket[att.dispatch.AttemptID] = att
 	r.mu.Unlock()

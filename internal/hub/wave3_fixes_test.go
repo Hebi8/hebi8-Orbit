@@ -126,6 +126,23 @@ func TestHub_BoardIdempotencyIsolatedByRealBoardID(t *testing.T) {
 	if wMsgA.MessageID == wMsgB.MessageID || wMsgA.TaskID != parentA || wMsgB.TaskID != parentB {
 		t.Fatalf("web board idempotency leaked across boards: A=%+v B=%+v", wMsgA, wMsgB)
 	}
+
+	// 4. Raw keys "sync" vs "board:sync" on the SAME board MUST NOT collide.
+	rK1, bK1 := doJSONReq(t, http.MethodPost, ts.URL+"/api/tasks/"+parentA+"/board/messages", protocol.PostBoardMessageRequest{
+		Body: "key sync",
+	}, map[string]string{"Idempotency-Key": "sync"})
+	rK2, bK2 := doJSONReq(t, http.MethodPost, ts.URL+"/api/tasks/"+parentA+"/board/messages", protocol.PostBoardMessageRequest{
+		Body: "key board:sync",
+	}, map[string]string{"Idempotency-Key": "board:sync"})
+	if rK1.StatusCode != http.StatusCreated || rK2.StatusCode != http.StatusCreated {
+		t.Fatalf("board key distinction failed: k1=%d(%s) k2=%d(%s)", rK1.StatusCode, bK1, rK2.StatusCode, bK2)
+	}
+	var mK1, mK2 protocol.BoardMessage
+	_ = json.Unmarshal(bK1, &mK1)
+	_ = json.Unmarshal(bK2, &mK2)
+	if mK1.MessageID == mK2.MessageID || mK1.Body == mK2.Body {
+		t.Fatalf("raw key 'sync' collided with 'board:sync': m1=%+v m2=%+v", mK1, mK2)
+	}
 }
 
 func TestHub_BoardMentionsUnifiedDeliveryChildParentAllAndTimelineCount(t *testing.T) {
@@ -337,6 +354,64 @@ func TestHub_BoardMentionsUnifiedDeliveryChildParentAllAndTimelineCount(t *testi
 	}
 	if bodies := pendingBodies(parentID); len(bodies) != 3 {
 		t.Fatalf("unknown @mention must not wake parent session, got %+v", bodies)
+	}
+
+	// 7. Two same-titled idle children: mentioning dup2 by taskId records consumption cursor on dup2, NOT dup1.
+	finishAttempt := func(attID, evID string) {
+		rec, err := st.GetAttemptRecord(ctx, attID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.IngestOutboxBatch(ctx, "hub-node", "run_men_1", protocol.AttemptOutboxBatchFrame{
+			Type:       protocol.RunnerMsgOutboxBatch,
+			AttemptID:  rec.AttemptID,
+			LeaseToken: rec.LeaseToken,
+			Items: []protocol.OutboxItem{
+				{
+					OutboxSeq: 1,
+					EventID:   evID,
+					FrameType: protocol.OutboxFrameState,
+					Payload: map[string]any{
+						"state":            string(protocol.AttemptSucceeded),
+						"completionSource": string(protocol.CompletionPromptEndTurn),
+					},
+					TS: time.Now().UnixMilli(),
+				},
+			},
+		}); err != nil {
+			t.Fatalf("finish attempt %s failed: %v", attID, err)
+		}
+	}
+	dup1, attDup1 := spawnChild("Duplicate Worker")
+	dup2, attDup2 := spawnChild("Duplicate Worker")
+	finishAttempt(attDup1, "evt_dup1_done")
+	finishAttempt(attDup2, "evt_dup2_done")
+
+	rDup, bDup := doJSONReq(t, http.MethodPost, ts.URL+"/api/tasks/"+parentID+"/board/messages", protocol.PostBoardMessageRequest{
+		AuthorName:    "human",
+		TargetMention: dup2,
+		Body:          "exact target dup2",
+	}, nil)
+	if rDup.StatusCode != http.StatusCreated {
+		t.Fatalf("mention dup2 failed: %d %s", rDup.StatusCode, bDup)
+	}
+	var dupMsg protocol.BoardMessage
+	_ = json.Unmarshal(bDup, &dupMsg)
+	boardAfterDup, err := st.GetTaskBoard(ctx, parentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var dup1Cursor, dup2Cursor int64
+	for _, m := range boardAfterDup.Members {
+		if m.WorkerTaskID == dup1 {
+			dup1Cursor = m.LastConsumedSeq
+		}
+		if m.WorkerTaskID == dup2 {
+			dup2Cursor = m.LastConsumedSeq
+		}
+	}
+	if dup2Cursor != dupMsg.Seq || dup1Cursor != 0 {
+		t.Fatalf("expected dup2 cursor=%d and dup1 cursor=0, got dup2=%d dup1=%d (members=%+v)", dupMsg.Seq, dup2Cursor, dup1Cursor, boardAfterDup.Members)
 	}
 	_ = attC2
 }
@@ -552,6 +627,43 @@ func TestHub_PendingQueueUsesItemPersistedRouteAndRecordsBlock(t *testing.T) {
 		if n.TaskID == created.Task.TaskID {
 			t.Fatalf("pending_queue_drain should be cleared after recording dispatch_blocked to prevent silent loop")
 		}
+	}
+
+	// Verify waiting_reason is set while blocked, and deleting the blocked head item restores idle task to in_review & clears waiting_reason!
+	blockedTask, err := st.GetTask(ctx, created.Task.TaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if blockedTask.State != protocol.TaskStateWaitingResource || strings.TrimSpace(blockedTask.WaitingReason) == "" {
+		t.Fatalf("expected waiting_resource with non-empty waitingReason, got state=%s reason=%q", blockedTask.State, blockedTask.WaitingReason)
+	}
+	pendingList, err := st.ListPendingInputs(ctx, created.Task.TaskID)
+	if err != nil || len(pendingList) != 1 {
+		t.Fatalf("expected 1 blocked pending input, got %+v (err=%v)", pendingList, err)
+	}
+	rDelQ, bDelQ := doJSONReq(t, http.MethodDelete, ts.URL+"/api/tasks/"+created.Task.TaskID+"/queue/"+pendingList[0].InputID, nil, nil)
+	if rDelQ.StatusCode != http.StatusOK {
+		t.Fatalf("delete blocked queue head failed: %d %s", rDelQ.StatusCode, bDelQ)
+	}
+	recoveredTask, err := st.GetTask(ctx, created.Task.TaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recoveredTask.State != protocol.TaskStateInReview || recoveredTask.WaitingReason != "" {
+		t.Fatalf("expected idle task recovered to in_review with empty waitingReason after deleting blocked head, got state=%s reason=%q", recoveredTask.State, recoveredTask.WaitingReason)
+	}
+
+	// Verify 0-Part project still rejects an explicit deleted locationId rather than falling back!
+	if _, _, err := st.DeleteProjectPart(ctx, proj.ProjectID, partID, "human"); err != nil {
+		t.Fatalf("delete last part failed: %v", err)
+	}
+	rBadZero, bBadZero := doJSONReq(t, http.MethodPost, ts.URL+"/api/projects/"+proj.ProjectID+"/tasks", protocol.CreateTaskRequest{
+		Title:      "Zero Part Explicit Loc",
+		Goal:       "should reject deleted loc",
+		LocationID: locB,
+	}, nil)
+	if rBadZero.StatusCode == http.StatusCreated {
+		t.Fatalf("expected 0-part project with explicit deleted locationId to fail, got 201 %s", bBadZero)
 	}
 }
 

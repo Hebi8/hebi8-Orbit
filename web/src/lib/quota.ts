@@ -203,11 +203,19 @@ export function resolveAgentQuota({
 
   if (bestScore > 0 && bestGroup !== '') {
     const groupWins = windows.filter((w) => groupKey(w) === bestGroup);
-    // Evaluate BOTH the matched model-specific bucket AND any shared generic bucket
-    // (e.g. Claude's shared 7d vs 7d Sonnet) and take the tighter remaining limit so an
-    // exhausted shared cap is never masked by a looser model-specific bucket.
-    win5h = pickTightestWindow(groupWins.find(isWindow5h), genericWindows.find(isWindow5h));
-    win7d = pickTightestWindow(groupWins.find(isWindow7d), genericWindows.find(isWindow7d));
+    const group5h = groupWins.find(isWindow5h);
+    const group7d = groupWins.find(isWindow7d);
+    if (adapter === 'claude') {
+      // Claude shares account-wide 5h/7d caps alongside per-model 7d buckets (Opus/Sonnet):
+      // take the tighter limit so an exhausted shared cap is never masked.
+      win5h = pickTightestWindow(group5h, genericWindows.find(isWindow5h));
+      win7d = pickTightestWindow(group7d, genericWindows.find(isWindow7d));
+    } else {
+      // Codex (e.g. codex vs codex_spark) and Antigravity maintain independent per-group pools:
+      // never clamp a matched model group against an unrelated generic/default group.
+      win5h = group5h;
+      win7d = group7d;
+    }
     resolvedGroup = bestGroup;
   } else if (genericWindows.some((w) => isWindow5h(w) || isWindow7d(w))) {
     win5h = pickTightestWindow(...genericWindows.filter(isWindow5h));
@@ -216,8 +224,8 @@ export function resolveAgentQuota({
     const firstValid = windows.find((w) => isWindow5h(w) || isWindow7d(w));
     const fallbackGroup = firstValid ? groupKey(firstValid) : '';
     const groupWins = windows.filter((w) => groupKey(w) === fallbackGroup);
-    win5h = pickTightestWindow(groupWins.find(isWindow5h), genericWindows.find(isWindow5h));
-    win7d = pickTightestWindow(groupWins.find(isWindow7d), genericWindows.find(isWindow7d));
+    win5h = groupWins.find(isWindow5h);
+    win7d = groupWins.find(isWindow7d);
     resolvedGroup = fallbackGroup;
   }
 

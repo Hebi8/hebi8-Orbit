@@ -16,10 +16,7 @@ import (
 	"github.com/Hebi8/hebi8-Orbit/internal/protocol"
 )
 
-func useDelegateSocket(hubURLFlag string) (sockPath, delegateToken string, ok bool) {
-	if strings.TrimSpace(hubURLFlag) != "" {
-		return "", "", false
-	}
+func useDelegateSocket(_ string) (sockPath, delegateToken string, ok bool) {
 	sockPath = strings.TrimSpace(os.Getenv("ORBIT_RUNNER_SOCK"))
 	delegateToken = strings.TrimSpace(os.Getenv("ORBIT_DELEGATE_TOKEN"))
 	if sockPath != "" && delegateToken != "" {

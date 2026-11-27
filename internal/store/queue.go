@@ -1149,8 +1149,12 @@ func (s *Store) SubmitFollowupAtomic(ctx context.Context, p SubmitFollowupParams
 				bmTaskID = p.TaskID
 			}
 			bmMember := stringField(p.PayloadExtra, "boardMemberName")
+			bmWorkerID := stringField(p.PayloadExtra, "boardWorkerTaskId")
+			if bmWorkerID == "" && p.TaskID != bmTaskID {
+				bmWorkerID = p.TaskID
+			}
 			bmSeq := int64Field(p.PayloadExtra, "boardSeq")
-			if evBM, err := markBoardMessageConsumedTx(ctx, tx, bmTaskID, bmID, bmSeq, bmMember, now); err == nil && evBM != nil {
+			if evBM, err := markBoardMessageConsumedTx(ctx, tx, bmTaskID, bmID, bmSeq, bmMember, bmWorkerID, now); err == nil && evBM != nil {
 				res.Events = append(res.Events, *evBM)
 			}
 		}
@@ -1728,9 +1732,9 @@ func (s *Store) RecordPendingQueueBlocked(ctx context.Context, taskID, inputID, 
 		if !activeAtt.Valid || strings.TrimSpace(activeAtt.String) == "" {
 			if _, err := tx.ExecContext(ctx, `
 				UPDATE tasks
-				SET state = ?, pending_queue_drain = 0, pending_steer_input_id = NULL, updated_at = ?
+				SET state = ?, waiting_reason = ?, pending_queue_drain = 0, pending_steer_input_id = NULL, version = version + 1, updated_at = ?
 				WHERE task_id = ?
-			`, string(protocol.TaskStateWaitingResource), now, taskID); err != nil {
+			`, string(protocol.TaskStateWaitingResource), reason, now, taskID); err != nil {
 				return err
 			}
 		} else {
@@ -1752,6 +1756,62 @@ func (s *Store) RecordPendingQueueBlocked(ctx context.Context, taskID, inputID, 
 				"action":  "dispatch_blocked",
 				"inputId": strings.TrimSpace(inputID),
 				"reason":  reason,
+			},
+			CreatedAt: now,
+		})
+		if err != nil {
+			return err
+		}
+		emitted = &ev
+		return nil
+	})
+	return emitted, err
+}
+
+// RecoverIdleBlockedTask restores an idle waiting_resource task to in_review and clears waiting_reason
+// once its pending input queue has been emptied (e.g. after deleting a blocked queue head).
+func (s *Store) RecoverIdleBlockedTask(ctx context.Context, taskID string) (*protocol.EventRecord, error) {
+	now := time.Now().UnixMilli()
+	var emitted *protocol.EventRecord
+	err := s.WithWriteTx(ctx, func(tx *sql.Tx) error {
+		var projectID, state string
+		var activeAtt sql.NullString
+		var archivedAt sql.NullInt64
+		if err := tx.QueryRowContext(ctx, `
+			SELECT project_id, state, active_attempt_id, archived_at FROM tasks WHERE task_id = ?
+		`, taskID).Scan(&projectID, &state, &activeAtt, &archivedAt); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return nil
+			}
+			return err
+		}
+		if archivedAt.Valid || (activeAtt.Valid && strings.TrimSpace(activeAtt.String) != "") || protocol.TaskState(state) != protocol.TaskStateWaitingResource {
+			return nil
+		}
+		var queuedCount int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM task_pending_inputs WHERE task_id = ? AND state = 'queued'`, taskID).Scan(&queuedCount); err != nil {
+			return err
+		}
+		if queuedCount > 0 {
+			return nil
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE tasks
+			SET state = ?, waiting_reason = NULL, pending_queue_drain = 0, pending_steer_input_id = NULL, version = version + 1, updated_at = ?
+			WHERE task_id = ?
+		`, string(protocol.TaskStateInReview), now, taskID); err != nil {
+			return err
+		}
+		ev, err := insertEventTx(ctx, tx, eventInsert{
+			StreamID:   "task:" + taskID,
+			ProjectID:  projectID,
+			TaskID:     taskID,
+			ActorKind:  protocol.ActorSystem,
+			ActorID:    "queue-dispatcher",
+			Kind:       protocol.EventTaskStateChanged,
+			Visibility: protocol.VisibilityTimeline,
+			Payload: map[string]any{
+				"state": string(protocol.TaskStateInReview),
 			},
 			CreatedAt: now,
 		})
@@ -2080,8 +2140,12 @@ func (s *Store) ConsumeNextPendingInput(ctx context.Context, p ConsumeNextPendin
 				bmTaskID = p.TaskID
 			}
 			bmMember := stringField(pi.Payload, "boardMemberName")
+			bmWorkerID := stringField(pi.Payload, "boardWorkerTaskId")
+			if bmWorkerID == "" && p.TaskID != bmTaskID {
+				bmWorkerID = p.TaskID
+			}
 			bmSeq := int64Field(pi.Payload, "boardSeq")
-			if evBM, err := markBoardMessageConsumedTx(ctx, tx, bmTaskID, bmID, bmSeq, bmMember, now); err == nil && evBM != nil {
+			if evBM, err := markBoardMessageConsumedTx(ctx, tx, bmTaskID, bmID, bmSeq, bmMember, bmWorkerID, now); err == nil && evBM != nil {
 				events = append(events, *evBM)
 			}
 		}

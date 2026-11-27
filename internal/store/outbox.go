@@ -402,7 +402,7 @@ func applyActiveOutboxItemTx(
 		msgID := stringField(item.Payload, "messageId")
 		memberName := stringField(item.Payload, "memberName")
 		seq := int64Field(item.Payload, "seq")
-		ev, err := markBoardMessageConsumedTx(ctx, tx, att.TaskID, msgID, seq, memberName, ts)
+		ev, err := markBoardMessageConsumedTx(ctx, tx, att.TaskID, msgID, seq, memberName, "", ts)
 		if err != nil {
 			return err
 		}

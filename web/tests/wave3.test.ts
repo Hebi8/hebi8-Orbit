@@ -5,7 +5,7 @@ import { createImeGuardController, IME_TRAILING_ENTER_WINDOW_MS } from '../src/l
 import { resolveAgentQuota } from '../src/lib/quota.ts';
 import type { MachineView } from '../src/generated/protocol.ts';
 
-test('BoardPanel manual @mention resolves full untruncated name by longest prefix to taskId and rejects ambiguous/unknown', () => {
+test('BoardPanel manual @mention resolves full untruncated name by longest complete target and rejects ambiguous/unknown', () => {
   const longTitle = 'A'.repeat(95) + ' Final Architecture Review Worker';
   const truncatedDisplay = `${longTitle.slice(0, 80)}…`;
 
@@ -32,6 +32,13 @@ test('BoardPanel manual @mention resolves full untruncated name by longest prefi
       taskId: 'tsk_longer',
     },
     {
+      key: 'child:tsk_parent_rev',
+      mentionValue: 'tsk_parent_rev',
+      fullName: 'Parent Review',
+      displayLabel: 'Parent Review',
+      taskId: 'tsk_parent_rev',
+    },
+    {
       key: 'child:tsk_dup_1',
       mentionValue: 'tsk_dup_1',
       fullName: 'Duplicate Worker',
@@ -55,21 +62,30 @@ test('BoardPanel manual @mention resolves full untruncated name by longest prefi
   const resPrefix = resolveManualBoardMention('@API Gateway Worker check TLS', '', participants);
   assert.deepEqual(resPrefix, { ok: true, target: 'tsk_longer', body: 'check TLS' });
 
-  // 3. Exact @taskId works even for duplicate-titled children
+  // 3. Longest complete target without body asks for body instead of falling back to shorter "API"
+  const resNoBody = resolveManualBoardMention('@API Gateway Worker', '', participants);
+  assert.equal(resNoBody.ok, false);
+  assert.match(resNoBody.error, /输入消息正文/);
+
+  // 4. Child named "Parent Review" beats reserved keyword "parent" by longest-prefix match
+  const resParentRev = resolveManualBoardMention('@Parent Review check PR #42', '', participants);
+  assert.deepEqual(resParentRev, { ok: true, target: 'tsk_parent_rev', body: 'check PR #42' });
+
+  // 5. Exact @taskId works even for duplicate-titled children
   const resById = resolveManualBoardMention('@tsk_dup_2 run unit tests', '', participants);
   assert.deepEqual(resById, { ok: true, target: 'tsk_dup_2', body: 'run unit tests' });
 
-  // 4. Duplicate ambiguous name fails inline before sending (does NOT misroute to parent)
+  // 6. Duplicate ambiguous name fails inline before sending (does NOT misroute to parent)
   const resDup = resolveManualBoardMention('@Duplicate Worker hello', '', participants);
   assert.equal(resDup.ok, false);
   assert.match(resDup.error, /同名/);
 
-  // 5. Unknown @mention fails inline before sending (does NOT misroute to parent)
+  // 7. Unknown @mention fails inline before sending (does NOT misroute to parent)
   const resUnknown = resolveManualBoardMention('@NonExistentWorker hello', '', participants);
   assert.equal(resUnknown.ok, false);
   assert.match(resUnknown.error, /未找到提及对象/);
 
-  // 6. @all and @parent resolve directly
+  // 8. @all and @parent resolve directly when no longer target matches
   assert.deepEqual(resolveManualBoardMention('@all sync now', '', participants), {
     ok: true,
     target: 'all',
@@ -81,7 +97,7 @@ test('BoardPanel manual @mention resolves full untruncated name by longest prefi
     body: 'ready for review',
   });
 
-  // 7. Plain message preserves selected button target (child taskId directly)
+  // 9. Plain message preserves selected button target (child taskId directly)
   assert.deepEqual(resolveManualBoardMention('looks good', 'tsk_long', participants), {
     ok: true,
     target: 'tsk_long',
@@ -89,7 +105,7 @@ test('BoardPanel manual @mention resolves full untruncated name by longest prefi
   });
 });
 
-test('Claude quota picks tightest limit between shared 7d and model-specific 7d with bottleneck resetsAt', () => {
+test('Claude clamps shared+model 7d to tightest limit while Codex independent groups stay isolated', () => {
   const reset5h = Date.UTC(2026, 10, 28, 5, 0, 0);
   const resetShared7d = Date.UTC(2026, 10, 30, 0, 0, 0);
   const resetSonnet7d = Date.UTC(2026, 11, 2, 0, 0, 0);
@@ -100,7 +116,7 @@ test('Claude quota picks tightest limit between shared 7d and model-specific 7d 
     transportMode: 'local_ws',
     status: 'online',
     capabilities: ['primary-dev'],
-    adapters: ['claude'],
+    adapters: ['claude', 'codex'],
     resources: {},
     agents: [
       {
@@ -127,11 +143,44 @@ test('Claude quota picks tightest limit between shared 7d and model-specific 7d 
           ],
         },
       },
+      {
+        adapter: 'codex',
+        enabled: true,
+        state: 'ready',
+        source: 'path',
+        quota: {
+          adapter: 'codex',
+          available: true,
+          fetchedAt: Date.UTC(2026, 10, 27, 12, 0, 0),
+          windows: [
+            { window: '5h', label: '5h', usedPercent: 100, remainingPercent: 0, resetsAt: reset5h },
+            { window: '7d', label: '7d', usedPercent: 100, remainingPercent: 0, resetsAt: resetShared7d },
+            {
+              window: '5h',
+              label: 'Codex Spark 5h',
+              group: 'Codex Spark',
+              modelHints: ['gpt-5.3-codex-spark'],
+              usedPercent: 15,
+              remainingPercent: 85,
+              resetsAt: reset5h,
+            },
+            {
+              window: '7d',
+              label: 'Codex Spark 7d',
+              group: 'Codex Spark',
+              modelHints: ['gpt-5.3-codex-spark'],
+              usedPercent: 10,
+              remainingPercent: 90,
+              resetsAt: resetSonnet7d,
+            },
+          ],
+        },
+      },
     ],
     updatedAt: Date.UTC(2026, 10, 27, 12, 0, 0),
   });
 
-  // Scenario from review: 5h=80%, shared 7d=0%, Sonnet 7d=75% -> BOTH primary badge and 7d show 0% with shared 7d reset!
+  // Claude: 5h=80%, shared 7d=0%, Sonnet 7d=75% -> BOTH primary badge and 7d show 0% with shared 7d reset!
   const exhaustedShared = resolveAgentQuota({
     machines: [makeMachine(0, 75)],
     machineId: 'hub-node',
@@ -144,7 +193,7 @@ test('Claude quota picks tightest limit between shared 7d and model-specific 7d 
   assert.equal(exhaustedShared.win7d?.remainingPercent, 0);
   assert.equal(exhaustedShared.win7d?.resetsAt, resetShared7d);
 
-  // Converse: 5h=80%, shared 7d=60%, Sonnet 7d=12% -> Sonnet 7d is tighter -> 12% with Sonnet 7d reset!
+  // Claude converse: 5h=80%, shared 7d=60%, Sonnet 7d=12% -> Sonnet 7d is tighter -> 12% with Sonnet 7d reset!
   const tighterSonnet = resolveAgentQuota({
     machines: [makeMachine(60, 12)],
     machineId: 'hub-node',
@@ -154,9 +203,23 @@ test('Claude quota picks tightest limit between shared 7d and model-specific 7d 
   assert.equal(tighterSonnet.primaryRemainingPercent, 12);
   assert.equal(tighterSonnet.win7d?.remainingPercent, 12);
   assert.equal(tighterSonnet.win7d?.resetsAt, resetSonnet7d);
+
+  // Codex independent pool: default codex is 0%, Codex Spark is 85%/90% -> Spark MUST stay 85% (not clamped to 0%)!
+  const codexSpark = resolveAgentQuota({
+    machines: [makeMachine(0, 75)],
+    machineId: 'hub-node',
+    adapter: 'codex',
+    model: 'gpt-5.3-codex-spark',
+  });
+  assert.equal(codexSpark.available, true);
+  assert.equal(codexSpark.group, 'Codex Spark');
+  assert.equal(codexSpark.primaryRemainingPercent, 85);
+  assert.equal(codexSpark.win5h?.remainingPercent, 85);
+  assert.equal(codexSpark.win7d?.remainingPercent, 90);
 });
 
-test('IME guard blocks only synchronous one-shot trailing Enter and never swallows independent Enter or Arrow/Esc', () => {
+test('IME guard blocks only synchronous 25ms one-shot trailing Enter and never swallows independent Enter or Arrow/Esc', () => {
+  assert.equal(IME_TRAILING_ENTER_WINDOW_MS, 25);
   let now = 1000;
   const ime = createImeGuardController(() => now);
 
@@ -172,18 +235,18 @@ test('IME guard blocks only synchronous one-shot trailing Enter and never swallo
   //    then an immediately following independent Enter sends normally!
   now = 1000;
   ime.onCompositionEnd();
-  now = 1008; // 8ms <= 50ms
+  now = 1008; // 8ms <= 25ms
   assert.equal(ime.isImeKeyEvent({ key: 'Enter' }), true, 'synchronous trailing Enter must be blocked');
-  now = 1020; // still within 50ms, but one-shot already consumed!
+  now = 1015; // still within 25ms, but one-shot already consumed!
   assert.equal(ime.isImeKeyEvent({ key: 'Enter' }), false, 'independent Enter immediately after must NOT be swallowed');
 
-  // 3. keyup clears the one-shot flag immediately (e.g. Chromium where no trailing keydown(Enter) fires)
+  // 3. keyup clears the one-shot flag immediately
   now = 2000;
   ime.onCompositionStart();
   ime.onCompositionEnd();
-  now = 2010;
+  now = 2005;
   ime.onKeyUp();
-  now = 2020; // only 20ms after compositionend
+  now = 2012;
   assert.equal(ime.isImeKeyEvent({ key: 'Enter' }), false, 'independent Enter after keyup must send');
 
   // 4. Subsequent real input event clears the one-shot flag, while composition-commit input preserves it
@@ -201,19 +264,18 @@ test('IME guard blocks only synchronous one-shot trailing Enter and never swallo
   now = 3110;
   assert.equal(ime.isImeKeyEvent({ key: 'Enter' }), false, 'new text input must disarm pending trailing Enter');
 
-  // 5. ArrowDown / ArrowUp / Escape / Tab / Backspace within 30ms after compositionend MUST NOT be blocked
+  // 5. ArrowDown / ArrowUp / Escape / Tab / Backspace within 15ms after compositionend MUST NOT be blocked
   for (const navKey of ['ArrowDown', 'ArrowUp', 'Escape', 'Tab', 'Backspace']) {
     now = 4000;
     ime.onCompositionStart();
     ime.onCompositionEnd();
-    now = 4030; // 30ms after compositionend (< 50ms)
-    assert.equal(ime.isImeKeyEvent({ key: navKey }), false, `${navKey} 30ms after compositionend must respond normally`);
-    // And pressing navKey must also clear the pending trailing Enter flag!
-    now = 4035;
+    now = 4015; // 15ms < 25ms
+    assert.equal(ime.isImeKeyEvent({ key: navKey }), false, `${navKey} 15ms after compositionend must respond normally`);
+    now = 4018;
     assert.equal(ime.isImeKeyEvent({ key: 'Enter' }), false, `Enter after ${navKey} must not be swallowed`);
   }
 
-  // 6. Expired trailing Enter beyond window (> 50ms) is not swallowed
+  // 6. Expired trailing Enter beyond 25ms window is not swallowed
   now = 5000;
   ime.onCompositionStart();
   ime.onCompositionEnd();

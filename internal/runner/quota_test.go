@@ -448,4 +448,21 @@ exit 0
 	if elapsed2 > 1500*time.Millisecond {
 		t.Fatalf("stdout-holding orphan delayed agy probe return: elapsed=%v", elapsed2)
 	}
+	// Verify the leftover process group was terminated after pipe drain timed out.
+	if runtime.GOOS == "linux" {
+		if b, err := os.ReadFile(orphanPIDFile); err == nil {
+			if pid, err := strconv.Atoi(strings.TrimSpace(string(b))); err == nil && pid > 0 {
+				deadline := time.Now().Add(800 * time.Millisecond)
+				for time.Now().Before(deadline) {
+					if _, statErr := os.Stat(filepath.Join("/proc", strconv.Itoa(pid))); os.IsNotExist(statErr) {
+						break
+					}
+					time.Sleep(25 * time.Millisecond)
+				}
+				if _, statErr := os.Stat(filepath.Join("/proc", strconv.Itoa(pid))); statErr == nil {
+					t.Fatalf("expected stdout-holding orphan pid %d to be terminated after pipe drain timeout", pid)
+				}
+			}
+		}
+	}
 }

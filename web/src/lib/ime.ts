@@ -14,7 +14,7 @@ import {
  * Pinyin candidate fires `compositionend` *before* `keydown(Enter)`, causing a naive
  * `e.nativeEvent.isComposing` check to read `false` and prematurely submit messages.
  */
-export const IME_TRAILING_ENTER_WINDOW_MS = 50;
+export const IME_TRAILING_ENTER_WINDOW_MS = 25;
 
 export interface ImeKeyLikeEvent {
   key: string;

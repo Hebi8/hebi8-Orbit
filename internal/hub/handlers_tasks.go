@@ -1250,6 +1250,7 @@ func (s *Server) handleDeleteQueueInput(w http.ResponseWriter, r *http.Request) 
 	if ev != nil {
 		s.broker.Broadcast(*ev)
 	}
+	s.reconcileTaskQueueAfterEdit(r.Context(), taskID)
 	writeJSON(w, http.StatusOK, map[string]any{"deleted": true, "inputId": inputID})
 }
 
@@ -1312,6 +1313,7 @@ func (s *Server) handleReorderQueue(w http.ResponseWriter, r *http.Request) {
 	if ev != nil {
 		s.broker.Broadcast(*ev)
 	}
+	s.reconcileTaskQueueAfterEdit(r.Context(), taskID)
 	writeJSON(w, http.StatusOK, map[string]any{"items": items})
 }
 
@@ -1522,15 +1524,19 @@ func (s *Server) deliverBoardMessageMentions(
 			return
 		}
 		delivered[targetTaskID] = true
-		fResp, _, _, fErr := s.followupTaskWithExtra(ctx, targetTaskID, protocol.FollowupTaskRequest{
-			Message: fmt.Sprintf("[Board @%s] %s", mentionLabel, msg.Body),
-			Mode:    protocol.FollowupModeQueue,
-		}, actorKind, actorID, map[string]any{
+		extra := map[string]any{
 			"boardMessageId":  msg.MessageID,
 			"boardTaskId":     boardTaskID,
 			"boardMemberName": boardMemberName,
 			"boardSeq":        msg.Seq,
-		})
+		}
+		if targetTaskID != boardTaskID {
+			extra["boardWorkerTaskId"] = targetTaskID
+		}
+		fResp, _, _, fErr := s.followupTaskWithExtra(ctx, targetTaskID, protocol.FollowupTaskRequest{
+			Message: fmt.Sprintf("[Board @%s] %s", mentionLabel, msg.Body),
+			Mode:    protocol.FollowupModeQueue,
+		}, actorKind, actorID, extra)
 		if fErr == nil && fResp.Attempt != nil {
 			anyConsumed = true
 		}

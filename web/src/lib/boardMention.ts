@@ -13,9 +13,10 @@ export type ResolvedBoardMention =
 /**
  * Resolves a Board composer input line.
  * - If input does not start with `@`, uses `selectedTarget` directly.
- * - If input starts with `@`, resolves `@all`, `@parent`, `@<taskId>`, or longest-prefix
- *   match against participants' full untruncated names (converting matched children to `taskId`).
- * - Unknown or ambiguous duplicate names fail fast with a clear inline error instead of
+ * - If input starts with `@`, evaluates reserved targets (`all`, `parent`) and all participants'
+ *   full untruncated names / taskIds in a single longest-prefix pass, selecting the longest
+ *   complete target first before checking whether a non-empty message body follows.
+ * - Unknown or ambiguous duplicate targets fail fast with a clear inline error instead of
  *   misrouting to the parent session.
  */
 export function resolveManualBoardMention(
@@ -34,70 +35,59 @@ export function resolveManualBoardMention(
   const afterAt = trimmed.slice(1);
   const afterAtLower = afterAt.toLowerCase();
 
-  const reservedMatch = /^(all|parent)(?:\s+([\s\S]*))?$/i.exec(afterAt);
-  if (reservedMatch) {
-    const kw = reservedMatch[1].toLowerCase();
-    const rest = (reservedMatch[2] ?? '').trim();
-    if (!rest) {
-      return { ok: false, error: `请在 @${kw} 后输入消息正文` };
-    }
-    return { ok: true, target: kw, body: rest };
+  interface UnifiedTarget {
+    key: string;
+    mentionValue: string;
+    names: string[];
   }
 
-  let bestLen = 0;
-  let bestMatchedText = '';
-  const bestMatches = new Map<string, BoardMentionCandidate>();
-  let exactOnlyNoBody = false;
-
+  const targets: UnifiedTarget[] = [
+    { key: '__reserved:all', mentionValue: 'all', names: ['all'] },
+    { key: '__reserved:parent', mentionValue: 'parent', names: ['parent'] },
+  ];
   for (const p of participants) {
     const names = new Set<string>();
     if (p.taskId && p.taskId.trim()) names.add(p.taskId.trim());
     if (p.fullName.trim()) names.add(p.fullName.trim());
     const strippedDisplay = p.displayLabel.replace(/^@/, '').trim();
     if (strippedDisplay) names.add(strippedDisplay);
+    targets.push({ key: p.key, mentionValue: p.mentionValue, names: [...names] });
+  }
 
-    for (const cand of names) {
+  let bestLen = 0;
+  let bestMatchedText = '';
+  const bestMatches = new Map<string, UnifiedTarget>();
+
+  for (const t of targets) {
+    for (const cand of t.names) {
       const candLower = cand.toLowerCase();
       if (!afterAtLower.startsWith(candLower)) continue;
       const tail = afterAt.slice(cand.length);
-      if (tail.length === 0) {
-        exactOnlyNoBody = true;
-        continue;
-      }
-      if (!/^\s/.test(tail)) continue;
-      const restBody = tail.trim();
-      if (!restBody) {
-        exactOnlyNoBody = true;
-        continue;
-      }
+      if (tail.length > 0 && !/^\s/.test(tail)) continue;
       if (cand.length > bestLen) {
         bestLen = cand.length;
         bestMatchedText = cand;
         bestMatches.clear();
-        bestMatches.set(p.key, p);
+        bestMatches.set(t.key, t);
       } else if (cand.length === bestLen) {
-        bestMatches.set(p.key, p);
+        bestMatches.set(t.key, t);
       }
     }
   }
 
   if (bestLen > 0) {
-    if (bestMatches.size === 1) {
-      const only = [...bestMatches.values()][0];
+    if (bestMatches.size > 1) {
       return {
-        ok: true,
-        target: only.mentionValue,
-        body: afterAt.slice(bestLen).trim(),
+        ok: false,
+        error: `存在多个同名参与者「${bestMatchedText}」，请点击上方提及按钮或使用 @taskId 精确指定`,
       };
     }
-    return {
-      ok: false,
-      error: `存在多个同名参与者「${bestMatchedText}」，请点击上方提及按钮或使用 @taskId 精确指定`,
-    };
-  }
-
-  if (exactOnlyNoBody) {
-    return { ok: false, error: '请在 @提及 后输入消息正文' };
+    const only = [...bestMatches.values()][0];
+    const restBody = afterAt.slice(bestLen).trim();
+    if (!restBody) {
+      return { ok: false, error: `请在 @${bestMatchedText} 后输入消息正文` };
+    }
+    return { ok: true, target: only.mentionValue, body: restBody };
   }
 
   const firstToken = afterAt.split(/\s+/)[0] || '';

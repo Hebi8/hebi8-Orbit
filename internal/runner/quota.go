@@ -262,7 +262,7 @@ func (c *QuotaCollector) collectAgy(ctx context.Context) protocol.AgentQuotaSnap
 		_, _ = io.Copy(&stderr, io.LimitReader(errR, 512<<10))
 	}()
 
-	drainPipesBounded := func(timeout time.Duration) {
+	drainPipesBounded := func(timeout time.Duration) (timedOut bool) {
 		timer := time.NewTimer(timeout)
 		defer timer.Stop()
 		for outCh, errCh := outDone, errDone; outCh != nil || errCh != nil; {
@@ -276,11 +276,12 @@ func (c *QuotaCollector) collectAgy(ctx context.Context) protocol.AgentQuotaSnap
 				_ = errR.Close()
 				<-outDone
 				<-errDone
-				return
+				return true
 			}
 		}
 		_ = outR.Close()
 		_ = errR.Close()
+		return false
 	}
 
 	waitCh := make(chan error, 1)
@@ -291,7 +292,9 @@ func (c *QuotaCollector) collectAgy(ctx context.Context) protocol.AgentQuotaSnap
 	var runErr error
 	select {
 	case runErr = <-waitCh:
-		drainPipesBounded(150 * time.Millisecond)
+		if drainPipesBounded(150 * time.Millisecond) {
+			killProcessGroupByID(cmd, pgid)
+		}
 	case <-pctx.Done():
 		killProcessGroupByID(cmd, pgid)
 		select {

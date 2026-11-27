@@ -299,11 +299,11 @@ func TestCLIBoard_DelegateSocketAlwaysUsedWithParentFlag(t *testing.T) {
 	}
 
 	out.Reset()
-	if err := run(ctx, []string{"child", "board", "post", "--parent", "tsk_other_parent", "--target", "@parent", "--body", "sync check"}, &out, &errOut); err != nil {
-		t.Fatalf("delegate board post with --parent failed: %v", err)
+	if err := run(ctx, []string{"child", "board", "post", "--hub", httpSrv.URL, "--parent", "tsk_other_parent", "--target", "@parent", "--body", "sync check"}, &out, &errOut); err != nil {
+		t.Fatalf("delegate board post with --hub and --parent failed: %v", err)
 	}
 	if httpHits != 2 {
-		t.Fatalf("delegate board post bypassed socket and hit REST API! httpHits=%d", httpHits)
+		t.Fatalf("delegate board post with --hub bypassed socket and hit REST API! httpHits=%d", httpHits)
 	}
 	if gotPostPayload["boardTaskId"] != "tsk_other_parent" || gotPostPayload["targetMention"] != "@parent" || gotPostPayload["body"] != "sync check" {
 		t.Fatalf("expected board-post payload with boardTaskId via socket, got %+v", gotPostPayload)
