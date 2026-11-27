@@ -167,7 +167,12 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
   },
   setBoardOpen: (open) => set({ boardOpen: open }),
   setMobileDockOpen: (open) => set({ mobileDockOpen: open }),
-  setCmdkOpen: (open) => set({ cmdkOpen: open, machinesOpen: false }),
+  setCmdkOpen: (open) => {
+    if (open && typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('orbit:dismiss-popovers'));
+    }
+    set({ cmdkOpen: open, machinesOpen: false });
+  },
   setMachinesOpen: (open) => set({ machinesOpen: open }),
   openReview: (tab, taskId, deliveryId, artifactId) =>
     set({

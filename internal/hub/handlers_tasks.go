@@ -554,7 +554,7 @@ func (s *Server) followupTaskWithExtra(
 	actorID string,
 	payloadExtra map[string]any,
 ) (protocol.FollowupTaskResponse, int, string, error) {
-	resp, _, status, code, err := s.followupTaskInternalWithTrigger(ctx, taskID, req, protocol.TriggerFollowup, actorKind, actorID, payloadExtra, nil, nil, nil)
+	resp, _, status, code, err := s.followupTaskInternalWithTrigger(ctx, taskID, req, protocol.TriggerFollowup, actorKind, actorID, payloadExtra, nil, nil, nil, nil)
 	return resp, status, code, err
 }
 
@@ -566,8 +566,9 @@ func (s *Server) followupTaskWithRunnerGuard(
 	actorID string,
 	payloadExtra map[string]any,
 	runnerGuard *store.RunnerParentControlGuard,
+	delegationSent *store.RecordDelegationSentParams,
 ) (protocol.FollowupTaskResponse, int, string, error) {
-	resp, _, status, code, err := s.followupTaskInternalWithTrigger(ctx, taskID, req, protocol.TriggerFollowup, actorKind, actorID, payloadExtra, nil, nil, runnerGuard)
+	resp, _, status, code, err := s.followupTaskInternalWithTrigger(ctx, taskID, req, protocol.TriggerFollowup, actorKind, actorID, payloadExtra, nil, nil, runnerGuard, delegationSent)
 	return resp, status, code, err
 }
 
@@ -581,7 +582,7 @@ func (s *Server) followupTaskWithTrigger(
 	payloadExtra map[string]any,
 	childNotif *store.ChildNotificationDelivery,
 ) (protocol.FollowupTaskResponse, int, string, error) {
-	resp, _, status, code, err := s.followupTaskInternalWithTrigger(ctx, taskID, req, triggerKind, actorKind, actorID, payloadExtra, nil, childNotif, nil)
+	resp, _, status, code, err := s.followupTaskInternalWithTrigger(ctx, taskID, req, triggerKind, actorKind, actorID, payloadExtra, nil, childNotif, nil, nil)
 	return resp, status, code, err
 }
 
@@ -594,7 +595,7 @@ func (s *Server) followupTaskInternalWithPA(
 	payloadExtra map[string]any,
 	paIdemp *store.PAActionIdempotencySpec,
 ) (protocol.FollowupTaskResponse, *protocol.PAActionResult, int, string, error) {
-	return s.followupTaskInternalWithTrigger(ctx, taskID, req, protocol.TriggerFollowup, actorKind, actorID, payloadExtra, paIdemp, nil, nil)
+	return s.followupTaskInternalWithTrigger(ctx, taskID, req, protocol.TriggerFollowup, actorKind, actorID, payloadExtra, paIdemp, nil, nil, nil)
 }
 
 func (s *Server) followupTaskInternalWithTrigger(
@@ -608,6 +609,7 @@ func (s *Server) followupTaskInternalWithTrigger(
 	paIdemp *store.PAActionIdempotencySpec,
 	childNotif *store.ChildNotificationDelivery,
 	runnerGuard *store.RunnerParentControlGuard,
+	delegationSent *store.RecordDelegationSentParams,
 ) (protocol.FollowupTaskResponse, *protocol.PAActionResult, int, string, error) {
 	var resp protocol.FollowupTaskResponse
 	req.Message = strings.TrimSpace(req.Message)
@@ -878,6 +880,7 @@ func (s *Server) followupTaskInternalWithTrigger(
 		PAIdempotency:     paIdemp,
 		ChildNotification: childNotif,
 		RunnerParentGuard: runnerGuard,
+		DelegationSent:    delegationSent,
 	})
 	if errors.Is(err, store.ErrForbidden) {
 		return resp, nil, http.StatusForbidden, "ERR_FORBIDDEN", err

@@ -486,21 +486,19 @@ func (s *Server) handleRunnerDelegateSend(w http.ResponseWriter, r *http.Request
 			"delegatedRelation":   relation,
 		},
 		guard,
+		&store.RecordDelegationSentParams{
+			SenderTaskID:    strings.TrimSpace(req.ParentTaskID),
+			SenderAttemptID: strings.TrimSpace(req.ParentAttemptID),
+			TargetTaskID:    strings.TrimSpace(req.ChildTaskID),
+			Relation:        relation,
+			Mode:            mode,
+			Summary:         strings.TrimSpace(req.Message),
+			ActorID:         "agent:" + runnerMachineID,
+		},
 	)
 	if err != nil {
 		writeAPIError(w, status, code, err.Error())
 		return
-	}
-	if ev, evErr := s.store.RecordDelegationSent(r.Context(), store.RecordDelegationSentParams{
-		SenderTaskID:    strings.TrimSpace(req.ParentTaskID),
-		SenderAttemptID: strings.TrimSpace(req.ParentAttemptID),
-		TargetTaskID:    strings.TrimSpace(req.ChildTaskID),
-		Relation:        relation,
-		Mode:            mode,
-		Summary:         strings.TrimSpace(req.Message),
-		ActorID:         "agent:" + runnerMachineID,
-	}); evErr == nil {
-		s.broker.Broadcast(ev)
 	}
 	writeJSON(w, status, resp)
 }

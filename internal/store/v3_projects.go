@@ -1038,6 +1038,27 @@ func (s *Store) UpdateProjectLocationWithRuntime(
 				if _, err := tx.ExecContext(ctx, `UPDATE project_parts SET repo_identity = ?, updated_at = ? WHERE part_id = ?`, newRepoID, now, partID); err != nil {
 					return err
 				}
+				// Keep project-level repo_identity mirror in sync when this is the sole non-folder part.
+				var partCount int
+				if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM project_parts WHERE project_id = ?`, projectID).Scan(&partCount); err != nil {
+					return err
+				}
+				if partCount <= 1 && (kindStr != string(protocol.ProjectPartFolder) || newRepoID != "") {
+					var cfgJSON string
+					if err := tx.QueryRowContext(ctx, `SELECT config_json FROM projects WHERE project_id = ?`, projectID).Scan(&cfgJSON); err != nil {
+						return err
+					}
+					var cfg protocol.ProjectConfig
+					_ = json.Unmarshal([]byte(cfgJSON), &cfg)
+					cfg.RepoIdentity = newRepoID
+					updatedCfg, err := json.Marshal(cfg)
+					if err != nil {
+						return err
+					}
+					if _, err := tx.ExecContext(ctx, `UPDATE projects SET repo_identity = ?, config_json = ?, updated_at = ? WHERE project_id = ?`, newRepoID, string(updatedCfg), now, projectID); err != nil {
+						return err
+					}
+				}
 			} else if strings.TrimSpace(curRepoID) == "" && newRepoID != "" {
 				if _, err := tx.ExecContext(ctx, `UPDATE project_parts SET repo_identity = ?, updated_at = ? WHERE part_id = ?`, newRepoID, now, partID); err != nil {
 					return err

@@ -623,54 +623,59 @@ type RecordDelegationSentParams struct {
 func (s *Store) RecordDelegationSent(ctx context.Context, p RecordDelegationSentParams) (protocol.EventRecord, error) {
 	var ev protocol.EventRecord
 	now := time.Now().UnixMilli()
+	err := s.WithWriteTx(ctx, func(tx *sql.Tx) error {
+		var err error
+		ev, err = insertDelegationSentTx(ctx, tx, p, now)
+		return err
+	})
+	return ev, err
+}
+
+func insertDelegationSentTx(ctx context.Context, tx *sql.Tx, p RecordDelegationSentParams, now int64) (protocol.EventRecord, error) {
+	var ev protocol.EventRecord
 	actorID := strings.TrimSpace(p.ActorID)
 	if actorID == "" {
 		actorID = "agent"
 	}
-	err := s.WithWriteTx(ctx, func(tx *sql.Tx) error {
-		var senderProjectID string
-		if err := tx.QueryRowContext(ctx, `SELECT project_id FROM tasks WHERE task_id = ?`, p.SenderTaskID).Scan(&senderProjectID); err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return fmt.Errorf("%w: sender task %s", ErrNotFound, p.SenderTaskID)
-			}
-			return err
+	var senderProjectID string
+	if err := tx.QueryRowContext(ctx, `SELECT project_id FROM tasks WHERE task_id = ?`, p.SenderTaskID).Scan(&senderProjectID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ev, fmt.Errorf("%w: sender task %s", ErrNotFound, p.SenderTaskID)
 		}
-		var targetProjectID, targetTitle, targetGoal string
-		if err := tx.QueryRowContext(ctx, `SELECT project_id, title, goal FROM tasks WHERE task_id = ?`, p.TargetTaskID).Scan(&targetProjectID, &targetTitle, &targetGoal); err != nil {
-			if !errors.Is(err, sql.ErrNoRows) {
-				return err
-			}
+		return ev, err
+	}
+	var targetProjectID, targetTitle, targetGoal string
+	if err := tx.QueryRowContext(ctx, `SELECT project_id, title, goal FROM tasks WHERE task_id = ?`, p.TargetTaskID).Scan(&targetProjectID, &targetTitle, &targetGoal); err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			return ev, err
 		}
-		title := strings.TrimSpace(targetTitle)
-		if title == "" {
-			title = strings.TrimSpace(strings.Split(targetGoal, "\n")[0])
-		}
-		if title == "" {
-			title = p.TargetTaskID
-		}
-		var err error
-		ev, err = insertEventTx(ctx, tx, eventInsert{
-			StreamID:   "task:" + p.SenderTaskID,
-			ProjectID:  senderProjectID,
-			TaskID:     p.SenderTaskID,
-			AttemptID:  strings.TrimSpace(p.SenderAttemptID),
-			ActorKind:  protocol.ActorAgent,
-			ActorID:    actorID,
-			Kind:       protocol.EventDelegationSent,
-			Visibility: protocol.VisibilityTimeline,
-			Payload: map[string]any{
-				"targetTaskId":    p.TargetTaskID,
-				"targetProjectId": targetProjectID,
-				"targetTitle":     title,
-				"relation":        strings.TrimSpace(p.Relation),
-				"mode":            string(p.Mode),
-				"summary":         truncatePromptText(p.Summary),
-			},
-			CreatedAt: now,
-		})
-		return err
+	}
+	title := strings.TrimSpace(targetTitle)
+	if title == "" {
+		title = strings.TrimSpace(strings.Split(targetGoal, "\n")[0])
+	}
+	if title == "" {
+		title = p.TargetTaskID
+	}
+	return insertEventTx(ctx, tx, eventInsert{
+		StreamID:   "task:" + p.SenderTaskID,
+		ProjectID:  senderProjectID,
+		TaskID:     p.SenderTaskID,
+		AttemptID:  strings.TrimSpace(p.SenderAttemptID),
+		ActorKind:  protocol.ActorAgent,
+		ActorID:    actorID,
+		Kind:       protocol.EventDelegationSent,
+		Visibility: protocol.VisibilityTimeline,
+		Payload: map[string]any{
+			"targetTaskId":    p.TargetTaskID,
+			"targetProjectId": targetProjectID,
+			"targetTitle":     title,
+			"relation":        strings.TrimSpace(p.Relation),
+			"mode":            string(p.Mode),
+			"summary":         truncatePromptText(p.Summary),
+		},
+		CreatedAt: now,
 	})
-	return ev, err
 }
 
 // IsDescendantTask reports whether targetTaskID is strictly under ancestorTaskID's delegation subtree.

@@ -192,7 +192,7 @@ export function ReviewOverlay({ boot }: { boot: BootstrapResponse }) {
         <div
           ref={bodyRef}
           className={`rev-grid mobile-${mobilePane}`}
-          style={{ gridTemplateColumns: `minmax(0, ${ratio}fr) 1px minmax(0, ${100 - ratio}fr)` }}
+          style={{ gridTemplateColumns: `minmax(360px, ${ratio}fr) 1px minmax(340px, ${100 - ratio}fr)` }}
         >
           {/* Left: Source Review or Artifacts */}
           <div className="rev-pane rev-left">

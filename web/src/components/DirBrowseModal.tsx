@@ -138,6 +138,7 @@ export function CodexDirBrowser({
   const [error, setError] = useState('');
 
   const reqSeqRef = useRef(0);
+  const validateSeqRef = useRef(0);
   const activeMachineRef = useRef(machineId);
   activeMachineRef.current = machineId;
   const initialMachineRef = useRef(machineId);
@@ -155,6 +156,8 @@ export function CodexDirBrowser({
     ): Promise<boolean> => {
       if (!mid) return false;
       const seq = ++reqSeqRef.current;
+      validateSeqRef.current += 1;
+      setValidating(false);
       setLoading(true);
       setError('');
       try {
@@ -213,6 +216,7 @@ export function CodexDirBrowser({
   useEffect(() => {
     if (!machineId) return;
     reqSeqRef.current += 1;
+    validateSeqRef.current += 1;
     setValidating(false);
     setCurPath('');
     setHomePath('');
@@ -334,11 +338,12 @@ export function CodexDirBrowser({
         return;
       }
       const seq = ++reqSeqRef.current;
+      const vSeq = ++validateSeqRef.current;
       setValidating(true);
       try {
         const res = await api.listMachineDirs(targetMid, raw);
         // Discard stale response if user switched machines or triggered a newer directory request while validating.
-        if (seq !== reqSeqRef.current || activeMachineRef.current !== targetMid) return;
+        if (seq !== reqSeqRef.current || vSeq !== validateSeqRef.current || activeMachineRef.current !== targetMid) return;
         setCurPath(res.path);
         setHomePath(res.homePath || '');
         setParentPath(res.parentPath ?? '');
@@ -353,11 +358,11 @@ export function CodexDirBrowser({
           entryName: res.path.split('/').filter(Boolean).pop() || '',
         });
       } catch (e) {
-        if (seq === reqSeqRef.current && activeMachineRef.current === targetMid) {
+        if (seq === reqSeqRef.current && vSeq === validateSeqRef.current && activeMachineRef.current === targetMid) {
           setError(formatBrowseError(e));
         }
       } finally {
-        if (seq === reqSeqRef.current && activeMachineRef.current === targetMid) {
+        if (vSeq === validateSeqRef.current) {
           setValidating(false);
         }
       }

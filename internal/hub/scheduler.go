@@ -670,13 +670,41 @@ func (s *Server) buildAttemptDispatchFrame(
 		}
 	}
 
-	isPlainFolder := strings.HasPrefix(strings.ToLower(strings.TrimSpace(proj.RepoIdentity)), "folder:")
-	if !isPlainFolder && att.PartID != "" {
-		for _, p := range proj.Parts {
-			if p.PartID == att.PartID && p.Kind == protocol.ProjectPartFolder {
-				isPlainFolder = true
+	var selectedPart *protocol.ProjectPartView
+	if att.PartID != "" {
+		for i := range proj.Parts {
+			if proj.Parts[i].PartID == att.PartID {
+				selectedPart = &proj.Parts[i]
 				break
 			}
+		}
+	}
+	if selectedPart == nil && att.LocationID != "" {
+		for i := range proj.Parts {
+			for _, loc := range proj.Parts[i].Locations {
+				if loc.LocationID == att.LocationID {
+					selectedPart = &proj.Parts[i]
+					break
+				}
+			}
+			if selectedPart != nil {
+				break
+			}
+		}
+	}
+	if selectedPart == nil && len(proj.Parts) == 1 {
+		selectedPart = &proj.Parts[0]
+	}
+
+	isPlainFolder := strings.HasPrefix(strings.ToLower(strings.TrimSpace(proj.RepoIdentity)), "folder:")
+	repoIdentity := strings.TrimSpace(proj.RepoIdentity)
+	if selectedPart != nil {
+		if selectedPart.Kind == protocol.ProjectPartFolder || strings.HasPrefix(strings.ToLower(strings.TrimSpace(selectedPart.RepoIdentity)), "folder:") {
+			isPlainFolder = true
+			repoIdentity = ""
+		} else {
+			isPlainFolder = false
+			repoIdentity = strings.TrimSpace(selectedPart.RepoIdentity)
 		}
 	}
 	isolation := att.Isolation
@@ -726,7 +754,7 @@ func (s *Server) buildAttemptDispatchFrame(
 		ProviderSessionID:  provSID,
 		ExpectedSessionCWD: expectedCWD,
 		RepoPath:           repoPath,
-		RepoIdentity:       proj.RepoIdentity,
+		RepoIdentity:       repoIdentity,
 		LocationID:         att.LocationID,
 		Isolation:          isolation,
 		IsPlainFolder:      isPlainFolder,

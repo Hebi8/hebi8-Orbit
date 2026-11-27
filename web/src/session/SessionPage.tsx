@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { Archive, ArchiveRestore, ArrowLeft, Layers, MessageSquare, MoreHorizontal, Trash2 } from 'lucide-react';
 import type { BoardMemberCursor, BootstrapResponse } from '../generated/protocol';
@@ -31,9 +31,11 @@ import { SessionConversation } from './SessionConversation';
 
 const CODE_KINDS = new Set(['code_diff', 'mixed', 'workspace_snapshot']);
 const SUB_DRAWER_WIDTH_KEY = 'orbit.subDrawerWidth';
-const SUB_DRAWER_MIN = 260;
+const SUB_DRAWER_MIN = 340;
+const SUB_DRAWER_NARROW_MIN = 260;
+const SUB_DRAWER_MAIN_MIN = 280;
 const SUB_DRAWER_MAX = 680;
-const SUB_DRAWER_DEFAULT = 468;
+const SUB_DRAWER_DEFAULT = 440;
 
 function measureNaturalDockHeight(cwrap: HTMLElement | null): number {
   if (!cwrap) return 0;
@@ -78,10 +80,25 @@ function measureNaturalDockHeight(cwrap: HTMLElement | null): number {
   return Math.ceil(total);
 }
 
+function hasSavedDrawerWidth(): boolean {
+  try {
+    const raw = localStorage.getItem(SUB_DRAWER_WIDTH_KEY);
+    if (raw == null || raw.trim() === '') return false;
+    const n = Number(raw);
+    return Number.isFinite(n) && n >= SUB_DRAWER_NARROW_MIN;
+  } catch {
+    return false;
+  }
+}
+
 function readDrawerWidth(): number {
   try {
-    const n = Number(localStorage.getItem(SUB_DRAWER_WIDTH_KEY));
-    if (Number.isFinite(n)) return Math.min(SUB_DRAWER_MAX, Math.max(SUB_DRAWER_MIN, Math.round(n)));
+    const raw = localStorage.getItem(SUB_DRAWER_WIDTH_KEY);
+    if (raw == null || raw.trim() === '') return SUB_DRAWER_DEFAULT;
+    const n = Number(raw);
+    if (Number.isFinite(n) && n >= SUB_DRAWER_NARROW_MIN) {
+      return Math.min(SUB_DRAWER_MAX, Math.max(SUB_DRAWER_MIN, Math.round(n)));
+    }
   } catch {
     // ignore storage errors
   }
@@ -135,12 +152,18 @@ export function SessionPage({
   const [actionBusy, setActionBusy] = useState(false);
   const [activeNativeMemberName, setActiveNativeMemberName] = useState<string | null>(null);
   const [drawerWidth, setDrawerWidth] = useState<number>(readDrawerWidth);
+  const [hasExplicitDrawerWidth, setHasExplicitDrawerWidth] = useState<boolean>(hasSavedDrawerWidth);
   const [stageWidth, setStageWidth] = useState<number>(0);
   const [draggingSash, setDraggingSash] = useState(false);
 
   const artMenuRef = useRef<HTMLDivElement | null>(null);
   const moreMenuRef = useRef<HTMLDivElement | null>(null);
   const sessRef = useRef<HTMLDivElement | null>(null);
+  const [sessEl, setSessEl] = useState<HTMLDivElement | null>(null);
+  const setSessNode = useCallback((node: HTMLDivElement | null) => {
+    sessRef.current = node;
+    setSessEl(node);
+  }, []);
   const drawerWidthRef = useRef(drawerWidth);
   drawerWidthRef.current = drawerWidth;
 
@@ -214,8 +237,10 @@ export function SessionPage({
 
   // Observe stage width so split layout at narrow desktop viewports (e.g. 920px with 220px sidebar = 700px)
   // stays cleanly side-by-side without the child drawer ever overlapping the main session.
+  // Depends on `sessEl` (callback ref state) so cold-start / direct reload of `#/t/parent?child=...` attaches
+  // immediately as soon as `tl` loads and `.sess` mounts.
   useLayoutEffect(() => {
-    const root = sessRef.current;
+    const root = sessEl;
     if (!root) return;
     const update = () => {
       const w = Math.round(root.getBoundingClientRect().width);
@@ -225,13 +250,13 @@ export function SessionPage({
     const ro = new ResizeObserver(update);
     ro.observe(root);
     return () => ro.disconnect();
-  }, [taskId, childDrawerOpen]);
+  }, [sessEl, taskId, childDrawerOpen]);
 
   // Keep `--composer-dock-h` synchronized to the MAX natural height of BOTH main & child Composer docks
   // (accounting for multiline textarea growth, pending Review annotation rows, banners, and ref chips),
   // guaranteeing Δtop = 0px and Δheight = 0px across every state and smooth snap-back to 113px when cleared.
   useLayoutEffect(() => {
-    const root = sessRef.current;
+    const root = sessEl;
     if (!root || !childDrawerOpen) return;
 
     let rafId = 0;
@@ -261,8 +286,10 @@ export function SessionPage({
       const childDock = root.querySelector('.sub-drawer .cwrap') as HTMLElement | null;
       const mainH = measureNaturalDockHeight(mainDock);
       const childH = measureNaturalDockHeight(childDock);
-      const targetH = Math.max(113, mainH, childH);
-      root.style.setProperty('--composer-dock-h', `${targetH}px`);
+      const nextVal = `${Math.max(113, mainH, childH)}px`;
+      if (root.style.getPropertyValue('--composer-dock-h') !== nextVal) {
+        root.style.setProperty('--composer-dock-h', nextVal);
+      }
     };
 
     const scheduleSync = () => {
@@ -274,9 +301,10 @@ export function SessionPage({
     };
 
     sync();
+    scheduleSync();
     const mo = new MutationObserver(() => {
       attachTargets();
-      sync();
+      scheduleSync();
     });
     mo.observe(root, { childList: true, subtree: true, attributes: true, attributeFilter: ['style', 'class'] });
 
@@ -286,10 +314,15 @@ export function SessionPage({
       ro.disconnect();
       root.style.removeProperty('--composer-dock-h');
     };
-  }, [childDrawerOpen, taskId, effectiveChildId, activeNativeMember?.memberName]);
+  }, [sessEl, childDrawerOpen, taskId, effectiveChildId, activeNativeMember?.memberName]);
 
   useEffect(() => {
     if (!artMenuOpen && !moreMenuOpen) return;
+    const closeAll = () => {
+      setArtMenuOpen(false);
+      setMoreMenuOpen(false);
+      setConfirmDeleteMenu(false);
+    };
     const onDown = (e: MouseEvent) => {
       const target = e.target as Node;
       if (artMenuOpen && artMenuRef.current && !artMenuRef.current.contains(target)) {
@@ -302,18 +335,19 @@ export function SessionPage({
     };
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape' && !e.isComposing) {
+        if (useWorkbenchStore.getState().cmdkOpen) return;
         e.preventDefault();
         e.stopImmediatePropagation();
-        setArtMenuOpen(false);
-        setMoreMenuOpen(false);
-        setConfirmDeleteMenu(false);
+        closeAll();
       }
     };
     window.addEventListener('mousedown', onDown);
     window.addEventListener('keydown', onKey, true);
+    window.addEventListener('orbit:dismiss-popovers', closeAll);
     return () => {
       window.removeEventListener('mousedown', onDown);
       window.removeEventListener('keydown', onKey, true);
+      window.removeEventListener('orbit:dismiss-popovers', closeAll);
     };
   }, [artMenuOpen, moreMenuOpen]);
 
@@ -601,20 +635,19 @@ export function SessionPage({
   );
 
   const clampDrawerWidth = (rawW: number, curStageW = stageWidth || (sessRef.current?.getBoundingClientRect().width ?? 0)) => {
-    const minMain = curStageW > 0 && curStageW < 820 ? 310 : 340;
-    const minDrawer = curStageW > 0 && curStageW < 820 ? SUB_DRAWER_MIN : 320;
-    const sashW = 5;
     const maxAllowed =
       curStageW > 0
-        ? Math.min(SUB_DRAWER_MAX, Math.max(minDrawer, curStageW - minMain - sashW))
+        ? Math.min(SUB_DRAWER_MAX, Math.max(SUB_DRAWER_NARROW_MIN, curStageW - SUB_DRAWER_MAIN_MIN))
         : SUB_DRAWER_MAX;
+    const minDrawer = Math.min(SUB_DRAWER_MIN, maxAllowed);
     return Math.round(Math.min(maxAllowed, Math.max(minDrawer, rawW)));
   };
 
-  // Proportional cap at narrow desktop widths (e.g. 920px with 220px sidebar => 700px stage => ~345px drawer, ~350px main)
+  // Keep v4 340px floor & 440px default on wide desktop; on narrow desktop (e.g. 920px => 700px stage)
+  // default balances ~350px/345px before explicit drag, while explicit drag reaches Math.min(680, stageWidth - 280) (420px at 920px).
   const effectiveDrawerWidth =
-    stageWidth > 0 && stageWidth < 820
-      ? clampDrawerWidth(Math.min(drawerWidth, Math.floor((stageWidth - 5) * 0.49)), stageWidth)
+    !hasExplicitDrawerWidth && stageWidth > 0 && stageWidth < 900
+      ? clampDrawerWidth(Math.min(drawerWidth, Math.max(SUB_DRAWER_MIN, Math.floor(stageWidth * 0.5))), stageWidth)
       : clampDrawerWidth(drawerWidth, stageWidth);
 
   return (
@@ -801,7 +834,7 @@ export function SessionPage({
         </div>
       )}
 
-      <div ref={sessRef} className={`sess ${childDrawerOpen ? 'has-child-drawer' : ''}`}>
+      <div ref={setSessNode} className={`sess ${childDrawerOpen ? 'has-child-drawer' : ''}`}>
         <div className="session-main-col">
           <SessionConversation
             taskId={taskId}
@@ -845,7 +878,10 @@ export function SessionPage({
                 if (!e.currentTarget.hasPointerCapture(e.pointerId)) return;
                 const rect = sessRef.current?.getBoundingClientRect();
                 if (!rect) return;
-                setDrawerWidth(clampDrawerWidth(rect.right - e.clientX, rect.width));
+                const next = clampDrawerWidth(rect.right - e.clientX, rect.width);
+                setHasExplicitDrawerWidth(true);
+                setDrawerWidth(next);
+                drawerWidthRef.current = next;
               }}
               onPointerUp={(e) => {
                 if (e.currentTarget.hasPointerCapture(e.pointerId)) {
@@ -860,7 +896,9 @@ export function SessionPage({
                 if (delta === 0) return;
                 e.preventDefault();
                 const next = clampDrawerWidth(effectiveDrawerWidth + delta);
+                setHasExplicitDrawerWidth(true);
                 setDrawerWidth(next);
+                drawerWidthRef.current = next;
                 writeDrawerWidth(next);
               }}
             />

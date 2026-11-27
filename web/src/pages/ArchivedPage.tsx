@@ -15,7 +15,7 @@ import { useArchivedTasks } from '../hooks/queries';
 import { api, errMsg } from '../lib/api';
 import { PA_PROJECT_ID, SCRATCH_PROJECT_ID, isVirtualProject, relTime, taskTitle } from '../lib/format';
 import { navigate, paths } from '../lib/router';
-import { toast } from '../store/useWorkbenchStore';
+import { toast, useWorkbenchStore } from '../store/useWorkbenchStore';
 
 type ArchivedSortKey = 'archived_desc' | 'active_desc' | 'title_asc';
 
@@ -59,16 +59,20 @@ export function ArchivedPage({ boot }: { boot: BootstrapResponse }) {
     };
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape' && !e.isComposing) {
+        if (useWorkbenchStore.getState().cmdkOpen) return;
         e.preventDefault();
         e.stopImmediatePropagation();
         setOpenMenu(null);
       }
     };
+    const onDismissAll = () => setOpenMenu(null);
     document.addEventListener('mousedown', onDown);
     window.addEventListener('keydown', onKey, true);
+    window.addEventListener('orbit:dismiss-popovers', onDismissAll);
     return () => {
       document.removeEventListener('mousedown', onDown);
       window.removeEventListener('keydown', onKey, true);
+      window.removeEventListener('orbit:dismiss-popovers', onDismissAll);
     };
   }, [openMenu]);
 

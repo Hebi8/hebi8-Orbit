@@ -158,17 +158,21 @@ export function NewThreadPage({
     };
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
+        if (useWorkbenchStore.getState().cmdkOpen) return;
         e.preventDefault();
         e.stopImmediatePropagation();
         e.stopPropagation();
         setOpenMenu(null);
       }
     };
+    const onDismissAll = () => setOpenMenu(null);
     document.addEventListener('mousedown', onDown);
     window.addEventListener('keydown', onKey, true);
+    window.addEventListener('orbit:dismiss-popovers', onDismissAll);
     return () => {
       document.removeEventListener('mousedown', onDown);
       window.removeEventListener('keydown', onKey, true);
+      window.removeEventListener('orbit:dismiss-popovers', onDismissAll);
     };
   }, [openMenu]);
 

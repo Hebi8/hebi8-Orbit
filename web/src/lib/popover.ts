@@ -1,4 +1,5 @@
 import { useEffect, useLayoutEffect, useState, type CSSProperties, type RefObject } from 'react';
+import { useWorkbenchStore } from '../store/useWorkbenchStore';
 
 /**
  * Computes viewport-clamped `position: fixed` coordinates for a portal popover
@@ -87,17 +88,22 @@ export function useAnchoredPopover({
     };
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape' && !e.isComposing) {
+        // Never steal Escape when the higher-layer Command Palette (⌘K) is open.
+        if (useWorkbenchStore.getState().cmdkOpen) return;
         e.preventDefault();
         e.stopImmediatePropagation();
         e.stopPropagation();
         onClose();
       }
     };
+    const onDismissAll = () => onClose();
     document.addEventListener('mousedown', onDown);
     window.addEventListener('keydown', onKey, true);
+    window.addEventListener('orbit:dismiss-popovers', onDismissAll);
     return () => {
       document.removeEventListener('mousedown', onDown);
       window.removeEventListener('keydown', onKey, true);
+      window.removeEventListener('orbit:dismiss-popovers', onDismissAll);
     };
   }, [open, anchorRef, popRef, onClose]);
 

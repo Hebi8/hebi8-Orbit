@@ -1,14 +1,20 @@
 package hub
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/Hebi8/hebi8-Orbit/internal/protocol"
+	"github.com/Hebi8/hebi8-Orbit/internal/runner"
 	"github.com/Hebi8/hebi8-Orbit/internal/store"
 )
 
@@ -188,5 +194,206 @@ func TestPhase4_SchedulerPromptByRole(t *testing.T) {
 	}
 	if !strings.Contains(paPrompt, "Cross-Directory") {
 		t.Fatalf("expected PA/Hebi8 prompt to preserve cross-directory guidance, got: %s", paPrompt)
+	}
+}
+
+func initInternalGitRepo(t *testing.T, dir, originURL string) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{
+		{"git", "init", "-b", "main"},
+		{"git", "config", "user.name", "Orbit Test"},
+		{"git", "config", "user.email", "user@example.com"},
+		{"git", "remote", "add", "origin", originURL},
+	} {
+		cmd := exec.Command(args[0], args[1:]...)
+		cmd.Dir = dir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("%v failed: %v\n%s", args, err, string(out))
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("# demo\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"git", "add", "."}, {"git", "commit", "-m", "init"}} {
+		cmd := exec.Command(args[0], args[1:]...)
+		cmd.Dir = dir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("%v failed: %v\n%s", args, err, string(out))
+		}
+	}
+}
+
+func TestPhase4_RebindLocationDispatchFrameMatchesPrepareWorktree(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	workRoot := filepath.Join(tmp, "work")
+	repoA := filepath.Join(workRoot, "repo-a")
+	repoB := filepath.Join(workRoot, "repo-b")
+	initInternalGitRepo(t, repoA, "https://github.com/example/repo-a.git")
+	initInternalGitRepo(t, repoB, "https://github.com/example/repo-b.git")
+
+	cfgDir := filepath.Join(tmp, "config")
+	dataDir := filepath.Join(tmp, "data")
+	wtDataDir := filepath.Join(tmp, "runner-data")
+	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cfgDir, "machines.yaml"), []byte(`schemaVersion: 1
+machines:
+  hub-node:
+    displayName: "Hub Node"
+    transport: "local_ws"
+    capabilities: ["primary-dev"]
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := store.Open(ctx, filepath.Join(tmp, "hub.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	srv, err := NewServer(ctx, ServerOptions{
+		Store: st,
+		HubConfig: protocol.HubConfig{
+			ListenAddr: "127.0.0.1:0",
+			DataDir:    dataDir,
+			ConfigDir:  cfgDir,
+			DevToken:   "test-dev-token",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Shutdown()
+
+	if _, err := st.UpdateMachineMetadata(ctx, "hub-node", protocol.UpdateMachineRequest{
+		AllowedRoots: []string{workRoot},
+	}, "human"); err != nil {
+		t.Fatal(err)
+	}
+
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	doReq := func(method, path string, body any) (*http.Response, []byte) {
+		var buf bytes.Buffer
+		if body != nil {
+			_ = json.NewEncoder(&buf).Encode(body)
+		}
+		req, _ := http.NewRequest(method, ts.URL+path, &buf)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Orbit-Dev-Token", "test-dev-token")
+		req.Header.Set("X-Orbit-Request", "1")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var out bytes.Buffer
+		_, _ = out.ReadFrom(resp.Body)
+		return resp, out.Bytes()
+	}
+
+	// 1. Create single-location project bound to repoA
+	resp, raw := doReq(http.MethodPost, "/api/projects", protocol.CreateProjectRequest{
+		MachineID:   "hub-node",
+		RepoPath:    repoA,
+		DisplayName: "Rebind Worktree Proj",
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create project failed (%d): %s", resp.StatusCode, string(raw))
+	}
+	var created protocol.CreateProjectResponse
+	_ = json.Unmarshal(raw, &created)
+	projID := created.Project.ProjectID
+	part1ID := created.Project.Parts[0].PartID
+	loc1ID := created.Project.Parts[0].Locations[0].LocationID
+
+	// 2. PATCH single-location part absPath -> repoB
+	resp, raw = doReq(http.MethodPatch, "/api/projects/"+projID+"/parts/"+part1ID+"/locations/"+loc1ID, protocol.UpdateProjectLocationRequest{
+		AbsPath: &repoB,
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("PATCH to repoB failed (%d): %s", resp.StatusCode, string(raw))
+	}
+
+	proj, err := st.GetProject(ctx, projID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(proj.RepoIdentity, "repo-b") || !strings.Contains(proj.Parts[0].RepoIdentity, "repo-b") {
+		t.Fatalf("expected both project and part repo_identity synced to repo-b, got proj=%q part=%q", proj.RepoIdentity, proj.Parts[0].RepoIdentity)
+	}
+
+	// 3. Create task/attempt targeting part1 (repoB), build real dispatch frame, and run REAL runner.PrepareWorktree
+	taskRes, err := st.CreateTask(ctx, store.CreateTaskParams{
+		ProjectID:     projID,
+		Title:         "Run on repoB",
+		Goal:          "verify worktree after rebind",
+		MachineID:     "hub-node",
+		Adapter:       protocol.AdapterClaude,
+		PartID:        part1ID,
+		LocationID:    loc1ID,
+		Isolation:     protocol.IsolationWorktree,
+		Anchor:        &protocol.ProjectAnchorConfig{Machine: "hub-node", RepoPath: repoB},
+		CreateAttempt: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame1, err := srv.buildAttemptDispatchFrame(ctx, *taskRes.Attempt, proj, protocol.ProjectAnchorConfig{Machine: "hub-node", RepoPath: repoB}, "", 0, "", "")
+	if err != nil {
+		t.Fatalf("buildAttemptDispatchFrame(part1) failed: %v", err)
+	}
+	if !strings.Contains(frame1.RepoIdentity, "repo-b") {
+		t.Fatalf("expected dispatch frame RepoIdentity for part1 to contain repo-b, got %q", frame1.RepoIdentity)
+	}
+	wtPath1, sha1, err := runner.PrepareWorktree(ctx, frame1, wtDataDir)
+	if err != nil {
+		t.Fatalf("PrepareWorktree(part1/repoB) failed after rebind: %v", err)
+	}
+	if wtPath1 == "" || sha1 == "" {
+		t.Fatalf("expected non-empty worktree path & sha for repoB, got path=%q sha=%q", wtPath1, sha1)
+	}
+
+	// 4. Add second Part bound to repoA (multi-part project with distinct repo_identity per part) and verify dispatch resolves part2's repoA!
+	proj2, part2, _, err := st.CreateProjectPart(ctx, projID, "part-a", protocol.ProjectPartGit, "github.com/example/repo-a", "hub-node", repoA, &protocol.LocationRuntimeState{Exists: true, IsGit: true}, "human")
+	if err != nil {
+		t.Fatal(err)
+	}
+	loc2ID := part2.Locations[0].LocationID
+	taskRes2, err := st.CreateTask(ctx, store.CreateTaskParams{
+		ProjectID:     projID,
+		Title:         "Run on part2 repoA",
+		Goal:          "verify multi-part repoIdentity dispatch",
+		MachineID:     "hub-node",
+		Adapter:       protocol.AdapterClaude,
+		PartID:        part2.PartID,
+		LocationID:    loc2ID,
+		Isolation:     protocol.IsolationWorktree,
+		Anchor:        &protocol.ProjectAnchorConfig{Machine: "hub-node", RepoPath: repoA},
+		CreateAttempt: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame2, err := srv.buildAttemptDispatchFrame(ctx, *taskRes2.Attempt, proj2, protocol.ProjectAnchorConfig{Machine: "hub-node", RepoPath: repoA}, "", 0, "", "")
+	if err != nil {
+		t.Fatalf("buildAttemptDispatchFrame(part2) failed: %v", err)
+	}
+	if !strings.Contains(frame2.RepoIdentity, "repo-a") {
+		t.Fatalf("expected dispatch frame RepoIdentity for part2 to contain repo-a, got %q", frame2.RepoIdentity)
+	}
+	wtPath2, sha2, err := runner.PrepareWorktree(ctx, frame2, wtDataDir)
+	if err != nil {
+		t.Fatalf("PrepareWorktree(part2/repoA) failed: %v", err)
+	}
+	if wtPath2 == "" || sha2 == "" {
+		t.Fatalf("expected non-empty worktree path & sha for repoA, got path=%q sha=%q", wtPath2, sha2)
 	}
 }

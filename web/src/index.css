@@ -2436,11 +2436,11 @@ details[open] > .proc-summary .proc-chev { transform: rotate(90deg); }
 /* Unified Cross-Session Minimal Communication Rails: Outbound (↗) & Inbound (↵) */
 .comm-track,
 .comm-out-msg {
-  border-left: 2px solid var(--line2); padding-left: 10px;
+  border-left: 1.5px solid var(--line2); padding-left: 10px;
   display: flex; flex-direction: column; gap: 2px; margin: 2px 0;
 }
 .comm-in {
-  border-left: 2px solid color-mix(in srgb, var(--accent) 44%, var(--line)); padding-left: 10px; margin: 2px 0;
+  border-left: 1.5px solid color-mix(in srgb, var(--accent) 44%, var(--line)); padding-left: 10px; margin: 2px 0;
 }
 .comm-in.is-failed { border-left-color: rgba(229, 122, 122, 0.58); }
 .comm-row {
@@ -2488,7 +2488,7 @@ details[open] > .proc-summary .proc-chev { transform: rotate(90deg); }
 .sub-ret-diff { font-size: 10.5px; display: inline-flex; gap: 4px; flex: none; }
 .sub-ret-link { color: var(--accent); font-size: 11px; display: inline-flex; align-items: center; gap: 3px; }
 .sub-ret-link:hover { text-decoration: underline; }
-.sub-quiet-details { border-left: 2px solid var(--line); padding-left: 12px; margin: 2px 0; }
+.sub-quiet-details { border-left: 1.5px solid var(--line); padding-left: 12px; margin: 2px 0; }
 .sub-quiet-details > .comm-track { border-left: 0; padding-left: 0; margin-top: 4px; }
 .qb-delegated-src { display: inline-flex; align-items: center; gap: 4px; max-width: 82%; }
 .qb-delegated-link { color: var(--muted); max-width: 240px; }
@@ -2832,6 +2832,26 @@ details[open] > .proc-summary .proc-chev { transform: rotate(90deg); }
   .perm-icon-btn { width: 22px; height: 22px; }
   .tel-btn { padding: 0 4px; font-size: 10px; gap: 3px; }
   .cfoot-acts { gap: 4px; }
+}
+
+@container composer-bar (max-width: 340px) {
+  .composer-meta-bar { gap: 3px; }
+  .ref-trigger { padding: 0 4px; }
+  .rt-sep { font-size: 9px; }
+  .rt-pill { padding: 0 2px; gap: 1px; font-size: 10px; }
+  .rt-pill-agent { min-width: 34px; max-width: 56px; }
+  .rt-pill-model { min-width: 44px; max-width: 78px; }
+  .rt-pill-effort { flex: 0 0 auto; min-width: 28px; }
+  .rt-pill-chev { width: 8px; height: 8px; }
+  .perm-icon-btn { width: 21px; height: 21px; }
+  .tel-btn { padding: 0 3px; font-size: 9.5px; gap: 2px; }
+  .cfoot-acts { gap: 3px; }
+  .send-icon-btn { width: 26px; height: 26px; }
+}
+
+/* Keep ReviewOverlay dialog generous at 920px–1120px desktop so left code (>=550px) & right session (>=340px) both stay usable */
+@media (max-width: 1120px) and (min-width: 768px) {
+  .rev-dialog { width: calc(100vw - 24px); height: calc(100dvh - 24px); }
 }
 
 /* Responsive overlay & mobile overrides placed at EOF so later base styles never override them */

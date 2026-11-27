@@ -74,8 +74,8 @@ function extractOneLineGist(md: string): string {
   return line ?? '';
 }
 
-function stripSystemWakeupBoilerplate(raw: string): string {
-  const trimmed = raw.trim();
+function stripSystemWakeupBoilerplate(raw?: string): string {
+  const trimmed = (raw ?? '').trim();
   if (!trimmed) return '';
   // Remove leading system wakeup metadata headers (e.g. "[Orbit 子会话回传] ...") if present.
   const lines = trimmed.split('\n');
@@ -579,23 +579,31 @@ export function Turn({
         const targetTaskId = typeof p.targetTaskId === 'string' ? p.targetTaskId : '';
         const relation = typeof p.relation === 'string' ? p.relation : '';
         const summary = typeof p.summary === 'string' ? p.summary.trim() : '';
-        const targetMatch =
-          sibPool.find((x) => x.taskId === targetTaskId) ??
-          childPool.find((x) => x.taskId === targetTaskId) ??
-          allTasks?.find((x) => x.taskId === targetTaskId);
+        const sibMatch = sibPool.find((x) => x.taskId === targetTaskId);
+        const childMatch = childPool.find((x) => x.taskId === targetTaskId);
+        const taskMatch = allTasks?.find((x) => x.taskId === targetTaskId);
+        const targetMatch = sibMatch ?? childMatch ?? taskMatch;
+        const targetMark = sibMatch
+          ? childSessionMark(sibMatch, inboxByTask?.get(targetTaskId))
+          : childMatch
+            ? childSessionMark(childMatch, inboxByTask?.get(targetTaskId))
+            : taskMatch
+              ? sessionMark(taskMatch, inboxByTask?.get(targetTaskId))
+              : null;
         const rawTitle = typeof p.targetTitle === 'string' ? p.targetTitle.trim() : '';
         const targetTitle = (targetMatch && taskTitle(targetMatch)) || rawTitle || targetTaskId;
         return {
           key: e.eventId || `ds:${e.seq}`,
           targetTaskId,
           targetTitle,
+          targetMark,
           relation,
           summary,
           createdAt: e.createdAt,
         };
       })
       .filter((x) => !!x.targetTaskId);
-  }, [isPA, tl.events, tl.siblingChildren, tl.children, siblingChildren, childrenList, allTasks, attempt.attemptId]);
+  }, [isPA, tl.events, tl.siblingChildren, tl.children, siblingChildren, childrenList, allTasks, inboxByTask, attempt.attemptId]);
   const dispatchedChildren = useMemo(() => {
     if (!isTopLevel) return [];
     const pool = childrenList ?? tl.children ?? [];
@@ -752,7 +760,7 @@ export function Turn({
       ) : !isPA && delegatedInbound ? (
         <InboundCommRail
           title={delegatedInbound.senderTitle}
-          bodyMd={stripSystemWakeupBoilerplate(prompt.text)}
+          bodyMd={stripSystemWakeupBoilerplate(prompt.text || attempt.promptText || '')}
           time={hhmm(attempt.startedAt)}
           targetTaskId={delegatedInbound.fromId}
           openLinkLabel={delegatedInbound.relation === 'sibling' && onOpenChild ? '切换查看' : '打开会话'}
@@ -839,7 +847,7 @@ export function Turn({
       {!isPA &&
         sentDelegations.map((msg) => (
           <details className="it comm-out-msg" key={msg.key}>
-            <summary className="comm-row is-out">
+            <summary className={`comm-row is-out ${!msg.targetMark ? 'is-resting' : ''}`}>
               <span className="comm-dir-ico is-out" aria-hidden="true">
                 <ArrowUpRight size={13} strokeWidth={1.75} />
               </span>
@@ -848,6 +856,7 @@ export function Turn({
               </span>
               <span className="comm-meta">{extractOneLineGist(msg.summary)}</span>
               <span className="comm-trail">
+                <StatusMark mark={msg.targetMark} />
                 <span className="comm-chev" aria-hidden="true">
                   <ChevronRight size={12} strokeWidth={1.7} />
                 </span>

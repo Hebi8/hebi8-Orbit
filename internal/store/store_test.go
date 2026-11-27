@@ -935,3 +935,181 @@ func TestTaskTimelineExposesRealTokenUsageAndContextUsage(t *testing.T) {
 		t.Fatalf("manual import attempt must NOT resurrect locked session ContextUsage, got %+v", tlAfterManual.ContextUsage)
 	}
 }
+
+func TestSubmitFollowupAtomicDelegationSentAtomicity(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+
+	parent, err := s.CreateTask(ctx, store.CreateTaskParams{
+		ProjectID:     "proj-a",
+		Title:         "Parent",
+		Goal:          "coordinate",
+		MachineID:     "hub-node",
+		Adapter:       protocol.AdapterClaude,
+		CreateAttempt: true,
+		LeaseTTLMs:    60000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sibA, err := s.CreateTask(ctx, store.CreateTaskParams{
+		ProjectID:     "proj-a",
+		ParentTaskID:  parent.Task.TaskID,
+		Title:         "Sib A",
+		Goal:          "sender",
+		MachineID:     "hub-node",
+		Adapter:       protocol.AdapterClaude,
+		CreateAttempt: true,
+		LeaseTTLMs:    60000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sibB, err := s.CreateTask(ctx, store.CreateTaskParams{
+		ProjectID:     "proj-a",
+		ParentTaskID:  parent.Task.TaskID,
+		Title:         "Sib B",
+		Goal:          "receiver",
+		MachineID:     "hub-node",
+		Adapter:       protocol.AdapterClaude,
+		CreateAttempt: true,
+		LeaseTTLMs:    60000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Case 1: Invalid DelegationSent.SenderTaskID MUST fail AND roll back receiver enqueue atomically.
+	_, err = s.SubmitFollowupAtomic(ctx, store.SubmitFollowupParams{
+		TaskID:    sibB.Task.TaskID,
+		Body:      "must rollback on sender error",
+		Mode:      protocol.FollowupModeQueue,
+		MachineID: "hub-node",
+		Adapter:   protocol.AdapterClaude,
+		ActorKind: protocol.ActorAgent,
+		ActorID:   "agent:hub-node",
+		DelegationSent: &store.RecordDelegationSentParams{
+			SenderTaskID:    "tsk_nonexistent_sender",
+			SenderAttemptID: sibA.Attempt.AttemptID,
+			TargetTaskID:    sibB.Task.TaskID,
+			Relation:        "sibling",
+			Mode:            protocol.FollowupModeQueue,
+			Summary:         "must rollback",
+			ActorID:         "agent:hub-node",
+		},
+	})
+	if !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound when delegation sender missing, got %v", err)
+	}
+	tlB, err := s.GetTaskTimeline(ctx, sibB.Task.TaskID, 0, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tlB.PendingInputs) != 0 {
+		t.Fatalf("expected 0 pending inputs after atomic rollback, got %d", len(tlB.PendingInputs))
+	}
+
+	// Case 2: Valid DelegationSent while target is busy atomically commits BOTH receiver pending input AND sender delegation.sent event.
+	subBusy, err := s.SubmitFollowupAtomic(ctx, store.SubmitFollowupParams{
+		TaskID:    sibB.Task.TaskID,
+		Body:      "ping busy sibling",
+		Mode:      protocol.FollowupModeQueue,
+		MachineID: "hub-node",
+		Adapter:   protocol.AdapterClaude,
+		ActorKind: protocol.ActorAgent,
+		ActorID:   "agent:hub-node",
+		PayloadExtra: map[string]any{
+			"delegatedFromTaskId": sibA.Task.TaskID,
+			"delegatedRelation":   "sibling",
+		},
+		DelegationSent: &store.RecordDelegationSentParams{
+			SenderTaskID:    sibA.Task.TaskID,
+			SenderAttemptID: sibA.Attempt.AttemptID,
+			TargetTaskID:    sibB.Task.TaskID,
+			Relation:        "sibling",
+			Mode:            protocol.FollowupModeQueue,
+			Summary:         "ping busy sibling",
+			ActorID:         "agent:hub-node",
+		},
+	})
+	if err != nil {
+		t.Fatalf("atomic busy delegation followup failed: %v", err)
+	}
+	if subBusy.PendingInput == nil {
+		t.Fatalf("expected queued pending input on busy sibling")
+	}
+	var foundSentInResult bool
+	for _, ev := range subBusy.Events {
+		if ev.Kind == protocol.EventDelegationSent && ev.TaskID == sibA.Task.TaskID && ev.AttemptID == sibA.Attempt.AttemptID {
+			foundSentInResult = true
+		}
+	}
+	if !foundSentInResult {
+		t.Fatalf("expected delegation.sent in SubmitFollowupResult.Events for broadcast, got %+v", subBusy.Events)
+	}
+
+	// Case 3: Idle target -> direct attempt + atomic delegation.sent event.
+	now := time.Now().UnixMilli()
+	if _, err := s.IngestOutboxBatch(ctx, "hub-node", "run-sib", protocol.AttemptOutboxBatchFrame{
+		AttemptID:  sibB.Attempt.AttemptID,
+		LeaseToken: sibB.Attempt.LeaseToken,
+		Items: []protocol.OutboxItem{
+			{
+				OutboxSeq: 1,
+				EventID:   "ev_sib_done",
+				FrameType: protocol.OutboxFrameState,
+				TS:        now,
+				Payload: map[string]any{
+					"state":            string(protocol.AttemptSucceeded),
+					"completionSource": string(protocol.CompletionPromptEndTurn),
+				},
+			},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DeletePendingInput(ctx, sibB.Task.TaskID, subBusy.PendingInput.InputID, "human"); err != nil {
+		t.Fatal(err)
+	}
+	subIdle, err := s.SubmitFollowupAtomic(ctx, store.SubmitFollowupParams{
+		TaskID:    sibB.Task.TaskID,
+		Body:      "ping idle sibling",
+		Mode:      protocol.FollowupModeQueue,
+		MachineID: "hub-node",
+		Adapter:   protocol.AdapterClaude,
+		ActorKind: protocol.ActorAgent,
+		ActorID:   "agent:hub-node",
+		PayloadExtra: map[string]any{
+			"delegatedFromTaskId": sibA.Task.TaskID,
+			"delegatedRelation":   "sibling",
+		},
+		DelegationSent: &store.RecordDelegationSentParams{
+			SenderTaskID:    sibA.Task.TaskID,
+			SenderAttemptID: sibA.Attempt.AttemptID,
+			TargetTaskID:    sibB.Task.TaskID,
+			Relation:        "sibling",
+			Mode:            protocol.FollowupModeQueue,
+			Summary:         "ping idle sibling",
+			ActorID:         "agent:hub-node",
+		},
+	})
+	if err != nil {
+		t.Fatalf("atomic idle delegation followup failed: %v", err)
+	}
+	if subIdle.Attempt == nil {
+		t.Fatalf("expected direct attempt on idle sibling")
+	}
+	tlA, err := s.GetTaskTimeline(ctx, sibA.Task.TaskID, 0, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sentCount := 0
+	for _, ev := range tlA.Events {
+		if ev.Kind == protocol.EventDelegationSent {
+			sentCount++
+		}
+	}
+	if sentCount != 2 {
+		t.Fatalf("expected 2 atomic delegation.sent events on sender timeline, got %d", sentCount)
+	}
+}

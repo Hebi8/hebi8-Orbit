@@ -668,6 +668,7 @@ type SubmitFollowupParams struct {
 	PAIdempotency     *PAActionIdempotencySpec
 	ChildNotification *ChildNotificationDelivery
 	RunnerParentGuard *RunnerParentControlGuard
+	DelegationSent    *RecordDelegationSentParams
 }
 
 // SubmitFollowupResult reports whether the follow-up started an Attempt directly, queued while busy,
@@ -772,6 +773,25 @@ func (s *Store) SubmitFollowupAtomic(ctx context.Context, p SubmitFollowupParams
 				UPDATE tasks SET parent_notified_attempt_id = ?
 				WHERE task_id = (SELECT child_task_id FROM child_parent_notifications WHERE child_attempt_id = ?)
 			`, notifChildAttemptID, notifChildAttemptID)
+			return nil
+		}
+
+		recordDelegationSentTx := func() error {
+			if p.DelegationSent == nil {
+				return nil
+			}
+			ds := *p.DelegationSent
+			if strings.TrimSpace(ds.TargetTaskID) == "" {
+				ds.TargetTaskID = p.TaskID
+			}
+			if ds.Mode == "" {
+				ds.Mode = p.Mode
+			}
+			evSent, err := insertDelegationSentTx(ctx, tx, ds, now)
+			if err != nil {
+				return err
+			}
+			res.Events = append(res.Events, evSent)
 			return nil
 		}
 
@@ -949,6 +969,9 @@ func (s *Store) SubmitFollowupAtomic(ctx context.Context, p SubmitFollowupParams
 						UpdatedAt: now,
 					}
 					res.ActiveToCancel = &actRec
+					if err := recordDelegationSentTx(); err != nil {
+						return err
+					}
 					res.Task, err = loadTaskSummaryTx(ctx, tx, p.TaskID)
 					if err != nil {
 						return err
@@ -1029,6 +1052,9 @@ func (s *Store) SubmitFollowupAtomic(ctx context.Context, p SubmitFollowupParams
 					return err
 				}
 				if err := markChildNotificationDeliveredTx(); err != nil {
+					return err
+				}
+				if err := recordDelegationSentTx(); err != nil {
 					return err
 				}
 				if p.PAIdempotency != nil && strings.TrimSpace(p.PAIdempotency.Key) != "" {
@@ -1134,6 +1160,9 @@ func (s *Store) SubmitFollowupAtomic(ctx context.Context, p SubmitFollowupParams
 			return err
 		}
 		if err := markChildNotificationDeliveredTx(); err != nil {
+			return err
+		}
+		if err := recordDelegationSentTx(); err != nil {
 			return err
 		}
 		if p.PAIdempotency != nil && strings.TrimSpace(p.PAIdempotency.Key) != "" {
