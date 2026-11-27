@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode, type RefObject } from 'react';
 import { createPortal } from 'react-dom';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { Check, ChevronDown, MessageSquare, Pencil } from 'lucide-react';
+import { Check, ChevronDown, MessageSquare, Pencil, RefreshCw } from 'lucide-react';
 import type {
   AgentModeOption,
   AgentProbe,
@@ -12,6 +12,7 @@ import type {
   MachineView,
   PendingInput,
   ProjectView,
+  QuotaWindow,
   SessionAdapter,
   TaskSummary,
 } from '../generated/protocol';
@@ -44,7 +45,9 @@ import {
 } from '../lib/agentCaps';
 import { api, errMsg } from '../lib/api';
 import { PA_PROJECT_ID, formatTokenCount, isTaskBusy } from '../lib/format';
+import { useImeGuard } from '../lib/ime';
 import { useAnchoredPopover } from '../lib/popover';
+import { formatQuotaResetTime, resolveAgentQuota } from '../lib/quota';
 import { toast, useWorkbenchStore } from '../store/useWorkbenchStore';
 
 export type ComposerIndicatorMode = 'context' | 'quota';
@@ -101,6 +104,8 @@ export interface StandaloneComposerProps {
   refIds: string[];
   onRefIdsChange: (ids: string[]) => void;
   projects?: readonly ProjectView[];
+  machines?: readonly MachineView[];
+  machineId?: string;
   refProminent?: boolean;
   chipsSlot?: ReactNode;
   topSlot?: ReactNode;
@@ -249,18 +254,28 @@ function PermissionModeControl({
 
 /**
  * Lody-style single 14px ring + percentage micro-button (immediately left of send/stop).
- * Shows real live context usage in active sessions and honest empty state where ACP quotas are not yet reported.
+ * Shows real live context usage in active sessions and real 5h/7d agent quotas in New Thread & detail popover.
  */
 function LodyTelemetryControl({
   indicatorMode,
   contextUsage,
   agentLabel,
+  adapter,
+  model,
+  machines,
+  machineId,
 }: {
   indicatorMode: ComposerIndicatorMode;
   contextUsage?: ContextUsage | null;
   agentLabel: string;
+  adapter: SessionAdapter | '';
+  model: string;
+  machines?: readonly MachineView[];
+  machineId?: string;
 }) {
+  const qc = useQueryClient();
   const [open, setOpen] = useState(false);
+  const [refreshingQuota, setRefreshingQuota] = useState(false);
   const btnRef = useRef<HTMLButtonElement | null>(null);
   const popRef = useRef<HTMLDivElement | null>(null);
   const close = useCallback(() => setOpen(false), []);
@@ -269,23 +284,45 @@ function LodyTelemetryControl({
     open,
     anchorRef: btnRef,
     popRef,
-    width: 264,
+    width: 276,
     align: 'right',
     placement: 'up',
     gap: 8,
-    minSpaceUp: 210,
+    minSpaceUp: 230,
     onClose: close,
   });
+
+  const quota = useMemo(
+    () => resolveAgentQuota({ machines, machineId, adapter, model }),
+    [machines, machineId, adapter, model],
+  );
+
+  const handleRefreshQuota = async () => {
+    if (!quota.machineId || !quota.machineOnline || !quota.canRefresh || refreshingQuota) return;
+    setRefreshingQuota(true);
+    try {
+      await api.refreshMachineQuotas(quota.machineId);
+      void qc.invalidateQueries({ queryKey: ['bootstrap'] });
+      void qc.invalidateQueries({ queryKey: ['machines'] });
+    } catch (e) {
+      toast(errMsg(e), 'err');
+    } finally {
+      setRefreshingQuota(false);
+    }
+  };
 
   const hasContext = !!contextUsage && contextUsage.size > 0;
   const ctxPct = hasContext
     ? Math.min(100, Math.max(0, Math.round((contextUsage.used / contextUsage.size) * 100)))
     : null;
 
-  // Quota telemetry is not yet reported by ACP backends; display honest empty ring/text instead of fabricated numbers.
   const isNewQuota = indicatorMode === 'quota';
-  const primaryPct = isNewQuota ? null : ctxPct;
-  const isWarn = primaryPct !== null && primaryPct >= 80;
+  const ctxIsWarn = !isNewQuota && ctxPct !== null && ctxPct >= 80;
+  const quotaPct = quota.available ? quota.primaryRemainingPercent : null;
+  const quotaIsWarn = quotaPct !== null && quotaPct <= 20;
+
+  const primaryPct = isNewQuota ? quotaPct : ctxPct;
+  const isWarn = isNewQuota ? quotaIsWarn : ctxIsWarn;
   const dashOffset = primaryPct !== null ? RING_CIRC * (1 - primaryPct / 100) : RING_CIRC;
   const primaryText = primaryPct !== null ? `${primaryPct}%` : '—';
 
@@ -296,10 +333,47 @@ function LodyTelemetryControl({
       : '暂无上下文数据';
 
   const btnTitle = isNewQuota
-    ? `${agentLabel || 'Agent'} 额度暂未上报 · 点击查看上下文与额度详情`
+    ? quotaPct !== null
+      ? `${agentLabel || 'Agent'} 剩余额度 ${quotaPct}% · 点击查看上下文与额度详情`
+      : !quota.machineOnline && quota.machineId
+        ? `${agentLabel || 'Agent'} 目标设备离线 · 点击查看详情`
+        : `${agentLabel || 'Agent'} 额度暂未上报 · 点击查看上下文与额度详情`
     : hasContext && ctxPct !== null
       ? `当前对话上下文 ${formatTokenCount(contextUsage.used)} / ${formatTokenCount(contextUsage.size)} (${ctxPct}%) · 点击查看详情`
       : '当前对话上下文暂未上报 · 点击查看上下文与额度详情';
+
+  const renderQuotaRow = (title: string, win?: QuotaWindow) => {
+    if (!win) {
+      return (
+        <div className="tel-pop-row">
+          <div className="tel-pop-row-top">
+            <span>{title}</span>
+            <span className="tel-pop-val faint">
+              {!quota.machineOnline && quota.machineId ? '设备离线' : '暂未上报'}
+            </span>
+          </div>
+          <div className="tel-meter-bar">
+            <i style={{ width: '0%' }} />
+          </div>
+        </div>
+      );
+    }
+    const rem = Math.min(100, Math.max(0, Math.round(win.remainingPercent)));
+    const low = rem <= 20;
+    const resetText = formatQuotaResetTime(win.resetsAt);
+    return (
+      <div className="tel-pop-row">
+        <div className="tel-pop-row-top">
+          <span>{title}</span>
+          <span className={`tel-pop-val ${low ? 'is-warn' : ''}`}>剩 {rem}%</span>
+        </div>
+        <div className={`tel-meter-bar ${low ? 'is-warn' : 'is-accent'}`}>
+          <i style={{ width: `${rem}%` }} />
+        </div>
+        {resetText && <div className="tel-pop-reset">{resetText}</div>}
+      </div>
+    );
+  };
 
   return (
     <div className="tel-anchor">
@@ -334,36 +408,47 @@ function LodyTelemetryControl({
             <div className="tel-pop-sec">
               <div className="tel-pop-hd">
                 <span>当前对话上下文</span>
-                <span className={`tel-pop-val ${isWarn ? 'is-warn' : ''}`}>{ctxSummaryText}</span>
+                <span className={`tel-pop-val ${ctxIsWarn ? 'is-warn' : ''}`}>{ctxSummaryText}</span>
               </div>
-              <div className={`tel-meter-bar ${isWarn ? 'is-warn' : hasContext && !isNewQuota ? 'is-accent' : ''}`}>
+              <div className={`tel-meter-bar ${ctxIsWarn ? 'is-warn' : hasContext && !isNewQuota ? 'is-accent' : ''}`}>
                 <i style={{ width: `${!isNewQuota && ctxPct !== null ? ctxPct : 0}%` }} />
               </div>
             </div>
             <div className="tel-pop-div" />
             <div className="tel-pop-sec">
               <div className="tel-pop-hd">
-                <span>Agent 额度</span>
-                <span className="tel-pop-sub">{agentLabel || '—'}</span>
+                <span className="tel-pop-title">
+                  <span>Agent 额度</span>
+                  {quota.group && (
+                    <span className="tel-pop-grp ell" title={quota.group}>
+                      {quota.group}
+                    </span>
+                  )}
+                </span>
+                <span className="tel-pop-hd-r">
+                  <span className="tel-pop-sub">{agentLabel || '—'}</span>
+                  {quota.machineId && (
+                    <button
+                      type="button"
+                      className="tel-refresh-btn"
+                      disabled={!quota.machineOnline || !quota.canRefresh || refreshingQuota}
+                      title={
+                        !quota.machineOnline
+                          ? '目标设备离线，无法刷新额度'
+                          : !quota.canRefresh
+                            ? '当前 Runner 暂不支持刷新额度'
+                            : '刷新 Agent 额度'
+                      }
+                      aria-label="刷新 Agent 额度"
+                      onClick={() => void handleRefreshQuota()}
+                    >
+                      <RefreshCw size={11} strokeWidth={1.8} className={refreshingQuota ? 'spin-ico' : ''} />
+                    </button>
+                  )}
+                </span>
               </div>
-              <div className="tel-pop-row">
-                <div className="tel-pop-row-top">
-                  <span>5 小时额度</span>
-                  <span className="tel-pop-val faint">暂未上报</span>
-                </div>
-                <div className="tel-meter-bar">
-                  <i style={{ width: '0%' }} />
-                </div>
-              </div>
-              <div className="tel-pop-row">
-                <div className="tel-pop-row-top">
-                  <span>7 天额度</span>
-                  <span className="tel-pop-val faint">暂未上报</span>
-                </div>
-                <div className="tel-meter-bar">
-                  <i style={{ width: '0%' }} />
-                </div>
-              </div>
+              {renderQuotaRow('5 小时额度', quota.win5h)}
+              {renderQuotaRow('7 天额度', quota.win7d)}
             </div>
           </div>,
           document.body,
@@ -387,11 +472,15 @@ interface ComposerViewProps {
   textareaRef: RefObject<HTMLTextAreaElement | null>;
   onChange: (value: string) => void;
   onKeyDown: (e: React.KeyboardEvent<HTMLTextAreaElement>) => void;
+  onCompositionStart?: () => void;
+  onCompositionEnd?: () => void;
   workerLabel?: string;
   hideRef?: boolean;
   refIds: string[];
   onRefIdsChange: (ids: string[]) => void;
   projects?: readonly ProjectView[];
+  machines?: readonly MachineView[];
+  machineId?: string;
   currentTaskId?: string;
   refProminent?: boolean;
   controlsDisabled?: boolean;
@@ -433,11 +522,15 @@ function ComposerView({
   textareaRef,
   onChange,
   onKeyDown,
+  onCompositionStart,
+  onCompositionEnd,
   workerLabel,
   hideRef = false,
   refIds,
   onRefIdsChange,
   projects,
+  machines,
+  machineId,
   currentTaskId,
   refProminent = false,
   controlsDisabled = false,
@@ -476,6 +569,8 @@ function ComposerView({
         autoFocus={autoFocus}
         placeholder={placeholder}
         onChange={(e) => onChange(e.target.value)}
+        onCompositionStart={onCompositionStart}
+        onCompositionEnd={onCompositionEnd}
         onKeyDown={onKeyDown}
         aria-label="输入"
       />
@@ -585,6 +680,10 @@ function ComposerView({
               indicatorMode={indicatorMode}
               contextUsage={contextUsage}
               agentLabel={effectiveAdapter ? ADAPTER_LABELS[effectiveAdapter] ?? effectiveAdapter : ''}
+              adapter={effectiveAdapter}
+              model={effectiveModel || activeProbe?.defaultModel || ''}
+              machines={machines}
+              machineId={machineId}
             />
           )}
           <span className="cfoot-send-slot">{actionSlot}</span>
@@ -613,6 +712,7 @@ function ComposerView({
 function StandaloneComposer(props: StandaloneComposerProps) {
   const internalRef = useRef<HTMLTextAreaElement | null>(null);
   const taRef = props.textareaRef ?? internalRef;
+  const ime = useImeGuard();
 
   const actionSlot = (
     <button
@@ -648,8 +748,10 @@ function StandaloneComposer(props: StandaloneComposerProps) {
       autoFocus={props.autoFocus}
       textareaRef={taRef}
       onChange={props.onChange}
+      onCompositionStart={ime.onCompositionStart}
+      onCompositionEnd={ime.onCompositionEnd}
       onKeyDown={(e) => {
-        if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
+        if (e.key === 'Enter' && !e.shiftKey && !ime.isImeEnter(e)) {
           e.preventDefault();
           if (props.canSend) props.onSubmit();
         }
@@ -657,6 +759,8 @@ function StandaloneComposer(props: StandaloneComposerProps) {
       refIds={props.refIds}
       onRefIdsChange={props.onRefIdsChange}
       projects={props.projects}
+      machines={props.machines}
+      machineId={props.machineId}
       refProminent={props.refProminent}
       controlsDisabled={props.controlsDisabled}
       availableAdapters={props.availableAdapters}
@@ -701,6 +805,7 @@ function SessionComposer({
   onOpenReview,
 }: SessionComposerProps) {
   const qc = useQueryClient();
+  const ime = useImeGuard();
   const remember = useWorkbenchStore((s) => s.rememberPrompt);
   const clearDeselected = useWorkbenchStore((s) => s.clearDeselectedAnnotations);
   const [text, setText] = useState(() => drafts.get(task.taskId) ?? '');
@@ -1192,8 +1297,10 @@ function SessionComposer({
       placeholder={placeholder}
       textareaRef={taRef}
       onChange={setDraft}
+      onCompositionStart={ime.onCompositionStart}
+      onCompositionEnd={ime.onCompositionEnd}
       onKeyDown={(e) => {
-        if (e.nativeEvent.isComposing) return;
+        if (ime.isImeEnter(e)) return;
         if (e.key === 'Escape' && editing) {
           e.preventDefault();
           e.stopPropagation();
@@ -1215,6 +1322,8 @@ function SessionComposer({
       refIds={refIds}
       onRefIdsChange={setRefIds}
       projects={projects}
+      machines={machines}
+      machineId={machineId}
       currentTaskId={task.taskId}
       refProminent={isPA}
       availableAdapters={availableAdapters}

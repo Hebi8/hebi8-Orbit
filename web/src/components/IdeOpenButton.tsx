@@ -15,6 +15,7 @@ import {
   type SSHHostSource,
 } from '../lib/ide';
 import { useAnchoredPopover } from '../lib/popover';
+import { useImeGuard } from '../lib/ime';
 import { toast, useWorkbenchStore } from '../store/useWorkbenchStore';
 import { IdeGlyph } from './Icons';
 
@@ -60,6 +61,7 @@ export function IdeOpenButton({
 }) {
   const [open, setOpen] = useState(false);
   const [editingSsh, setEditingSsh] = useState(false);
+  const ime = useImeGuard();
   const splitRef = useRef<HTMLDivElement | null>(null);
   const menuRef = useRef<HTMLDivElement | null>(null);
 
@@ -297,7 +299,9 @@ export function IdeOpenButton({
                       placeholder="SSH 别名"
                       value={draftAlias}
                       onChange={(e) => setDraftAlias(e.target.value)}
+                      {...ime.compositionProps}
                       onKeyDown={(e) => {
+                        if (ime.isImeEnter(e)) return;
                         if (e.key === 'Enter') {
                           e.preventDefault();
                           handleSaveCustom();

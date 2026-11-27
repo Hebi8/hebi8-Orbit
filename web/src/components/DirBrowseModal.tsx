@@ -3,6 +3,7 @@ import { ArrowUp, Check, ChevronRight, Folder, GitBranch, Pencil, X } from 'luci
 import type { DirEntryView, MachineView, ProjectPartKind } from '../generated/protocol';
 import { ApiError, api, errMsg } from '../lib/api';
 import { cleanMachineName } from '../lib/format';
+import { isImeKeyEvent, useImeGuard } from '../lib/ime';
 import { DeviceRoleIcon } from './DeviceRoleIcon';
 
 export interface CodexDirSelection {
@@ -147,6 +148,7 @@ export function CodexDirBrowser({
   const lastClickRef = useRef<{ path: string; at: number }>({ path: '', at: 0 });
   const lastEnteredRef = useRef<{ path: string; at: number }>({ path: '', at: 0 });
   const appliedInitRef = useRef<string | null>(null);
+  const ime = useImeGuard();
 
   const loadDir = useCallback(
     async (
@@ -415,8 +417,17 @@ export function CodexDirBrowser({
 
   useEffect(() => {
     if (!keyboardActive) return;
+    let winComposing = false;
+    let winLastCompositionEndAt = 0;
+    const onCompStart = () => {
+      winComposing = true;
+    };
+    const onCompEnd = () => {
+      winComposing = false;
+      winLastCompositionEndAt = performance.now();
+    };
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.isComposing) return;
+      if (isImeKeyEvent(e, winComposing, winLastCompositionEndAt)) return;
       const activeEl = document.activeElement instanceof HTMLElement ? document.activeElement : null;
       const targetEl = e.target instanceof HTMLElement ? e.target : activeEl;
 
@@ -492,8 +503,14 @@ export function CodexDirBrowser({
         }
       }
     };
+    window.addEventListener('compositionstart', onCompStart, true);
+    window.addEventListener('compositionend', onCompEnd, true);
     window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
+    return () => {
+      window.removeEventListener('compositionstart', onCompStart, true);
+      window.removeEventListener('compositionend', onCompEnd, true);
+      window.removeEventListener('keydown', onKeyDown);
+    };
   }, [keyboardActive]);
 
   if (eligible.length === 0) {
@@ -579,8 +596,9 @@ export function CodexDirBrowser({
                   setPathDraft(e.target.value);
                   if (error) setError('');
                 }}
+                {...ime.compositionProps}
                 onKeyDown={(e) => {
-                  if (e.nativeEvent.isComposing) return;
+                  if (ime.isImeEnter(e)) return;
                   if (e.key === 'Enter') {
                     e.preventDefault();
                     e.stopPropagation();

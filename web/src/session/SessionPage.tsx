@@ -173,10 +173,13 @@ export function SessionPage({
 
   const members = tl?.boardMembers ?? [];
   const hasSwarm = !isChildSession && (members.length > 0 || (task?.workerCount ?? 0) > 0);
-  const boardQ = useBoard(taskId, !isChildSession && (hasSwarm || boardOpen || !!worker));
   const childrenQ = useTaskChildren(taskId, !!tl && !isChildSession);
-  const allMembers = isChildSession ? [] : (boardQ.data?.members ?? members);
   const childrenList = isChildSession ? [] : (childrenQ.data?.children ?? tl?.children ?? []);
+  const boardQ = useBoard(
+    taskId,
+    !isChildSession && (hasSwarm || childrenList.length > 0 || (task?.childCount ?? 0) > 0 || boardOpen || !!worker),
+  );
+  const allMembers = isChildSession ? [] : (boardQ.data?.members ?? members);
   const nativeMembers = useMemo(() => allMembers.filter((m) => !m.workerTaskId), [allMembers]);
 
   // Max depth = 1: child sessions never open a grandchild drawer.
@@ -487,7 +490,7 @@ export function SessionPage({
   const hasCardContent =
     !!latestCode ||
     sessionArtifacts.length > 0 ||
-    (!isChildSession && (childrenList.length > 0 || hasSwarm)) ||
+    (!isChildSession && (childrenList.length > 0 || hasSwarm || (boardQ.data?.messages?.length ?? 0) > 0)) ||
     tl.sources.length > 0 ||
     (!isVirtual && !!project);
   const cardVisible = hasCardContent ? cardOpen : manualCardOpen;
@@ -929,7 +932,11 @@ export function SessionPage({
                   taskId={taskId}
                   board={boardQ.data}
                   fallbackMembers={members}
+                  childrenList={childrenList}
+                  machines={boot.machines}
+                  inboxByTask={inboxByTask}
                   worker={effectiveWorker}
+                  onOpenChild={openChildDrawer}
                   onSelectMember={openNativeMemberDrawer}
                   onClose={() => {
                     setBoardOpen(false);

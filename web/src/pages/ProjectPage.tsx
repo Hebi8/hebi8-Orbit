@@ -44,6 +44,7 @@ import {
   type SessionMark,
 } from '../lib/format';
 import { buildIDEJump, launchIDE, resolveEffectiveLocalMachineId } from '../lib/ide';
+import { useImeGuard } from '../lib/ime';
 import { navigate, paths, type ProjectTab } from '../lib/router';
 import { toast, useWorkbenchStore } from '../store/useWorkbenchStore';
 
@@ -89,6 +90,7 @@ function ProjectSettingsTab({
   const [partNameDraft, setPartNameDraft] = useState('');
   const [partKindDraft, setPartKindDraft] = useState<ProjectPartKind>('folder');
   const [savingPart, setSavingPart] = useState(false);
+  const ime = useImeGuard();
 
   // Shared ENV state
   const [envRows, setEnvRows] = useState<ProjectEnvVar[]>(() => project.sharedEnv ?? []);
@@ -639,8 +641,9 @@ function ProjectSettingsTab({
                     value={partNameDraft}
                     autoFocus
                     onChange={(e) => setPartNameDraft(e.target.value)}
+                    {...ime.compositionProps}
                     onKeyDown={(e) => {
-                      if (e.nativeEvent.isComposing) return;
+                      if (ime.isImeEnter(e)) return;
                       if (e.key === 'Enter') {
                         e.preventDefault();
                         void handleSavePart();

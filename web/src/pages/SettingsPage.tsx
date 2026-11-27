@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import {
-  ArrowDown,
   ArrowLeftRight,
   ArrowUp,
   Check,
@@ -10,6 +9,7 @@ import {
   Copy,
   Folder,
   Globe,
+  GripVertical,
   Laptop,
   LogOut,
   MonitorSmartphone,
@@ -24,6 +24,7 @@ import type {
   MachineRole,
   MachineView,
   NetworkDiscoverResponse,
+  NetworkSettingsView,
   TailscaleEnableResponse,
 } from '../generated/protocol';
 import { AgentList, agentDisplayName } from '../components/AgentList';
@@ -35,6 +36,7 @@ import { useClientDevices, useNetworkSettings } from '../hooks/queries';
 import { api, errMsg, isDesktopShell, openDesktopSetup, setStoredClientToken } from '../lib/api';
 import { cleanMachineName, relTime } from '../lib/format';
 import { resolveEffectiveLocalMachineId } from '../lib/ide';
+import { useImeGuard } from '../lib/ime';
 import { navigate, paths } from '../lib/router';
 import { toast, useWorkbenchStore } from '../store/useWorkbenchStore';
 
@@ -68,6 +70,11 @@ export function SettingsPage({
   const [nameDraft, setNameDraft] = useState(workspaceName);
   const [savingName, setSavingName] = useState(false);
   const [savingDuty, setSavingDuty] = useState(false);
+  const [optimisticDutyOrder, setOptimisticDutyOrder] = useState<string[] | null>(null);
+  const [draggingDutyId, setDraggingDutyId] = useState<string | null>(null);
+  const [dropTarget, setDropTarget] = useState<{ id: string; edge: 'before' | 'after' } | null>(null);
+  const draggingDutyRef = useRef<string | null>(null);
+  const ime = useImeGuard();
 
   const consumedInitialRef = useRef<string | null>(
     initialMachineId && boot.machines.some((m) => m.machineId === initialMachineId) ? initialMachineId : null,
@@ -94,7 +101,27 @@ export function SettingsPage({
   }, [initialMachineId, boot.machines]);
 
   const [aliasEdits, setAliasEdits] = useState<Record<string, string>>({});
+  const [sshAliasEdits, setSshAliasEdits] = useState<Record<string, string>>({});
   const [rootDrafts, setRootDrafts] = useState<Record<string, string>>({});
+  const [confirmRemoveId, setConfirmRemoveId] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!confirmRemoveId) return;
+    const onDown = (e: MouseEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (target?.closest('[data-remove-machine-confirm]')) return;
+      setConfirmRemoveId(null);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setConfirmRemoveId(null);
+    };
+    document.addEventListener('mousedown', onDown);
+    window.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onDown);
+      window.removeEventListener('keydown', onKey);
+    };
+  }, [confirmRemoveId]);
 
   const [pairOpen, setPairOpen] = useState(false);
   const [pairBindMachine, setPairBindMachine] = useState<string | undefined>(undefined);
@@ -106,6 +133,7 @@ export function SettingsPage({
 
   const refreshAll = () => {
     void qc.invalidateQueries({ queryKey: ['bootstrap'] });
+    void qc.invalidateQueries({ queryKey: ['machines'] });
     void qc.invalidateQueries({ queryKey: ['network-settings'] });
     void qc.invalidateQueries({ queryKey: ['client-devices'] });
   };
@@ -154,12 +182,30 @@ export function SettingsPage({
   };
 
   const saveDutyOrder = async (nextOrder: string[]) => {
+    setOptimisticDutyOrder(nextOrder);
     setSavingDuty(true);
     try {
-      await api.updateNetworkSettings({ dutyPriority: nextOrder });
+      const updated = await api.updateNetworkSettings({ dutyPriority: nextOrder });
+      qc.setQueryData<NetworkSettingsView>(['network-settings'], updated);
+      qc.setQueryData<BootstrapResponse>(['bootstrap'], (prev) =>
+        prev
+          ? {
+              ...prev,
+              setup: prev.setup
+                ? {
+                    ...prev.setup,
+                    dutyPriority: updated.dutyPriority,
+                    activeDutyMachineId: updated.activeDutyMachineId,
+                  }
+                : prev.setup,
+            }
+          : prev,
+      );
+      setOptimisticDutyOrder(null);
       refreshAll();
       toast('已调整主控顺位');
     } catch (e) {
+      setOptimisticDutyOrder(null);
       toast(errMsg(e), 'err');
     } finally {
       setSavingDuty(false);
@@ -167,17 +213,26 @@ export function SettingsPage({
   };
 
   const pinDutyMachine = async (machineId: string) => {
-    const next = [machineId, ...dutyPriority.filter((id) => id !== machineId)];
+    const base = optimisticDutyOrder ?? dutyPriority;
+    const next = [machineId, ...base.filter((id) => id !== machineId)];
     await saveDutyOrder(next);
   };
 
-  const moveDutyMachine = async (idx: number, delta: -1 | 1) => {
-    const target = idx + delta;
-    if (target < 0 || target >= dutyMachines.length) return;
-    const order = dutyMachines.map((m) => m.machineId);
-    const [moved] = order.splice(idx, 1);
-    order.splice(target, 0, moved);
-    await saveDutyOrder(order);
+  const handleDutyDrop = (targetId: string, edge: 'before' | 'after', transferredId?: string) => {
+    const dragId = draggingDutyRef.current || transferredId || '';
+    draggingDutyRef.current = null;
+    setDraggingDutyId(null);
+    setDropTarget(null);
+    if (!dragId || dragId === targetId || savingDuty) return;
+    const currentOrder = dutyMachines.map((m) => m.machineId);
+    if (!currentOrder.includes(dragId) || !currentOrder.includes(targetId)) return;
+    const without = currentOrder.filter((id) => id !== dragId);
+    const targetIdx = without.indexOf(targetId);
+    if (targetIdx < 0) return;
+    const insertIdx = edge === 'before' ? targetIdx : targetIdx + 1;
+    without.splice(insertIdx, 0, dragId);
+    if (without.every((id, i) => id === currentOrder[i])) return;
+    void saveDutyOrder(without);
   };
 
   const triggerTailscaleShare = async (confirm = false, port?: number) => {
@@ -228,8 +283,21 @@ export function SettingsPage({
     const alias = (aliasEdits[m.machineId] ?? m.displayAlias ?? '').trim();
     try {
       await api.updateMachine(m.machineId, { displayAlias: alias });
+      setAliasEdits((prev) => ({ ...prev, [m.machineId]: alias }));
       refreshAll();
       toast('已更新设备名称');
+    } catch (e) {
+      toast(errMsg(e), 'err');
+    }
+  };
+
+  const saveMachineSshAlias = async (m: MachineView) => {
+    const sshAlias = (sshAliasEdits[m.machineId] ?? m.sshAlias ?? '').trim();
+    try {
+      await api.updateMachine(m.machineId, { sshAlias });
+      setSshAliasEdits((prev) => ({ ...prev, [m.machineId]: sshAlias }));
+      refreshAll();
+      toast(sshAlias ? '已更新 SSH 别名' : '已清除自定义 SSH 别名');
     } catch (e) {
       toast(errMsg(e), 'err');
     }
@@ -298,7 +366,8 @@ export function SettingsPage({
   };
 
   const machineMap = new Map(boot.machines.map((m) => [m.machineId, m]));
-  const dutyMachines = dutyPriority
+  const effectiveDutyPriority = optimisticDutyOrder ?? dutyPriority;
+  const dutyMachines = effectiveDutyPriority
     .map((id) => machineMap.get(id))
     .filter((m): m is MachineView => !!m);
   const primaryDutyMachine = dutyMachines[0];
@@ -351,7 +420,9 @@ export function SettingsPage({
                       className="field"
                       value={nameDraft}
                       onChange={(e) => setNameDraft(e.target.value)}
+                      {...ime.compositionProps}
                       onKeyDown={(e) => {
+                        if (ime.isImeEnter(e)) return;
                         if (e.key === 'Enter') void saveWorkspaceName();
                         if (e.key === 'Escape') setEditingName(false);
                       }}
@@ -407,11 +478,54 @@ export function SettingsPage({
                       const isTakeover = isFailoverActive && isDuty;
                       const online = m.status === 'online';
                       const label = m.displayAlias || cleanMachineName(m);
+                      const canDrag = dutyMachines.length > 1 && !savingDuty;
+                      const isDragging = draggingDutyId === m.machineId;
+                      const dropEdge = dropTarget?.id === m.machineId ? dropTarget.edge : null;
                       return (
                         <div
-                          className={`duty-row ${isTakeover ? 'is-takeover' : isDuty ? 'is-active-duty' : ''}`}
+                          className={`duty-row ${isTakeover ? 'is-takeover' : isDuty ? 'is-active-duty' : ''} ${canDrag ? 'is-draggable' : ''} ${isDragging ? 'is-dragging' : ''} ${dropEdge === 'before' ? 'is-drop-before' : dropEdge === 'after' ? 'is-drop-after' : ''}`}
                           key={m.machineId}
+                          draggable={canDrag}
+                          onDragStart={(e) => {
+                            if (!canDrag) return;
+                            draggingDutyRef.current = m.machineId;
+                            setDraggingDutyId(m.machineId);
+                            e.dataTransfer.effectAllowed = 'move';
+                            e.dataTransfer.setData('text/plain', m.machineId);
+                          }}
+                          onDragOver={(e) => {
+                            const dragId = draggingDutyRef.current;
+                            if (!canDrag || !dragId || dragId === m.machineId) return;
+                            e.preventDefault();
+                            e.dataTransfer.dropEffect = 'move';
+                            const rect = e.currentTarget.getBoundingClientRect();
+                            const edge: 'before' | 'after' = e.clientY - rect.top < rect.height / 2 ? 'before' : 'after';
+                            if (dropTarget?.id !== m.machineId || dropTarget.edge !== edge) {
+                              setDropTarget({ id: m.machineId, edge });
+                            }
+                          }}
+                          onDragLeave={(e) => {
+                            if (!e.currentTarget.contains(e.relatedTarget as Node | null)) {
+                              setDropTarget((cur) => (cur?.id === m.machineId ? null : cur));
+                            }
+                          }}
+                          onDrop={(e) => {
+                            e.preventDefault();
+                            const rect = e.currentTarget.getBoundingClientRect();
+                            const edge: 'before' | 'after' = e.clientY - rect.top < rect.height / 2 ? 'before' : 'after';
+                            handleDutyDrop(m.machineId, edge, e.dataTransfer.getData('text/plain'));
+                          }}
+                          onDragEnd={() => {
+                            draggingDutyRef.current = null;
+                            setDraggingDutyId(null);
+                            setDropTarget(null);
+                          }}
                         >
+                          {dutyMachines.length > 1 && (
+                            <span className="duty-grip" title="拖拽调整主控顺位" aria-hidden="true">
+                              <GripVertical size={13} strokeWidth={1.7} />
+                            </span>
+                          )}
                           <DeviceRoleIcon
                             machine={m}
                             isActiveDuty={isDuty}
@@ -429,35 +543,13 @@ export function SettingsPage({
                             </span>
                           ) : null}
                           <span className="duty-right">
-                            {dutyMachines.length > 2 && (
-                              <>
-                                <button
-                                  type="button"
-                                  className="ib duty-move-btn"
-                                  disabled={savingDuty || idx === 0}
-                                  title="上移一位"
-                                  aria-label={`上移 ${label}`}
-                                  onClick={() => void moveDutyMachine(idx, -1)}
-                                >
-                                  <ArrowUp size={12} strokeWidth={1.8} />
-                                </button>
-                                <button
-                                  type="button"
-                                  className="ib duty-move-btn"
-                                  disabled={savingDuty || idx === dutyMachines.length - 1}
-                                  title="下移一位"
-                                  aria-label={`下移 ${label}`}
-                                  onClick={() => void moveDutyMachine(idx, 1)}
-                                >
-                                  <ArrowDown size={12} strokeWidth={1.8} />
-                                </button>
-                              </>
-                            )}
                             {idx > 0 && (
                               <button
                                 type="button"
                                 className="btn ghost sm"
+                                draggable={false}
                                 disabled={savingDuty}
+                                onMouseDown={(e) => e.stopPropagation()}
                                 onClick={() => void pinDutyMachine(m.machineId)}
                               >
                                 <ArrowUp size={11.5} strokeWidth={1.8} /> 置顶
@@ -704,6 +796,7 @@ export function SettingsPage({
 
                 const toggleCard = () => {
                   consumedInitialRef.current = initialMachineId ?? '__manual__';
+                  setConfirmRemoveId(null);
                   setExpandedMachine((cur) => (cur === m.machineId ? '' : m.machineId));
                 };
 
@@ -788,7 +881,9 @@ export function SettingsPage({
                             onChange={(e) =>
                               setAliasEdits((prev) => ({ ...prev, [m.machineId]: e.target.value }))
                             }
+                            {...ime.compositionProps}
                             onKeyDown={(e) => {
+                              if (ime.isImeEnter(e)) return;
                               if (e.key === 'Enter') void saveMachineAlias(m);
                             }}
                           />
@@ -819,6 +914,34 @@ export function SettingsPage({
                             </span>
                           )}
                         </div>
+
+                        {m.transportMode !== 'local_ws' && (
+                          <div className="set-mach-alias">
+                            <span className="muted">SSH 别名</span>
+                            <input
+                              className="field mono"
+                              style={{ maxWidth: 200 }}
+                              value={sshAliasEdits[m.machineId] ?? m.sshAlias ?? ''}
+                              placeholder={m.tailscaleHost || '~/.ssh/config 中的 Host'}
+                              onChange={(e) =>
+                                setSshAliasEdits((prev) => ({ ...prev, [m.machineId]: e.target.value }))
+                              }
+                              {...ime.compositionProps}
+                              onKeyDown={(e) => {
+                                if (ime.isImeEnter(e)) return;
+                                if (e.key === 'Enter') void saveMachineSshAlias(m);
+                              }}
+                            />
+                            <button type="button" className="btn ghost sm" onClick={() => void saveMachineSshAlias(m)}>
+                              保存
+                            </button>
+                            {m.tailscaleHost && (
+                              <span className="faint mono ell" style={{ fontSize: 11 }}>
+                                {m.tailscaleHost}
+                              </span>
+                            )}
+                          </div>
+                        )}
 
                         {isExec && <AgentList machine={m} showAdvanced />}
 
@@ -861,7 +984,9 @@ export function SettingsPage({
                               onChange={(e) =>
                                 setRootDrafts((d) => ({ ...d, [m.machineId]: e.target.value }))
                               }
+                              {...ime.compositionProps}
                               onKeyDown={(e) => {
+                                if (ime.isImeEnter(e)) return;
                                 if (e.key === 'Enter') {
                                   e.preventDefault();
                                   void addAllowedRoot(m);
@@ -876,15 +1001,31 @@ export function SettingsPage({
                             >
                               <Plus size={12} strokeWidth={1.8} /> 添加
                             </button>
-                            {m.source === 'paired' && (
-                              <button
-                                type="button"
-                                className="btn ghost sm bad-t"
-                                style={{ marginLeft: 'auto' }}
-                                onClick={() => void removeMachine(m)}
-                              >
-                                <Trash2 size={12} strokeWidth={1.7} /> 移除设备
-                              </button>
+                            {m.transportMode !== 'local_ws' && (
+                              confirmRemoveId === m.machineId ? (
+                                <button
+                                  type="button"
+                                  data-remove-machine-confirm="1"
+                                  className="btn sm set-mach-rm-confirm"
+                                  style={{ marginLeft: 'auto' }}
+                                  onClick={() => {
+                                    setConfirmRemoveId(null);
+                                    void removeMachine(m);
+                                  }}
+                                >
+                                  <Trash2 size={12} strokeWidth={1.8} /> 确认移除
+                                </button>
+                              ) : (
+                                <button
+                                  type="button"
+                                  data-remove-machine-confirm="1"
+                                  className="btn ghost sm bad-t"
+                                  style={{ marginLeft: 'auto' }}
+                                  onClick={() => setConfirmRemoveId(m.machineId)}
+                                >
+                                  <Trash2 size={12} strokeWidth={1.7} /> 移除设备
+                                </button>
+                              )
                             )}
                           </div>
                         </div>

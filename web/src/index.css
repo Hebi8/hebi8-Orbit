@@ -549,7 +549,8 @@ button.topbar-crumb-parent:hover { background: var(--hover); color: var(--fg); }
 .bsec { padding: 10px 10px 6px; flex: none; max-height: 40%; overflow-y: auto; }
 .bsec-h { font-size: 11px; color: var(--faint); padding: 0 6px 6px; display: flex; align-items: center; }
 .bsec-h .r { margin-left: auto; }
-.mem { display: grid; grid-template-columns: 8px minmax(0, 1fr) auto; align-items: center; column-gap: 9px; width: 100%; text-align: left; padding: 7px 8px; border-radius: 8px; position: relative; }
+.mem { display: grid; grid-template-columns: 14px minmax(0, 1fr) auto; align-items: center; column-gap: 8px; width: 100%; text-align: left; padding: 7px 8px; border-radius: 8px; position: relative; }
+.mem-mark { display: inline-flex; align-items: center; justify-content: center; width: 14px; }
 .mem:hover { background: var(--hover); }
 .mem.cur-view { background: var(--hover2); }
 .mem .nm { color: var(--fg); font-size: 12.5px; display: flex; flex-direction: column; gap: 1px; min-width: 0; white-space: nowrap; }
@@ -1046,11 +1047,21 @@ button.topbar-crumb-parent:hover { background: var(--hover); color: var(--fg); }
 .tel-pop-sec { display: flex; flex-direction: column; gap: 5px; }
 .tel-pop-div { height: 1px; background: var(--line); }
 .tel-pop-hd { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 11px; font-weight: 600; color: var(--fg2); }
+.tel-pop-title { display: inline-flex; align-items: center; gap: 6px; min-width: 0; }
+.tel-pop-grp { font-size: 10px; font-weight: 400; color: var(--faint); max-width: 116px; }
+.tel-pop-hd-r { display: inline-flex; align-items: center; gap: 4px; flex: none; }
 .tel-pop-sub { font-family: "JetBrains Mono", "SF Mono", ui-monospace, Menlo, Consolas, monospace; font-size: 10.5px; font-weight: 400; color: var(--faint); }
+.tel-refresh-btn {
+  width: 20px; height: 20px; border-radius: 5px; display: inline-flex; align-items: center; justify-content: center;
+  color: var(--faint); transition: background var(--motion-fast), color var(--motion-fast), opacity var(--motion-fast);
+}
+.tel-refresh-btn:hover:not(:disabled) { background: var(--hover2); color: var(--fg); }
+.tel-refresh-btn:disabled { opacity: 0.4; cursor: default; }
 .tel-pop-row { display: flex; flex-direction: column; gap: 4px; }
 .tel-pop-row-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 11px; color: var(--muted); }
 .tel-pop-val { font-family: "JetBrains Mono", "SF Mono", ui-monospace, Menlo, Consolas, monospace; font-size: 10.5px; color: var(--fg2); }
 .tel-pop-val.is-warn { color: var(--warn); }
+.tel-pop-reset { font-family: "JetBrains Mono", "SF Mono", ui-monospace, Menlo, Consolas, monospace; font-size: 10px; color: var(--faint); }
 .tel-meter-bar { width: 100%; height: 4px; border-radius: 99px; background: var(--line2); overflow: hidden; }
 .tel-meter-bar > i { display: block; height: 100%; border-radius: 99px; background: var(--muted); transition: width 0.2s ease; }
 .tel-meter-bar.is-accent > i { background: var(--accent); opacity: 0.82; }
@@ -2803,9 +2814,18 @@ details[open] > .proc-summary .proc-chev { transform: rotate(90deg); }
 .pset-del-loc:hover { color: var(--bad) !important; }
 .pset-edit-part-modal { width: min(460px, 92vw); }
 
-/* Settings Page: Clean duty list + restricted worker scope note */
+/* Settings Page: Clean draggable duty list, machine removal confirmation & restricted worker scope note */
 .duty-right { margin-left: auto; display: inline-flex; align-items: center; gap: 4px; flex: none; }
-.duty-move-btn { width: 22px !important; height: 22px !important; }
+.duty-row.is-draggable { cursor: grab; user-select: none; }
+.duty-row.is-dragging { opacity: 0.45; cursor: grabbing; }
+.duty-row.is-drop-before { box-shadow: inset 0 2px 0 var(--accent); }
+.duty-row.is-drop-after { box-shadow: inset 0 -2px 0 var(--accent); }
+.duty-grip {
+  display: inline-flex; align-items: center; justify-content: center; flex: none;
+  margin-left: -4px; color: var(--faint); opacity: 0.72;
+  transition: color var(--motion-fast), opacity var(--motion-fast);
+}
+.duty-row:hover .duty-grip { color: var(--muted); opacity: 1; }
 .duty-row.is-takeover { background: color-mix(in srgb, var(--warn) 6%, transparent); }
 .duty-takeover {
   font-size: 11px; color: var(--warn); padding: 1px 6px; border-radius: 4px;
@@ -2813,6 +2833,12 @@ details[open] > .proc-summary .proc-chev { transform: rotate(90deg); }
 }
 .set-mach-hd { cursor: pointer; }
 .set-mach-os { font-size: 11px; flex: none; }
+.set-mach-rm-confirm {
+  background: var(--bad); color: #fff; border: 1px solid var(--bad);
+}
+.set-mach-rm-confirm:hover { opacity: 0.9; }
+.ag-block-acts { display: inline-flex; align-items: center; gap: 6px; }
+.ag-offline-hint { font-size: 11px; color: var(--faint); }
 .worker-scope-note {
   padding: 8px 10px; border-radius: 7px; background: var(--bg);
   border: 1px solid var(--line); font-size: 11.5px; color: var(--muted);

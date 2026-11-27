@@ -183,6 +183,16 @@ export function SessionConversation({
   const task = tl.task;
   const members = tl.boardMembers ?? [];
   const lastAttempt = tl.attempts[tl.attempts.length - 1];
+  const project = boot?.projects.find((p) => p.projectId === task.projectId);
+  const anchorMachineId = project
+    ? project.anchors[task.requiredCapability || project.defaultCapability]?.machine
+    : undefined;
+  const composerMachineId =
+    lastAttempt?.machineId ||
+    (anchorMachineId && boot?.machines?.some((m) => m.machineId === anchorMachineId) ? anchorMachineId : undefined) ||
+    (boot?.setup?.activeDutyMachineId && boot?.machines?.some((m) => m.machineId === boot.setup?.activeDutyMachineId)
+      ? boot.setup.activeDutyMachineId
+      : undefined);
   const needsVerifyAttemptId = !task.activeAttemptId && lastAttempt?.state === 'needs_verification' ? lastAttempt.attemptId : undefined;
   const pendingInputs = [...tl.pendingInputs].sort((a, b) => a.position - b.position || a.createdAt - b.createdAt);
   const openAnnotations = useMemo(() => tl.annotations.filter((a) => a.status === 'open'), [tl.annotations]);
@@ -343,7 +353,7 @@ export function SessionConversation({
           indicatorMode="context"
           machines={boot?.machines}
           projects={boot?.projects}
-          machineId={lastAttempt?.machineId}
+          machineId={composerMachineId}
           compact={compact}
           inDrawer={inDrawer}
           topSlot={composerTopSlot}

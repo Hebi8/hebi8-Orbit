@@ -15,6 +15,7 @@ import {
   taskTitle,
 } from '../lib/format';
 import { navigate, paths } from '../lib/router';
+import { useImeGuard } from '../lib/ime';
 import { toast, useWorkbenchStore } from '../store/useWorkbenchStore';
 import { PAIcon } from './Icons';
 import { BriefView, usePABrief } from './PAViews';
@@ -39,6 +40,7 @@ export function CommandPalette({ boot }: { boot: BootstrapResponse }) {
   const [act, setAct] = useState(0);
   const [out, setOut] = useState<Out>(null);
   const inputRef = useRef<HTMLInputElement | null>(null);
+  const ime = useImeGuard();
   const tasksBy = useManyProjectTasks(boot.projects);
   const askHebi8 = useMutation({
     mutationFn: async (message: string) => {
@@ -158,8 +160,9 @@ export function CommandPalette({ boot }: { boot: BootstrapResponse }) {
             value={q}
             placeholder="跳线程、搜项目，或问 Hebi8…"
             onChange={(e) => setQ(e.target.value)}
+            {...ime.compositionProps}
             onKeyDown={(e) => {
-              if (e.nativeEvent.isComposing) return;
+              if (ime.isImeEnter(e)) return;
               if (e.key === 'ArrowDown') {
                 e.preventDefault();
                 setAct((a) => Math.min(items.length - 1, a + 1));

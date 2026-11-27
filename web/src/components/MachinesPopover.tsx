@@ -6,6 +6,7 @@ import { useHubLatency } from '../hooks/useHubLatency';
 import { api, errMsg, isDesktopShell, openDesktopSetup } from '../lib/api';
 import { cleanMachineName, humanResourceLabel, relTime } from '../lib/format';
 import { resolveEffectiveLocalMachineId } from '../lib/ide';
+import { useImeGuard } from '../lib/ime';
 import { navigate, paths } from '../lib/router';
 import { toast, useWorkbenchStore } from '../store/useWorkbenchStore';
 import { DeviceRoleIcon } from './DeviceRoleIcon';
@@ -92,6 +93,7 @@ export function MachinesPopover({
   const workspaceName = workspaceNameOverride || defaultWorkspaceName || 'Home LAN';
   const [renaming, setRenaming] = useState(false);
   const [draftName, setDraftName] = useState(workspaceName);
+  const ime = useImeGuard();
 
   const effectiveLocalId = resolveEffectiveLocalMachineId(machines, currentMachineId || storedLocalId);
   const onlineCount = machines.filter((m) => m.status === 'online').length;
@@ -180,7 +182,9 @@ export function MachinesPopover({
                 className="ws-rename-input"
                 value={draftName}
                 onChange={(e) => setDraftName(e.target.value)}
+                {...ime.compositionProps}
                 onKeyDown={(e) => {
+                  if (ime.isImeEnter(e)) return;
                   if (e.key === 'Enter') void saveName();
                   if (e.key === 'Escape') setRenaming(false);
                 }}

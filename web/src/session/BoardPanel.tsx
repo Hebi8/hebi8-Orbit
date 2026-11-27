@@ -1,30 +1,82 @@
-import { Fragment, useEffect, useRef, useState } from 'react';
+import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { X } from 'lucide-react';
-import type { BoardMemberCursor, TaskBoardResponse } from '../generated/protocol';
+import type {
+  BoardMemberCursor,
+  ChildTaskView,
+  InboxItemView,
+  MachineView,
+  TaskBoardResponse,
+} from '../generated/protocol';
 import { SendUpIcon } from '../components/Icons';
+import { StatusMark } from '../components/StatusMark';
+import { ADAPTER_LABELS } from '../lib/agentCaps';
 import { api, errMsg } from '../lib/api';
-import { hhmm, memberDot, memberStateLabel } from '../lib/format';
+import {
+  childSessionMark,
+  childStateLabel,
+  cleanMachineName,
+  hhmm,
+  memberStateLabel,
+  taskTitle,
+  type SessionMark,
+} from '../lib/format';
+import { useImeGuard } from '../lib/ime';
 import { navigate, paths } from '../lib/router';
 import { toast } from '../store/useWorkbenchStore';
 
-/** Expanded right panel: ordered #seq shared board with per-member cursors and an @worker composer. */
+interface BoardParticipant {
+  key: string;
+  kind: 'child' | 'native';
+  label: string;
+  mentionValue: string;
+  meta: string;
+  mark: SessionMark;
+  lastConsumedSeq: number;
+  cursorLabel: string;
+  child?: ChildTaskView;
+  member?: BoardMemberCursor;
+}
+
+function nativeMemberMark(m: BoardMemberCursor): SessionMark {
+  switch (m.state) {
+    case 'working':
+      return 'running';
+    case 'waiting':
+      return 'needs-you';
+    case 'killed':
+      return 'failed';
+    default:
+      return null;
+  }
+}
+
+/** Expanded right panel: ordered #seq shared board with first-class child sessions, native swarm cursors, and @mention composer. */
 export function BoardPanel({
   taskId,
   board,
   fallbackMembers,
+  childrenList = [],
+  machines = [],
+  inboxByTask,
   worker,
   onClose,
+  onOpenChild,
   onSelectMember,
 }: {
   taskId: string;
   board?: TaskBoardResponse;
   fallbackMembers: BoardMemberCursor[];
+  childrenList?: ChildTaskView[];
+  machines?: MachineView[];
+  inboxByTask?: ReadonlyMap<string, InboxItemView[]>;
   worker?: string;
   onClose: () => void;
+  onOpenChild?: (childTaskId: string) => void;
   onSelectMember?: (member: BoardMemberCursor) => void;
 }) {
   const qc = useQueryClient();
+  const ime = useImeGuard();
   const members = board?.members ?? fallbackMembers;
   const [olderMessages, setOlderMessages] = useState<TaskBoardResponse['messages']>([]);
   const [olderHasMore, setOlderHasMore] = useState<boolean | null>(null);
@@ -41,6 +93,96 @@ export function BoardPanel({
   const messages = [...msgById.values()].sort((a, b) => a.seq - b.seq);
   const hasMore = olderHasMore !== null ? olderHasMore : !!board?.hasMore;
   const oldestSeq = messages.length > 0 ? messages[0].seq : 0;
+
+  const machineLabelOf = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const m of machines) {
+      map.set(m.machineId, m.displayAlias?.trim() || cleanMachineName(m));
+    }
+    return (mid?: string) => (mid ? map.get(mid) || mid : '');
+  }, [machines]);
+
+  const participants = useMemo<BoardParticipant[]>(() => {
+    const list: BoardParticipant[] = [];
+    const memberByChildId = new Map<string, BoardMemberCursor>();
+    const consumedNativeKeys = new Set<string>();
+
+    for (const m of members) {
+      if (m.workerTaskId) {
+        memberByChildId.set(m.workerTaskId, m);
+      }
+    }
+
+    const titleCounts = new Map<string, number>();
+    for (const c of childrenList) {
+      const t = taskTitle(c).toLowerCase();
+      titleCounts.set(t, (titleCounts.get(t) ?? 0) + 1);
+    }
+
+    const seenChildIds = new Set<string>();
+    for (const c of childrenList) {
+      seenChildIds.add(c.taskId);
+      const cursor = memberByChildId.get(c.taskId);
+      const label = taskTitle(c);
+      const isUniqueTitle = (titleCounts.get(label.toLowerCase()) ?? 0) <= 1;
+      const machName = machineLabelOf(c.machineId || cursor?.machineId);
+      const adpRaw = c.preferredAdapter || cursor?.adapter;
+      const adpName = adpRaw ? ADAPTER_LABELS[adpRaw] ?? adpRaw : '';
+      const stateText = childStateLabel(c.state, c.openApprovalCount);
+      const meta = [machName, adpName, stateText, c.currentStep || cursor?.currentStep].filter(Boolean).join(' · ');
+
+      list.push({
+        key: `child:${c.taskId}`,
+        kind: 'child',
+        label,
+        mentionValue: isUniqueTitle ? label : c.taskId,
+        meta,
+        mark: childSessionMark(c, inboxByTask?.get(c.taskId)),
+        lastConsumedSeq: cursor?.lastConsumedSeq ?? 0,
+        cursorLabel: label,
+        child: c,
+        member: cursor,
+      });
+    }
+
+    for (const m of members) {
+      if (m.workerTaskId && seenChildIds.has(m.workerTaskId)) continue;
+      if (consumedNativeKeys.has(m.memberName)) continue;
+      consumedNativeKeys.add(m.memberName);
+
+      const isChildCursor = !!m.workerTaskId;
+      const machName = machineLabelOf(m.machineId);
+      const adpName = m.adapter ? ADAPTER_LABELS[m.adapter] ?? m.adapter : '';
+      const meta = [machName, adpName, memberStateLabel(m.state), m.currentStep, !isChildCursor ? '内置' : '']
+        .filter(Boolean)
+        .join(' · ');
+
+      list.push({
+        key: isChildCursor ? `child:${m.workerTaskId}` : `native:${m.memberName}`,
+        kind: isChildCursor ? 'child' : 'native',
+        label: isChildCursor ? m.memberName : `@${m.memberName}`,
+        mentionValue: m.memberName,
+        meta,
+        mark: nativeMemberMark(m),
+        lastConsumedSeq: m.lastConsumedSeq,
+        cursorLabel: m.memberName,
+        member: m,
+      });
+    }
+
+    return list;
+  }, [members, childrenList, machineLabelOf, inboxByTask]);
+
+  const childTitleById = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const c of childrenList) map.set(c.taskId, taskTitle(c));
+    for (const m of members) {
+      if (m.workerTaskId && !map.has(m.workerTaskId)) map.set(m.workerTaskId, m.memberName);
+    }
+    return map;
+  }, [childrenList, members]);
+
+  const formatActorOrMention = (raw: string) => childTitleById.get(raw) ?? raw;
 
   const loadOlder = async () => {
     if (loadingOlder || !hasMore || oldestSeq <= 1) return;
@@ -85,6 +227,7 @@ export function BoardPanel({
     onSuccess: () => {
       setText('');
       void qc.invalidateQueries({ queryKey: ['task-board', taskId] });
+      void qc.invalidateQueries({ queryKey: ['task-children', taskId] });
     },
     onError: (e) => toast(errMsg(e), 'err'),
   });
@@ -93,15 +236,28 @@ export function BoardPanel({
     let body = text.trim();
     if (!body || post.isPending) return;
     let to = target;
-    const m = /^@([\w.-]+)\s+([\s\S]+)$/.exec(body);
+    const m = /^@(\S+)\s+([\s\S]+)$/.exec(body);
     if (m) {
-      to = m[1];
+      const token = m[1];
+      const matched = participants.find(
+        (p) =>
+          p.mentionValue.toLowerCase() === token.toLowerCase() ||
+          p.label.replace(/^@/, '').toLowerCase() === token.toLowerCase() ||
+          p.child?.taskId === token,
+      );
+      to = token.toLowerCase() === 'all' ? 'all' : matched ? matched.mentionValue : token;
       body = m[2].trim();
     }
     post.mutate({ target: to, body });
   };
 
-  const cursorsAt = (seq: number) => members.filter((m) => m.lastConsumedSeq === seq).map((m) => m.memberName);
+  const cursorsAt = (seq: number) =>
+    participants.filter((p) => p.lastConsumedSeq > 0 && p.lastConsumedSeq === seq).map((p) => p.cursorLabel);
+
+  const selectedTargetDisplay =
+    target === 'all'
+      ? 'all'
+      : participants.find((p) => p.mentionValue === target)?.label.replace(/^@/, '') || formatActorOrMention(target);
 
   return (
     <aside className="board" aria-label="共享消息板">
@@ -114,34 +270,46 @@ export function BoardPanel({
       </div>
       <div className="bsec">
         <div className="bsec-h">
-          成员与消费游标<span className="r mono">#{latest}</span>
+          协作参与者与消费游标<span className="r mono">#{latest}</span>
         </div>
-        {members.length === 0 && <div className="fsub">还没有成员加入</div>}
-        {members.map((m) => {
-          const pct = latest > 0 ? Math.min(100, (m.lastConsumedSeq / latest) * 100) : 0;
+        {participants.length === 0 && <div className="fsub">还没有协作子会话或成员加入</div>}
+        {participants.map((p) => {
+          const pct = latest > 0 && p.lastConsumedSeq > 0 ? Math.min(100, (p.lastConsumedSeq / latest) * 100) : 0;
+          const isActiveView = p.kind === 'native' && worker === p.member?.memberName;
           return (
             <button
               type="button"
-              key={m.memberName}
-              className={`mem ${worker === m.memberName ? 'cur-view' : ''}`}
+              key={p.key}
+              className={`mem ${isActiveView ? 'cur-view' : ''}`}
               onClick={() => {
-                if (onSelectMember) onSelectMember(m);
-                else if (m.workerTaskId) navigate(paths.session(taskId, undefined, m.workerTaskId));
-                else navigate(paths.session(taskId, m.memberName));
+                if (p.child) {
+                  if (onOpenChild) onOpenChild(p.child.taskId);
+                  else navigate(paths.session(taskId, undefined, p.child.taskId));
+                } else if (p.member?.workerTaskId) {
+                  if (onOpenChild) onOpenChild(p.member.workerTaskId);
+                  else navigate(paths.session(taskId, undefined, p.member.workerTaskId));
+                } else if (p.member) {
+                  if (onSelectMember) onSelectMember(p.member);
+                  else navigate(paths.session(taskId, p.member.memberName));
+                }
               }}
-              title={m.workerTaskId ? '分屏查看并接管该子会话' : '查看该成员的投影记录与消息流'}
+              title={p.kind === 'child' ? '分屏查看并接管该子会话' : '查看该内置成员的投影记录与消息流'}
             >
-              <span className={`sd ${memberDot(m.state)}`} />
+              <span className="mem-mark">
+                <StatusMark mark={p.mark} reserveSlot />
+              </span>
               <span className="nm">
-                <span className="ell">{m.memberName}</span>
-                <span className="host">
-                  {[m.machineId, m.adapter, memberStateLabel(m.state), m.currentStep].filter(Boolean).join(' · ')}
+                <span className="ell">{p.label}</span>
+                {p.meta && <span className="host">{p.meta}</span>}
+              </span>
+              <span className={`cur mono ${p.lastConsumedSeq < latest ? '' : 'faint'}`}>
+                {p.lastConsumedSeq > 0 ? `#${p.lastConsumedSeq}` : '—'}
+              </span>
+              {latest > 0 && p.lastConsumedSeq > 0 && (
+                <span className="trk">
+                  <i style={{ width: `${pct}%` }} />
                 </span>
-              </span>
-              <span className={`cur mono ${m.lastConsumedSeq < latest ? '' : 'faint'}`}>#{m.lastConsumedSeq}</span>
-              <span className="trk">
-                <i style={{ width: `${pct}%` }} />
-              </span>
+              )}
             </button>
           );
         })}
@@ -163,8 +331,12 @@ export function BoardPanel({
               <div className="bm">
                 <span className="seq mono">#{msg.seq}</span>
                 <div style={{ minWidth: 0 }}>
-                  <span className={`who ${you ? 'you' : ''}`}>{you ? '你' : msg.authorName}</span>
-                  {msg.targetMention && <span className="men">@{msg.targetMention}</span>}
+                  <span className={`who ${you ? 'you' : ''}`}>{you ? '你' : formatActorOrMention(msg.authorName)}</span>
+                  {msg.targetMention && (
+                    <span className="men" title={msg.targetMention}>
+                      @{formatActorOrMention(msg.targetMention)}
+                    </span>
+                  )}
                   <span className="body2">{msg.body}</span>
                   <div className="bell">
                     <span>{hhmm(msg.createdAt)}</span>
@@ -178,16 +350,24 @@ export function BoardPanel({
         })}
       </div>
       <div className="bcomp">
-        {members.length > 0 && (
-          <div className="bmen">
-            {members.map((m) => (
+        {participants.length > 0 && (
+          <div className="bmen" role="group" aria-label="提及对象">
+            <button
+              type="button"
+              className={target === 'all' ? 'on' : ''}
+              onClick={() => setTarget(target === 'all' ? '' : 'all')}
+            >
+              @all
+            </button>
+            {participants.map((p) => (
               <button
                 type="button"
-                key={m.memberName}
-                className={target === m.memberName ? 'on' : ''}
-                onClick={() => setTarget(target === m.memberName ? '' : m.memberName)}
+                key={p.key}
+                className={target === p.mentionValue ? 'on' : ''}
+                title={`提及 ${p.label}`}
+                onClick={() => setTarget(target === p.mentionValue ? '' : p.mentionValue)}
               >
-                @{m.memberName}
+                @{p.label.replace(/^@/, '')}
               </button>
             ))}
           </div>
@@ -195,10 +375,13 @@ export function BoardPanel({
         <div className="bin">
           <input
             value={text}
-            placeholder={target ? `投给 @${target}，@ 即门铃…` : '往板上投一条，@worker 唤醒对应成员…'}
+            placeholder={
+              target ? `投给 @${selectedTargetDisplay}，按 Enter 发送…` : '往板上投一条，点击上方 @ 提及子会话或 @all…'
+            }
             onChange={(e) => setText(e.target.value)}
+            {...ime.compositionProps}
             onKeyDown={(e) => {
-              if (e.key === 'Enter' && !e.nativeEvent.isComposing) {
+              if (e.key === 'Enter' && !ime.isImeEnter(e)) {
                 e.preventDefault();
                 send();
               }

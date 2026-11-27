@@ -27,6 +27,7 @@ import {
   type SessionMark,
 } from '../lib/format';
 import { navigate, paths } from '../lib/router';
+import { useImeGuard } from '../lib/ime';
 import { toast, useWorkbenchStore } from '../store/useWorkbenchStore';
 
 const CODE_KINDS = new Set(['code_diff', 'mixed', 'workspace_snapshot']);
@@ -143,6 +144,7 @@ export function RightCard({
   const [kind, setKind] = useState<TaskSourceKind>('link');
   const [label, setLabel] = useState('');
   const [uri, setUri] = useState('');
+  const ime = useImeGuard();
   const taskId = tl.task.taskId;
   const isChildSession = !!tl.task.parentTaskId;
   const isScratch = tl.task.projectId === SCRATCH_PROJECT_ID;
@@ -176,7 +178,8 @@ export function RightCard({
   const nativeMembers = allMembers.filter((m) => !m.workerTaskId);
   const effectiveChildren = isChildSession ? [] : (childrenList ?? tl.children ?? []);
   const totalSubs = effectiveChildren.length + nativeMembers.length;
-  const showSubsSection = !isChildSession && (totalSubs > 0 || tl.task.workerCount > 0);
+  const boardMsgCount = board?.messages?.length ?? 0;
+  const showSubsSection = !isChildSession && (totalSubs > 0 || tl.task.workerCount > 0 || boardMsgCount > 0);
 
   const lastAttempt = tl.attempts[tl.attempts.length - 1];
   const matchedPart = lastAttempt?.partId ? project?.parts?.find((p) => p.partId === lastAttempt.partId) : project?.parts?.[0];
@@ -328,10 +331,10 @@ export function RightCard({
               <StatusMark mark={nativeMemberMark(m)} />
             </button>
           ))}
-          {totalSubs === 0 && <div className="fsub">有协作子任务</div>}
-          {(nativeMembers.length > 0 || (board?.messages?.length ?? 0) > 0) && (
+          {totalSubs === 0 && boardMsgCount === 0 && <div className="fsub">有协作子任务</div>}
+          {(effectiveChildren.length > 0 || nativeMembers.length > 0 || boardMsgCount > 0) && (
             <button type="button" className="flink" onClick={onOpenBoard}>
-              <SwarmIcon size={12} /> 消息板 →
+              <SwarmIcon size={12} /> 消息板{boardMsgCount > 0 ? ` (${boardMsgCount})` : ''} →
             </button>
           )}
         </RightSection>
@@ -404,12 +407,25 @@ export function RightCard({
               <option value="file">文件</option>
               <option value="nmem">nmem 记忆</option>
             </select>
-            <input className="field" placeholder="标题（可选）" value={label} onChange={(e) => setLabel(e.target.value)} />
+            <input
+              className="field"
+              placeholder="标题（可选）"
+              value={label}
+              onChange={(e) => setLabel(e.target.value)}
+              {...ime.compositionProps}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && ime.isImeEnter(e)) e.preventDefault();
+              }}
+            />
             <input
               className="field"
               placeholder={kind === 'link' ? 'https://…' : kind === 'file' ? '仓库内路径' : 'nmem 引用'}
               value={uri}
               onChange={(e) => setUri(e.target.value)}
+              {...ime.compositionProps}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && ime.isImeEnter(e)) e.preventDefault();
+              }}
               autoFocus
             />
             <div className="row">

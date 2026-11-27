@@ -132,6 +132,7 @@
   - **发出（派发 / 外发消息）**：**`1.5px` 中性灰左轨 + `↗` 外发轻图标** + 目标标题 + 行尾单槽 `StatusMark`（整批均静息时自然收合）；
   - **收到（回传 / `child_result` / 接收消息）**：**`1.5px` 低饱和淡强调左轨 + `↵` 回折轻图标** + 一行摘要（默认折叠，点击展开干净格式化 Markdown，**严禁裸吐 `<pre>` 系统唤醒词**）。
 - 底层原生 subagent / swarm 成员仅在元信息末标注极淡纯文本「内置」，抽屉内给单行静默提示条。
+- **一等子会话共享信息板（`BoardPanel`）**：当父会话存在一等子会话或原生 Swarm 成员（或已有板消息）时，`RightCard` 的「协作子会话」区块提供低刺激的 **`消息板 →`** 入口（有消息时附轻计数）；信息板同时展示一等子会话与原生 Swarm 成员作为协作参与者，支持点击打开对应分屏抽屉、实时同步 `board.message_posted` 消息，以及通过 `@<子会话>` / `@all` 提及唤醒。
 
 ---
 
@@ -167,8 +168,8 @@
   - 下方为清爽的上下目录列表，保证鼠标点选、双击进入子目录与键盘导航（`↑↓ / Enter / Backspace`）的选中路径结果 **100% 一致**。
 
 ### 2. 网络与机器管理、故障接管与左下直连状态
-- **机器列表去噪**：移除主机顺位列表左侧多余的排序号数字与拖拽排序图标。
-- **受限节点（`worker`）完整可管理**：点击任意受限节点（含新配对节点）均可在原位正常展开管理面板（展示工作范围说明与可编辑目录白名单；新配对受限节点分配唯一 ID 并自动展开，不触发页面滚回顶部）。
+- **主控顺位简洁拖拽调序**：主控顺位列表不显示排序号数字、不堆砌上移/下移按钮；每行左侧保留极克制的拖拽手柄图标（`GripVertical`），支持流畅拖拽重排并乐观更新顺序（右侧仅保留非首位节点的轻量「置顶」动作）。
+- **所有非本机设备完整可管理与两步删除**：点击任意设备卡片（含离线、受限 `worker`、`yaml` 与 `ssh_outbound` 远端节点）均可原位展开管理面板，离线时仍可编辑显示名称、SSH 别名（远端设备）、目录白名单与角色（在线依赖的 Agent 探测/测试/安装按钮在离线时展示清晰禁用态与「设备离线」提示）；除本机 `local_ws` 节点外，所有非本机设备均提供**原地两步确认移除**（首次点击切为红色「确认移除」，再次点击执行删除，点击外部复位）。
 - **故障接管横幅可关闭**：顶栏故障接管提示条右侧增加 **`×` 关闭按钮**（读完即可关闭，左下角连接态仍常驻提示；移动端同步）。
 - **左下角直连本机图标化**：当本机直连本地节点时，去掉「直连」文字，改用简洁的**直连本机图标**（悬停提示「直连本机」）。
 
@@ -183,7 +184,7 @@
   - `web/src/session/SessionPage.tsx`、`web/src/session/RightCard.tsx`、`web/src/session/ChildSessionDrawer.tsx`、`web/src/session/SubsessionStrip.tsx`、`web/src/session/Turn.tsx`、`web/src/components/IdeOpenButton.tsx`、`web/src/components/FolderChangesCard.tsx`：顶栏去重、可折叠紧凑 `RightCard`、IDE 铅笔原位编辑、全宽通透普通文件夹变更条、单块过程折叠 + 保留历史正文、单层子会话抽屉与 `↗ / ↵` 极简通信轨。
   - `web/src/windows/ReviewOverlay.tsx` & `web/src/windows/CodeReviewPane.tsx`：统一/分栏 Diff + 高亮、`Checkpoint` 发送前撤销、`×` 关闭键、全宽行内批注卡片。
   - `web/src/pages/PAPage.tsx` & `web/src/components/Hebi8LineDrawer.tsx`：PA 暂不挂子会话、独立跨目录提示卡片、顶栏单一树形图标、底部按需快速汇总建议条、`HEAD` 置顶 Git-Tree。
-  - `web/src/pages/ProjectPage.tsx`、`web/src/components/DirBrowseModal.tsx`、`web/src/pages/SettingsPage.tsx`：去冗余默认隔离策略、Part/路径独立编辑删除、Codex 风格目录选择器、去机器排序号/图标、受限节点展开管理、故障横幅 `×` 关闭。
+  - `web/src/pages/ProjectPage.tsx`、`web/src/components/DirBrowseModal.tsx`、`web/src/pages/SettingsPage.tsx`：去冗余默认隔离策略、Part/路径独立编辑删除、Codex 风格目录选择器、主控顺位左侧简洁拖拽手柄调序、全量非本机离线/YAML/SSH 设备展开管理与两步删除、故障横幅 `×` 关闭。
 - **不可破坏的底层能力**：保留一等子会话协议基线（`parent_task_id`、内置 5 工具 stdio MCP `orbit mcp-serve`、`orbit child` CLI、`child_result` 持久异步唤醒、跨机 steer；同时在业务层约束最大层级 = 1）、Hebi8 Fold-Rollover 后端存储、3 层 Project 模型、普通文件夹轻量快照与 SSH Config 解析。
 
 ---

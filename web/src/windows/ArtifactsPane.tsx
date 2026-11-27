@@ -8,6 +8,7 @@ import { useDelivery, useRyugiArtifactContent } from '../hooks/queries';
 import { api, errMsg, makeIdempotencyKey } from '../lib/api';
 import type { SessionArtifactItem } from '../lib/artifacts';
 import { artifactShortLabel, basename } from '../lib/format';
+import { useImeGuard } from '../lib/ime';
 import { toast } from '../store/useWorkbenchStore';
 
 function openExternal(url: string) {
@@ -489,6 +490,7 @@ export function ArtifactsPane({
   const [addingNote, setAddingNote] = useState(false);
   const [noteBody, setNoteBody] = useState('');
   const [showRawHtml, setShowRawHtml] = useState(false);
+  const ime = useImeGuard();
 
   const activeArt = useMemo(() => {
     if (artifactId) {
@@ -782,7 +784,9 @@ export function ArtifactsPane({
                 value={noteBody}
                 placeholder="写下针对这份 Artifact 的修改建议…"
                 onChange={(e) => setNoteBody(e.target.value)}
+                {...ime.compositionProps}
                 onKeyDown={(e) => {
+                  if (ime.isImeEnter(e)) return;
                   if (e.key === 'Escape') {
                     e.stopPropagation();
                     setAddingNote(false);

@@ -21,6 +21,7 @@ import { IdeOpenButton } from '../components/IdeOpenButton';
 import { useDelivery } from '../hooks/queries';
 import { ApiError, api, errMsg, makeIdempotencyKey } from '../lib/api';
 import { shortSha } from '../lib/format';
+import { useImeGuard } from '../lib/ime';
 import { tokenizeHunksWithShiki } from '../lib/shikiDiff';
 import { toast, useWorkbenchStore } from '../store/useWorkbenchStore';
 
@@ -118,6 +119,7 @@ export function CodeReviewPane({
   const [railPopOpen, setRailPopOpen] = useState(false);
   const [textSel, setTextSel] = useState<TextSelPop | null>(null);
   const diffPaneRef = useRef<HTMLDivElement | null>(null);
+  const ime = useImeGuard();
 
   useEffect(() => {
     setFile('');
@@ -448,7 +450,9 @@ export function CodeReviewPane({
                 setBody(e.target.value);
                 setDraft((d) => (d ? { ...d, idempotencyKey: makeIdempotencyKey() } : d));
               }}
+              {...ime.compositionProps}
               onKeyDown={(e) => {
+                if (ime.isImeEnter(e)) return;
                 if (e.key === 'Escape') {
                   e.preventDefault();
                   e.stopPropagation();
@@ -512,7 +516,7 @@ export function CodeReviewPane({
       for (const [k, nodes] of Object.entries(map)) out[k] = <div className="cmrow">{nodes}</div>;
     }
     return out;
-  }, [parsed, fileAnns, draft, body, effectiveDeliveryId, activeFile, create, removeAnn, lineIndex, effectiveViewType]);
+  }, [parsed, fileAnns, draft, body, effectiveDeliveryId, activeFile, create, removeAnn, lineIndex, effectiveViewType, ime.compositionProps, ime.isImeEnter]);
 
   // For pure-insert / pure-delete lines in Split Diff mode, react-diff-view renders two colSpan=2 cells
   // (one empty, one with widget content). Promote the populated cell to full-width colSpan=4 without

@@ -20,6 +20,7 @@ import {
 } from './lib/api';
 import { cleanMachineName, hasUrgentSession } from './lib/format';
 import { resolveEffectiveLocalMachineId } from './lib/ide';
+import { useImeGuard } from './lib/ime';
 import { navigate, parseHash, paths, replaceHash, useRoute } from './lib/router';
 import { ArchivedPage } from './pages/ArchivedPage';
 import { ArtifactsPage } from './pages/ArtifactsPage';
@@ -115,6 +116,7 @@ function BootError({ error, onRetry }: { error: unknown; onRetry: () => void }) 
   const [showManual, setShowManual] = useState(!isUnauth);
   const [token, setToken] = useState('');
   const inDesktop = isDesktopShell();
+  const ime = useImeGuard();
 
   const submitPair = async () => {
     const trimmed = pairCode.trim();
@@ -154,7 +156,9 @@ function BootError({ error, onRetry }: { error: unknown; onRetry: () => void }) 
                 className="field mono auth-code-in"
                 value={pairCode}
                 onChange={(e) => setPairCode(e.target.value.toUpperCase())}
+                {...ime.compositionProps}
                 onKeyDown={(e) => {
+                  if (ime.isImeEnter(e)) return;
                   if (e.key === 'Enter') void submitPair();
                 }}
                 placeholder="输入配对码（如 XXXX-XXXX）"
@@ -167,7 +171,9 @@ function BootError({ error, onRetry }: { error: unknown; onRetry: () => void }) 
                 className="field"
                 value={deviceName}
                 onChange={(e) => setDeviceName(e.target.value)}
+                {...ime.compositionProps}
                 onKeyDown={(e) => {
+                  if (ime.isImeEnter(e)) return;
                   if (e.key === 'Enter') void submitPair();
                 }}
                 placeholder="设备名称（可选，如 MacBook Chrome）"
@@ -221,7 +227,9 @@ function BootError({ error, onRetry }: { error: unknown; onRetry: () => void }) 
               className="field"
               value={token}
               onChange={(e) => setToken(e.target.value)}
+              {...ime.compositionProps}
               onKeyDown={(e) => {
+                if (ime.isImeEnter(e)) return;
                 if (e.key === 'Enter' && token.trim()) {
                   const trimmed = token.trim();
                   if (trimmed.startsWith('ock_')) {

@@ -35,6 +35,7 @@ import {
 import { api, errMsg } from '../lib/api';
 import { PA_PROJECT_ID, SCRATCH_PROJECT_ID, cleanMachineName, isVirtualProject } from '../lib/format';
 import { resolveEffectiveLocalMachineId } from '../lib/ide';
+import { useImeGuard } from '../lib/ime';
 import { navigate, paths, type NewMode } from '../lib/router';
 import { Composer } from '../session/Composer';
 import { toast, useWorkbenchStore } from '../store/useWorkbenchStore';
@@ -138,6 +139,7 @@ export function NewThreadPage({
   const [openMenu, setOpenMenu] = useState<OpenMenu>(null);
   const taRef = useRef<HTMLTextAreaElement | null>(null);
   const composerWrapRef = useRef<HTMLDivElement | null>(null);
+  const srcIme = useImeGuard();
 
   useEffect(() => {
     if (mode) setM(mode);
@@ -491,7 +493,9 @@ export function NewThreadPage({
               placeholder={srcKind === 'link' ? 'https://…' : srcKind === 'file' ? '目录内相对路径' : 'nmem 记忆引用'}
               value={srcUri}
               onChange={(e) => setSrcUri(e.target.value)}
+              {...srcIme.compositionProps}
               onKeyDown={(e) => {
+                if (srcIme.isImeEnter(e)) return;
                 if (e.key === 'Enter') {
                   e.preventDefault();
                   addDraftSource();
@@ -811,6 +815,8 @@ export function NewThreadPage({
               refIds={refIds}
               onRefIdsChange={setRefIds}
               projects={boot.projects}
+              machines={boot.machines}
+              machineId={selectedMachine?.machineId}
               refProminent={m === 'pa'}
               chipsSlot={sourceChips}
             />

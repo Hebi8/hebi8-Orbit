@@ -182,8 +182,14 @@ function AgentRow({ machine, probe, canControl, showAdvanced, onRefreshDone }: A
         </div>
 
         <div className="ag-right">
-          {probe.state === 'missing_bridge' && probe.hintCode !== 'missing_npm' && online && canControl && (
-            <button type="button" className="btn pri sm" disabled={busy !== null} onClick={() => void runInstall()}>
+          {probe.state === 'missing_bridge' && probe.hintCode !== 'missing_npm' && (online ? canControl : true) && (
+            <button
+              type="button"
+              className="btn pri sm"
+              disabled={!online || !canControl || busy !== null}
+              title={!online ? '设备离线' : '一键安装 ACP 适配器'}
+              onClick={() => void runInstall()}
+            >
               {busy === 'install' ? '安装中…' : '一键安装适配器'}
             </button>
           )}
@@ -196,15 +202,27 @@ function AgentRow({ machine, probe, canControl, showAdvanced, onRefreshDone }: A
               >
                 <Copy size={11} strokeWidth={1.7} /> 复制登录命令
               </button>
-              {online && canControl && (
-                <button type="button" className="btn pri sm" disabled={busy !== null} onClick={() => void runTest()}>
+              {(online ? canControl : true) && (
+                <button
+                  type="button"
+                  className="btn pri sm"
+                  disabled={!online || !canControl || busy !== null}
+                  title={!online ? '设备离线' : '重新检测登录状态'}
+                  onClick={() => void runTest()}
+                >
                   {busy === 'test' ? '检测中…' : '重新检测'}
                 </button>
               )}
             </>
           )}
-          {probe.state === 'ready' && online && canControl && !showAdvanced && (
-            <button type="button" className="btn ghost sm" disabled={busy !== null} onClick={() => void runTest()}>
+          {probe.state === 'ready' && (online ? canControl : true) && !showAdvanced && (
+            <button
+              type="button"
+              className="btn ghost sm"
+              disabled={!online || !canControl || busy !== null}
+              title={!online ? '设备离线' : '验证连通性'}
+              onClick={() => void runTest()}
+            >
               {busy === 'test' ? '验证中…' : '验证连通性'}
             </button>
           )}
@@ -217,8 +235,14 @@ function AgentRow({ machine, probe, canControl, showAdvanced, onRefreshDone }: A
               <Copy size={11} strokeWidth={1.7} /> 复制安装命令
             </button>
           )}
-          {probe.state === 'error' && online && canControl && (
-            <button type="button" className="btn ghost sm" disabled={busy !== null} onClick={() => void runTest()}>
+          {probe.state === 'error' && (online ? canControl : true) && (
+            <button
+              type="button"
+              className="btn ghost sm"
+              disabled={!online || !canControl || busy !== null}
+              title={!online ? '设备离线' : '重试检测'}
+              onClick={() => void runTest()}
+            >
               {busy === 'test' ? '检查中…' : '重试'}
             </button>
           )}
@@ -295,14 +319,15 @@ function AgentRow({ machine, probe, canControl, showAdvanced, onRefreshDone }: A
             />
           </div>
           <div className="ag-adv-foot">
-            {online && canControl && (
+            {(online ? canControl : true) && (
               <button
                 type="button"
                 className="btn ghost sm"
-                disabled={busy !== null}
+                disabled={!online || !canControl || busy !== null}
+                title={!online ? '设备离线' : '验证连通性'}
                 onClick={() => void runTest()}
               >
-                {busy === 'test' ? '检查中…' : '验证连通性'}
+                {busy === 'test' ? '检查中…' : !online ? '验证连通性（离线）' : '验证连通性'}
               </button>
             )}
             <button type="button" className="btn pri sm" disabled={busy !== null} onClick={() => void saveAdvanced()}>
@@ -351,18 +376,21 @@ export function AgentList({
     <div className="ag-block">
       <div className="ag-block-hd">
         <span className="ag-block-lbl">Agent</span>
-        {online && canControl && (
-          <button
-            type="button"
-            className="ib"
-            title="刷新 Agent 状态"
-            aria-label="刷新 Agent 状态"
-            disabled={probing}
-            onClick={() => void runProbeAll()}
-          >
-            <RefreshCw size={12.5} strokeWidth={1.7} className={probing ? 'spin-ico' : ''} />
-          </button>
-        )}
+        <div className="ag-block-acts">
+          {!online && <span className="ag-offline-hint">设备离线</span>}
+          {(online ? canControl : true) && (
+            <button
+              type="button"
+              className="ib"
+              title={!online ? '设备离线' : '刷新 Agent 状态'}
+              aria-label={!online ? '设备离线，无法刷新 Agent 状态' : '刷新 Agent 状态'}
+              disabled={!online || !canControl || probing}
+              onClick={() => void runProbeAll()}
+            >
+              <RefreshCw size={12.5} strokeWidth={1.7} className={probing ? 'spin-ico' : ''} />
+            </button>
+          )}
+        </div>
       </div>
       <div className="ag-list">
         {agents.map((probe) => (
