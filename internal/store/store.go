@@ -458,6 +458,9 @@ func applySchema(ctx context.Context, db *sql.DB) error {
 	if err := ensureColumnTx(ctx, tx, "machines", "agent_quotas_json", "TEXT NOT NULL DEFAULT '[]'"); err != nil {
 		return err
 	}
+	if err := ensureColumnTx(ctx, tx, "tasks", "ready_version", "INTEGER NOT NULL DEFAULT 1"); err != nil {
+		return err
+	}
 
 	// Idempotently ensure the built-in virtual _scratch project exists on every startup.
 	if err := ensureScratchProjectTx(ctx, tx, now); err != nil {

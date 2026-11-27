@@ -347,7 +347,7 @@ export interface InboxItemView {
   inboxId: string;
   projectId: string;
   taskId?: string;
-  taskVersion?: number;
+  readyVersion?: number;
   category: InboxCategory;
   refId: string;
   title: string;
@@ -575,6 +575,7 @@ export interface ChildTaskView {
   insertions?: number;
   deletions?: number;
   version: number;
+  readyVersion: number;
   createdAt: number;
   updatedAt: number;
   archivedAt?: number | null;
@@ -647,6 +648,7 @@ export interface TaskSummary {
   queuedInputCount: number;
   workerCount: number;
   version: number;
+  readyVersion: number;
   createdBy: TaskCreatedBy;
   createdAt: number;
   updatedAt: number;

@@ -678,7 +678,7 @@ func applyStateFrameTx(
 			UPDATE tasks
 			SET state = 'in_review', active_attempt_id = NULL, waiting_reason = NULL,
 			    pending_queue_drain = 1, pending_steer_input_id = NULL,
-			    version = version + 1, updated_at = ?
+			    version = version + 1, ready_version = ready_version + 1, updated_at = MAX(?, updated_at + 1)
 			WHERE task_id = ? AND active_attempt_id = ?
 		`, hubNow, att.TaskID, att.AttemptID); err != nil {
 			return err
@@ -1077,7 +1077,8 @@ func applyDeliveryPublishedFrameTx(
 	// Use Hub server clock for task/inbox projection timestamps so cross-machine Runner clock skew never leaks in.
 	hubNow := time.Now().UnixMilli()
 	if _, err := tx.ExecContext(ctx, `
-		UPDATE tasks SET latest_delivery_id = ?, version = version + 1, updated_at = ?
+		UPDATE tasks
+		SET latest_delivery_id = ?, version = version + 1, ready_version = ready_version + 1, updated_at = MAX(?, updated_at + 1)
 		WHERE task_id = ? AND active_attempt_id = ?
 	`, deliveryID, hubNow, att.TaskID, att.AttemptID); err != nil {
 		return err

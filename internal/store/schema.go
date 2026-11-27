@@ -54,6 +54,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   created_by          TEXT NOT NULL CHECK (created_by IN (%s)),
   idempotency_key     TEXT UNIQUE,
   version             INTEGER NOT NULL DEFAULT 1,
+  ready_version       INTEGER NOT NULL DEFAULT 1,
   created_at          INTEGER NOT NULL,
   updated_at          INTEGER NOT NULL,
   archived_at         INTEGER,

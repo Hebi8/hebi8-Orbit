@@ -245,7 +245,7 @@ export function ChildSessionDrawer({
   const childReadyWatermark =
     childTaskId && !isMismatchedParent && (childTask || childSummary)
       ? effectiveReadyWatermark(
-          { version: Math.max(childTask?.version ?? 0, childSummary?.version ?? 0) },
+          { readyVersion: Math.max(childTask?.readyVersion ?? 0, childSummary?.readyVersion ?? 0) },
           inboxByTask.get(childTaskId),
         )
       : 0;
@@ -334,7 +334,7 @@ export function ChildSessionDrawer({
       taskId: childTaskId,
       state: task?.state ?? childSummary?.state ?? 'queued',
       openApprovalCount: openApprovals,
-      version: Math.max(task?.version ?? 0, childSummary?.version ?? 0),
+      readyVersion: Math.max(task?.readyVersion ?? 0, childSummary?.readyVersion ?? 0),
     },
     inboxByTask.get(childTaskId),
     seenTasks,

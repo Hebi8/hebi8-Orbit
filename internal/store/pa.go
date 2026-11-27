@@ -643,7 +643,7 @@ func (s *Store) BuildPABrief(
 			iRows, err = tx.QueryContext(ctx, `
 				SELECT i.inbox_id, i.project_id, i.task_id, i.category, i.ref_id, i.title, i.summary,
 				       i.priority, i.state, i.created_at, i.updated_at, i.resolved_at,
-				       COALESCE(t.version, 0)
+				       COALESCE(t.ready_version, 0)
 				FROM inbox_items i
 				LEFT JOIN tasks t ON t.task_id = i.task_id
 				WHERE i.state = 'open' AND i.project_id = ?
@@ -653,7 +653,7 @@ func (s *Store) BuildPABrief(
 			iRows, err = tx.QueryContext(ctx, `
 				SELECT i.inbox_id, i.project_id, i.task_id, i.category, i.ref_id, i.title, i.summary,
 				       i.priority, i.state, i.created_at, i.updated_at, i.resolved_at,
-				       COALESCE(t.version, 0)
+				       COALESCE(t.ready_version, 0)
 				FROM inbox_items i
 				LEFT JOIN tasks t ON t.task_id = i.task_id
 				WHERE i.state = 'open'

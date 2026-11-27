@@ -345,7 +345,7 @@ func (s *Store) Bootstrap(ctx context.Context, machineMeta map[string]protocol.M
 		iRows, err := tx.QueryContext(ctx, `
 			SELECT i.inbox_id, i.project_id, i.task_id, i.category, i.ref_id, i.title, i.summary,
 			       i.priority, i.state, i.created_at, i.updated_at, i.resolved_at,
-			       COALESCE(t.version, 0)
+			       COALESCE(t.ready_version, 0)
 			FROM inbox_items i
 			LEFT JOIN tasks t ON t.task_id = i.task_id
 			WHERE i.state = 'open'
@@ -431,7 +431,7 @@ func scanInboxItem(scanner interface{ Scan(...any) error }) (protocol.InboxItemV
 	if err := scanner.Scan(
 		&item.InboxID, &item.ProjectID, &taskID, &cat, &item.RefID,
 		&item.Title, &item.Summary, &item.Priority, &state,
-		&item.CreatedAt, &item.UpdatedAt, &resolvedAt, &item.TaskVersion,
+		&item.CreatedAt, &item.UpdatedAt, &resolvedAt, &item.ReadyVersion,
 	); err != nil {
 		return item, err
 	}
@@ -515,7 +515,7 @@ const taskSummarySelectSQL = `
 		       (SELECT COUNT(*) FROM board_members bm WHERE bm.task_id = t.task_id AND bm.state IN ('working', 'waiting'))
 		       + (SELECT COUNT(*) FROM tasks ct WHERE ct.parent_task_id = t.task_id AND ct.archived_at IS NULL AND ct.state NOT IN ('done', 'cancelled')
 		          AND NOT EXISTS (SELECT 1 FROM board_members bm2 WHERE bm2.task_id = t.task_id AND bm2.worker_task_id = ct.task_id)) AS worker_count,
-		       t.version, t.created_by, t.created_at, t.updated_at, t.archived_at
+		       t.version, t.ready_version, t.created_by, t.created_at, t.updated_at, t.archived_at
 		FROM tasks t
 		LEFT JOIN attempts a ON a.attempt_id = t.active_attempt_id
 		LEFT JOIN deliveries d ON d.delivery_id = t.latest_delivery_id
@@ -579,7 +579,7 @@ func scanTaskSummary(scanner interface{ Scan(...any) error }) (protocol.TaskSumm
 		&activeAttID, &activeAttState, &latestDlvID, &latestHead,
 		&ts.OpenAnnotationCount, &ts.DeliveryCount,
 		&ts.QueuedInputCount, &ts.WorkerCount,
-		&ts.Version, &createdBy, &ts.CreatedAt, &ts.UpdatedAt, &archivedAt,
+		&ts.Version, &ts.ReadyVersion, &createdBy, &ts.CreatedAt, &ts.UpdatedAt, &archivedAt,
 	); err != nil {
 		return ts, err
 	}
@@ -1589,7 +1589,8 @@ func (s *Store) CreateManualImportDelivery(ctx context.Context, p ManualImportPa
 		// Update task pointers & state
 		_, err = tx.ExecContext(ctx, `
 			UPDATE tasks
-			SET state = 'in_review', latest_delivery_id = ?, version = version + 1, updated_at = ?
+			SET state = 'in_review', latest_delivery_id = ?, version = version + 1,
+			    ready_version = ready_version + 1, updated_at = MAX(?, updated_at + 1)
 			WHERE task_id = ?
 		`, p.DeliveryID, now, taskID)
 		if err != nil {
@@ -1722,7 +1723,7 @@ func loadManualImportExisting(ctx context.Context, tx *sql.Tx, taskID, attemptID
 	iRow := tx.QueryRowContext(ctx, `
 		SELECT i.inbox_id, i.project_id, i.task_id, i.category, i.ref_id, i.title, i.summary,
 		       i.priority, i.state, i.created_at, i.updated_at, i.resolved_at,
-		       COALESCE(t.version, 0)
+		       COALESCE(t.ready_version, 0)
 		FROM inbox_items i
 		LEFT JOIN tasks t ON t.task_id = i.task_id
 		WHERE i.inbox_id = ?
@@ -2720,7 +2721,9 @@ func (s *Store) ReopenDeliveryReview(ctx context.Context, deliveryID, actorID st
 		}
 		if changed, _ := res.RowsAffected(); changed > 0 {
 			if _, err := tx.ExecContext(ctx, `
-				UPDATE tasks SET version = version + 1, updated_at = ? WHERE task_id = ?
+				UPDATE tasks
+				SET version = version + 1, ready_version = ready_version + 1, updated_at = MAX(?, updated_at + 1)
+				WHERE task_id = ?
 			`, now, taskID); err != nil {
 				return err
 			}

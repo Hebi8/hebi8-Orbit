@@ -97,6 +97,8 @@ export interface AttemptRawSyncController {
   getState: (attemptId: string) => AttemptHttpSyncState;
   isCaughtUp: (attemptId: string | undefined) => boolean;
   markNeedsCatchup: (attemptId: string, targetSeq?: number) => void;
+  reset: (attemptId: string) => void;
+  clear: () => void;
   fetchNextPass: (
     attemptId: string,
     fetchPage: (attemptId: string, afterSeq: number, limit: number) => Promise<{ events?: EventRecord[] }>,
@@ -113,6 +115,8 @@ const MAX_TRACKED_ATTEMPTS = 500;
  *   an initial HTTP fetch and a later `watch_ack` are always filled cleanly from `httpCursor`.
  * - Long attempts exceeding `maxPages * pageSize` frames stay `caughtUp = false` and return
  *   `needsMore = true` so callers schedule continuation passes until a short page is reached.
+ * - `reset(attemptId)` drops cursor state when React Query GCs/clears the cached query so reopening
+ *   always rehydrates from `afterSeq=0`.
  */
 export function createAttemptRawSyncController(): AttemptRawSyncController {
   const states = new Map<string, AttemptHttpSyncState>();
@@ -146,6 +150,13 @@ export function createAttemptRawSyncController(): AttemptRawSyncController {
         st.requiredSeq = targetSeq;
       }
     },
+    reset(attemptId: string) {
+      if (!attemptId) return;
+      states.delete(attemptId);
+    },
+    clear() {
+      states.clear();
+    },
     async fetchNextPass(attemptId, fetchPage, opts) {
       const pageSize = opts?.pageSize ?? ATTEMPT_RAW_PAGE_SIZE;
       const maxPages = opts?.maxPages ?? ATTEMPT_RAW_MAX_PAGES_PER_PASS;
@@ -157,6 +168,10 @@ export function createAttemptRawSyncController(): AttemptRawSyncController {
 
       for (let page = 0; page < maxPages; page++) {
         const res = await fetchPage(attemptId, cursor, pageSize);
+        if (states.get(attemptId) !== st) {
+          // Cache was GC'd or reset while this pass was in flight; discard stale cursor progress.
+          return { fetched: [], httpCursor: 0, needsMore: true };
+        }
         const evs = res.events ?? [];
         for (const ev of evs) {
           if (ev.seq > cursor) {
@@ -171,6 +186,10 @@ export function createAttemptRawSyncController(): AttemptRawSyncController {
         hitPageBudget = true;
       }
 
+      if (states.get(attemptId) !== st) {
+        return { fetched: [], httpCursor: 0, needsMore: true };
+      }
+
       if (cursor > st.httpCursor) {
         st.httpCursor = cursor;
       }
@@ -181,6 +200,59 @@ export function createAttemptRawSyncController(): AttemptRawSyncController {
         httpCursor: st.httpCursor,
         needsMore,
       };
+    },
+  };
+}
+
+export interface AttemptRawQueryCacheLike {
+  subscribe: (
+    listener: (event: { type: string; query: { queryKey: readonly unknown[] } }) => void,
+  ) => () => void;
+}
+
+export interface AttemptRawQueryClientLike {
+  getQueryData: <T = unknown>(queryKey: readonly unknown[]) => T | undefined;
+  getQueryCache: () => AttemptRawQueryCacheLike;
+}
+
+export interface BoundAttemptRawSync {
+  controller: AttemptRawSyncController;
+  unsubscribe: () => void;
+  fetchAndMergePass: (
+    attemptId: string,
+    fetchPage: (attemptId: string, afterSeq: number, limit: number) => Promise<{ events?: EventRecord[] }>,
+    opts?: { pageSize?: number; maxPages?: number },
+  ) => Promise<{ merged: EventRecord[]; fetched: EventRecord[]; httpCursor: number; needsMore: boolean }>;
+}
+
+/**
+ * Binds an AttemptRawSyncController to a React Query QueryClient so GC eviction / manual removal /
+ * cache clearing of `['attempt-raw', attemptId]` ALWAYS resets `httpCursor = 0` and `caughtUp = false`.
+ */
+export function bindAttemptRawSyncToQueryClient(qc: AttemptRawQueryClientLike): BoundAttemptRawSync {
+  const controller = createAttemptRawSyncController();
+  const unsubscribe = qc.getQueryCache().subscribe((event) => {
+    if (event.type !== 'removed') return;
+    const key = event.query?.queryKey;
+    if (Array.isArray(key) && key[0] === 'attempt-raw' && typeof key[1] === 'string' && key[1]) {
+      controller.reset(key[1]);
+    }
+  });
+
+  return {
+    controller,
+    unsubscribe,
+    async fetchAndMergePass(attemptId, fetchPage, opts) {
+      // Defensive sync check: if query data was cleared (`setQueryData(..., undefined)`) without a
+      // `removed` event, reset httpCursor to 0 before paginating so history is never skipped.
+      if (qc.getQueryData<EventRecord[]>(['attempt-raw', attemptId]) === undefined) {
+        controller.reset(attemptId);
+      }
+      const res = await controller.fetchNextPass(attemptId, fetchPage, opts);
+      // Re-read cache after async fetch so live WS chunks that landed in-flight are never overwritten.
+      const latest = qc.getQueryData<EventRecord[]>(['attempt-raw', attemptId]);
+      const merged = mergeAttemptRawEvents(latest, res.fetched);
+      return { ...res, merged };
     },
   };
 }

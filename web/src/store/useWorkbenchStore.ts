@@ -1,9 +1,9 @@
 import { create } from 'zustand';
 import type { IDEScheme } from '../generated/protocol';
 import {
-  SEEN_TASKS_STORAGE_KEY,
-  mergeSeenTaskMaps,
-  parseSeenTasksJSON,
+  mergeSeenTaskWatermark,
+  parseSeenTaskKey,
+  parseSeenTaskRecord,
   persistMergedSeenTasks,
   readSeenTasksFromStorage,
   type SeenTaskEntry,
@@ -134,7 +134,7 @@ interface WorkbenchState {
   rememberPrompt: (key: string, body: string) => void;
   markTaskSeen: (taskId: string, watermark: number) => void;
   markTasksSeen: (entries: ReadonlyArray<SeenTaskEntry>) => void;
-  syncSeenTasksFromStorage: (raw: string | null) => void;
+  syncSeenTaskFromStorage: (taskId: string, watermark: number) => void;
   toggleAnnotationSelected: (taskId: string, annotationId: string, selected: boolean) => void;
   clearDeselectedAnnotations: (taskId: string) => void;
   showToast: (text: string, tone?: 'info' | 'err', action?: ToastAction) => void;
@@ -276,9 +276,8 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
       set({ seenTasks: nextMem });
     }
   },
-  syncSeenTasksFromStorage: (raw) => {
-    const incoming = parseSeenTasksJSON(raw);
-    const merged = mergeSeenTaskMaps(get().seenTasks, incoming);
+  syncSeenTaskFromStorage: (taskId, watermark) => {
+    const merged = mergeSeenTaskWatermark(get().seenTasks, taskId, watermark);
     if (merged) {
       set({ seenTasks: merged });
     }
@@ -313,8 +312,11 @@ export function toast(text: string, tone: 'info' | 'err' = 'info', action?: Toas
 
 if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
   window.addEventListener('storage', (e: StorageEvent) => {
-    if (e.key === SEEN_TASKS_STORAGE_KEY && e.newValue !== null) {
-      useWorkbenchStore.getState().syncSeenTasksFromStorage(e.newValue);
+    const taskId = parseSeenTaskKey(e.key);
+    if (!taskId || e.newValue === null) return;
+    const rec = parseSeenTaskRecord(e.newValue);
+    if (rec) {
+      useWorkbenchStore.getState().syncSeenTaskFromStorage(taskId, rec.w);
     }
   });
 }

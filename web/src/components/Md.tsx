@@ -2,7 +2,7 @@ import { isValidElement, memo, useCallback, useEffect, useRef, useState, type Re
 import { AlertCircle, Check, Copy } from 'lucide-react';
 import Markdown, { type Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { classifyMdHref, safeMdUrlTransform } from '../lib/markdown';
+import { classifyMdHref, findFootnoteTargetInContainer, safeMdUrlTransform } from '../lib/markdown';
 import { navigate } from '../lib/router';
 
 export { classifyMdHref, isFootnoteHref, type MdHrefKind } from '../lib/markdown';
@@ -148,10 +148,8 @@ const MD_COMPONENTS: Components = {
           {...dataProps}
           onClick={(e) => {
             e.preventDefault();
-            const targetId = safeHref.slice(1);
             const scope = e.currentTarget.closest('.md');
-            if (!scope || !targetId) return;
-            const target = Array.from(scope.querySelectorAll<HTMLElement>('[id]')).find((el) => el.id === targetId);
+            const target = findFootnoteTargetInContainer<HTMLElement>(scope, safeHref);
             target?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
           }}
         >

@@ -84,28 +84,32 @@ export function indexInboxByTask(items: readonly InboxItemView[]): Map<string, I
   return map;
 }
 
-/** Map of taskId -> latest seen Hub monotonic watermark (`tasks.version`) for read/unread blue-dot semantics. */
+/** Map of taskId -> latest seen Hub monotonic watermark (`tasks.ready_version`) for read/unread blue-dot semantics. */
 export type SeenTaskMap = Readonly<Record<string, number>>;
 
 /**
  * Computes the Hub-authoritative monotonic ready watermark for a task/child:
- * strictly uses Hub's `tasks.version` (and `inbox.taskVersion` for open `delivery_review` items),
- * completely immune to browser or cross-machine Runner wall-clock skew.
+ * strictly uses Hub's `tasks.ready_version` (and `inbox.readyVersion` for open `delivery_review` items),
+ * which advances ONLY on real reviewable outputs (attempt succeeded, delivery published, plain-folder promote,
+ * review reopened) — never on archive/unarchive and completely immune to browser or Runner clock skew.
  */
 export function effectiveReadyWatermark(
-  task: { version?: number | null },
+  task: { readyVersion?: number | null },
   inboxItems?: readonly InboxItemView[],
 ): number {
-  let wm = typeof task.version === 'number' && Number.isFinite(task.version) && task.version > 0 ? task.version : 0;
+  let wm =
+    typeof task.readyVersion === 'number' && Number.isFinite(task.readyVersion) && task.readyVersion > 0
+      ? task.readyVersion
+      : 0;
   if (inboxItems) {
     for (const it of inboxItems) {
       if (
         it.category === 'delivery_review' &&
-        typeof it.taskVersion === 'number' &&
-        Number.isFinite(it.taskVersion) &&
-        it.taskVersion > wm
+        typeof it.readyVersion === 'number' &&
+        Number.isFinite(it.readyVersion) &&
+        it.readyVersion > wm
       ) {
-        wm = it.taskVersion;
+        wm = it.readyVersion;
       }
     }
   }
@@ -174,10 +178,10 @@ export function isChildFinishedForParentRead(
  * (never browser `Date.now()`).
  */
 export function collectParentSeenEntries(
-  parentTask: Pick<TaskSummary, 'taskId'> & { version?: number | null },
+  parentTask: Pick<TaskSummary, 'taskId'> & { readyVersion?: number | null },
   children: ReadonlyArray<
     Pick<TaskSummary, 'taskId' | 'state'> & {
-      version?: number | null;
+      readyVersion?: number | null;
       openApprovalCount?: number;
       activeAttemptState?: AttemptState | null;
     }
@@ -212,7 +216,7 @@ export function inboxItemsMark(
     if (it.category === 'approval_pending' || it.category === 'memory_conflict' || it.category === 'task_blocked') {
       m = 'needs-you';
     } else if (it.category === 'delivery_review') {
-      if (isReadyUnseen(it.taskId, it.taskVersion ?? 0, seenTasks)) {
+      if (isReadyUnseen(it.taskId, it.readyVersion ?? 0, seenTasks)) {
         m = 'ready';
       }
     }
@@ -222,7 +226,7 @@ export function inboxItemsMark(
 }
 
 export function sessionMark(
-  t: Pick<TaskSummary, 'state' | 'activeAttemptState'> & Partial<Pick<TaskSummary, 'taskId' | 'version'>>,
+  t: Pick<TaskSummary, 'state' | 'activeAttemptState'> & Partial<Pick<TaskSummary, 'taskId' | 'readyVersion'>>,
   inboxItems?: readonly InboxItemView[],
   seenTasks?: SeenTaskMap,
 ): SessionMark {
@@ -273,7 +277,7 @@ export function mergeSessionMarks(...marks: SessionMark[]): SessionMark {
 
 /** Derives the single trailing StatusMark for a ChildTaskView. */
 export function childSessionMark(
-  child: Pick<ChildTaskView, 'state' | 'openApprovalCount'> & Partial<Pick<ChildTaskView, 'taskId' | 'version'>>,
+  child: Pick<ChildTaskView, 'state' | 'openApprovalCount'> & Partial<Pick<ChildTaskView, 'taskId' | 'readyVersion'>>,
   inboxItems?: readonly InboxItemView[],
   seenTasks?: SeenTaskMap,
 ): SessionMark {

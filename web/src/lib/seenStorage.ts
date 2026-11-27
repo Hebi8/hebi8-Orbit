@@ -1,9 +1,12 @@
-export const SEEN_TASKS_STORAGE_KEY = 'orbit.seenTasks.v2';
+export const SEEN_TASK_KEY_PREFIX = 'orbit.seen.v2.';
 export const SEEN_TASKS_MAX = 2000;
 
 export interface StorageLike {
+  readonly length: number;
+  key(index: number): string | null;
   getItem(key: string): string | null;
   setItem(key: string, value: string): void;
+  removeItem(key: string): void;
 }
 
 export interface SeenTaskEntry {
@@ -11,137 +14,208 @@ export interface SeenTaskEntry {
   watermark: number;
 }
 
-export function parseSeenTasksJSON(raw: string | null | undefined): Record<string, number> {
-  if (!raw) return {};
+export interface SeenTaskRecord {
+  /** Hub monotonic readyVersion watermark (NEVER browser wall clock). */
+  w: number;
+  /** Local last-read timestamp used strictly for LRU eviction order. */
+  r: number;
+}
+
+export function seenTaskStorageKey(taskId: string): string {
+  return `${SEEN_TASK_KEY_PREFIX}${taskId}`;
+}
+
+export function parseSeenTaskKey(key: string | null | undefined): string | null {
+  if (!key || !key.startsWith(SEEN_TASK_KEY_PREFIX)) return null;
+  const taskId = key.slice(SEEN_TASK_KEY_PREFIX.length).trim();
+  return taskId || null;
+}
+
+export function parseSeenTaskRecord(raw: string | null | undefined): SeenTaskRecord | null {
+  if (!raw) return null;
   try {
     const parsed: unknown = JSON.parse(raw);
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
-    const out: Record<string, number> = {};
-    for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
-      const id = k.trim();
-      if (id && typeof v === 'number' && Number.isFinite(v) && v > 0) {
-        out[id] = v;
-      }
-    }
-    return out;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+    const obj = parsed as { w?: unknown; r?: unknown };
+    if (typeof obj.w !== 'number' || !Number.isFinite(obj.w) || obj.w <= 0) return null;
+    const r = typeof obj.r === 'number' && Number.isFinite(obj.r) && obj.r >= 0 ? obj.r : 0;
+    return { w: obj.w, r };
   } catch {
-    return {};
+    return null;
   }
 }
 
+/** Loads all per-task `orbit.seen.v2.<taskId>` records from storage into a `taskId -> watermark` map. */
 export function readSeenTasksFromStorage(
-  storage: Pick<StorageLike, 'getItem'> | null | undefined,
-  key = SEEN_TASKS_STORAGE_KEY,
+  storage: Pick<StorageLike, 'length' | 'key' | 'getItem'> | null | undefined,
 ): Record<string, number> {
   if (!storage) return {};
+  const out: Record<string, number> = {};
   try {
-    return parseSeenTasksJSON(storage.getItem(key));
+    const len = storage.length;
+    for (let i = 0; i < len; i++) {
+      const k = storage.key(i);
+      const taskId = parseSeenTaskKey(k);
+      if (!taskId || !k) continue;
+      const rec = parseSeenTaskRecord(storage.getItem(k));
+      if (rec && rec.w > (out[taskId] ?? 0)) {
+        out[taskId] = rec.w;
+      }
+    }
   } catch {
-    return {};
+    // storage may be unavailable (private mode)
   }
+  return out;
 }
 
-/** Monotonically merges `incoming` into `base` taking Math.max per taskId; returns null when unchanged. */
-export function mergeSeenTaskMaps(
+/** Monotonically merges a single task watermark into `base`; returns null when unchanged (strictly idempotent). */
+export function mergeSeenTaskWatermark(
   base: Readonly<Record<string, number>>,
-  incoming: Readonly<Record<string, number>>,
+  taskId: string,
+  watermark: number,
   max = SEEN_TASKS_MAX,
 ): Record<string, number> | null {
-  let next: Record<string, number> | null = null;
-  for (const [rawId, val] of Object.entries(incoming)) {
-    const id = rawId.trim();
-    if (!id || typeof val !== 'number' || !Number.isFinite(val) || val <= 0) continue;
-    const prev = (next ?? base)[id] ?? 0;
-    if (val > prev) {
-      if (!next) next = { ...base };
-      next[id] = val;
-    }
-  }
-  if (!next) return null;
-  return pruneSeenTaskMap(next, max);
+  const id = taskId.trim();
+  if (!id || !Number.isFinite(watermark) || watermark <= 0) return null;
+  if (watermark <= (base[id] ?? 0)) return null;
+  const next: Record<string, number> = { ...base };
+  // Refresh insertion order so in-memory eviction (if needed) also respects recency.
+  delete next[id];
+  next[id] = watermark;
+  pruneMemoryMapByInsertionOrder(next, max);
+  return next;
 }
 
-export function pruneSeenTaskMap(map: Record<string, number>, max = SEEN_TASKS_MAX): Record<string, number> {
+function pruneMemoryMapByInsertionOrder(map: Record<string, number>, max: number) {
   const keys = Object.keys(map);
-  if (keys.length <= max) return map;
-  keys.sort((a, b) => map[a] - map[b]);
+  if (keys.length <= max) return;
   for (const k of keys.slice(0, keys.length - max)) {
     delete map[k];
   }
-  return map;
 }
 
 /**
- * Multi-tab-safe read-modify-write for seenTasks:
- * 1. Reads the latest serialized map from `storage` first so concurrent tabs never clobber each other.
- * 2. Monotonically merges `currentMem`, latest `storage`, and new `entries` via Math.max.
- * 3. Writes to `storage` ONLY when the merged map advances beyond what `storage` already holds.
- * 4. Returns `nextMem` ONLY when memory strictly advances (strictly idempotent — prevents render loops).
+ * Evicts the least-recently-read (`r` ascending) `orbit.seen.v2.*` keys when total persisted keys
+ * exceed `max`, so newly-read low-watermark tasks are NEVER evicted behind older high-version tasks.
+ */
+function evictOverflowSeenTasksInStorage(
+  storage: StorageLike,
+  max: number,
+  protectedIds: ReadonlySet<string>,
+): string[] {
+  const records: Array<{ key: string; taskId: string; r: number }> = [];
+  try {
+    const len = storage.length;
+    for (let i = 0; i < len; i++) {
+      const k = storage.key(i);
+      const taskId = parseSeenTaskKey(k);
+      if (!taskId || !k) continue;
+      const rec = parseSeenTaskRecord(storage.getItem(k));
+      records.push({ key: k, taskId, r: rec?.r ?? 0 });
+    }
+  } catch {
+    return [];
+  }
+  if (records.length <= max) return [];
+
+  records.sort((a, b) => a.r - b.r || a.key.localeCompare(b.key));
+  let toRemove = records.length - max;
+  const evicted: string[] = [];
+  for (const item of records) {
+    if (toRemove <= 0) break;
+    if (protectedIds.has(item.taskId)) continue;
+    try {
+      storage.removeItem(item.key);
+      evicted.push(item.taskId);
+      toRemove -= 1;
+    } catch {
+      // ignore individual storage removal errors
+    }
+  }
+  return evicted;
+}
+
+/**
+ * Per-task lock-free multi-tab-safe persistence for seenTasks:
+ * 1. Each task occupies its own `orbit.seen.v2.<taskId>` key (`{ w: watermark, r: touchedAt }`),
+ *    eliminating cross-tab whole-table clobbering when tabs mark different tasks concurrently.
+ * 2. Before writing a task's key, reads that task's latest persisted `w` and writes ONLY when
+ *    `Math.max(storedW, memW, candidateW) > storedW` (monotonic & strictly idempotent).
+ * 3. When total persisted keys exceed `max`, evicts strictly by oldest `r` (LRU), never by `w`.
  */
 export function persistMergedSeenTasks(
   storage: StorageLike | null | undefined,
   currentMem: Readonly<Record<string, number>>,
   entries: ReadonlyArray<SeenTaskEntry>,
-  key = SEEN_TASKS_STORAGE_KEY,
-  max = SEEN_TASKS_MAX,
-): { nextMem: Record<string, number> | null; wroteStorage: boolean } {
+  opts?: { max?: number; nowMs?: number },
+): { nextMem: Record<string, number> | null; wroteStorage: boolean; evictedTaskIds: string[] } {
+  const max = opts?.max ?? SEEN_TASKS_MAX;
   if (!entries || entries.length === 0) {
-    return { nextMem: null, wroteStorage: false };
+    return { nextMem: null, wroteStorage: false, evictedTaskIds: [] };
   }
 
-  const delta: Record<string, number> = {};
-  let hasDelta = false;
+  const delta = new Map<string, number>();
   for (const entry of entries) {
     const id = entry.taskId?.trim();
     if (!id || !Number.isFinite(entry.watermark) || entry.watermark <= 0) continue;
-    const prev = delta[id] ?? 0;
+    const prev = delta.get(id) ?? 0;
     if (entry.watermark > prev) {
-      delta[id] = entry.watermark;
-      hasDelta = true;
+      delta.set(id, entry.watermark);
     }
   }
-  if (!hasDelta) {
-    return { nextMem: null, wroteStorage: false };
+  if (delta.size === 0) {
+    return { nextMem: null, wroteStorage: false, evictedTaskIds: [] };
   }
 
-  const stored = readSeenTasksFromStorage(storage, key);
-  const combined: Record<string, number> = { ...stored };
-  for (const [id, v] of Object.entries(currentMem)) {
-    if (v > (combined[id] ?? 0)) combined[id] = v;
-  }
-  for (const [id, v] of Object.entries(delta)) {
-    if (v > (combined[id] ?? 0)) combined[id] = v;
-  }
-  pruneSeenTaskMap(combined, max);
-
-  let storageChanged = false;
-  for (const [id, v] of Object.entries(combined)) {
-    if (v > (stored[id] ?? 0)) {
-      storageChanged = true;
-      break;
-    }
-  }
-
+  const touchBase = typeof opts?.nowMs === 'number' && Number.isFinite(opts.nowMs) ? opts.nowMs : Date.now();
+  let nextMem: Record<string, number> | null = null;
   let wroteStorage = false;
-  if (storageChanged && storage) {
-    try {
-      storage.setItem(key, JSON.stringify(combined));
-      wroteStorage = true;
-    } catch {
-      // storage may be unavailable (private mode)
+  const protectedIds = new Set<string>(delta.keys());
+
+  for (const [id, candidateW] of delta) {
+    const key = seenTaskStorageKey(id);
+    let storedRec: SeenTaskRecord | null = null;
+    if (storage) {
+      try {
+        storedRec = parseSeenTaskRecord(storage.getItem(key));
+      } catch {
+        storedRec = null;
+      }
+    }
+    const storedW = storedRec?.w ?? 0;
+    const memW = currentMem[id] ?? 0;
+    const finalW = Math.max(storedW, memW, candidateW);
+
+    if (storage && finalW > storedW) {
+      const nextTouch = Math.max(touchBase, (storedRec?.r ?? 0) + 1);
+      try {
+        storage.setItem(key, JSON.stringify({ w: finalW, r: nextTouch } satisfies SeenTaskRecord));
+        wroteStorage = true;
+      } catch {
+        // storage may be unavailable or full
+      }
+    }
+
+    if (finalW > memW) {
+      if (!nextMem) nextMem = { ...currentMem };
+      delete nextMem[id];
+      nextMem[id] = finalW;
     }
   }
 
-  let memChanged = false;
-  for (const [id, v] of Object.entries(combined)) {
-    if (v > (currentMem[id] ?? 0)) {
-      memChanged = true;
-      break;
+  let evictedTaskIds: string[] = [];
+  if (wroteStorage && storage) {
+    evictedTaskIds = evictOverflowSeenTasksInStorage(storage, max, protectedIds);
+    if (evictedTaskIds.length > 0 && nextMem) {
+      for (const evictedId of evictedTaskIds) {
+        delete nextMem[evictedId];
+      }
     }
   }
 
-  return {
-    nextMem: memChanged ? combined : null,
-    wroteStorage,
-  };
+  if (nextMem) {
+    pruneMemoryMapByInsertionOrder(nextMem, max);
+  }
+
+  return { nextMem, wroteStorage, evictedTaskIds };
 }

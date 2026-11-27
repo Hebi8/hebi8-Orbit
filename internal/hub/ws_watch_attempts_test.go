@@ -612,10 +612,12 @@ func TestStore_MonotonicTaskVersionWatermarkAdvancesAcrossSkewedRunnerClocks(t *
 		t.Fatal(err)
 	}
 
-	if parent.Task.Version < 1 || child.Task.Version < 1 {
-		t.Fatalf("expected initial versions >= 1, got parent=%d child=%d", parent.Task.Version, child.Task.Version)
+	if parent.Task.Version < 1 || child.Task.Version < 1 || parent.Task.ReadyVersion < 1 || child.Task.ReadyVersion < 1 {
+		t.Fatalf("expected initial versions/readyVersions >= 1, got parent=(%d,%d) child=(%d,%d)",
+			parent.Task.Version, parent.Task.ReadyVersion, child.Task.Version, child.Task.ReadyVersion)
 	}
 	vChildBefore := child.Task.Version
+	rvChildBefore := child.Task.ReadyVersion
 
 	// Runner reports attempt completion with a clock skewed 1 hour INTO THE PAST.
 	pastSkewTS := time.Now().Add(-1 * time.Hour).UnixMilli()
@@ -650,8 +652,67 @@ func TestStore_MonotonicTaskVersionWatermarkAdvancesAcrossSkewedRunnerClocks(t *
 	if childAfter.Version <= vChildBefore {
 		t.Fatalf("expected child Version to strictly increase past %d despite skewed Runner TS, got %d", vChildBefore, childAfter.Version)
 	}
+	if childAfter.ReadyVersion <= rvChildBefore {
+		t.Fatalf("expected child ReadyVersion to strictly increase past %d despite skewed Runner TS, got %d", rvChildBefore, childAfter.ReadyVersion)
+	}
 	// Hub also keeps UpdatedAt on Hub server clock (not Runner's 1-hour-past TS).
 	if childAfter.UpdatedAt <= pastSkewTS+30*60*1000 {
 		t.Fatalf("expected Hub server UpdatedAt (not Runner pastSkewTS=%d), got %d", pastSkewTS, childAfter.UpdatedAt)
+	}
+
+	// Verify archive -> unarchive does NOT bump ReadyVersion (so already-read task never spuriously re-lights blue dot),
+	// whereas plain-folder promote MUST bump ReadyVersion so the new delivery re-lights the blue dot.
+	seenWatermark := childAfter.ReadyVersion
+	updatedBeforeArchive := childAfter.UpdatedAt
+
+	archivedTask, _, err := st.ArchiveTask(ctx, child.Task.TaskID, "human")
+	if err != nil {
+		t.Fatalf("ArchiveTask failed: %v", err)
+	}
+	if archivedTask.ReadyVersion != seenWatermark {
+		t.Fatalf("ArchiveTask must NOT advance ReadyVersion: got %d, want %d", archivedTask.ReadyVersion, seenWatermark)
+	}
+	if archivedTask.UpdatedAt != updatedBeforeArchive {
+		t.Fatalf("ArchiveTask must NOT mutate UpdatedAt: got %d, want %d", archivedTask.UpdatedAt, updatedBeforeArchive)
+	}
+
+	unarchivedTask, _, err := st.UnarchiveTask(ctx, child.Task.TaskID, "human")
+	if err != nil {
+		t.Fatalf("UnarchiveTask failed: %v", err)
+	}
+	if unarchivedTask.Version <= archivedTask.Version {
+		t.Fatalf("expected UnarchiveTask to advance row Version for concurrency, got %d <= %d", unarchivedTask.Version, archivedTask.Version)
+	}
+	if unarchivedTask.ReadyVersion != seenWatermark {
+		t.Fatalf("UnarchiveTask must NOT advance ReadyVersion: got %d, want %d", unarchivedTask.ReadyVersion, seenWatermark)
+	}
+	if unarchivedTask.UpdatedAt != updatedBeforeArchive {
+		t.Fatalf("UnarchiveTask must NOT mutate UpdatedAt: got %d, want %d", unarchivedTask.UpdatedAt, updatedBeforeArchive)
+	}
+
+	// Promote plain-folder delivery -> MUST strictly advance ReadyVersion and UpdatedAt!
+	if _, _, err := st.PromoteAttemptFolderDelivery(
+		ctx,
+		*child.Attempt,
+		"folder:demo-app",
+		"Promoted plain-folder delivery",
+		nil,
+		2,
+		15,
+		3,
+		"human",
+	); err != nil {
+		t.Fatalf("PromoteAttemptFolderDelivery failed: %v", err)
+	}
+
+	kidsAfterPromote, err := st.ListChildTasks(ctx, parent.Task.TaskID, false)
+	if err != nil || len(kidsAfterPromote) != 1 {
+		t.Fatalf("ListChildTasks after promote failed: %v (len=%d)", err, len(kidsAfterPromote))
+	}
+	if kidsAfterPromote[0].ReadyVersion <= seenWatermark {
+		t.Fatalf("expected PromoteAttemptFolderDelivery to strictly advance ReadyVersion past %d, got %d", seenWatermark, kidsAfterPromote[0].ReadyVersion)
+	}
+	if kidsAfterPromote[0].UpdatedAt <= updatedBeforeArchive {
+		t.Fatalf("expected PromoteAttemptFolderDelivery to strictly advance UpdatedAt past %d, got %d", updatedBeforeArchive, kidsAfterPromote[0].UpdatedAt)
 	}
 }

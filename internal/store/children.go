@@ -86,7 +86,7 @@ func listChildTasksTx(ctx context.Context, tx *sql.Tx, parentTaskID string, incl
 		       (SELECT COUNT(*) FROM deliveries dl WHERE dl.task_id = t.task_id) AS dlv_count,
 		       (SELECT COUNT(*) FROM attempts att WHERE att.task_id = t.task_id) AS att_count,
 		       (SELECT COUNT(*) FROM approvals ap WHERE ap.task_id = t.task_id AND ap.state = 'pending') AS open_approvals,
-		       t.version, t.created_at, t.updated_at, t.archived_at
+		       t.version, t.ready_version, t.created_at, t.updated_at, t.archived_at
 		FROM tasks t
 		LEFT JOIN projects p ON p.project_id = t.project_id
 		WHERE t.parent_task_id = ? %s
@@ -108,7 +108,7 @@ func listChildTasksTx(ctx context.Context, tx *sql.Tx, parentTaskID string, incl
 			&c.Title, &c.Goal, &stateStr, &adp,
 			&cfgJSON, &activeAtt, &latestDlv,
 			&c.DeliveryCount, &c.AttemptCount, &c.OpenApprovalCount,
-			&c.Version, &c.CreatedAt, &c.UpdatedAt, &archivedAt,
+			&c.Version, &c.ReadyVersion, &c.CreatedAt, &c.UpdatedAt, &archivedAt,
 		); err != nil {
 			rows.Close()
 			return nil, err

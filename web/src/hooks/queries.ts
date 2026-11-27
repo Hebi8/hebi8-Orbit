@@ -1,12 +1,12 @@
 import { useEffect } from 'react';
 import { useQueries, useQuery, useQueryClient, type QueryClient } from '@tanstack/react-query';
-import type { EventRecord, MachineView, ProjectView, TaskSummary } from '../generated/protocol';
+import type { MachineView, ProjectView, TaskSummary } from '../generated/protocol';
 import { api } from '../lib/api';
 import {
   attemptWatchRegistry,
-  createAttemptRawSyncController,
-  mergeAttemptRawEvents,
+  bindAttemptRawSyncToQueryClient,
   type AttemptRawSyncController,
+  type BoundAttemptRawSync,
 } from '../lib/attemptStream';
 import { useWorkbenchStore } from '../store/useWorkbenchStore';
 
@@ -264,15 +264,19 @@ export function useHebi8Expand(nodeId: string | undefined, opts?: { offset?: num
   });
 }
 
-const rawSyncByClient = new WeakMap<QueryClient, AttemptRawSyncController>();
+const rawSyncByClient = new WeakMap<QueryClient, BoundAttemptRawSync>();
+
+function getBoundAttemptRawSync(qc: QueryClient): BoundAttemptRawSync {
+  let bound = rawSyncByClient.get(qc);
+  if (!bound) {
+    bound = bindAttemptRawSyncToQueryClient(qc);
+    rawSyncByClient.set(qc, bound);
+  }
+  return bound;
+}
 
 export function getAttemptRawSyncController(qc: QueryClient): AttemptRawSyncController {
-  let ctrl = rawSyncByClient.get(qc);
-  if (!ctrl) {
-    ctrl = createAttemptRawSyncController();
-    rawSyncByClient.set(qc, ctrl);
-  }
-  return ctrl;
+  return getBoundAttemptRawSync(qc).controller;
 }
 
 /** Marks an attempt as requiring a contiguous HTTP catchup from its independent `httpCursor` and refetches if active. */
@@ -285,6 +289,7 @@ export function scheduleAttemptRawCatchup(qc: QueryClient, attemptId: string, ta
 /**
  * Real-time raw ACP stream for one attempt:
  * - Tracks an independent contiguous `httpCursor` per attempt (NEVER advanced by high-seq WS pushes).
+ * - Automatically resets `httpCursor = 0` whenever React Query GCs/removes or clears the cache entry.
  * - Multi-page catchup continues cleanly across passes for >10,000-frame attempts until a short page is reached.
  * - While `opts.live` is true, registers `attemptId` in `attemptWatchRegistry` so `/ws/client`
  *   pushes live `raw_acp` chunks directly into `['attempt-raw', attemptId]` in-place (zero 2s polling).
@@ -294,7 +299,7 @@ export function useAttemptRaw(attemptId: string | undefined, opts: { enabled: bo
   const qc = useQueryClient();
   const wsStatus = useWorkbenchStore((s) => s.wsStatus);
   const watching = !!attemptId && opts.enabled && opts.live;
-  const syncCtrl = getAttemptRawSyncController(qc);
+  const boundSync = getBoundAttemptRawSync(qc);
 
   useEffect(() => {
     if (!watching || !attemptId) return;
@@ -306,18 +311,15 @@ export function useAttemptRaw(attemptId: string | undefined, opts: { enabled: bo
     enabled: !!attemptId && opts.enabled,
     queryFn: async () => {
       const id = attemptId!;
-      const res = await syncCtrl.fetchNextPass(id, (aid, afterSeq, limit) => api.getAttemptRaw(aid, afterSeq, limit));
-      // Re-read cache after async fetch so live WS chunks that landed in-flight are never overwritten.
-      const latest = qc.getQueryData<EventRecord[]>(['attempt-raw', id]);
-      const merged = mergeAttemptRawEvents(latest, res.fetched);
+      const res = await boundSync.fetchAndMergePass(id, (aid, afterSeq, limit) => api.getAttemptRaw(aid, afterSeq, limit));
       if (res.needsMore) {
         window.setTimeout(() => {
           void qc.invalidateQueries({ queryKey: ['attempt-raw', id], exact: true, refetchType: 'active' });
         }, 0);
       }
-      return merged;
+      return res.merged;
     },
     refetchInterval: watching && wsStatus !== 'live' ? 2000 : false,
-    staleTime: opts.live || !syncCtrl.isCaughtUp(attemptId) ? 0 : 60_000,
+    staleTime: opts.live || !boundSync.controller.isCaughtUp(attemptId) ? 0 : 60_000,
   });
 }

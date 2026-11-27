@@ -1522,7 +1522,10 @@ func (s *Store) PromoteAttemptFolderDelivery(
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, `
-			UPDATE tasks SET latest_delivery_id = ?, updated_at = ? WHERE task_id = ?
+			UPDATE tasks
+			SET latest_delivery_id = ?, version = version + 1, ready_version = ready_version + 1,
+			    updated_at = MAX(?, updated_at + 1)
+			WHERE task_id = ?
 		`, dlvID, now, att.TaskID); err != nil {
 			return err
 		}

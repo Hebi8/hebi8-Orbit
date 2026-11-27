@@ -371,7 +371,7 @@ export function SessionPage({
       {
         taskId: string;
         state: typeof task.state;
-        version: number;
+        readyVersion: number;
         openApprovalCount?: number;
         activeAttemptState?: typeof task.activeAttemptState;
       }
