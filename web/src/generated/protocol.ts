@@ -512,6 +512,8 @@ export interface FolderChangesSummary {
   totalDels: number;
   files: FolderChangeItem[];
   promoted?: boolean;
+  concurrentSharedDir?: boolean;
+  concurrentNotice?: string;
 }
 
 export interface ReferencedTaskMeta {
@@ -785,6 +787,7 @@ export interface TaskTimelineResponse {
   approvals: ApprovalView[];
   sources: TaskSource[];
   boardMembers: BoardMemberCursor[];
+  boardMessageCount?: number;
   events: EventRecord[];
 }
 

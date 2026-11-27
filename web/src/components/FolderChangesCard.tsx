@@ -57,6 +57,11 @@ export function FolderChangesCard({
 
         {open && (
           <div className="fc-list">
+            {(changes.concurrentSharedDir || changes.concurrentNotice) && (
+              <div className="fc-row" style={{ color: 'var(--warn)', fontSize: 11.5 }}>
+                <span className="ell">{changes.concurrentNotice || '共享目录存在并发运行，以下变更可能包含同期其他会话的修改'}</span>
+              </div>
+            )}
             {files.map((f) => {
               const tag = f.kind === 'add' ? 'A' : f.kind === 'del' ? 'D' : 'M';
               return (

@@ -176,10 +176,10 @@ export function RightCard({
   const sessionArtifacts = collectSessionArtifacts(tl);
   const allMembers = board?.members ?? tl.boardMembers;
   const nativeMembers = allMembers.filter((m) => !m.workerTaskId);
-  const effectiveChildren = isChildSession ? [] : (childrenList ?? tl.children ?? []);
+  const effectiveChildren = isChildSession || isPA ? [] : (childrenList ?? tl.children ?? []);
   const totalSubs = effectiveChildren.length + nativeMembers.length;
-  const boardMsgCount = board?.messages?.length ?? 0;
-  const showSubsSection = !isChildSession && (totalSubs > 0 || tl.task.workerCount > 0 || boardMsgCount > 0);
+  const boardMsgCount = Math.max(board?.messages?.length ?? 0, tl.boardMessageCount ?? 0);
+  const showSubsSection = !isChildSession && !isPA && (totalSubs > 0 || tl.task.workerCount > 0 || boardMsgCount > 0);
 
   const lastAttempt = tl.attempts[tl.attempts.length - 1];
   const matchedPart = lastAttempt?.partId ? project?.parts?.find((p) => p.partId === lastAttempt.partId) : project?.parts?.[0];
@@ -414,7 +414,8 @@ export function RightCard({
               onChange={(e) => setLabel(e.target.value)}
               {...ime.compositionProps}
               onKeyDown={(e) => {
-                if (e.key === 'Enter' && ime.isImeEnter(e)) e.preventDefault();
+                const blocked = ime.isImeEnter(e);
+                if (e.key === 'Enter' && blocked) e.preventDefault();
               }}
             />
             <input
@@ -424,7 +425,8 @@ export function RightCard({
               onChange={(e) => setUri(e.target.value)}
               {...ime.compositionProps}
               onKeyDown={(e) => {
-                if (e.key === 'Enter' && ime.isImeEnter(e)) e.preventDefault();
+                const blocked = ime.isImeEnter(e);
+                if (e.key === 'Enter' && blocked) e.preventDefault();
               }}
               autoFocus
             />

@@ -128,6 +128,25 @@ func saveDynamicNetworkSettingsTx(ctx context.Context, tx *sql.Tx, ns DynamicNet
 	return err
 }
 
+func loadActiveRegistryMachinesSetTx(ctx context.Context, tx *sql.Tx) (map[string]bool, error) {
+	out := map[string]bool{}
+	rows, err := tx.QueryContext(ctx, `SELECT machine_id FROM registry_machines WHERE removed_at IS NULL`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		if t := strings.TrimSpace(id); t != "" {
+			out[t] = true
+		}
+	}
+	return out, rows.Err()
+}
+
 func loadRemovedMachinesSetTx(ctx context.Context, tx *sql.Tx) (map[string]bool, error) {
 	out := map[string]bool{}
 	ns, err := loadDynamicNetworkSettingsTx(ctx, tx)
@@ -242,20 +261,55 @@ func (s *Store) GetDynamicNetworkSettings(ctx context.Context) (DynamicNetworkSe
 
 // SaveDynamicNetworkSettings persists updated dynamic network settings and emits an event.
 func (s *Store) SaveDynamicNetworkSettings(ctx context.Context, settings DynamicNetworkSettings, actorID string) (protocol.EventRecord, error) {
-	raw, err := json.Marshal(settings)
-	if err != nil {
-		return protocol.EventRecord{}, err
-	}
+	_, ev, err := s.UpdateDynamicNetworkSettings(ctx, actorID, func(cur *DynamicNetworkSettings) error {
+		*cur = settings
+		return nil
+	})
+	return ev, err
+}
+
+// UpdateDynamicNetworkSettings atomically reads the latest network_settings inside a single
+// BEGIN IMMEDIATE write transaction, applies mutate, prunes removed machines from dutyPriority,
+// persists the merged settings without clobbering concurrent removedMachines tombstones, and emits an event.
+func (s *Store) UpdateDynamicNetworkSettings(
+	ctx context.Context,
+	actorID string,
+	mutate func(cur *DynamicNetworkSettings) error,
+) (DynamicNetworkSettings, protocol.EventRecord, error) {
 	now := time.Now().UnixMilli()
+	var updated DynamicNetworkSettings
 	var ev protocol.EventRecord
-	err = s.WithWriteTx(ctx, func(tx *sql.Tx) error {
-		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO hub_settings (key, value_json, updated_at)
-			VALUES ('network_settings', ?, ?)
-			ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at
-		`, string(raw), now); err != nil {
+	err := s.WithWriteTx(ctx, func(tx *sql.Tx) error {
+		cur, err := loadDynamicNetworkSettingsTx(ctx, tx)
+		if err != nil {
 			return err
 		}
+		if mutate != nil {
+			if err := mutate(&cur); err != nil {
+				return err
+			}
+		}
+		removedSet, err := loadRemovedMachinesSetTx(ctx, tx)
+		if err != nil {
+			return err
+		}
+		if len(cur.DutyPriority) > 0 {
+			cleaned := make([]string, 0, len(cur.DutyPriority))
+			seen := map[string]bool{}
+			for _, id := range cur.DutyPriority {
+				t := strings.TrimSpace(id)
+				if t == "" || seen[t] || removedSet[t] {
+					continue
+				}
+				seen[t] = true
+				cleaned = append(cleaned, t)
+			}
+			cur.DutyPriority = cleaned
+		}
+		if err := saveDynamicNetworkSettingsTx(ctx, tx, cur, now); err != nil {
+			return err
+		}
+		updated = cur
 		var err2 error
 		ev, err2 = insertEventTx(ctx, tx, eventInsert{
 			StreamID:   "global",
@@ -264,15 +318,15 @@ func (s *Store) SaveDynamicNetworkSettings(ctx context.Context, settings Dynamic
 			Kind:       protocol.EventNetworkSettingsChanged,
 			Visibility: protocol.VisibilityTimeline,
 			Payload: map[string]any{
-				"workspaceName":   settings.WorkspaceName,
-				"tailscaleShared": settings.TailscaleShared,
-				"tailscaleOrigin": settings.TailscaleOrigin,
+				"workspaceName":   cur.WorkspaceName,
+				"tailscaleShared": cur.TailscaleShared,
+				"tailscaleOrigin": cur.TailscaleOrigin,
 			},
 			CreatedAt: now,
 		})
 		return err2
 	})
-	return ev, err
+	return updated, ev, err
 }
 
 // CreateClientToken mints and persists a new ock_ client bearer token.
@@ -785,9 +839,12 @@ func (s *Store) ClaimPairingCode(ctx context.Context, p ClaimPairingCodeParams) 
 					VALUES (?, 'remote_ws', 'offline', ?, ?, ?, ?, '{}', ?, ?, ?)
 					ON CONFLICT(machine_id) DO UPDATE SET
 						transport_mode = 'remote_ws',
+						status = 'offline',
 						role = excluded.role,
 						os_name = CASE WHEN excluded.os_name != '' THEN excluded.os_name ELSE machines.os_name END,
 						capabilities_json = excluded.capabilities_json,
+						adapters_json = excluded.adapters_json,
+						runner_version = excluded.runner_version,
 						updated_at = excluded.updated_at
 				`, machineID, string(machineRole), osName, string(capsJSON), string(adpsJSON), runnerVersionOrNil(p.Machine), now, now); err != nil {
 					return fmt.Errorf("upsert paired machine: %w", err)

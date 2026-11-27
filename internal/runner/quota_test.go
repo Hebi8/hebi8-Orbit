@@ -363,3 +363,89 @@ done
 			countLines(agyCountFile), claudeHits.Load(), countLines(codexCountFile))
 	}
 }
+
+func TestQuotaCollector_AgyTimeoutKillsProcessGroupAndReturnsBounded(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix process group test")
+	}
+	tmp := t.TempDir()
+
+	// Case 1: agy spawns a background grandchild inheriting stdout & ignoring SIGTERM, then hangs.
+	// Saving PGID at Start() + killing -pgid + bounded pipe drain guarantees prompt timeout return.
+	pidFile := filepath.Join(tmp, "grandchild.pid")
+	fakeAgyHang := filepath.Join(tmp, "agy-hang")
+	hangScript := `#!/bin/sh
+(trap '' TERM; sleep 30) &
+echo $! > "` + pidFile + `"
+sleep 30
+`
+	if err := os.WriteFile(fakeAgyHang, []byte(hangScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	qcHang := NewQuotaCollector(QuotaCollectorConfig{
+		ResolveMainCLI: func(adp protocol.Adapter) string {
+			if adp == protocol.AdapterAgy {
+				return fakeAgyHang
+			}
+			return ""
+		},
+	})
+	tctx, cancel := context.WithTimeout(context.Background(), 220*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	snap := qcHang.CollectOne(tctx, protocol.AdapterAgy, true)
+	elapsed := time.Since(start)
+	if snap.Available || snap.Error != "agy usage probe timed out" {
+		t.Fatalf("expected timed out agy snapshot, got %+v", snap)
+	}
+	if elapsed > 1800*time.Millisecond {
+		t.Fatalf("agy probe hung past bounded timeout exit: elapsed=%v", elapsed)
+	}
+
+	// Case 2: agy prints valid JSON and exits immediately, while an orphaned grandchild holds stdout open.
+	// Bounded pipe drain (150ms) MUST return the parsed quota promptly without blocking until 15s deadline.
+	orphanPIDFile := filepath.Join(tmp, "orphan.pid")
+	fakeAgyOrphan := filepath.Join(tmp, "agy-orphan")
+	orphanScript := `#!/bin/sh
+(sleep 3) &
+echo $! > "` + orphanPIDFile + `"
+cat <<'EOF'
+{"status":"SUCCESS","command":{"name":"/usage","data":{"groups":[{"name":"Gemini","description":"Models: Gemini 3 Pro","buckets":[{"id":"g5h","window":"5h","remaining_fraction":0.9,"reset_time":"2099-01-01T00:00:00Z"}]}]}}}
+EOF
+exit 0
+`
+	if err := os.WriteFile(fakeAgyOrphan, []byte(orphanScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		for _, pf := range []string{pidFile, orphanPIDFile} {
+			if b, err := os.ReadFile(pf); err == nil {
+				if pid, err := strconv.Atoi(strings.TrimSpace(string(b))); err == nil && pid > 0 {
+					if p, err := os.FindProcess(pid); err == nil {
+						_ = p.Kill()
+					}
+				}
+			}
+		}
+	})
+
+	qcOrphan := NewQuotaCollector(QuotaCollectorConfig{
+		ResolveMainCLI: func(adp protocol.Adapter) string {
+			if adp == protocol.AdapterAgy {
+				return fakeAgyOrphan
+			}
+			return ""
+		},
+	})
+	start2 := time.Now()
+	snap2 := qcOrphan.CollectOne(context.Background(), protocol.AdapterAgy, true)
+	elapsed2 := time.Since(start2)
+	if !snap2.Available || len(snap2.Windows) != 1 || snap2.Windows[0].RemainingPercent != 90 {
+		t.Fatalf("expected parsed agy quota despite stdout-holding orphan, got %+v", snap2)
+	}
+	if elapsed2 > 1500*time.Millisecond {
+		t.Fatalf("stdout-holding orphan delayed agy probe return: elapsed=%v", elapsed2)
+	}
+}

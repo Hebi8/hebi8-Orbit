@@ -1,71 +1,191 @@
-import { useCallback, useMemo, useRef, type KeyboardEvent as ReactKeyboardEvent } from 'react';
+import {
+  useCallback,
+  useMemo,
+  useRef,
+  type FormEvent as ReactFormEvent,
+  type KeyboardEvent as ReactKeyboardEvent,
+} from 'react';
 
 /**
- * Grace window (ms) after `compositionend` during which a trailing `keydown(Enter)`
- * is still treated as IME confirmation.
+ * Tight synchronous window (ms) after `compositionend` during which at most ONE
+ * trailing `keydown(Enter)` is treated as the IME candidate confirmation key.
  *
  * On macOS WKWebView (Orbit desktop shell & Safari), pressing Enter to commit a CJK
  * Pinyin candidate fires `compositionend` *before* `keydown(Enter)`, causing a naive
  * `e.nativeEvent.isComposing` check to read `false` and prematurely submit messages.
  */
-export const IME_COMPOSITION_GRACE_MS = 120;
+export const IME_TRAILING_ENTER_WINDOW_MS = 50;
 
-export function isImeKeyEvent(
-  e: ReactKeyboardEvent | KeyboardEvent,
-  composing: boolean,
-  lastCompositionEndAt: number,
-): boolean {
-  const native = 'nativeEvent' in e ? e.nativeEvent : e;
-  const reactKeyCode = 'keyCode' in e ? e.keyCode : 0;
-  const nativeKeyCode = native.keyCode ?? 0;
+export interface ImeKeyLikeEvent {
+  key: string;
+  keyCode?: number;
+  isComposing?: boolean;
+  metaKey?: boolean;
+  ctrlKey?: boolean;
+  altKey?: boolean;
+  nativeEvent?: {
+    key?: string;
+    keyCode?: number;
+    isComposing?: boolean;
+  };
+}
 
-  if (native.isComposing || reactKeyCode === 229 || nativeKeyCode === 229 || native.key === 'Process') {
-    return true;
-  }
-  if (composing) {
-    return true;
-  }
-  if (lastCompositionEndAt > 0 && performance.now() - lastCompositionEndAt < IME_COMPOSITION_GRACE_MS) {
-    return true;
-  }
-  return false;
+export interface ImeInputLikeEvent {
+  isComposing?: boolean;
+  inputType?: string;
+  nativeEvent?: {
+    isComposing?: boolean;
+    inputType?: string;
+  };
+}
+
+export interface ImeGuardController {
+  readonly isComposing: () => boolean;
+  onCompositionStart: () => void;
+  onCompositionEnd: () => void;
+  onKeyUp: () => void;
+  onInput: (e?: ImeInputLikeEvent | ReactFormEvent | Event) => void;
+  clearPendingTrailingEnter: () => void;
+  isImeKeyEvent: (e: ImeKeyLikeEvent | ReactKeyboardEvent | KeyboardEvent) => boolean;
+}
+
+function isCompositionCommitInput(e?: ImeInputLikeEvent | ReactFormEvent | Event): boolean {
+  if (!e) return false;
+  const raw = ('nativeEvent' in e && e.nativeEvent ? e.nativeEvent : e) as {
+    isComposing?: boolean;
+    inputType?: string;
+  };
+  if (raw.isComposing) return true;
+  const t = raw.inputType ?? '';
+  return t === 'insertCompositionText' || t === 'insertFromComposition';
+}
+
+function defaultNow(): number {
+  return typeof performance !== 'undefined' ? performance.now() : Date.now();
+}
+
+/**
+ * Pure stateful IME guard controller with one-shot trailing Enter suppression.
+ * - During active composition (`composing || isComposing || keyCode === 229 || key === 'Process'`),
+ *   ALL keys (Enter, ArrowUp/Down, Escape, Tab, Backspace) are treated as IME events.
+ * - On `compositionend`, arms a ONE-SHOT flag valid only for the immediately following `Enter`
+ *   within `IME_TRAILING_ENTER_WINDOW_MS` (50ms).
+ * - Immediately clears the one-shot flag after consuming that trailing `Enter`, on `keyup`,
+ *   on any subsequent non-composition `input`, or on any non-Enter keydown.
+ * - NEVER treats post-`compositionend` `ArrowUp` / `ArrowDown` / `Escape` / `Tab` / `Backspace`
+ *   as IME events.
+ */
+export function createImeGuardController(nowFn: () => number = defaultNow): ImeGuardController {
+  let composing = false;
+  let pendingTrailingEnter = false;
+  let lastCompositionEndAt = 0;
+
+  const clearPendingTrailingEnter = () => {
+    pendingTrailingEnter = false;
+    lastCompositionEndAt = 0;
+  };
+
+  const onCompositionStart = () => {
+    composing = true;
+    clearPendingTrailingEnter();
+  };
+
+  const onCompositionEnd = () => {
+    composing = false;
+    pendingTrailingEnter = true;
+    lastCompositionEndAt = nowFn();
+  };
+
+  const onKeyUp = () => {
+    clearPendingTrailingEnter();
+  };
+
+  const onInput = (e?: ImeInputLikeEvent | ReactFormEvent | Event) => {
+    if (!pendingTrailingEnter) return;
+    if (isCompositionCommitInput(e)) return;
+    clearPendingTrailingEnter();
+  };
+
+  const isImeKeyEvent = (e: ImeKeyLikeEvent | ReactKeyboardEvent | KeyboardEvent): boolean => {
+    const native = ('nativeEvent' in e && e.nativeEvent ? e.nativeEvent : e) as {
+      key?: string;
+      keyCode?: number;
+      isComposing?: boolean;
+    };
+    const reactKeyCode = 'keyCode' in e && typeof e.keyCode === 'number' ? e.keyCode : 0;
+    const nativeKeyCode = typeof native.keyCode === 'number' ? native.keyCode : 0;
+    const key = e.key ?? native.key ?? '';
+
+    if (native.isComposing || reactKeyCode === 229 || nativeKeyCode === 229 || native.key === 'Process' || key === 'Process') {
+      return true;
+    }
+    if (composing) {
+      return true;
+    }
+
+    if (key === 'Enter' && !e.metaKey && !e.ctrlKey && !e.altKey) {
+      if (pendingTrailingEnter) {
+        const elapsed = nowFn() - lastCompositionEndAt;
+        clearPendingTrailingEnter();
+        return elapsed >= 0 && elapsed <= IME_TRAILING_ENTER_WINDOW_MS;
+      }
+      return false;
+    }
+
+    if (pendingTrailingEnter) {
+      clearPendingTrailingEnter();
+    }
+    return false;
+  };
+
+  return {
+    isComposing: () => composing,
+    onCompositionStart,
+    onCompositionEnd,
+    onKeyUp,
+    onInput,
+    clearPendingTrailingEnter,
+    isImeKeyEvent,
+  };
 }
 
 /**
  * Shared IME composition guard for inputs & textareas across macOS WKWebView and all browsers.
  * Spread `compositionProps` onto `<input>` / `<textarea>`, and check `isImeEnter(e)` before
- * handling Enter / Escape submission shortcuts.
+ * handling Enter / Escape / navigation shortcuts.
  */
 export function useImeGuard() {
-  const composingRef = useRef(false);
-  const lastCompositionEndAtRef = useRef(0);
+  const controllerRef = useRef<ImeGuardController | null>(null);
+  if (controllerRef.current === null) {
+    controllerRef.current = createImeGuardController();
+  }
+  const ctrl = controllerRef.current;
 
-  const onCompositionStart = useCallback(() => {
-    composingRef.current = true;
-  }, []);
-
-  const onCompositionEnd = useCallback(() => {
-    composingRef.current = false;
-    lastCompositionEndAtRef.current = performance.now();
-  }, []);
+  const onCompositionStart = useCallback(() => ctrl.onCompositionStart(), [ctrl]);
+  const onCompositionEnd = useCallback(() => ctrl.onCompositionEnd(), [ctrl]);
+  const onKeyUp = useCallback(() => ctrl.onKeyUp(), [ctrl]);
+  const onInput = useCallback((e: ReactFormEvent<HTMLElement>) => ctrl.onInput(e), [ctrl]);
 
   const compositionProps = useMemo(
     () => ({
       onCompositionStart,
       onCompositionEnd,
+      onKeyUp,
+      onInput,
     }),
-    [onCompositionStart, onCompositionEnd],
+    [onCompositionStart, onCompositionEnd, onKeyUp, onInput],
   );
 
-  const isImeEnter = useCallback((e: ReactKeyboardEvent | KeyboardEvent): boolean => {
-    return isImeKeyEvent(e, composingRef.current, lastCompositionEndAtRef.current);
-  }, []);
+  const isImeEnter = useCallback(
+    (e: ReactKeyboardEvent | KeyboardEvent): boolean => ctrl.isImeKeyEvent(e),
+    [ctrl],
+  );
 
   return {
-    composingRef,
-    lastCompositionEndAtRef,
     onCompositionStart,
     onCompositionEnd,
+    onKeyUp,
+    onInput,
     compositionProps,
     isImeEnter,
   };

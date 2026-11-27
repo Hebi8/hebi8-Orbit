@@ -115,10 +115,13 @@ type attemptContext struct {
 	dispatch                protocol.AttemptDispatchFrame
 	slot                    *sessionSlot
 	driver                  AcpAdapterDriver
-	worktreePath            string
-	baseSHA                 string
-	beforeFolderSnap        *gitops.FolderSnapshot
-	state                   protocol.AttemptState
+	worktreePath             string
+	baseSHA                  string
+	beforeFolderSnap         *gitops.FolderSnapshot
+	inPlaceDir               string
+	concurrentInPlaceOverlap bool
+	performedNonReadOnlyTool bool
+	state                    protocol.AttemptState
 	resumeState             protocol.ResumeState
 	providerSessionID        acp.SessionId
 	appliedMode              string
@@ -184,8 +187,9 @@ type Runner struct {
 	attempts          map[string]*attemptContext
 	sessionOwner      map[acp.SessionId]string
 	delegateTokens    map[string]*delegateTokenEntry
-	resourceLocks     map[string]string // resourceName -> attemptID
-	cancelledAttempts map[string]bool   // B10: attemptID cancelled before/during dispatch
+	resourceLocks     map[string]string                   // resourceName -> attemptID
+	inPlaceActive     map[string]map[string]*attemptContext // canonical in-place dir -> attemptID -> attemptContext
+	cancelledAttempts map[string]bool                     // B10: attemptID cancelled before/during dispatch
 	reservedWorkers   int               // S1: atomic hard-cap reservation for global MaxLiveWorkers
 	reservedByAdapter map[protocol.Adapter]int
 
@@ -844,6 +848,8 @@ func (r *Runner) executeAttempt(ctx context.Context, att *attemptContext) {
 	}
 	var beforeSnap *gitops.FolderSnapshot
 	if isInPlace {
+		r.registerInPlaceAttempt(att, worktreePath)
+		defer r.unregisterInPlaceAttempt(att)
 		if snap, snapErr := gitops.CaptureFolderSnapshot(worktreePath); snapErr == nil {
 			beforeSnap = snap
 		}
@@ -1245,11 +1251,25 @@ func (r *Runner) executeAttempt(ctx context.Context, att *attemptContext) {
 		att.mu.Lock()
 		bSnap := att.beforeFolderSnap
 		wt := att.worktreePath
+		overlap := att.concurrentInPlaceOverlap
+		wroteOrExec := att.performedNonReadOnlyTool
 		att.mu.Unlock()
-		if afterSnap, snapErr := gitops.CaptureFolderSnapshot(wt); snapErr == nil {
-			fc := gitops.DiffFolderSnapshots(bSnap, afterSnap)
-			if len(fc.Files) > 0 {
-				payload["folderChanges"] = fc
+		if !overlap || wroteOrExec {
+			if afterSnap, snapErr := gitops.CaptureFolderSnapshot(wt); snapErr == nil {
+				att.mu.Lock()
+				overlap = att.concurrentInPlaceOverlap
+				wroteOrExec = att.performedNonReadOnlyTool
+				att.mu.Unlock()
+				if !overlap || wroteOrExec {
+					fc := gitops.DiffFolderSnapshots(bSnap, afterSnap)
+					if len(fc.Files) > 0 {
+						if overlap {
+							fc.ConcurrentSharedDir = true
+							fc.ConcurrentNotice = "共享目录存在并发运行，以下变更清单可能包含同期其他会话的修改"
+						}
+						payload["folderChanges"] = fc
+					}
+				}
 			}
 		}
 	}
@@ -2250,11 +2270,13 @@ type localDelegateCancelInput struct {
 }
 
 type localDelegateBoardReadInput struct {
-	BeforeSeq int64 `json:"beforeSeq,omitempty"`
-	Limit     int   `json:"limit,omitempty"`
+	BoardTaskID string `json:"boardTaskId,omitempty"`
+	BeforeSeq   int64  `json:"beforeSeq,omitempty"`
+	Limit       int    `json:"limit,omitempty"`
 }
 
 type localDelegateBoardPostInput struct {
+	BoardTaskID   string `json:"boardTaskId,omitempty"`
 	Body          string `json:"body"`
 	TargetMention string `json:"targetMention,omitempty"`
 }
@@ -2297,6 +2319,7 @@ type hubDelegateCancelPayload struct {
 type hubDelegateBoardReadPayload struct {
 	ParentTaskID    string `json:"parentTaskId"`
 	ParentAttemptID string `json:"parentAttemptId"`
+	BoardTaskID     string `json:"boardTaskId,omitempty"`
 	BeforeSeq       int64  `json:"beforeSeq,omitempty"`
 	Limit           int    `json:"limit,omitempty"`
 }
@@ -2304,6 +2327,7 @@ type hubDelegateBoardReadPayload struct {
 type hubDelegateBoardPostPayload struct {
 	ParentTaskID    string `json:"parentTaskId"`
 	ParentAttemptID string `json:"parentAttemptId"`
+	BoardTaskID     string `json:"boardTaskId,omitempty"`
 	Body            string `json:"body"`
 	TargetMention   string `json:"targetMention,omitempty"`
 }
@@ -2501,6 +2525,7 @@ func (r *Runner) HandleLocalDelegate(ctx context.Context, action, delegateToken 
 		upstreamPayload = hubDelegateBoardReadPayload{
 			ParentTaskID:    snap.TaskID,
 			ParentAttemptID: snap.AttemptID,
+			BoardTaskID:     strings.TrimSpace(in.BoardTaskID),
 			BeforeSeq:       in.BeforeSeq,
 			Limit:           in.Limit,
 		}
@@ -2512,6 +2537,7 @@ func (r *Runner) HandleLocalDelegate(ctx context.Context, action, delegateToken 
 		upstreamPayload = hubDelegateBoardPostPayload{
 			ParentTaskID:    snap.TaskID,
 			ParentAttemptID: snap.AttemptID,
+			BoardTaskID:     strings.TrimSpace(in.BoardTaskID),
 			Body:            in.Body,
 			TargetMention:   in.TargetMention,
 		}
@@ -3402,6 +3428,9 @@ func (r *Runner) handleSessionUpdate(ctx context.Context, note acp.SessionNotifi
 		if u.ToolCall.Name != nil {
 			name = *u.ToolCall.Name
 		}
+		if isNonReadOnlyToolCall(u.ToolCall.Kind, name, u.ToolCall.Title) {
+			att.markNonReadOnlyTool()
+		}
 		evPayload := map[string]any{
 			"toolCallId":  string(u.ToolCall.ToolCallId),
 			"name":        name,
@@ -3428,11 +3457,23 @@ func (r *Runner) handleSessionUpdate(ctx context.Context, note acp.SessionNotifi
 			"toolCallId":  string(u.ToolCallUpdate.ToolCallId),
 			"unsolicited": unsolicited,
 		}
+		var updKind acp.ToolKind
+		var updName, updTitle string
+		if v, ok := u.ToolCallUpdate.Kind.Value(); ok {
+			updKind = v
+		}
 		if v, ok := u.ToolCallUpdate.Name.Value(); ok {
+			updName = v
 			evPayload["name"] = v
 		}
 		if v, ok := u.ToolCallUpdate.Title.Value(); ok {
+			updTitle = v
 			evPayload["title"] = v
+		}
+		if updKind != "" || updName != "" || updTitle != "" {
+			if isNonReadOnlyToolCall(updKind, updName, updTitle) {
+				att.markNonReadOnlyTool()
+			}
 		}
 		if v, ok := u.ToolCallUpdate.Status.Value(); ok {
 			evPayload["status"] = string(v)
@@ -3568,6 +3609,9 @@ func (r *Runner) handlePermissionRequest(ctx context.Context, req acp.RequestPer
 	}
 
 	if allow && autoOpt != "" {
+		if isNonReadOnlyPermissionRequest(req) {
+			att.markNonReadOnlyTool()
+		}
 		r.coalescer.FlushAttempt(attemptID)
 		auditPayload := map[string]any{
 			"policyAutoAllowed": true,
@@ -3694,6 +3738,9 @@ func (r *Runner) handlePermissionRequest(ctx context.Context, req acp.RequestPer
 	case dec, ok := <-handle.ch:
 		if !ok || dec.Expired || dec.OptionID == "" {
 			return acp.RequestPermissionResponse{Outcome: acp.NewRequestPermissionOutcomeCancelled()}, nil
+		}
+		if !isRejectedPermissionOption(options, dec.OptionID) && isNonReadOnlyPermissionRequest(req) {
+			att.markNonReadOnlyTool()
 		}
 		return acp.RequestPermissionResponse{
 			Outcome: acp.NewRequestPermissionOutcomeSelected(acp.PermissionOptionId(dec.OptionID)),
@@ -3882,6 +3929,167 @@ func isReadOnlySessionMode(mode string) bool {
 	default:
 		return false
 	}
+}
+
+func (att *attemptContext) markNonReadOnlyTool() {
+	if att == nil {
+		return
+	}
+	att.mu.Lock()
+	att.performedNonReadOnlyTool = true
+	att.mu.Unlock()
+}
+
+func (r *Runner) registerInPlaceAttempt(att *attemptContext, worktreePath string) {
+	if att == nil || strings.TrimSpace(worktreePath) == "" {
+		return
+	}
+	key := canonicalWorktreeCheckPath(worktreePath)
+	if key == "" {
+		key = filepath.Clean(worktreePath)
+	}
+	var others []*attemptContext
+	r.mu.Lock()
+	if r.inPlaceActive == nil {
+		r.inPlaceActive = map[string]map[string]*attemptContext{}
+	}
+	bucket := r.inPlaceActive[key]
+	if bucket == nil {
+		bucket = map[string]*attemptContext{}
+		r.inPlaceActive[key] = bucket
+	}
+	for id, other := range bucket {
+		if id != att.dispatch.AttemptID && other != nil {
+			others = append(others, other)
+		}
+	}
+	bucket[att.dispatch.AttemptID] = att
+	r.mu.Unlock()
+
+	att.mu.Lock()
+	att.inPlaceDir = key
+	if len(others) > 0 {
+		att.concurrentInPlaceOverlap = true
+	}
+	att.mu.Unlock()
+
+	for _, other := range others {
+		other.mu.Lock()
+		other.concurrentInPlaceOverlap = true
+		other.mu.Unlock()
+	}
+}
+
+func (r *Runner) unregisterInPlaceAttempt(att *attemptContext) {
+	if att == nil {
+		return
+	}
+	att.mu.Lock()
+	key := att.inPlaceDir
+	att.inPlaceDir = ""
+	att.mu.Unlock()
+	if key == "" {
+		return
+	}
+	r.mu.Lock()
+	if bucket := r.inPlaceActive[key]; bucket != nil {
+		delete(bucket, att.dispatch.AttemptID)
+		if len(bucket) == 0 {
+			delete(r.inPlaceActive, key)
+		}
+	}
+	r.mu.Unlock()
+}
+
+var readOnlyToolNames = map[string]bool{
+	"read":              true,
+	"read_file":         true,
+	"view_file":         true,
+	"view_file_outline": true,
+	"view_code_item":    true,
+	"list_dir":          true,
+	"list_directory":    true,
+	"ls":                true,
+	"find_by_name":      true,
+	"find_files":        true,
+	"glob":              true,
+	"grep":              true,
+	"grep_search":       true,
+	"search":            true,
+	"ripgrep":           true,
+	"rg":                true,
+	"search_web":        true,
+	"web_search":        true,
+	"fetch":             true,
+	"read_url_content":  true,
+	"cat":               true,
+	"head":              true,
+	"tail":              true,
+	"stat":              true,
+}
+
+func isNonReadOnlyToolCall(kind acp.ToolKind, name, title string) bool {
+	switch kind {
+	case acp.ToolKindEdit, acp.ToolKindDelete, acp.ToolKindMove, acp.ToolKindExecute:
+		return true
+	case acp.ToolKindRead, acp.ToolKindSearch, acp.ToolKindFetch, acp.ToolKindThink:
+		return false
+	}
+
+	n := strings.ToLower(strings.TrimSpace(name))
+	if n != "" {
+		if readOnlyToolNames[n] {
+			return false
+		}
+		// Orbit's built-in delegation/board MCP tools never mutate the local workspace directory.
+		for tool := range orbitBuiltinMCPTools {
+			if n == tool || strings.HasSuffix(n, "_"+tool) || strings.HasSuffix(n, ":"+tool) || strings.HasSuffix(n, "/"+tool) || strings.HasSuffix(n, "."+tool) {
+				return false
+			}
+		}
+		return true
+	}
+
+	t := strings.ToLower(strings.TrimSpace(title))
+	if t == "" {
+		return false
+	}
+	for _, mut := range []string{"write", "edit", "patch", "replace", "delete", "remove", "mkdir", "move", "rename", "run", "exec", "bash", "shell", "command", "terminal"} {
+		if strings.Contains(t, mut) {
+			return true
+		}
+	}
+	for _, ro := range []string{"read", "view", "search", "grep", "find", "list", "glob", "fetch"} {
+		if strings.HasPrefix(t, ro) {
+			return false
+		}
+	}
+	return true
+}
+
+func isNonReadOnlyPermissionRequest(req acp.RequestPermissionRequest) bool {
+	var kind acp.ToolKind
+	var name, title string
+	if v, ok := req.ToolCall.Kind.Value(); ok {
+		kind = v
+	}
+	if v, ok := req.ToolCall.Name.Value(); ok {
+		name = v
+	}
+	if v, ok := req.ToolCall.Title.Value(); ok {
+		title = v
+	}
+	return isNonReadOnlyToolCall(kind, name, title)
+}
+
+func isRejectedPermissionOption(options []protocol.ApprovalOption, optionID string) bool {
+	for _, opt := range options {
+		if opt.ID == optionID {
+			k := strings.ToLower(strings.TrimSpace(opt.Kind))
+			return strings.Contains(k, "reject") || strings.Contains(k, "deny") || strings.Contains(k, "cancel")
+		}
+	}
+	return false
 }
 
 var orbitBuiltinMCPTools = map[string]bool{
@@ -5160,7 +5368,9 @@ func (r *Runner) handleRunnerRPC(ctx context.Context, req protocol.RunnerRPCFram
 			res.OK = true
 			res.Data = map[string]any{"agentQuotas": []protocol.AgentQuotaSnapshot{}}
 		} else {
-			quotas := r.refreshAndReportQuotas(ctx, force)
+			// Return fresh snapshots directly in the RPC response; Hub persists & broadcasts once
+			// without a redundant runner.quotas_report push.
+			quotas := r.quotaCollector.CollectAll(ctx, protocol.Phase1ImplementedSessionAdapters, force)
 			if quotas == nil {
 				quotas = []protocol.AgentQuotaSnapshot{}
 			}

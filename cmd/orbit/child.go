@@ -446,10 +446,13 @@ func runChildBoardRead(ctx context.Context, args []string, stdout, stderr io.Wri
 
 	var raw []byte
 	var err error
-	if sock, tok, ok := useDelegateSocket(*hubURLFlag); ok && strings.TrimSpace(*parentID) == "" {
+	if sock, tok, ok := useDelegateSocket(*hubURLFlag); ok {
 		payload := map[string]any{"limit": *limit}
 		if *beforeSeq > 0 {
 			payload["beforeSeq"] = *beforeSeq
+		}
+		if pid := strings.TrimSpace(*parentID); pid != "" {
+			payload["boardTaskId"] = pid
 		}
 		raw, err = mcpserver.NewSocketBackend(sock, tok).CallDelegate(ctx, "board-read", payload)
 	} else {
@@ -524,10 +527,13 @@ func runChildBoardPost(ctx context.Context, args []string, stdout, stderr io.Wri
 
 	var raw []byte
 	var err error
-	if sock, tok, ok := useDelegateSocket(*hubURLFlag); ok && strings.TrimSpace(*parentID) == "" {
+	if sock, tok, ok := useDelegateSocket(*hubURLFlag); ok {
 		payload := map[string]any{"body": body}
 		if v := strings.TrimSpace(*targetFlag); v != "" {
 			payload["targetMention"] = v
+		}
+		if pid := strings.TrimSpace(*parentID); pid != "" {
+			payload["boardTaskId"] = pid
 		}
 		raw, err = mcpserver.NewSocketBackend(sock, tok).CallDelegate(ctx, "board-post", payload)
 	} else {

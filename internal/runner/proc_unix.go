@@ -12,16 +12,28 @@ func setProcessGroup(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 }
 
-func killProcessGroup(cmd *exec.Cmd) {
+func processGroupID(cmd *exec.Cmd) int {
 	if cmd == nil || cmd.Process == nil {
-		return
+		return 0
 	}
-	pgid, err := syscall.Getpgid(cmd.Process.Pid)
-	if err == nil && pgid > 0 {
+	if pgid, err := syscall.Getpgid(cmd.Process.Pid); err == nil && pgid > 0 {
+		return pgid
+	}
+	return cmd.Process.Pid
+}
+
+func killProcessGroupByID(cmd *exec.Cmd, pgid int) {
+	if pgid > 0 {
 		_ = syscall.Kill(-pgid, syscall.SIGTERM)
-		time.Sleep(150 * time.Millisecond)
+		time.Sleep(100 * time.Millisecond)
 		_ = syscall.Kill(-pgid, syscall.SIGKILL)
 		return
 	}
-	_ = cmd.Process.Kill()
+	if cmd != nil && cmd.Process != nil {
+		_ = cmd.Process.Kill()
+	}
+}
+
+func killProcessGroup(cmd *exec.Cmd) {
+	killProcessGroupByID(cmd, processGroupID(cmd))
 }

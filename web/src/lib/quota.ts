@@ -129,6 +129,17 @@ function groupKey(w: QuotaWindow): string {
   return (w.group ?? '').trim();
 }
 
+function pickTightestWindow(...candidates: (QuotaWindow | undefined)[]): QuotaWindow | undefined {
+  let tightest: QuotaWindow | undefined;
+  for (const c of candidates) {
+    if (!c || typeof c.remainingPercent !== 'number' || !Number.isFinite(c.remainingPercent)) continue;
+    if (!tightest || c.remainingPercent < tightest.remainingPercent) {
+      tightest = c;
+    }
+  }
+  return tightest;
+}
+
 /**
  * Resolves real 5h / 7d quota windows for the active machine, adapter, and selected model.
  * Never fabricates numbers when the target machine is offline or quota telemetry is unavailable.
@@ -192,20 +203,21 @@ export function resolveAgentQuota({
 
   if (bestScore > 0 && bestGroup !== '') {
     const groupWins = windows.filter((w) => groupKey(w) === bestGroup);
-    // Prefer the matched model group; fall back to generic ungrouped windows (e.g. Claude's shared 5h)
-    // without ever crossing over into a different model family group.
-    win5h = groupWins.find(isWindow5h) ?? genericWindows.find(isWindow5h);
-    win7d = groupWins.find(isWindow7d) ?? genericWindows.find(isWindow7d);
+    // Evaluate BOTH the matched model-specific bucket AND any shared generic bucket
+    // (e.g. Claude's shared 7d vs 7d Sonnet) and take the tighter remaining limit so an
+    // exhausted shared cap is never masked by a looser model-specific bucket.
+    win5h = pickTightestWindow(groupWins.find(isWindow5h), genericWindows.find(isWindow5h));
+    win7d = pickTightestWindow(groupWins.find(isWindow7d), genericWindows.find(isWindow7d));
     resolvedGroup = bestGroup;
   } else if (genericWindows.some((w) => isWindow5h(w) || isWindow7d(w))) {
-    win5h = genericWindows.find(isWindow5h);
-    win7d = genericWindows.find(isWindow7d);
+    win5h = pickTightestWindow(...genericWindows.filter(isWindow5h));
+    win7d = pickTightestWindow(...genericWindows.filter(isWindow7d));
   } else {
     const firstValid = windows.find((w) => isWindow5h(w) || isWindow7d(w));
     const fallbackGroup = firstValid ? groupKey(firstValid) : '';
     const groupWins = windows.filter((w) => groupKey(w) === fallbackGroup);
-    win5h = groupWins.find(isWindow5h);
-    win7d = groupWins.find(isWindow7d);
+    win5h = pickTightestWindow(groupWins.find(isWindow5h), genericWindows.find(isWindow5h));
+    win7d = pickTightestWindow(groupWins.find(isWindow7d), genericWindows.find(isWindow7d));
     resolvedGroup = fallbackGroup;
   }
 

@@ -172,12 +172,13 @@ export function SessionPage({
   const isChildSession = !!parentTaskId;
 
   const members = tl?.boardMembers ?? [];
-  const hasSwarm = !isChildSession && (members.length > 0 || (task?.workerCount ?? 0) > 0);
-  const childrenQ = useTaskChildren(taskId, !!tl && !isChildSession);
-  const childrenList = isChildSession ? [] : (childrenQ.data?.children ?? tl?.children ?? []);
+  const hasSwarm = !isChildSession && !isPA && (members.length > 0 || (task?.workerCount ?? 0) > 0);
+  const childrenQ = useTaskChildren(taskId, !!tl && !isChildSession && !isPA);
+  const childrenList = isChildSession || isPA ? [] : (childrenQ.data?.children ?? tl?.children ?? []);
+  const hasBoardMessages = !isChildSession && !isPA && (tl?.boardMessageCount ?? 0) > 0;
   const boardQ = useBoard(
     taskId,
-    !isChildSession && (hasSwarm || childrenList.length > 0 || (task?.childCount ?? 0) > 0 || boardOpen || !!worker),
+    !isChildSession && !isPA && (hasSwarm || childrenList.length > 0 || (task?.childCount ?? 0) > 0 || hasBoardMessages || boardOpen || !!worker),
   );
   const allMembers = isChildSession ? [] : (boardQ.data?.members ?? members);
   const nativeMembers = useMemo(() => allMembers.filter((m) => !m.workerTaskId), [allMembers]);

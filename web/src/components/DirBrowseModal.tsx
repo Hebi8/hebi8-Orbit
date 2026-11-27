@@ -3,7 +3,7 @@ import { ArrowUp, Check, ChevronRight, Folder, GitBranch, Pencil, X } from 'luci
 import type { DirEntryView, MachineView, ProjectPartKind } from '../generated/protocol';
 import { ApiError, api, errMsg } from '../lib/api';
 import { cleanMachineName } from '../lib/format';
-import { isImeKeyEvent, useImeGuard } from '../lib/ime';
+import { createImeGuardController, useImeGuard } from '../lib/ime';
 import { DeviceRoleIcon } from './DeviceRoleIcon';
 
 export interface CodexDirSelection {
@@ -417,17 +417,13 @@ export function CodexDirBrowser({
 
   useEffect(() => {
     if (!keyboardActive) return;
-    let winComposing = false;
-    let winLastCompositionEndAt = 0;
-    const onCompStart = () => {
-      winComposing = true;
-    };
-    const onCompEnd = () => {
-      winComposing = false;
-      winLastCompositionEndAt = performance.now();
-    };
+    const winIme = createImeGuardController();
+    const onCompStart = () => winIme.onCompositionStart();
+    const onCompEnd = () => winIme.onCompositionEnd();
+    const onKeyUp = () => winIme.onKeyUp();
+    const onInput = (e: Event) => winIme.onInput(e);
     const onKeyDown = (e: KeyboardEvent) => {
-      if (isImeKeyEvent(e, winComposing, winLastCompositionEndAt)) return;
+      if (winIme.isImeKeyEvent(e)) return;
       const activeEl = document.activeElement instanceof HTMLElement ? document.activeElement : null;
       const targetEl = e.target instanceof HTMLElement ? e.target : activeEl;
 
@@ -505,10 +501,14 @@ export function CodexDirBrowser({
     };
     window.addEventListener('compositionstart', onCompStart, true);
     window.addEventListener('compositionend', onCompEnd, true);
+    window.addEventListener('keyup', onKeyUp, true);
+    window.addEventListener('input', onInput, true);
     window.addEventListener('keydown', onKeyDown);
     return () => {
       window.removeEventListener('compositionstart', onCompStart, true);
       window.removeEventListener('compositionend', onCompEnd, true);
+      window.removeEventListener('keyup', onKeyUp, true);
+      window.removeEventListener('input', onInput, true);
       window.removeEventListener('keydown', onKeyDown);
     };
   }, [keyboardActive]);

@@ -56,17 +56,16 @@ func (s *Server) refreshEffectiveRegistry(ctx context.Context) error {
 
 	s.mu.Lock()
 	mergedMachines := make(map[string]protocol.MachineConfig, len(s.yamlMachines.Machines)+len(dynMachines))
+	pairedIDs := make(map[string]bool, len(dynMachines))
 	for id, m := range dynMachines {
 		if removedSet[id] {
 			continue
 		}
 		mergedMachines[id] = m
+		pairedIDs[id] = true
 	}
 	for id, m := range s.yamlMachines.Machines {
-		if removedSet[id] {
-			continue
-		}
-		if _, isPaired := dynMachines[id]; isPaired {
+		if removedSet[id] || pairedIDs[id] {
 			continue
 		}
 		mergedMachines[id] = m
@@ -80,6 +79,7 @@ func (s *Server) refreshEffectiveRegistry(ctx context.Context) error {
 		mergedProjects[id] = p
 	}
 
+	s.pairedMachineIDs = pairedIDs
 	s.machines = protocol.MachinesConfig{
 		SchemaVersion: 1,
 		Machines:      mergedMachines,
@@ -116,7 +116,7 @@ func (s *Server) effectiveYAMLMachinesLocked() map[string]protocol.MachineConfig
 	}
 	out := make(map[string]protocol.MachineConfig, len(s.yamlMachines.Machines))
 	for k, v := range s.yamlMachines.Machines {
-		if removedSet[k] {
+		if removedSet[k] || s.pairedMachineIDs[k] {
 			continue
 		}
 		out[k] = v
@@ -349,11 +349,14 @@ func (s *Server) handleUpdateMachine(w http.ResponseWriter, r *http.Request) {
 	s.handleListMachines(w, r)
 }
 
-func removeMachineFromYAMLFile(configDir, machineID string) error {
+func (s *Server) removeMachineFromYAMLFile(configDir, machineID string) error {
 	configDir = strings.TrimSpace(configDir)
 	if configDir == "" {
 		return nil
 	}
+	s.yamlFileMu.Lock()
+	defer s.yamlFileMu.Unlock()
+
 	machPath := filepath.Join(configDir, "machines.yaml")
 	cfg, err := protocol.LoadMachinesConfig(machPath)
 	if err != nil {
@@ -367,14 +370,36 @@ func removeMachineFromYAMLFile(configDir, machineID string) error {
 	if err != nil {
 		return err
 	}
-	tmpPath := machPath + ".tmp"
-	if err := os.WriteFile(tmpPath, out, 0o600); err != nil {
+	tmp, err := os.CreateTemp(configDir, ".machines.yaml.tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	cleanupTmp := true
+	defer func() {
+		if cleanupTmp {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(out); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
 		return err
 	}
 	if err := os.Rename(tmpPath, machPath); err != nil {
-		_ = os.Remove(tmpPath)
 		return err
 	}
+	cleanupTmp = false
 	return nil
 }
 
@@ -400,7 +425,7 @@ func (s *Server) handleDeleteMachine(w http.ResponseWriter, r *http.Request) {
 	delete(s.yamlMachines.Machines, machineID)
 	cfgDir := s.hubCfg.ConfigDir
 	s.mu.Unlock()
-	_ = removeMachineFromYAMLFile(cfgDir, machineID)
+	_ = s.removeMachineFromYAMLFile(cfgDir, machineID)
 
 	for _, cid := range revokedClientIDs {
 		s.revokeClientTokenSessions(cid)
@@ -940,32 +965,29 @@ func (s *Server) handleUpdateNetworkSettings(w http.ResponseWriter, r *http.Requ
 		writeAPIError(w, http.StatusBadRequest, "ERR_INVALID_JSON", "invalid request body")
 		return
 	}
-	cur, err := s.store.GetDynamicNetworkSettings(r.Context())
-	if err != nil {
-		writeAPIError(w, http.StatusInternalServerError, "ERR_SETTINGS_READ", err.Error())
-		return
-	}
-	if req.WorkspaceName != nil {
-		cur.WorkspaceName = strings.TrimSpace(*req.WorkspaceName)
-	}
-	if req.DutyPriority != nil {
-		cleaned := make([]string, 0, len(req.DutyPriority))
-		seen := map[string]bool{}
-		for _, id := range req.DutyPriority {
-			t := strings.TrimSpace(id)
-			if t == "" || seen[t] {
-				continue
-			}
-			seen[t] = true
-			cleaned = append(cleaned, t)
+	_, ev, err := s.store.UpdateDynamicNetworkSettings(r.Context(), actorFromContext(r.Context()), func(cur *store.DynamicNetworkSettings) error {
+		if req.WorkspaceName != nil {
+			cur.WorkspaceName = strings.TrimSpace(*req.WorkspaceName)
 		}
-		cur.DutyPriority = cleaned
-	}
-	if req.ExternalGatewayEnabled != nil {
-		v := *req.ExternalGatewayEnabled
-		cur.ExternalGatewayEnabled = &v
-	}
-	ev, err := s.store.SaveDynamicNetworkSettings(r.Context(), cur, actorFromContext(r.Context()))
+		if req.DutyPriority != nil {
+			cleaned := make([]string, 0, len(req.DutyPriority))
+			seen := map[string]bool{}
+			for _, id := range req.DutyPriority {
+				t := strings.TrimSpace(id)
+				if t == "" || seen[t] {
+					continue
+				}
+				seen[t] = true
+				cleaned = append(cleaned, t)
+			}
+			cur.DutyPriority = cleaned
+		}
+		if req.ExternalGatewayEnabled != nil {
+			v := *req.ExternalGatewayEnabled
+			cur.ExternalGatewayEnabled = &v
+		}
+		return nil
+	})
 	if err != nil {
 		writeAPIError(w, http.StatusInternalServerError, "ERR_SETTINGS_SAVE", err.Error())
 		return
@@ -1127,12 +1149,13 @@ func (s *Server) handleTailscaleDisable(w http.ResponseWriter, r *http.Request) 
 			}
 		}
 	}
-	cur, _ := s.store.GetDynamicNetworkSettings(r.Context())
-	cur.TailscaleShared = false
-	cur.TailscaleOrigin = ""
-	disabled := false
-	cur.ExternalGatewayEnabled = &disabled
-	if ev, err := s.store.SaveDynamicNetworkSettings(context.WithoutCancel(r.Context()), cur, actorFromContext(r.Context())); err == nil {
+	if _, ev, err := s.store.UpdateDynamicNetworkSettings(context.WithoutCancel(r.Context()), actorFromContext(r.Context()), func(cur *store.DynamicNetworkSettings) error {
+		cur.TailscaleShared = false
+		cur.TailscaleOrigin = ""
+		disabled := false
+		cur.ExternalGatewayEnabled = &disabled
+		return nil
+	}); err == nil {
 		_ = s.refreshEffectiveRegistry(context.WithoutCancel(r.Context()))
 		s.broker.Broadcast(ev)
 	}
@@ -1143,13 +1166,15 @@ func (s *Server) handleTailscaleDisable(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *Server) recordTailscaleSharing(ctx context.Context, origin, actorID string) {
-	cur, _ := s.store.GetDynamicNetworkSettings(ctx)
-	cur.TailscaleShared = true
-	cur.TailscaleOrigin = strings.TrimRight(origin, "/")
-	if !slices.Contains(cur.ExtraOrigins, cur.TailscaleOrigin) {
-		cur.ExtraOrigins = append(cur.ExtraOrigins, cur.TailscaleOrigin)
-	}
-	if ev, err := s.store.SaveDynamicNetworkSettings(ctx, cur, actorID); err == nil {
+	trimmedOrigin := strings.TrimRight(origin, "/")
+	if _, ev, err := s.store.UpdateDynamicNetworkSettings(ctx, actorID, func(cur *store.DynamicNetworkSettings) error {
+		cur.TailscaleShared = true
+		cur.TailscaleOrigin = trimmedOrigin
+		if !slices.Contains(cur.ExtraOrigins, trimmedOrigin) {
+			cur.ExtraOrigins = append(cur.ExtraOrigins, trimmedOrigin)
+		}
+		return nil
+	}); err == nil {
 		_ = s.refreshEffectiveRegistry(context.WithoutCancel(ctx))
 		s.broker.Broadcast(ev)
 	}

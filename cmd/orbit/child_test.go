@@ -190,3 +190,132 @@ func TestCLITasksNewAndChildCommands_HubHTTPAndSocketProxy(t *testing.T) {
 		t.Fatalf("expected child spawn to route through ORBIT_RUNNER_SOCK, called=%v out=%q", sockSpawnCalled, out.String())
 	}
 }
+
+func TestCLIBoard_DelegateSocketAlwaysUsedWithParentFlag(t *testing.T) {
+	ctx := context.Background()
+
+	var httpHits int
+	httpMux := http.NewServeMux()
+	httpMux.HandleFunc("GET /api/tasks/tsk_ext/board", func(w http.ResponseWriter, r *http.Request) {
+		httpHits++
+		_ = json.NewEncoder(w).Encode(protocol.TaskBoardResponse{
+			TaskID: "tsk_ext",
+			Messages: []protocol.BoardMessage{
+				{Seq: 1, MessageID: "bms_http_1", TaskID: "tsk_ext", AuthorName: "human", Body: "from http"},
+			},
+		})
+	})
+	httpMux.HandleFunc("POST /api/tasks/tsk_ext/board/messages", func(w http.ResponseWriter, r *http.Request) {
+		httpHits++
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(protocol.BoardMessage{
+			Seq: 2, MessageID: "bms_http_2", TaskID: "tsk_ext", AuthorName: "human", Body: "posted http",
+		})
+	})
+	httpSrv := httptest.NewServer(httpMux)
+	defer httpSrv.Close()
+
+	// 1. Outside delegate context (no ORBIT_RUNNER_SOCK): falls back to REST HTTP client.
+	t.Setenv("ORBIT_RUNNER_SOCK", "")
+	t.Setenv("ORBIT_DELEGATE_TOKEN", "")
+	var out, errOut bytes.Buffer
+	if err := run(ctx, []string{"child", "board", "read", "--hub", httpSrv.URL, "--parent", "tsk_ext"}, &out, &errOut); err != nil {
+		t.Fatalf("outside-session board read failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "from http") {
+		t.Fatalf("unexpected REST board read output: %q", out.String())
+	}
+	out.Reset()
+	if err := run(ctx, []string{"child", "board", "post", "--hub", httpSrv.URL, "--parent", "tsk_ext", "--body", "hi rest"}, &out, &errOut); err != nil {
+		t.Fatalf("outside-session board post failed: %v", err)
+	}
+	if httpHits != 2 {
+		t.Fatalf("expected 2 REST calls outside delegate context, got %d", httpHits)
+	}
+
+	// 2. Inside delegate context: EVEN WITH --parent specified, ALWAYS routes over Runner socket
+	//    passing boardTaskId to Hub/Runner (preserving plan read-only & single-depth scope checks).
+	sockPath := filepath.Join(t.TempDir(), "delegate-board.sock")
+	ln, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = ln.Close()
+		_ = os.Remove(sockPath)
+	}()
+
+	var gotReadPayload, gotPostPayload map[string]any
+	blockPost := false
+	sockMux := http.NewServeMux()
+	sockMux.HandleFunc("/delegate/board-read", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Orbit-Delegate-Token") != "tok_board_1" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		gotReadPayload = nil
+		_ = json.NewDecoder(r.Body).Decode(&gotReadPayload)
+		_ = json.NewEncoder(w).Encode(protocol.TaskBoardResponse{
+			TaskID: "tsk_parent",
+			Messages: []protocol.BoardMessage{
+				{Seq: 5, MessageID: "bms_sock_1", TaskID: "tsk_parent", AuthorName: "Worker", Body: "from socket"},
+			},
+		})
+	})
+	sockMux.HandleFunc("/delegate/board-post", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Orbit-Delegate-Token") != "tok_board_1" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		gotPostPayload = nil
+		_ = json.NewDecoder(r.Body).Decode(&gotPostPayload)
+		if blockPost {
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"error":"delegate action \"board-post\" is forbidden in plan mode"}`))
+			return
+		}
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(protocol.BoardMessage{
+			Seq: 6, MessageID: "bms_sock_2", TaskID: "tsk_parent", AuthorName: "Worker", Body: "posted socket",
+		})
+	})
+	sockSrv := &http.Server{Handler: sockMux}
+	go func() { _ = sockSrv.Serve(ln) }()
+	defer func() { _ = sockSrv.Close() }()
+
+	t.Setenv("ORBIT_RUNNER_SOCK", sockPath)
+	t.Setenv("ORBIT_DELEGATE_TOKEN", "tok_board_1")
+	t.Setenv("ORBIT_HUB_URL", httpSrv.URL)
+
+	out.Reset()
+	if err := run(ctx, []string{"child", "board", "read", "--parent", "tsk_other_parent", "--limit", "15"}, &out, &errOut); err != nil {
+		t.Fatalf("delegate board read with --parent failed: %v", err)
+	}
+	if httpHits != 2 {
+		t.Fatalf("delegate board read bypassed socket and hit REST API! httpHits=%d", httpHits)
+	}
+	if gotReadPayload["boardTaskId"] != "tsk_other_parent" || gotReadPayload["limit"] != float64(15) {
+		t.Fatalf("expected boardTaskId=tsk_other_parent via socket, got %+v", gotReadPayload)
+	}
+
+	out.Reset()
+	if err := run(ctx, []string{"child", "board", "post", "--parent", "tsk_other_parent", "--target", "@parent", "--body", "sync check"}, &out, &errOut); err != nil {
+		t.Fatalf("delegate board post with --parent failed: %v", err)
+	}
+	if httpHits != 2 {
+		t.Fatalf("delegate board post bypassed socket and hit REST API! httpHits=%d", httpHits)
+	}
+	if gotPostPayload["boardTaskId"] != "tsk_other_parent" || gotPostPayload["targetMention"] != "@parent" || gotPostPayload["body"] != "sync check" {
+		t.Fatalf("expected board-post payload with boardTaskId via socket, got %+v", gotPostPayload)
+	}
+
+	// Plan mode / Hub 403 rejection over socket must fail cleanly without falling back to REST.
+	blockPost = true
+	out.Reset()
+	if err := run(ctx, []string{"child", "board", "post", "--parent", "tsk_other_parent", "--body", "forbidden in plan"}, &out, &errOut); err == nil {
+		t.Fatal("expected error when delegate socket returns 403 in plan mode")
+	}
+	if httpHits != 2 {
+		t.Fatalf("plan-mode rejection must not fall back to REST API, httpHits=%d", httpHits)
+	}
+}

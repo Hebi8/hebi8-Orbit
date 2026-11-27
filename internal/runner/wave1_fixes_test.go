@@ -439,31 +439,31 @@ func TestRunner_LocalDelegateBoardReadPostAndPlanGuard(t *testing.T) {
 	if st := postSock(tokNorm, "/delegate/board-read", `{"parentTaskId":"tsk_evil"}`); st != http.StatusBadRequest {
 		t.Fatalf("expected 400 on spoofed parentTaskId, got %d", st)
 	}
-	// Normal session board-read -> 200 with authoritative parentTaskId/parentAttemptId.
-	if st := postSock(tokNorm, "/delegate/board-read", `{"limit":20}`); st != http.StatusOK {
-		t.Fatalf("expected 200 for board-read, got %d", st)
+	// Normal session board-read with explicit boardTaskId -> forwarded while keeping authoritative parentTaskId/parentAttemptId.
+	if st := postSock(tokNorm, "/delegate/board-read", `{"boardTaskId":"tsk_expected","limit":20}`); st != http.StatusOK {
+		t.Fatalf("expected 200 for board-read with boardTaskId, got %d", st)
 	}
 	mu.Lock()
-	if lastPath != "/api/runner/delegate/board-read" || lastBody["parentTaskId"] != "tsk_norm" || lastBody["parentAttemptId"] != "att_norm" {
+	if lastPath != "/api/runner/delegate/board-read" || lastBody["parentTaskId"] != "tsk_norm" || lastBody["parentAttemptId"] != "att_norm" || lastBody["boardTaskId"] != "tsk_expected" {
 		t.Fatalf("unexpected forwarded board-read: path=%s body=%+v", lastPath, lastBody)
 	}
 	mu.Unlock()
 
-	// Normal session board-post -> 201.
-	if st := postSock(tokNorm, "/delegate/board-post", `{"body":"shared update","targetMention":"@parent"}`); st != http.StatusCreated {
+	// Normal session board-post with explicit boardTaskId -> 201.
+	if st := postSock(tokNorm, "/delegate/board-post", `{"boardTaskId":"tsk_expected","body":"shared update","targetMention":"@parent"}`); st != http.StatusCreated {
 		t.Fatalf("expected 201 for board-post, got %d", st)
 	}
 	mu.Lock()
-	if lastPath != "/api/runner/delegate/board-post" || lastBody["parentTaskId"] != "tsk_norm" || lastBody["parentAttemptId"] != "att_norm" || lastBody["body"] != "shared update" {
+	if lastPath != "/api/runner/delegate/board-post" || lastBody["parentTaskId"] != "tsk_norm" || lastBody["parentAttemptId"] != "att_norm" || lastBody["boardTaskId"] != "tsk_expected" || lastBody["body"] != "shared update" {
 		t.Fatalf("unexpected forwarded board-post: path=%s body=%+v", lastPath, lastBody)
 	}
 	mu.Unlock()
 
-	// Plan/read-only session: board-read allowed (200), board-post forbidden (403).
-	if st := postSock(tokPlan, "/delegate/board-read", `{}`); st != http.StatusOK {
+	// Plan/read-only session: board-read allowed (200), board-post forbidden (403) even with boardTaskId.
+	if st := postSock(tokPlan, "/delegate/board-read", `{"boardTaskId":"tsk_plan"}`); st != http.StatusOK {
 		t.Fatalf("expected plan mode board-read=200, got %d", st)
 	}
-	if st := postSock(tokPlan, "/delegate/board-post", `{"body":"should block"}`); st != http.StatusForbidden {
+	if st := postSock(tokPlan, "/delegate/board-post", `{"boardTaskId":"tsk_plan","body":"should block"}`); st != http.StatusForbidden {
 		t.Fatalf("expected plan mode board-post=403, got %d", st)
 	}
 }

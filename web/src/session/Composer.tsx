@@ -472,6 +472,8 @@ interface ComposerViewProps {
   textareaRef: RefObject<HTMLTextAreaElement | null>;
   onChange: (value: string) => void;
   onKeyDown: (e: React.KeyboardEvent<HTMLTextAreaElement>) => void;
+  onKeyUp?: () => void;
+  onInput?: (e: React.FormEvent<HTMLTextAreaElement>) => void;
   onCompositionStart?: () => void;
   onCompositionEnd?: () => void;
   workerLabel?: string;
@@ -522,6 +524,8 @@ function ComposerView({
   textareaRef,
   onChange,
   onKeyDown,
+  onKeyUp,
+  onInput,
   onCompositionStart,
   onCompositionEnd,
   workerLabel,
@@ -569,9 +573,11 @@ function ComposerView({
         autoFocus={autoFocus}
         placeholder={placeholder}
         onChange={(e) => onChange(e.target.value)}
+        onInput={onInput}
         onCompositionStart={onCompositionStart}
         onCompositionEnd={onCompositionEnd}
         onKeyDown={onKeyDown}
+        onKeyUp={onKeyUp}
         aria-label="输入"
       />
 
@@ -748,10 +754,13 @@ function StandaloneComposer(props: StandaloneComposerProps) {
       autoFocus={props.autoFocus}
       textareaRef={taRef}
       onChange={props.onChange}
+      onInput={ime.onInput}
       onCompositionStart={ime.onCompositionStart}
       onCompositionEnd={ime.onCompositionEnd}
+      onKeyUp={ime.onKeyUp}
       onKeyDown={(e) => {
-        if (e.key === 'Enter' && !e.shiftKey && !ime.isImeEnter(e)) {
+        if (ime.isImeEnter(e)) return;
+        if (e.key === 'Enter' && !e.shiftKey) {
           e.preventDefault();
           if (props.canSend) props.onSubmit();
         }
@@ -1297,8 +1306,10 @@ function SessionComposer({
       placeholder={placeholder}
       textareaRef={taRef}
       onChange={setDraft}
+      onInput={ime.onInput}
       onCompositionStart={ime.onCompositionStart}
       onCompositionEnd={ime.onCompositionEnd}
+      onKeyUp={ime.onKeyUp}
       onKeyDown={(e) => {
         if (ime.isImeEnter(e)) return;
         if (e.key === 'Escape' && editing) {

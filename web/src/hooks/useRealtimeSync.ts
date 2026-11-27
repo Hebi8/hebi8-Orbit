@@ -244,7 +244,11 @@ export function collectInvalidations(
     }
     if (kind === 'board.message_posted') {
       add('task-board', tid);
-      if (parentTaskId) add('task-board', parentTaskId);
+      add('task-timeline', tid);
+      if (parentTaskId) {
+        add('task-board', parentTaskId);
+        add('task-timeline', parentTaskId);
+      }
       add('worker-stream', tid);
       continue;
     }

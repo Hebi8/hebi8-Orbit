@@ -230,6 +230,22 @@ func scanBoardMember(scanner interface{ Scan(...any) error }) (protocol.BoardMem
 	return bm, nil
 }
 
+func scopeBoardExternalKey(boardTaskID, rawKey string) string {
+	rawKey = strings.TrimSpace(rawKey)
+	if rawKey == "" {
+		return ""
+	}
+	boardTaskID = strings.TrimSpace(boardTaskID)
+	prefix := "board:" + boardTaskID + ":"
+	if strings.HasPrefix(rawKey, prefix) {
+		return rawKey
+	}
+	if strings.HasPrefix(rawKey, "board:") {
+		return prefix + strings.TrimPrefix(rawKey, "board:")
+	}
+	return prefix + rawKey
+}
+
 func insertBoardMessageTx(
 	ctx context.Context,
 	tx *sql.Tx,
@@ -240,8 +256,8 @@ func insertBoardMessageTx(
 	if externalKey != "" {
 		row := tx.QueryRowContext(ctx, `
 			SELECT seq, message_id, task_id, project_id, author_name, target_mention, body, status, external_key, created_at
-			FROM board_messages WHERE external_key = ?
-		`, externalKey)
+			FROM board_messages WHERE task_id = ? AND external_key = ?
+		`, taskID, externalKey)
 		if existing, err := scanBoardMessage(row); err == nil {
 			return existing, nil, nil
 		}
@@ -803,7 +819,8 @@ func (s *Store) PostBoardMessage(ctx context.Context, taskID, authorName, target
 			return err
 		}
 		var err error
-		msg, emitted, err = insertBoardMessageTx(ctx, tx, taskID, projectID, authorName, strings.TrimSpace(targetMention), body, externalKey, now)
+		scopedExtKey := scopeBoardExternalKey(taskID, externalKey)
+		msg, emitted, err = insertBoardMessageTx(ctx, tx, taskID, projectID, authorName, strings.TrimSpace(targetMention), body, scopedExtKey, now)
 		return err
 	})
 	return msg, emitted, err
@@ -939,7 +956,8 @@ func (s *Store) PostRunnerDelegateBoardMessage(
 				return fmt.Errorf("%w: targetMention %s is outside parent task %s board scope", ErrForbidden, mention, boardTaskID)
 			}
 		}
-		msg, emitted, err = insertBoardMessageTx(ctx, tx, boardTaskID, boardProjectID, authorName, mention, body, externalKey, now)
+		scopedExtKey := scopeBoardExternalKey(boardTaskID, externalKey)
+		msg, emitted, err = insertBoardMessageTx(ctx, tx, boardTaskID, boardProjectID, authorName, mention, body, scopedExtKey, now)
 		return err
 	})
 	return msg, emitted, err

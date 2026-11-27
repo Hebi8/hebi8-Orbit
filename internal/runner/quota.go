@@ -222,25 +222,83 @@ func (c *QuotaCollector) collectAgy(ctx context.Context) protocol.AgentQuotaSnap
 	pctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 
+	outR, outW, err := os.Pipe()
+	if err != nil {
+		return empty
+	}
+	errR, errW, err := os.Pipe()
+	if err != nil {
+		_ = outR.Close()
+		_ = outW.Close()
+		return empty
+	}
+
 	cmd := exec.Command(binPath, "-p", "/usage", "--output-format", "json")
 	setProcessGroup(cmd)
 	cmd.Env = setEnvVar(os.Environ(), "PATH", c.cfg.MergedPATH)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	cmd.Stdout = outW
+	cmd.Stderr = errW
 	if err := cmd.Start(); err != nil {
+		_ = outR.Close()
+		_ = outW.Close()
+		_ = errR.Close()
+		_ = errW.Close()
 		return empty
 	}
+	pgid := processGroupID(cmd)
+	// Close parent's write ends immediately so EOF reflects child/process-group exit.
+	_ = outW.Close()
+	_ = errW.Close()
+
+	var stdout, stderr bytes.Buffer
+	outDone := make(chan struct{})
+	errDone := make(chan struct{})
+	go func() {
+		defer close(outDone)
+		_, _ = io.Copy(&stdout, io.LimitReader(outR, 2<<20))
+	}()
+	go func() {
+		defer close(errDone)
+		_, _ = io.Copy(&stderr, io.LimitReader(errR, 512<<10))
+	}()
+
+	drainPipesBounded := func(timeout time.Duration) {
+		timer := time.NewTimer(timeout)
+		defer timer.Stop()
+		for outCh, errCh := outDone, errDone; outCh != nil || errCh != nil; {
+			select {
+			case <-outCh:
+				outCh = nil
+			case <-errCh:
+				errCh = nil
+			case <-timer.C:
+				_ = outR.Close()
+				_ = errR.Close()
+				<-outDone
+				<-errDone
+				return
+			}
+		}
+		_ = outR.Close()
+		_ = errR.Close()
+	}
+
 	waitCh := make(chan error, 1)
 	go func() {
 		waitCh <- cmd.Wait()
 	}()
+
 	var runErr error
 	select {
 	case runErr = <-waitCh:
+		drainPipesBounded(150 * time.Millisecond)
 	case <-pctx.Done():
-		killProcessGroup(cmd)
-		<-waitCh
+		killProcessGroupByID(cmd, pgid)
+		select {
+		case <-waitCh:
+		case <-time.After(150 * time.Millisecond):
+		}
+		drainPipesBounded(150 * time.Millisecond)
 		empty.Error = "agy usage probe timed out"
 		return empty
 	}
@@ -349,6 +407,7 @@ func (c *QuotaCollector) collectCodex(ctx context.Context) protocol.AgentQuotaSn
 		_ = stdout.Close()
 		return empty
 	}
+	pgid := processGroupID(cmd)
 
 	type rpcReadResult struct {
 		raw json.RawMessage
@@ -389,10 +448,15 @@ func (c *QuotaCollector) collectCodex(ctx context.Context) protocol.AgentQuotaSn
 	waitProcess := func(killImmediate bool) {
 		_ = stdin.Close()
 		if killImmediate {
-			killProcessGroup(cmd)
+			killProcessGroupByID(cmd, pgid)
+			_ = stdout.Close()
 		}
-		// Never call cmd.Wait() before stdout reads finish (exec.Cmd.StdoutPipe contract).
-		<-readDone
+		select {
+		case <-readDone:
+		case <-time.After(150 * time.Millisecond):
+			_ = stdout.Close()
+			<-readDone
+		}
 		waitDone := make(chan struct{})
 		go func() {
 			_ = cmd.Wait()
@@ -400,9 +464,12 @@ func (c *QuotaCollector) collectCodex(ctx context.Context) protocol.AgentQuotaSn
 		}()
 		select {
 		case <-waitDone:
-		case <-time.After(400 * time.Millisecond):
-			killProcessGroup(cmd)
-			<-waitDone
+		case <-time.After(250 * time.Millisecond):
+			killProcessGroupByID(cmd, pgid)
+			select {
+			case <-waitDone:
+			case <-time.After(150 * time.Millisecond):
+			}
 		}
 	}
 

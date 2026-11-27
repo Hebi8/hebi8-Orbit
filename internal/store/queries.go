@@ -25,8 +25,12 @@ func (s *Store) SyncRegistry(ctx context.Context, dataDir string, projects proto
 		if err != nil {
 			return err
 		}
+		activePairedSet, err := loadActiveRegistryMachinesSetTx(ctx, tx)
+		if err != nil {
+			return err
+		}
 		for machineID, m := range machines.Machines {
-			if removedSet[machineID] {
+			if removedSet[machineID] || activePairedSet[machineID] {
 				continue
 			}
 			caps := m.Capabilities
@@ -275,7 +279,16 @@ func (s *Store) Bootstrap(ctx context.Context, machineMeta map[string]protocol.M
 			_ = json.Unmarshal([]byte(allowedRootsJSON), &mv.AllowedRoots)
 			mv.DisplayName = mv.MachineID
 			mv.DisplayAlias = strings.TrimSpace(displayAlias)
-			if inYAML {
+			isActivePaired := inReg && !ri.removed
+			if isActivePaired {
+				mv.Source = protocol.MachineSourcePaired
+				if ri.displayName != "" {
+					mv.DisplayName = ri.displayName
+				}
+				if ri.sshAlias != "" {
+					mv.SSHAlias = ri.sshAlias
+				}
+			} else if inYAML {
 				mv.Source = protocol.MachineSourceYAML
 				if cfg.DisplayName != "" {
 					mv.DisplayName = cfg.DisplayName
@@ -287,12 +300,6 @@ func (s *Store) Bootstrap(ctx context.Context, machineMeta map[string]protocol.M
 				}
 			} else {
 				mv.Source = protocol.MachineSourcePaired
-				if inReg && ri.displayName != "" {
-					mv.DisplayName = ri.displayName
-				}
-				if inReg && ri.sshAlias != "" {
-					mv.SSHAlias = ri.sshAlias
-				}
 			}
 			if sshAliasDB.Valid {
 				mv.SSHAlias = strings.TrimSpace(sshAliasDB.String)
@@ -819,6 +826,9 @@ func (s *Store) GetTaskTimeline(ctx context.Context, taskID string, beforeSeq in
 			return err
 		}
 		resp.BoardMembers = boardMembers
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM board_messages WHERE task_id = ?`, taskID).Scan(&resp.BoardMessageCount); err != nil {
+			return err
+		}
 
 		// Delegated child sessions (live summary cards for this task)
 		children, err := listChildTasksTx(ctx, tx, taskID, false)

@@ -1645,6 +1645,125 @@ func (s *Store) DispatchAnnotations(ctx context.Context, p DispatchAnnotationsPa
 	return res, err
 }
 
+// PeekNextPendingInput returns the next queued input (honoring preferredInputID when present)
+// together with its server-persisted routing metadata without mutating queue state.
+func (s *Store) PeekNextPendingInput(ctx context.Context, taskID, preferredInputID string) (*protocol.PendingInput, *PendingInputRoute, error) {
+	var outPI *protocol.PendingInput
+	var outRoute *PendingInputRoute
+	err := s.WithReadTx(ctx, func(tx *sql.Tx) error {
+		if strings.TrimSpace(preferredInputID) != "" {
+			row := tx.QueryRowContext(ctx, `
+				SELECT input_id, task_id, project_id, kind, source, body, payload_json, route_json, position, state, created_at, updated_at, dispatched_attempt_id
+				FROM task_pending_inputs
+				WHERE task_id = ? AND input_id = ? AND state = 'queued'
+			`, taskID, preferredInputID)
+			cand, rr, err := scanPendingInputWithRoute(row)
+			if err == nil {
+				outPI = &cand
+				outRoute = parsePendingInputRoute(rr)
+				return nil
+			}
+			if !errors.Is(err, sql.ErrNoRows) {
+				return err
+			}
+		}
+		row := tx.QueryRowContext(ctx, `
+			SELECT input_id, task_id, project_id, kind, source, body, payload_json, route_json, position, state, created_at, updated_at, dispatched_attempt_id
+			FROM task_pending_inputs
+			WHERE task_id = ? AND state = 'queued'
+			ORDER BY position ASC, created_at ASC
+			LIMIT 1
+		`, taskID)
+		cand, rr, err := scanPendingInputWithRoute(row)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		outPI = &cand
+		outRoute = parsePendingInputRoute(rr)
+		return nil
+	})
+	return outPI, outRoute, err
+}
+
+// ClearPendingQueueDrain clears a stale pending_queue_drain marker when no queued items remain.
+func (s *Store) ClearPendingQueueDrain(ctx context.Context, taskID string) error {
+	return s.WithWriteTx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `
+			UPDATE tasks SET pending_queue_drain = 0, pending_steer_input_id = NULL
+			WHERE task_id = ?
+		`, taskID)
+		return err
+	})
+}
+
+// RecordPendingQueueBlocked records a visible blocking reason when the head queued input
+// cannot resolve any valid execution route/location, and clears pending_queue_drain so the
+// maintenance scanner does not spin silently forever.
+func (s *Store) RecordPendingQueueBlocked(ctx context.Context, taskID, inputID, reason string) (*protocol.EventRecord, error) {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "排队输入无法出队：缺少可用的执行目录或设备路由"
+	}
+	now := time.Now().UnixMilli()
+	var emitted *protocol.EventRecord
+	err := s.WithWriteTx(ctx, func(tx *sql.Tx) error {
+		var projectID string
+		var activeAtt sql.NullString
+		var archivedAt sql.NullInt64
+		if err := tx.QueryRowContext(ctx, `
+			SELECT project_id, active_attempt_id, archived_at FROM tasks WHERE task_id = ?
+		`, taskID).Scan(&projectID, &activeAtt, &archivedAt); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("%w: task %s", ErrNotFound, taskID)
+			}
+			return err
+		}
+		if archivedAt.Valid {
+			_, _ = tx.ExecContext(ctx, `UPDATE tasks SET pending_queue_drain = 0, pending_steer_input_id = NULL WHERE task_id = ?`, taskID)
+			return nil
+		}
+		if !activeAtt.Valid || strings.TrimSpace(activeAtt.String) == "" {
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE tasks
+				SET state = ?, pending_queue_drain = 0, pending_steer_input_id = NULL, updated_at = ?
+				WHERE task_id = ?
+			`, string(protocol.TaskStateWaitingResource), now, taskID); err != nil {
+				return err
+			}
+		} else {
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE tasks SET pending_queue_drain = 0, pending_steer_input_id = NULL WHERE task_id = ?
+			`, taskID); err != nil {
+				return err
+			}
+		}
+		ev, err := insertEventTx(ctx, tx, eventInsert{
+			StreamID:   "task:" + taskID,
+			ProjectID:  projectID,
+			TaskID:     taskID,
+			ActorKind:  protocol.ActorSystem,
+			ActorID:    "queue-dispatcher",
+			Kind:       protocol.EventQueueUpdated,
+			Visibility: protocol.VisibilityTimeline,
+			Payload: map[string]any{
+				"action":  "dispatch_blocked",
+				"inputId": strings.TrimSpace(inputID),
+				"reason":  reason,
+			},
+			CreatedAt: now,
+		})
+		if err != nil {
+			return err
+		}
+		emitted = &ev
+		return nil
+	})
+	return emitted, err
+}
+
 // ConsumeNextPendingInputParams configures automatic queue pop after an Attempt completes.
 type ConsumeNextPendingInputParams struct {
 	TaskID            string

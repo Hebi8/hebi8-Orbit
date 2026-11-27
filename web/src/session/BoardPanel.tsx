@@ -16,11 +16,13 @@ import {
   childSessionMark,
   childStateLabel,
   cleanMachineName,
+  fullTaskTitle,
   hhmm,
   memberStateLabel,
   taskTitle,
   type SessionMark,
 } from '../lib/format';
+import { resolveManualBoardMention } from '../lib/boardMention';
 import { useImeGuard } from '../lib/ime';
 import { navigate, paths } from '../lib/router';
 import { toast } from '../store/useWorkbenchStore';
@@ -29,7 +31,9 @@ interface BoardParticipant {
   key: string;
   kind: 'child' | 'native';
   label: string;
+  fullName: string;
   mentionValue: string;
+  taskId?: string;
   meta: string;
   mark: SessionMark;
   lastConsumedSeq: number;
@@ -113,18 +117,12 @@ export function BoardPanel({
       }
     }
 
-    const titleCounts = new Map<string, number>();
-    for (const c of childrenList) {
-      const t = taskTitle(c).toLowerCase();
-      titleCounts.set(t, (titleCounts.get(t) ?? 0) + 1);
-    }
-
     const seenChildIds = new Set<string>();
     for (const c of childrenList) {
       seenChildIds.add(c.taskId);
       const cursor = memberByChildId.get(c.taskId);
       const label = taskTitle(c);
-      const isUniqueTitle = (titleCounts.get(label.toLowerCase()) ?? 0) <= 1;
+      const fullName = fullTaskTitle(c);
       const machName = machineLabelOf(c.machineId || cursor?.machineId);
       const adpRaw = c.preferredAdapter || cursor?.adapter;
       const adpName = adpRaw ? ADAPTER_LABELS[adpRaw] ?? adpRaw : '';
@@ -135,7 +133,9 @@ export function BoardPanel({
         key: `child:${c.taskId}`,
         kind: 'child',
         label,
-        mentionValue: isUniqueTitle ? label : c.taskId,
+        fullName,
+        mentionValue: c.taskId,
+        taskId: c.taskId,
         meta,
         mark: childSessionMark(c, inboxByTask?.get(c.taskId)),
         lastConsumedSeq: cursor?.lastConsumedSeq ?? 0,
@@ -161,7 +161,9 @@ export function BoardPanel({
         key: isChildCursor ? `child:${m.workerTaskId}` : `native:${m.memberName}`,
         kind: isChildCursor ? 'child' : 'native',
         label: isChildCursor ? m.memberName : `@${m.memberName}`,
-        mentionValue: m.memberName,
+        fullName: m.memberName,
+        mentionValue: isChildCursor ? m.workerTaskId! : m.memberName,
+        taskId: m.workerTaskId || undefined,
         meta,
         mark: nativeMemberMark(m),
         lastConsumedSeq: m.lastConsumedSeq,
@@ -206,6 +208,7 @@ export function BoardPanel({
   const latest = board?.latestSeq ?? 0;
   const [target, setTarget] = useState<string>(worker ?? '');
   const [text, setText] = useState('');
+  const [mentionError, setMentionError] = useState('');
   const listRef = useRef<HTMLDivElement | null>(null);
   const prevLatestSeqRef = useRef<number>(0);
 
@@ -226,29 +229,33 @@ export function BoardPanel({
       api.postBoardMessage(taskId, { authorName: 'human', targetMention: v.target || undefined, body: v.body }),
     onSuccess: () => {
       setText('');
+      setMentionError('');
       void qc.invalidateQueries({ queryKey: ['task-board', taskId] });
       void qc.invalidateQueries({ queryKey: ['task-children', taskId] });
+      void qc.invalidateQueries({ queryKey: ['task-timeline', taskId] });
     },
     onError: (e) => toast(errMsg(e), 'err'),
   });
 
   const send = () => {
-    let body = text.trim();
-    if (!body || post.isPending) return;
-    let to = target;
-    const m = /^@(\S+)\s+([\s\S]+)$/.exec(body);
-    if (m) {
-      const token = m[1];
-      const matched = participants.find(
-        (p) =>
-          p.mentionValue.toLowerCase() === token.toLowerCase() ||
-          p.label.replace(/^@/, '').toLowerCase() === token.toLowerCase() ||
-          p.child?.taskId === token,
-      );
-      to = token.toLowerCase() === 'all' ? 'all' : matched ? matched.mentionValue : token;
-      body = m[2].trim();
+    if (!text.trim() || post.isPending) return;
+    const resolved = resolveManualBoardMention(
+      text,
+      target,
+      participants.map((p) => ({
+        key: p.key,
+        mentionValue: p.mentionValue,
+        fullName: p.fullName,
+        displayLabel: p.label,
+        taskId: p.taskId,
+      })),
+    );
+    if (!resolved.ok) {
+      setMentionError(resolved.error);
+      return;
     }
-    post.mutate({ target: to, body });
+    setMentionError('');
+    post.mutate({ target: resolved.target, body: resolved.body });
   };
 
   const cursorsAt = (seq: number) =>
@@ -355,7 +362,10 @@ export function BoardPanel({
             <button
               type="button"
               className={target === 'all' ? 'on' : ''}
-              onClick={() => setTarget(target === 'all' ? '' : 'all')}
+              onClick={() => {
+                setTarget(target === 'all' ? '' : 'all');
+                setMentionError('');
+              }}
             >
               @all
             </button>
@@ -364,12 +374,20 @@ export function BoardPanel({
                 type="button"
                 key={p.key}
                 className={target === p.mentionValue ? 'on' : ''}
-                title={`提及 ${p.label}`}
-                onClick={() => setTarget(target === p.mentionValue ? '' : p.mentionValue)}
+                title={`提及 ${p.fullName}`}
+                onClick={() => {
+                  setTarget(target === p.mentionValue ? '' : p.mentionValue);
+                  setMentionError('');
+                }}
               >
                 @{p.label.replace(/^@/, '')}
               </button>
             ))}
+          </div>
+        )}
+        {mentionError && (
+          <div className="fsub" role="alert" style={{ color: 'var(--warn)', marginBottom: 6 }}>
+            {mentionError}
           </div>
         )}
         <div className="bin">
@@ -378,10 +396,14 @@ export function BoardPanel({
             placeholder={
               target ? `投给 @${selectedTargetDisplay}，按 Enter 发送…` : '往板上投一条，点击上方 @ 提及子会话或 @all…'
             }
-            onChange={(e) => setText(e.target.value)}
+            onChange={(e) => {
+              setText(e.target.value);
+              if (mentionError) setMentionError('');
+            }}
             {...ime.compositionProps}
             onKeyDown={(e) => {
-              if (e.key === 'Enter' && !ime.isImeEnter(e)) {
+              if (ime.isImeEnter(e)) return;
+              if (e.key === 'Enter') {
                 e.preventDefault();
                 send();
               }

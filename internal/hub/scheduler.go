@@ -3,6 +3,7 @@ package hub
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -861,10 +862,79 @@ func (s *Server) consumeAndDispatchNextPendingInput(ctx context.Context, taskID,
 	if err != nil {
 		return
 	}
-	partID, locationID, _ := s.store.GetTaskLocationTarget(ctx, taskID)
-	route, err := s.resolveExecutionRouteWithLocation(proj, task.RequiredCapability, task.PreferredAdapter, "", partID, locationID)
+	headPI, headRoute, err := s.store.PeekNextPendingInput(ctx, taskID, preferredInputID)
 	if err != nil {
 		return
+	}
+	if headPI == nil {
+		_ = s.store.ClearPendingQueueDrain(ctx, taskID)
+		return
+	}
+
+	taskPartID, taskLocationID, _ := s.store.GetTaskLocationTarget(ctx, taskID)
+	prefMachineID := ""
+	prefPartID := taskPartID
+	prefLocationID := taskLocationID
+	prefAdapter := task.PreferredAdapter
+	prefCap := task.RequiredCapability
+	pinnedPart := false
+	pinnedLocation := false
+	var prefIsolation protocol.LocationIsolation
+
+	if headRoute != nil {
+		if strings.TrimSpace(headRoute.MachineID) != "" {
+			prefMachineID = strings.TrimSpace(headRoute.MachineID)
+		}
+		if headRoute.Adapter != "" {
+			prefAdapter = headRoute.Adapter
+		}
+		if strings.TrimSpace(headRoute.AnchorCapability) != "" {
+			prefCap = strings.TrimSpace(headRoute.AnchorCapability)
+		}
+		if strings.TrimSpace(headRoute.PartID) != "" {
+			prefPartID = strings.TrimSpace(headRoute.PartID)
+			pinnedPart = true
+		}
+		if strings.TrimSpace(headRoute.LocationID) != "" {
+			prefLocationID = strings.TrimSpace(headRoute.LocationID)
+			pinnedLocation = true
+		}
+		if headRoute.RouteExplicit {
+			prefPartID = strings.TrimSpace(headRoute.PartID)
+			prefLocationID = strings.TrimSpace(headRoute.LocationID)
+			pinnedPart = prefPartID != ""
+			pinnedLocation = prefLocationID != ""
+		}
+		if headRoute.Isolation != "" {
+			prefIsolation = headRoute.Isolation
+		}
+	}
+
+	route, routeErr := s.resolveExecutionRouteWithLocation(proj, prefCap, prefAdapter, prefMachineID, prefPartID, prefLocationID)
+	// If only the task's fallback location/part became stale (not explicitly pinned by the queued item),
+	// retry resolution without the stale fallback target.
+	if routeErr != nil && !pinnedLocation && prefLocationID != "" {
+		if r2, err2 := s.resolveExecutionRouteWithLocation(proj, prefCap, prefAdapter, prefMachineID, prefPartID, ""); err2 == nil {
+			route = r2
+			routeErr = nil
+		} else if !pinnedPart && prefPartID != "" {
+			if r3, err3 := s.resolveExecutionRouteWithLocation(proj, prefCap, prefAdapter, prefMachineID, "", ""); err3 == nil {
+				route = r3
+				routeErr = nil
+			}
+		}
+	}
+	if routeErr != nil {
+		reason := fmt.Sprintf("排队输入无法出队：%v", routeErr)
+		if ev, bErr := s.store.RecordPendingQueueBlocked(ctx, taskID, headPI.InputID, reason); bErr == nil && ev != nil {
+			s.broker.Broadcast(*ev)
+		}
+		return
+	}
+
+	effectiveIsolation := route.Isolation
+	if prefIsolation != "" && !route.IsPlainFolder {
+		effectiveIsolation = prefIsolation
 	}
 	var anchorPtr *protocol.ProjectAnchorConfig
 	if route.HasAnchor {
@@ -878,7 +948,7 @@ func (s *Server) consumeAndDispatchNextPendingInput(ctx context.Context, taskID,
 		Adapter:          route.Adapter,
 		PartID:           route.PartID,
 		LocationID:       route.LocationID,
-		Isolation:        route.Isolation,
+		Isolation:        effectiveIsolation,
 		Anchor:           anchorPtr,
 		AnchorCapability: route.Capability,
 		LeaseTTLMs:       s.leaseTTL.Milliseconds(),
@@ -912,7 +982,16 @@ func (s *Server) consumeAndDispatchNextPendingInput(ctx context.Context, taskID,
 			return nil
 		},
 	})
-	if err != nil || att == nil {
+	if err != nil {
+		if errors.Is(err, store.ErrInvalidInput) || errors.Is(err, store.ErrForbidden) {
+			reason := fmt.Sprintf("排队输入无法出队：%v", err)
+			if ev, bErr := s.store.RecordPendingQueueBlocked(ctx, taskID, headPI.InputID, reason); bErr == nil && ev != nil {
+				s.broker.Broadcast(*ev)
+			}
+		}
+		return
+	}
+	if att == nil {
 		return
 	}
 	if len(events) > 0 {

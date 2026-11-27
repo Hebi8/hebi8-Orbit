@@ -767,7 +767,11 @@ func (s *Store) BuildPABrief(
 			return err
 		}
 
-		// Machines
+		// Machines (filtering out tombstoned / removed machines so online denominator stays accurate)
+		removedSet, err := loadRemovedMachinesSetTx(ctx, tx)
+		if err != nil {
+			return err
+		}
 		mRows, err := tx.QueryContext(ctx, `
 			SELECT machine_id, transport_mode, status, capabilities_json, resources_json,
 			       adapters_json, runner_version, last_seen_at, updated_at
@@ -787,6 +791,9 @@ func (s *Store) BuildPABrief(
 				&adaptersJSON, &runnerVer, &lastSeen, &mv.UpdatedAt,
 			); err != nil {
 				return err
+			}
+			if removedSet[mv.MachineID] {
+				continue
 			}
 			mv.TransportMode = protocol.TransportMode(transport)
 			mv.Status = protocol.MachineStatus(status)

@@ -616,10 +616,7 @@ func (s *Server) handleRunnerDelegateBoardPost(w http.ResponseWriter, r *http.Re
 		ParentTaskID:    strings.TrimSpace(req.ParentTaskID),
 		ParentAttemptID: strings.TrimSpace(req.ParentAttemptID),
 	}
-	extKey := ""
-	if idemp := strings.TrimSpace(r.Header.Get("Idempotency-Key")); idemp != "" {
-		extKey = "board:" + idemp
-	}
+	extKey := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
 	msg, ev, err := s.store.PostRunnerDelegateBoardMessage(r.Context(), guard, strings.TrimSpace(req.BoardTaskID), req.Body, req.TargetMention, extKey)
 	if errors.Is(err, store.ErrForbidden) {
 		writeAPIError(w, http.StatusForbidden, "ERR_FORBIDDEN", err.Error())
@@ -639,6 +636,7 @@ func (s *Server) handleRunnerDelegateBoardPost(w http.ResponseWriter, r *http.Re
 	}
 	if ev != nil {
 		s.broker.Broadcast(*ev)
+		s.deliverBoardMessageMentions(r.Context(), msg.TaskID, &msg, strings.TrimSpace(req.ParentTaskID), protocol.ActorAgent, "agent:"+runnerMachineID)
 	}
 	writeJSON(w, http.StatusCreated, msg)
 }

@@ -1464,10 +1464,7 @@ func (s *Server) handlePostBoardMessage(w http.ResponseWriter, r *http.Request) 
 	if author == "" {
 		author = "human"
 	}
-	extKey := ""
-	if idemp := strings.TrimSpace(r.Header.Get("Idempotency-Key")); idemp != "" {
-		extKey = "board:" + idemp
-	}
+	extKey := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
 	msg, ev, err := s.store.PostBoardMessage(r.Context(), taskID, author, req.TargetMention, req.Body, extKey)
 	if errors.Is(err, store.ErrNotFound) {
 		writeAPIError(w, http.StatusNotFound, "ERR_TASK_NOT_FOUND", err.Error())
@@ -1487,75 +1484,133 @@ func (s *Server) handlePostBoardMessage(w http.ResponseWriter, r *http.Request) 
 	}
 	if ev != nil {
 		s.broker.Broadcast(*ev)
+		s.deliverBoardMessageMentions(r.Context(), taskID, &msg, "", actorKindFromContext(r.Context()), actorFromContext(r.Context()))
 	}
 
-	// B16: Route @worker / @member board messages onto a real executable delivery path so
-	// status transitions posted -> consumed when dispatched/delivered.
-	if msg.TargetMention != "" && msg.Status == protocol.BoardMessagePosted {
-		target, _ := s.store.ResolveBoardTarget(r.Context(), taskID, msg.TargetMention)
-		actorKind := actorKindFromContext(r.Context())
-		actorID := actorFromContext(r.Context())
-		if target != nil && target.WorkerTaskID != "" {
-			// Child-task worker: deliver directly via its followup/queue path.
-			fResp, _, _, fErr := s.followupTaskWithExtra(r.Context(), target.WorkerTaskID, protocol.FollowupTaskRequest{
-				Message: fmt.Sprintf("[Board @%s] %s", target.MemberName, msg.Body),
-				Mode:    protocol.FollowupModeQueue,
-			}, actorKind, actorID, map[string]any{
-				"boardMessageId":  msg.MessageID,
-				"boardTaskId":     taskID,
-				"boardMemberName": target.MemberName,
-				"boardSeq":        msg.Seq,
-			})
-			if fErr == nil && fResp.Attempt != nil {
-				msg.Status = protocol.BoardMessageConsumed
+	writeJSON(w, http.StatusCreated, msg)
+}
+
+// deliverBoardMessageMentions routes @child, @parent, @all, and native Swarm @member board mentions
+// uniformly for both Web API and Runner delegate posts. Deduplicates by (messageId, targetTaskId)
+// and never wakes senderTaskID to prevent self-trigger loops.
+func (s *Server) deliverBoardMessageMentions(
+	ctx context.Context,
+	boardTaskID string,
+	msg *protocol.BoardMessage,
+	senderTaskID string,
+	actorKind protocol.ActorKind,
+	actorID string,
+) {
+	if msg == nil || msg.Status != protocol.BoardMessagePosted {
+		return
+	}
+	mention := strings.TrimPrefix(strings.TrimSpace(msg.TargetMention), "@")
+	if mention == "" {
+		return
+	}
+	boardTaskID = strings.TrimSpace(boardTaskID)
+	senderTaskID = strings.TrimSpace(senderTaskID)
+	delivered := map[string]bool{}
+	anyConsumed := false
+
+	deliverToTask := func(targetTaskID, boardMemberName, mentionLabel string) {
+		targetTaskID = strings.TrimSpace(targetTaskID)
+		if targetTaskID == "" || targetTaskID == senderTaskID {
+			return
+		}
+		if delivered[targetTaskID] {
+			return
+		}
+		delivered[targetTaskID] = true
+		fResp, _, _, fErr := s.followupTaskWithExtra(ctx, targetTaskID, protocol.FollowupTaskRequest{
+			Message: fmt.Sprintf("[Board @%s] %s", mentionLabel, msg.Body),
+			Mode:    protocol.FollowupModeQueue,
+		}, actorKind, actorID, map[string]any{
+			"boardMessageId":  msg.MessageID,
+			"boardTaskId":     boardTaskID,
+			"boardMemberName": boardMemberName,
+			"boardSeq":        msg.Seq,
+		})
+		if fErr == nil && fResp.Attempt != nil {
+			anyConsumed = true
+		}
+	}
+
+	tryForwardLiveSwarm := func(memberName string) bool {
+		parentTask, err := s.store.GetTask(ctx, boardTaskID)
+		if err != nil || parentTask.ActiveAttemptID == "" {
+			return false
+		}
+		attRec, err := s.store.GetAttemptRecord(ctx, parentTask.ActiveAttemptID)
+		if err != nil || attRec.State != protocol.AttemptSwarmMonitoring || !s.runners.IsConnected(attRec.MachineID) {
+			return false
+		}
+		return s.runners.SendBoardMessage(attRec.MachineID, protocol.BoardMessageDispatchFrame{
+			Type:          protocol.RunnerMsgBoardMessage,
+			AttemptID:     attRec.AttemptID,
+			TaskID:        boardTaskID,
+			MessageID:     msg.MessageID,
+			Seq:           msg.Seq,
+			AuthorName:    msg.AuthorName,
+			TargetMention: memberName,
+			Body:          msg.Body,
+		}) == nil
+	}
+
+	switch {
+	case strings.EqualFold(mention, "all"):
+		if children, err := s.store.ListChildTasks(ctx, boardTaskID, false); err == nil {
+			for _, c := range children {
+				if c.TaskID == senderTaskID {
+					continue
+				}
+				label := strings.TrimSpace(c.Title)
+				if label == "" {
+					label = c.TaskID
+				}
+				deliverToTask(c.TaskID, label, "all")
 			}
-		} else {
-			// Native Swarm worker (or coordinator mention): forward live into active swarm_monitoring attempt,
-			// or fall back to parent task's followup/queue path.
+		}
+		if boardTaskID != senderTaskID {
 			forwardedLive := false
-			if parentTask, err := s.store.GetTask(r.Context(), taskID); err == nil && parentTask.ActiveAttemptID != "" {
-				if attRec, err := s.store.GetAttemptRecord(r.Context(), parentTask.ActiveAttemptID); err == nil &&
-					attRec.State == protocol.AttemptSwarmMonitoring && s.runners.IsConnected(attRec.MachineID) {
-					memberName := msg.TargetMention
-					if target != nil && target.MemberName != "" {
-						memberName = target.MemberName
-					}
-					if sendErr := s.runners.SendBoardMessage(attRec.MachineID, protocol.BoardMessageDispatchFrame{
-						Type:          protocol.RunnerMsgBoardMessage,
-						AttemptID:     attRec.AttemptID,
-						TaskID:        taskID,
-						MessageID:     msg.MessageID,
-						Seq:           msg.Seq,
-						AuthorName:    msg.AuthorName,
-						TargetMention: memberName,
-						Body:          msg.Body,
-					}); sendErr == nil {
-						forwardedLive = true
+			if board, err := s.store.GetTaskBoardPage(ctx, boardTaskID, 0, 1); err == nil {
+				for _, m := range board.Members {
+					if m.WorkerTaskID == "" {
+						forwardedLive = tryForwardLiveSwarm("all")
+						break
 					}
 				}
 			}
 			if !forwardedLive {
-				memberName := msg.TargetMention
-				if target != nil && target.MemberName != "" {
-					memberName = target.MemberName
-				}
-				fResp, _, _, fErr := s.followupTaskWithExtra(r.Context(), taskID, protocol.FollowupTaskRequest{
-					Message: fmt.Sprintf("[Board @%s] %s", memberName, msg.Body),
-					Mode:    protocol.FollowupModeQueue,
-				}, actorKind, actorID, map[string]any{
-					"boardMessageId":  msg.MessageID,
-					"boardTaskId":     taskID,
-					"boardMemberName": memberName,
-					"boardSeq":        msg.Seq,
-				})
-				if fErr == nil && fResp.Attempt != nil {
-					msg.Status = protocol.BoardMessageConsumed
+				deliverToTask(boardTaskID, "", "all")
+			}
+		}
+
+	case strings.EqualFold(mention, "parent") || mention == boardTaskID:
+		if boardTaskID != senderTaskID {
+			deliverToTask(boardTaskID, "", "parent")
+		}
+
+	default:
+		target, _ := s.store.ResolveBoardTarget(ctx, boardTaskID, mention)
+		if target != nil && target.WorkerTaskID != "" {
+			deliverToTask(target.WorkerTaskID, target.MemberName, target.MemberName)
+		} else {
+			memberName := mention
+			if target != nil && target.MemberName != "" {
+				memberName = target.MemberName
+			}
+			if !tryForwardLiveSwarm(memberName) {
+				if target != nil || strings.EqualFold(memberName, "coordinator") {
+					deliverToTask(boardTaskID, memberName, memberName)
 				}
 			}
 		}
 	}
 
-	writeJSON(w, http.StatusCreated, msg)
+	if anyConsumed {
+		msg.Status = protocol.BoardMessageConsumed
+	}
 }
 
 func (s *Server) handleGetWorkerStream(w http.ResponseWriter, r *http.Request) {

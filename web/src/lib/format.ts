@@ -354,8 +354,12 @@ export function memberStateLabel(s: BoardMemberState): string {
   return m[s] ?? s;
 }
 
+export function fullTaskTitle(t: Pick<TaskSummary, 'title' | 'goal' | 'taskId'>): string {
+  return (t.title || '').trim() || (t.goal || '').trim().split('\n')[0] || t.taskId;
+}
+
 export function taskTitle(t: Pick<TaskSummary, 'title' | 'goal' | 'taskId'>): string {
-  const s = (t.title || '').trim() || (t.goal || '').trim().split('\n')[0] || t.taskId;
+  const s = fullTaskTitle(t);
   return s.length > 80 ? `${s.slice(0, 80)}…` : s;
 }
 

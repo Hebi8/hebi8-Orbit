@@ -44,13 +44,15 @@ type ServerOptions struct {
 type Server struct {
 	mu                sync.RWMutex
 	registryRefreshMu sync.Mutex
+	yamlFileMu        sync.Mutex
 	hubCfg            protocol.HubConfig
-	yamlProjects protocol.ProjectsConfig
-	yamlMachines protocol.MachinesConfig
-	projects     protocol.ProjectsConfig
-	machines     protocol.MachinesConfig
-	dynNet       store.DynamicNetworkSettings
-	sshCfgOpts   sshcfg.MatchOptions
+	yamlProjects      protocol.ProjectsConfig
+	yamlMachines      protocol.MachinesConfig
+	pairedMachineIDs  map[string]bool
+	projects          protocol.ProjectsConfig
+	machines          protocol.MachinesConfig
+	dynNet            store.DynamicNetworkSettings
+	sshCfgOpts        sshcfg.MatchOptions
 
 	gcPaused    bool
 	gcReason    string
@@ -284,15 +286,19 @@ func (s *Server) ReloadConfig(ctx context.Context) (protocol.ReloadConfigRespons
 	}
 
 	machines := protocol.MachinesConfig{SchemaVersion: 1, Machines: map[string]protocol.MachineConfig{}}
+	s.yamlFileMu.Lock()
 	if _, err := os.Stat(machPath); err == nil {
 		m, err := protocol.LoadMachinesConfig(machPath)
 		if err != nil {
+			s.yamlFileMu.Unlock()
 			return protocol.ReloadConfigResponse{}, err
 		}
 		machines = m
 	} else if !errors.Is(err, os.ErrNotExist) {
+		s.yamlFileMu.Unlock()
 		return protocol.ReloadConfigResponse{}, err
 	}
+	s.yamlFileMu.Unlock()
 
 	if err := s.store.SyncRegistry(ctx, cfg.DataDir, projects, machines); err != nil {
 		return protocol.ReloadConfigResponse{}, err

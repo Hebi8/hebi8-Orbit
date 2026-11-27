@@ -288,10 +288,12 @@ type FolderChangeItem struct {
 
 // FolderChangesSummary captures lightweight before/after changes for a plain-folder execution (no shadow Git).
 type FolderChangesSummary struct {
-	TotalAdds int                `json:"totalAdds"`
-	TotalDels int                `json:"totalDels"`
-	Files     []FolderChangeItem `json:"files"`
-	Promoted  bool               `json:"promoted,omitempty"`
+	TotalAdds           int                `json:"totalAdds"`
+	TotalDels           int                `json:"totalDels"`
+	Files               []FolderChangeItem `json:"files"`
+	Promoted            bool               `json:"promoted,omitempty"`
+	ConcurrentSharedDir bool               `json:"concurrentSharedDir,omitempty"`
+	ConcurrentNotice    string             `json:"concurrentNotice,omitempty"`
 }
 
 // ReferencedTaskMeta identifies another conversation referenced by a turn (e.g. in PA).
@@ -470,9 +472,10 @@ type TaskTimelineResponse struct {
 	Annotations     []AnnotationView    `json:"annotations"`
 	PendingInputs   []PendingInput      `json:"pendingInputs"`
 	Approvals       []ApprovalView      `json:"approvals"`
-	Sources         []TaskSource        `json:"sources"`
-	BoardMembers    []BoardMemberCursor `json:"boardMembers"`
-	Events          []EventRecord       `json:"events"`
+	Sources           []TaskSource        `json:"sources"`
+	BoardMembers      []BoardMemberCursor `json:"boardMembers"`
+	BoardMessageCount int                 `json:"boardMessageCount,omitempty"`
+	Events            []EventRecord       `json:"events"`
 }
 
 // DiffFileStat summarizes one changed file in a delivery diff.
