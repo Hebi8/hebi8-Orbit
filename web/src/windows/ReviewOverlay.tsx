@@ -6,7 +6,7 @@ import { DiffIcon } from '../components/Icons';
 import { StatusMark } from '../components/StatusMark';
 import { useTimeline } from '../hooks/queries';
 import { collectSessionArtifacts } from '../lib/artifacts';
-import { artifactShortLabel, indexInboxByTask, sessionMark, taskTitle } from '../lib/format';
+import { artifactShortLabel, effectiveReadyAt, indexInboxByTask, sessionMark, taskTitle } from '../lib/format';
 import { useAnchoredPopover } from '../lib/popover';
 import { SessionConversation } from '../session/SessionConversation';
 import { useWorkbenchStore } from '../store/useWorkbenchStore';
@@ -27,6 +27,8 @@ export function ReviewOverlay({ boot }: { boot: BootstrapResponse }) {
   const close = useWorkbenchStore((s) => s.closeReview);
   const openReview = useWorkbenchStore((s) => s.openReview);
   const setDelivery = useWorkbenchStore((s) => s.setReviewDelivery);
+  const seenTasks = useWorkbenchStore((s) => s.seenTasks);
+  const markTaskSeen = useWorkbenchStore((s) => s.markTaskSeen);
 
   const [mobilePane, setMobilePane] = useState<'artifact' | 'session'>('artifact');
   const [switcherOpen, setSwitcherOpen] = useState(false);
@@ -56,10 +58,23 @@ export function ReviewOverlay({ boot }: { boot: BootstrapResponse }) {
     onClose: closeSwitcher,
   });
 
+  const reviewTask = tl?.task;
+  useEffect(() => {
+    if (!review || !reviewTask) return;
+    const markVisible = () => {
+      if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return;
+      const readyAt = effectiveReadyAt(reviewTask, inboxByTask.get(reviewTask.taskId));
+      markTaskSeen(reviewTask.taskId, Math.max(Date.now(), readyAt));
+    };
+    markVisible();
+    document.addEventListener('visibilitychange', markVisible);
+    return () => document.removeEventListener('visibilitychange', markVisible);
+  }, [review, reviewTask, inboxByTask, markTaskSeen]);
+
   if (!review) return null;
 
   const task = tl?.task;
-  const taskMark = task ? sessionMark(task, inboxByTask.get(task.taskId) ?? []) : null;
+  const taskMark = task ? sessionMark(task, inboxByTask.get(task.taskId) ?? [], seenTasks) : null;
   const deliveries = tl?.deliveries ?? [];
   const formalCode = deliveries.filter((d) => !d.lateArrival && CODE_KINDS.has(d.kind));
   const latestCode =

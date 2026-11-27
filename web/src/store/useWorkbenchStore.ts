@@ -52,8 +52,22 @@ function readJSON<T>(key: string, fallback: T): T {
 
 const PROMPT_CACHE_KEY = 'orbit.promptCache';
 const PROMPT_CACHE_MAX = 400;
+const SEEN_TASKS_KEY = 'orbit.seenTasks';
+const SEEN_TASKS_MAX = 2000;
 const REVIEW_RATIO_MIN = 36;
 const REVIEW_RATIO_MAX = 78;
+
+function readSeenTasks(): Record<string, number> {
+  const raw = readJSON<Record<string, unknown>>(SEEN_TASKS_KEY, {});
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+  const out: Record<string, number> = {};
+  for (const [k, v] of Object.entries(raw)) {
+    if (typeof v === 'number' && Number.isFinite(v) && v > 0) {
+      out[k] = v;
+    }
+  }
+  return out;
+}
 
 function readRatio(key: string, fallback: number): number {
   const n = Number(readLS(key, String(fallback)));
@@ -87,6 +101,7 @@ interface WorkbenchState {
   expandedParents: Record<string, boolean>;
   failoverBannerDismissedKey: string | null;
   promptCache: Record<string, string>;
+  seenTasks: Record<string, number>;
   deselectedAnnotations: Record<string, string[]>;
   toast: ToastState | null;
 
@@ -115,6 +130,8 @@ interface WorkbenchState {
   ensureParentExpanded: (parentTaskId: string) => void;
   dismissFailoverBanner: (key: string) => void;
   rememberPrompt: (key: string, body: string) => void;
+  markTaskSeen: (taskId: string, seenAtMs?: number) => void;
+  markTasksSeen: (entries: Array<{ taskId: string; seenAtMs?: number }>) => void;
   toggleAnnotationSelected: (taskId: string, annotationId: string, selected: boolean) => void;
   clearDeselectedAnnotations: (taskId: string) => void;
   showToast: (text: string, tone?: 'info' | 'err', action?: ToastAction) => void;
@@ -147,6 +164,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
   expandedParents: readJSON<Record<string, boolean>>('orbit.expandedParents', {}),
   failoverBannerDismissedKey: null,
   promptCache: readJSON<Record<string, string>>(PROMPT_CACHE_KEY, {}),
+  seenTasks: readSeenTasks(),
   deselectedAnnotations: {},
   toast: null,
 
@@ -243,6 +261,37 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
     }
     writeLS(PROMPT_CACHE_KEY, JSON.stringify(next));
     set({ promptCache: next });
+  },
+  markTaskSeen: (taskId, seenAtMs) => {
+    if (!taskId) return;
+    get().markTasksSeen([{ taskId, seenAtMs }]);
+  },
+  markTasksSeen: (entries) => {
+    if (!entries || entries.length === 0) return;
+    const cur = get().seenTasks;
+    const now = Date.now();
+    let next: Record<string, number> | null = null;
+    for (const entry of entries) {
+      const id = entry.taskId?.trim();
+      if (!id) continue;
+      const candidate = typeof entry.seenAtMs === 'number' && Number.isFinite(entry.seenAtMs) ? entry.seenAtMs : now;
+      const prev = (next ?? cur)[id] ?? 0;
+      const merged = Math.max(prev, candidate);
+      if (merged > prev) {
+        if (!next) next = { ...cur };
+        next[id] = merged;
+      }
+    }
+    if (!next) return;
+    const keys = Object.keys(next);
+    if (keys.length > SEEN_TASKS_MAX) {
+      keys.sort((a, b) => next![a] - next![b]);
+      for (const k of keys.slice(0, keys.length - SEEN_TASKS_MAX)) {
+        delete next[k];
+      }
+    }
+    writeLS(SEEN_TASKS_KEY, JSON.stringify(next));
+    set({ seenTasks: next });
   },
   toggleAnnotationSelected: (taskId, annotationId, selected) =>
     set((s) => {

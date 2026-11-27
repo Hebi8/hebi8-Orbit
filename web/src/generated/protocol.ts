@@ -84,7 +84,7 @@ export type InboxCategory = (typeof InboxCategoryValues)[number];
 export const InboxStateValues = ["open", "resolved", "dismissed"] as const;
 export type InboxState = (typeof InboxStateValues)[number];
 
-export const EventKindValues = ["task.created", "task.state_changed", "task.cancelled", "task.archived", "task.unarchived", "task.deleted", "attempt.started", "attempt.state_changed", "attempt.finished", "resource.waiting", "resource.acquired", "delivery.published", "delivery.verified", "delivery.ryugi_updated", "delivery.review_completed", "delivery.review_reopened", "annotation.created", "annotation.addressed", "approval.requested", "approval.decided", "approval.expired", "approval.consumed", "deploy.started", "deploy.verified", "deploy.failed", "acp.message_batch", "acp.thought_batch", "acp.tool_call", "acp.unsolicited_update", "acp.usage", "pa.turn", "pa.action_executed", "pa.thread_created", "board.message_posted", "board.member_updated", "queue.updated", "task.project_bound", "task.source_added", "task.source_removed", "machine.state_changed", "pairing.updated", "machine.agents_updated", "project.changed", "network.settings_changed", "hebi8.folded", "task.child_spawned", "task.child_updated", "delegation.sent"] as const;
+export const EventKindValues = ["task.created", "task.state_changed", "task.cancelled", "task.archived", "task.unarchived", "task.deleted", "attempt.started", "attempt.state_changed", "attempt.finished", "resource.waiting", "resource.acquired", "delivery.published", "delivery.verified", "delivery.ryugi_updated", "delivery.review_completed", "delivery.review_reopened", "annotation.created", "annotation.addressed", "approval.requested", "approval.decided", "approval.expired", "approval.consumed", "deploy.started", "deploy.verified", "deploy.failed", "acp.message_batch", "acp.thought_batch", "acp.tool_call", "acp.tool_call_update", "acp.unsolicited_update", "acp.usage", "pa.turn", "pa.action_executed", "pa.thread_created", "board.message_posted", "board.member_updated", "queue.updated", "task.project_bound", "task.source_added", "task.source_removed", "machine.state_changed", "pairing.updated", "machine.agents_updated", "project.changed", "network.settings_changed", "hebi8.folded", "task.child_spawned", "task.child_updated", "delegation.sent"] as const;
 export type EventKind = (typeof EventKindValues)[number];
 
 export const IDESchemeValues = ["cursor", "vscode", "zed", "antigravity"] as const;
@@ -92,6 +92,9 @@ export type IDEScheme = (typeof IDESchemeValues)[number];
 
 export const WSMessageTypeValues = ["replay", "replay_end", "event", "ping"] as const;
 export type WSMessageType = (typeof WSMessageTypeValues)[number];
+
+export const WSClientMessageTypeValues = ["watch_attempts"] as const;
+export type WSClientMessageType = (typeof WSClientMessageTypeValues)[number];
 
 export const RunnerWSMessageTypeValues = ["runner.hello", "hub.welcome", "attempt.dispatch", "attempt.cancel", "approval.decision", "session.close", "runner.heartbeat", "attempt.outbox_batch", "hub.outbox_ack", "board.message", "runner.config", "runner.rpc", "runner.agents_report", "runner.quotas_report", "runner.rpc_result"] as const;
 export type RunnerWSMessageType = (typeof RunnerWSMessageTypeValues)[number];
@@ -929,6 +932,11 @@ export interface WSServerMessage {
   event?: EventRecord | null;
   replayHeadSeq?: number;
   serverTime?: number;
+}
+
+export interface WSClientMessage {
+  type: WSClientMessageType;
+  attemptIds?: string[];
 }
 
 export interface PABriefRequest {

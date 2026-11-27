@@ -165,6 +165,7 @@ interface BriefRow {
 export function BriefView({ brief, projects }: { brief: PABriefResponse; projects: ProjectView[] }) {
   const pname = (pid: string) => projects.find((p) => p.projectId === pid)?.displayName ?? pid;
   const openReview = useWorkbenchStore((s) => s.openReview);
+  const seenTasks = useWorkbenchStore((s) => s.seenTasks);
 
   const inboxByTask = indexInboxByTask(brief.openInboxItems);
   const seen = new Set<string>();
@@ -172,7 +173,7 @@ export function BriefView({ brief, projects }: { brief: PABriefResponse; project
 
   for (const t of [...brief.blockedTasks, ...brief.activeTasks]) {
     if (seen.has(t.taskId)) continue;
-    const mark = sessionMark(t, inboxByTask.get(t.taskId));
+    const mark = sessionMark(t, inboxByTask.get(t.taskId), seenTasks);
     if (!mark) continue;
     seen.add(t.taskId);
     rows.push({ key: t.taskId, taskId: t.taskId, title: taskTitle(t), project: pname(t.projectId), mark });
@@ -180,7 +181,7 @@ export function BriefView({ brief, projects }: { brief: PABriefResponse; project
   for (const it of brief.openInboxItems) {
     const key = it.taskId || it.inboxId;
     if (seen.has(key)) continue;
-    const mark = inboxItemsMark([it]);
+    const mark = inboxItemsMark([it], seenTasks);
     if (!mark) continue;
     seen.add(key);
     rows.push({ key, taskId: it.taskId, title: it.title, project: pname(it.projectId), mark });

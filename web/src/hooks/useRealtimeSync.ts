@@ -6,9 +6,11 @@ import type {
   ListChildrenResponse,
   TaskSummary,
   TaskTimelineResponse,
+  WSClientMessage,
   WSServerMessage,
 } from '../generated/protocol';
 import { api, getStoredClientToken, getStoredDevToken } from '../lib/api';
+import { attemptWatchRegistry, isStreamableRawACPEvent, mergeAttemptRawEvents } from '../lib/attemptStream';
 import { useWorkbenchStore } from '../store/useWorkbenchStore';
 
 const strField = (payload: Record<string, unknown> | undefined, key: string): string => {
@@ -222,10 +224,13 @@ export function collectInvalidations(
       continue;
     }
     if (kind.startsWith('acp.')) {
-      add('attempt-raw', aid);
-      add('worker-stream', tid);
       if (kind === 'acp.usage') {
         add('task-timeline', tid);
+      } else if (!isStreamableRawACPEvent(ev)) {
+        add('attempt-raw', aid);
+      }
+      if (strField(p, 'workerName') || !isStreamableRawACPEvent(ev)) {
+        add('worker-stream', tid);
       }
       continue;
     }
@@ -317,6 +322,23 @@ export function useRealtimeSync(snapshotSeq: number | undefined) {
     let ws: WebSocket | null = null;
     let retryTimer: number | null = null;
     let backoffMs = 1000;
+    let hasConnectedOnce = false;
+    let needsReconnectCatchup = false;
+
+    const sendWatchedAttempts = (attemptIds: string[]) => {
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      const msg: WSClientMessage = {
+        type: 'watch_attempts',
+        attemptIds,
+      };
+      try {
+        ws.send(JSON.stringify(msg));
+      } catch {
+        // socket closing; reconnect handler will re-send watched attempts on open
+      }
+    };
+
+    const unsubWatch = attemptWatchRegistry.subscribe(sendWatchedAttempts);
 
     const applyEvents = (events: EventRecord[]) => {
       if (events.length === 0) return;
@@ -332,10 +354,23 @@ export function useRealtimeSync(snapshotSeq: number | undefined) {
       }
       if (fresh.length === 0) return;
       setLastSeq(lastAppliedSeqRef.current);
-      applyInvalidations(
-        queryClient,
-        collectInvalidations(fresh, (taskId) => findCachedParentTaskId(queryClient, taskId)),
-      );
+
+      const rawByAttempt = new Map<string, EventRecord[]>();
+      for (const ev of fresh) {
+        if (isStreamableRawACPEvent(ev) && ev.attemptId) {
+          const list = rawByAttempt.get(ev.attemptId);
+          if (list) list.push(ev);
+          else rawByAttempt.set(ev.attemptId, [ev]);
+        }
+      }
+      for (const [aid, incoming] of rawByAttempt) {
+        queryClient.setQueryData<EventRecord[]>(['attempt-raw', aid], (prev) => mergeAttemptRawEvents(prev, incoming));
+      }
+
+      const keys = collectInvalidations(fresh, (taskId) => findCachedParentTaskId(queryClient, taskId));
+      if (keys.length > 0) {
+        applyInvalidations(queryClient, keys);
+      }
     };
 
     const scheduleReconnect = () => {
@@ -372,14 +407,21 @@ export function useRealtimeSync(snapshotSeq: number | undefined) {
       const replayBatch: EventRecord[] = [];
       const liveBuffer: EventRecord[] = [];
 
-      ws = new WebSocket(url);
+      const socket = new WebSocket(url);
+      ws = socket;
 
-      ws.onopen = () => {
+      socket.onopen = () => {
+        if (ws !== socket) return;
         backoffMs = 1000;
+        hasConnectedOnce = true;
         setWSStatus('live');
+        const watched = attemptWatchRegistry.getIds();
+        if (watched.length > 0) {
+          sendWatchedAttempts(watched);
+        }
       };
 
-      ws.onmessage = (evt) => {
+      socket.onmessage = (evt) => {
         try {
           const msg = JSON.parse(String(evt.data)) as WSServerMessage;
           if (msg.type === 'replay' && msg.events) {
@@ -394,6 +436,12 @@ export function useRealtimeSync(snapshotSeq: number | undefined) {
             applyEvents(liveBuffer);
             replayBatch.length = 0;
             liveBuffer.length = 0;
+            if (needsReconnectCatchup) {
+              needsReconnectCatchup = false;
+              for (const aid of attemptWatchRegistry.getIds()) {
+                void queryClient.invalidateQueries({ queryKey: ['attempt-raw', aid] });
+              }
+            }
           } else if (msg.type === 'event' && msg.event) {
             if (replaying) {
               liveBuffer.push(msg.event);
@@ -406,12 +454,18 @@ export function useRealtimeSync(snapshotSeq: number | undefined) {
         }
       };
 
-      ws.onclose = () => {
+      socket.onclose = () => {
+        if (ws === socket) {
+          ws = null;
+        }
+        if (hasConnectedOnce) {
+          needsReconnectCatchup = true;
+        }
         scheduleReconnect();
       };
 
-      ws.onerror = () => {
-        ws?.close();
+      socket.onerror = () => {
+        socket.close();
       };
     };
 
@@ -419,10 +473,12 @@ export function useRealtimeSync(snapshotSeq: number | undefined) {
 
     return () => {
       cancelled = true;
+      unsubWatch();
       if (retryTimer !== null) {
         window.clearTimeout(retryTimer);
       }
       ws?.close();
+      ws = null;
     };
   }, [bootstrapReady, queryClient, setLastSeq, setWSStatus]);
 }

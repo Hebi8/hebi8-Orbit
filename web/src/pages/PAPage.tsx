@@ -7,11 +7,11 @@ import { PageHeader } from '../components/PageHeader';
 import { StatusMark } from '../components/StatusMark';
 import { useAllTasks, useHebi8Main, useTimeline } from '../hooks/queries';
 import { api, errMsg } from '../lib/api';
-import { PA_PROJECT_ID, indexInboxByTask, isTaskBusy, sessionMark } from '../lib/format';
+import { PA_PROJECT_ID, effectiveReadyAt, indexInboxByTask, isTaskBusy, sessionMark } from '../lib/format';
 import { navigate, paths } from '../lib/router';
 import { SessionConversation } from '../session/SessionConversation';
 import { SessionPage } from '../session/SessionPage';
-import { toast } from '../store/useWorkbenchStore';
+import { toast, useWorkbenchStore } from '../store/useWorkbenchStore';
 
 const HEBI8_STARTERS = [
   '帮我汇总当前工作区各项目的最新进展和待处理事项，按优先级排序',
@@ -141,8 +141,22 @@ function Hebi8MainView({
     onError: (e) => toast(errMsg(e), 'err'),
   });
 
+  const seenTasks = useWorkbenchStore((s) => s.seenTasks);
+  const markTaskSeen = useWorkbenchStore((s) => s.markTaskSeen);
   const liveTask = tlq.data?.task ?? mainTask;
-  const currentMark = liveTask ? sessionMark(liveTask, inboxByTask.get(liveTask.taskId) ?? []) : null;
+  const currentMark = liveTask ? sessionMark(liveTask, inboxByTask.get(liveTask.taskId) ?? [], seenTasks) : null;
+
+  useEffect(() => {
+    if (!liveTask) return;
+    const markVisible = () => {
+      if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return;
+      const readyAt = effectiveReadyAt(liveTask, inboxByTask.get(liveTask.taskId));
+      markTaskSeen(liveTask.taskId, Math.max(Date.now(), readyAt));
+    };
+    markVisible();
+    document.addEventListener('visibilitychange', markVisible);
+    return () => document.removeEventListener('visibilitychange', markVisible);
+  }, [liveTask, inboxByTask, markTaskSeen]);
   const busy = liveTask ? isTaskBusy(liveTask) : false;
   const nodes = mainQ.data?.nodes ?? [];
   const lineSummary = mainQ.data?.lineSummary ?? {

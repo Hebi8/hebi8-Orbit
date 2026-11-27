@@ -22,7 +22,7 @@ type attemptChunkBuffer struct {
 type ChunkFlushFunc func(attemptID, leaseToken string, kind protocol.EventKind, text string, unsolicited bool)
 
 // ChunkCoalescer merges consecutive same-kind agent_message_chunk or agent_thought_chunk updates
-// over a fixed 200ms deadline window while guaranteeing strict per-attempt chronological order
+// over a fixed 60ms deadline window while guaranteeing strict per-attempt chronological order
 // across kind switches, unsolicited switches, tool calls, state transitions, and shutdown (B15).
 // Lock ordering discipline: ALWAYS acquire flushMu before mu.
 type ChunkCoalescer struct {
@@ -38,7 +38,7 @@ type ChunkCoalescer struct {
 
 func NewChunkCoalescer(window time.Duration, onFlush ChunkFlushFunc) *ChunkCoalescer {
 	if window <= 0 {
-		window = 200 * time.Millisecond
+		window = 60 * time.Millisecond
 	}
 	return &ChunkCoalescer{
 		window:  window,

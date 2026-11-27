@@ -25,7 +25,7 @@ import {
 import { resolveManualBoardMention } from '../lib/boardMention';
 import { useImeGuard } from '../lib/ime';
 import { navigate, paths } from '../lib/router';
-import { toast } from '../store/useWorkbenchStore';
+import { toast, useWorkbenchStore } from '../store/useWorkbenchStore';
 
 interface BoardParticipant {
   key: string;
@@ -80,6 +80,7 @@ export function BoardPanel({
   onSelectMember?: (member: BoardMemberCursor) => void;
 }) {
   const qc = useQueryClient();
+  const seenTasks = useWorkbenchStore((s) => s.seenTasks);
   const ime = useImeGuard();
   const members = board?.members ?? fallbackMembers;
   const [olderMessages, setOlderMessages] = useState<TaskBoardResponse['messages']>([]);
@@ -137,7 +138,7 @@ export function BoardPanel({
         mentionValue: c.taskId,
         taskId: c.taskId,
         meta,
-        mark: childSessionMark(c, inboxByTask?.get(c.taskId)),
+        mark: childSessionMark(c, inboxByTask?.get(c.taskId), seenTasks),
         lastConsumedSeq: cursor?.lastConsumedSeq ?? 0,
         cursorLabel: label,
         child: c,
@@ -173,7 +174,7 @@ export function BoardPanel({
     }
 
     return list;
-  }, [members, childrenList, machineLabelOf, inboxByTask]);
+  }, [members, childrenList, machineLabelOf, inboxByTask, seenTasks]);
 
   const childTitleById = useMemo(() => {
     const map = new Map<string, string>();

@@ -44,6 +44,7 @@ import {
   shortSha,
   taskTitle,
   triggerLabel,
+  type SeenTaskMap,
   type SessionMark,
 } from '../lib/format';
 import { navigate, paths } from '../lib/router';
@@ -342,6 +343,7 @@ function OutboundCommTrack({
   nativeMembers = [],
   machines,
   inboxByTask,
+  seenTasks,
   activeChildId,
   activeNativeMember,
   onOpenChild,
@@ -353,6 +355,7 @@ function OutboundCommTrack({
   nativeMembers?: BoardMemberCursor[];
   machines?: MachineView[];
   inboxByTask?: ReadonlyMap<string, InboxItemView[]>;
+  seenTasks?: SeenTaskMap;
   activeChildId?: string;
   activeNativeMember?: string;
   onOpenChild?: (childTaskId: string) => void;
@@ -362,13 +365,13 @@ function OutboundCommTrack({
   if (totalCount === 0) return null;
 
   const allResting =
-    children.every((c) => !childSessionMark(c, inboxByTask?.get(c.taskId))) &&
+    children.every((c) => !childSessionMark(c, inboxByTask?.get(c.taskId), seenTasks)) &&
     nativeMembers.every((m) => !nativeMemberMark(m));
 
   const rows = (
     <div className="comm-track is-out">
       {children.map((c) => {
-        const mark = childSessionMark(c, inboxByTask?.get(c.taskId));
+        const mark = childSessionMark(c, inboxByTask?.get(c.taskId), seenTasks);
         const mach = machines?.find((m) => m.machineId === c.machineId);
         const machName = mach ? mach.displayAlias?.trim() || cleanMachineName(mach) : c.machineId || '';
         const adpLabel = c.preferredAdapter ? ADAPTER_LABELS[c.preferredAdapter] ?? c.preferredAdapter : '';
@@ -509,6 +512,7 @@ export function Turn({
   const segs = useMemo(() => buildSegments(raw.data ?? []), [raw.data]);
   const prompt = usePromptFor(attempt, tl);
   const openReview = useWorkbenchStore((s) => s.openReview);
+  const seenTasks = useWorkbenchStore((s) => s.seenTasks);
 
   const approvals = tl.approvals
     .filter((a) => a.attemptId === attempt.attemptId)
@@ -584,11 +588,11 @@ export function Turn({
         const taskMatch = allTasks?.find((x) => x.taskId === targetTaskId);
         const targetMatch = sibMatch ?? childMatch ?? taskMatch;
         const targetMark = sibMatch
-          ? childSessionMark(sibMatch, inboxByTask?.get(targetTaskId))
+          ? childSessionMark(sibMatch, inboxByTask?.get(targetTaskId), seenTasks)
           : childMatch
-            ? childSessionMark(childMatch, inboxByTask?.get(targetTaskId))
+            ? childSessionMark(childMatch, inboxByTask?.get(targetTaskId), seenTasks)
             : taskMatch
-              ? sessionMark(taskMatch, inboxByTask?.get(targetTaskId))
+              ? sessionMark(taskMatch, inboxByTask?.get(targetTaskId), seenTasks)
               : null;
         const rawTitle = typeof p.targetTitle === 'string' ? p.targetTitle.trim() : '';
         const targetTitle = (targetMatch && taskTitle(targetMatch)) || rawTitle || targetTaskId;
@@ -603,7 +607,7 @@ export function Turn({
         };
       })
       .filter((x) => !!x.targetTaskId);
-  }, [isPA, tl.events, tl.siblingChildren, tl.children, siblingChildren, childrenList, allTasks, inboxByTask, attempt.attemptId]);
+  }, [isPA, tl.events, tl.siblingChildren, tl.children, siblingChildren, childrenList, allTasks, inboxByTask, seenTasks, attempt.attemptId]);
   const dispatchedChildren = useMemo(() => {
     if (!isTopLevel) return [];
     const pool = childrenList ?? tl.children ?? [];
@@ -680,7 +684,7 @@ export function Turn({
       if (!t) continue;
       const proj = projectMap.get(t.projectId);
       const inboxItems = inboxByTask?.get(t.taskId) ?? [];
-      const mark = sessionMark(t, inboxItems);
+      const mark = sessionMark(t, inboxItems, seenTasks);
       const cleanedLine = line
         ? line
             .replace(/\[([^\]]+)\]\(#\/t\/[A-Za-z0-9_-]+\)/g, '$1')
@@ -723,13 +727,13 @@ export function Turn({
         title: taskTitle(c),
         projectLabel: c.projectName || resolveProjectLabel(c.projectId),
         machineLabel: resolveMachineLabel(c.machineId, proj),
-        mark: childSessionMark(c, inboxItems),
+        mark: childSessionMark(c, inboxItems, seenTasks),
         hint: c.currentStep?.trim() || c.goal?.split('\n')[0]?.trim() || undefined,
       });
     }
 
     return cards;
-  }, [isPA, projects, machines, allTasks, tl.task.taskId, segs, inboxByTask, dispatchedChildren]);
+  }, [isPA, projects, machines, allTasks, tl.task.taskId, segs, inboxByTask, seenTasks, dispatchedChildren]);
 
   const childResultMd = useMemo(() => {
     if (!isChildResult) return '';
@@ -837,6 +841,7 @@ export function Turn({
           nativeMembers={turnNativeMembers}
           machines={machines}
           inboxByTask={inboxByTask}
+          seenTasks={seenTasks}
           activeChildId={activeChildId}
           activeNativeMember={activeNativeMember}
           onOpenChild={onOpenChild}

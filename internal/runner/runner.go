@@ -257,7 +257,7 @@ func New(ctx context.Context, cfg Config) (*Runner, error) {
 		cfg.ConfigApplyTimeout = 10 * time.Second
 	}
 	if cfg.ChunkCoalesceWindow <= 0 {
-		cfg.ChunkCoalesceWindow = 200 * time.Millisecond
+		cfg.ChunkCoalesceWindow = 60 * time.Millisecond
 	}
 	if cfg.DefaultSwarmIdleTimeout <= 0 {
 		cfg.DefaultSwarmIdleTimeout = 120 * time.Second

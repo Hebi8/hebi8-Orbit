@@ -139,6 +139,7 @@ export function RightCard({
 }) {
   const qc = useQueryClient();
   const openReview = useWorkbenchStore((s) => s.openReview);
+  const seenTasks = useWorkbenchStore((s) => s.seenTasks);
   const [collapsedMap, setCollapsedMap] = useState<Record<string, boolean>>(readCollapsedMap);
   const [adding, setAdding] = useState(false);
   const [kind, setKind] = useState<TaskSourceKind>('link');
@@ -296,7 +297,7 @@ export function RightCard({
           onToggle={toggleSec}
         >
           {effectiveChildren.map((c) => {
-            const mark = childSessionMark(c, inboxByTask?.get(c.taskId));
+            const mark = childSessionMark(c, inboxByTask?.get(c.taskId), seenTasks);
             return (
               <button
                 type="button"

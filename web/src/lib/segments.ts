@@ -1,5 +1,5 @@
 import type { EventRecord } from '../generated/protocol';
-import { toolVerb } from './format';
+import { toolVerb } from './format.ts';
 
 export interface ToolStep {
   id: string;
@@ -47,7 +47,8 @@ export function buildSegments(events: EventRecord[]): Segment[] {
         else segs.push({ kind: 'msg', key: `m${ev.seq}`, text: t });
         break;
       }
-      case 'acp.tool_call': {
+      case 'acp.tool_call':
+      case 'acp.tool_call_update': {
         const id = str(p.toolCallId) || `anon${ev.seq}`;
         const existing = stepById.get(id);
         if (existing) {

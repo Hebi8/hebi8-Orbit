@@ -714,6 +714,7 @@ export function ProjectPage({ boot, projectId, tab }: { boot: BootstrapResponse;
   const [q, setQ] = useState('');
   const openReview = useWorkbenchStore((s) => s.openReview);
   const localMachineId = useWorkbenchStore((s) => s.localMachineId);
+  const seenTasks = useWorkbenchStore((s) => s.seenTasks);
 
   const allTasks = useMemo(() => tasksQ.data ?? [], [tasksQ.data]);
   const threads = useMemo(() => allTasks.filter((t) => !t.parentTaskId), [allTasks]);
@@ -727,9 +728,9 @@ export function ProjectPage({ boot, projectId, tab }: { boot: BootstrapResponse;
     const k = q.trim().toLowerCase();
     const list = k ? threads.filter((t) => `${t.title} ${t.goal}`.toLowerCase().includes(k)) : threads;
     return list
-      .map((t) => ({ t, mark: rootSessionMark(t, allTasks, inboxByTask) }))
+      .map((t) => ({ t, mark: rootSessionMark(t, allTasks, inboxByTask, seenTasks) }))
       .sort((a, b) => displayMarkRank(a.mark) - displayMarkRank(b.mark) || b.t.updatedAt - a.t.updatedAt);
-  }, [threads, allTasks, inboxByTask, q]);
+  }, [threads, allTasks, inboxByTask, seenTasks, q]);
 
   const filteredArchived = useMemo(() => {
     const k = q.trim().toLowerCase();

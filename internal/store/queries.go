@@ -2794,32 +2794,52 @@ func (s *Store) MaxEventSeq(ctx context.Context) (int64, error) {
 // ListEventsPage returns one ascending page of committed non-raw events with seq > afterSeq
 // (and seq <= upToSeq when upToSeq > 0), enabling unbounded gapless WebSocket replay & tailing.
 func (s *Store) ListEventsPage(ctx context.Context, afterSeq, upToSeq int64, limit int) ([]protocol.EventRecord, error) {
+	return s.ListEventsPageWithWatched(ctx, afterSeq, upToSeq, limit, nil)
+}
+
+// ListEventsPageWithWatched returns one ascending page of committed events with seq > afterSeq
+// (and seq <= upToSeq when upToSeq > 0): all non-raw events, acp.usage, plus live raw_acp
+// streaming frames for any attemptId explicitly listed in watchedAttemptIDs.
+func (s *Store) ListEventsPageWithWatched(
+	ctx context.Context,
+	afterSeq, upToSeq int64,
+	limit int,
+	watchedAttemptIDs []string,
+) ([]protocol.EventRecord, error) {
 	if limit <= 0 || limit > 1000 {
 		limit = 200
 	}
-	var (
-		rows *sql.Rows
-		err  error
-	)
+
+	var b strings.Builder
+	b.WriteString(`
+		SELECT seq, event_id, stream_id, project_id, task_id, attempt_id,
+		       actor_kind, actor_id, kind, visibility, payload_json, created_at
+		FROM events
+		WHERE seq > ?`)
+	args := make([]any, 0, len(watchedAttemptIDs)+4)
+	args = append(args, afterSeq)
 	if upToSeq > 0 {
-		rows, err = s.ro.QueryContext(ctx, `
-			SELECT seq, event_id, stream_id, project_id, task_id, attempt_id,
-			       actor_kind, actor_id, kind, visibility, payload_json, created_at
-			FROM events
-			WHERE seq > ? AND seq <= ? AND (visibility != 'raw_acp' OR kind = 'acp.usage')
-			ORDER BY seq ASC
-			LIMIT ?
-		`, afterSeq, upToSeq, limit)
-	} else {
-		rows, err = s.ro.QueryContext(ctx, `
-			SELECT seq, event_id, stream_id, project_id, task_id, attempt_id,
-			       actor_kind, actor_id, kind, visibility, payload_json, created_at
-			FROM events
-			WHERE seq > ? AND (visibility != 'raw_acp' OR kind = 'acp.usage')
-			ORDER BY seq ASC
-			LIMIT ?
-		`, afterSeq, limit)
+		b.WriteString(` AND seq <= ?`)
+		args = append(args, upToSeq)
 	}
+	if len(watchedAttemptIDs) == 0 {
+		b.WriteString(` AND (visibility != 'raw_acp' OR kind = 'acp.usage')`)
+	} else {
+		placeholders := make([]string, len(watchedAttemptIDs))
+		for i, aid := range watchedAttemptIDs {
+			placeholders[i] = "?"
+			args = append(args, aid)
+		}
+		b.WriteString(` AND (visibility != 'raw_acp' OR kind = 'acp.usage' OR (visibility = 'raw_acp' AND attempt_id IN (`)
+		b.WriteString(strings.Join(placeholders, ","))
+		b.WriteString(`) AND kind IN ('acp.message_batch', 'acp.thought_batch', 'acp.tool_call', 'acp.tool_call_update')))`)
+	}
+	b.WriteString(`
+		ORDER BY seq ASC
+		LIMIT ?`)
+	args = append(args, limit)
+
+	rows, err := s.ro.QueryContext(ctx, b.String(), args...)
 	if err != nil {
 		return nil, err
 	}

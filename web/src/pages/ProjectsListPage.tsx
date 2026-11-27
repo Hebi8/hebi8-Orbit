@@ -15,9 +15,11 @@ import {
   taskTitle,
 } from '../lib/format';
 import { navigate, paths } from '../lib/router';
+import { useWorkbenchStore } from '../store/useWorkbenchStore';
 
 /** Project index (mobile "项目" tab); threads never expand into workers here either. */
 export function ProjectsListPage({ boot }: { boot: BootstrapResponse }) {
+  const seenTasks = useWorkbenchStore((s) => s.seenTasks);
   const projects = boot.projects.filter((p) => !isVirtualProject(p.projectId) && !p.archived);
   const tasksByProject = useManyProjectTasks(boot.projects);
   const scratch = (tasksByProject[SCRATCH_PROJECT_ID] ?? [])
@@ -42,7 +44,7 @@ export function ProjectsListPage({ boot }: { boot: BootstrapResponse }) {
           {projects.map((p) => {
             const pTasks = tasksByProject[p.projectId] ?? [];
             const roots = pTasks.filter((t) => !t.parentTaskId);
-            const mark = mergeSessionMarks(...roots.map((r) => rootSessionMark(r, pTasks, inboxByTask)));
+            const mark = mergeSessionMarks(...roots.map((r) => rootSessionMark(r, pTasks, inboxByTask, seenTasks)));
             return (
               <button type="button" key={p.projectId} className="srow" onClick={() => navigate(paths.project(p.projectId))}>
                 <span className="t">{p.displayName}</span>
@@ -59,7 +61,7 @@ export function ProjectsListPage({ boot }: { boot: BootstrapResponse }) {
                 <span className="t">自由 Chat</span>
               </div>
               {scratch.map((t) => {
-                const mark = sessionMark(t, inboxByTask.get(t.taskId));
+                const mark = sessionMark(t, inboxByTask.get(t.taskId), seenTasks);
                 return (
                   <button type="button" key={t.taskId} className="srow" onClick={() => navigate(paths.session(t.taskId))}>
                     <span className="t">{taskTitle(t)}</span>

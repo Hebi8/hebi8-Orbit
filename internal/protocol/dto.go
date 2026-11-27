@@ -634,6 +634,12 @@ type WSServerMessage struct {
 	ServerTime    int64         `json:"serverTime,omitempty"`
 }
 
+// WSClientMessage is a control frame sent from a client to Hub over /ws/client.
+type WSClientMessage struct {
+	Type       WSClientMessageType `json:"type"`
+	AttemptIDs []string            `json:"attemptIds,omitempty"`
+}
+
 // PendingInput represents a queued follow-up message or annotation batch waiting
 // to be consumed by a task session (rendered as dashed bubbles at the tail of the chat stream).
 type PendingInput struct {

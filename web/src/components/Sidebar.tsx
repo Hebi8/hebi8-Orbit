@@ -22,6 +22,7 @@ import {
   sessionMark,
   sessionMarkHint,
   taskTitle,
+  type SeenTaskMap,
   type SessionMark,
 } from '../lib/format';
 import { resolveEffectiveLocalMachineId } from '../lib/ide';
@@ -41,6 +42,7 @@ function SidebarChildTree({
   localChildren,
   machines,
   inboxByTask,
+  seenTasks,
   activeTaskId,
   activeChildDrawerId,
 }: {
@@ -48,6 +50,7 @@ function SidebarChildTree({
   localChildren: TaskSummary[];
   machines: MachineView[];
   inboxByTask: ReadonlyMap<string, InboxItemView[]>;
+  seenTasks: SeenTaskMap;
   activeTaskId: string;
   activeChildDrawerId: string;
 }) {
@@ -85,7 +88,7 @@ function SidebarChildTree({
   return (
     <div className="th-children" role="group" aria-label="子会话列表">
       {items.map((child) => {
-        const mark = childSessionMark(child, inboxByTask.get(child.taskId));
+        const mark = childSessionMark(child, inboxByTask.get(child.taskId), seenTasks);
         const hint = sessionMarkHint(mark);
         const isCurrent = activeTaskId === child.taskId || activeChildDrawerId === child.taskId;
         const mach = machines.find((m) => m.machineId === child.machineId);
@@ -121,6 +124,7 @@ function SidebarThreadItem({
   localChildren,
   machines,
   inboxByTask,
+  seenTasks,
   activeTaskId,
   activeChildDrawerId,
   archiveArmed,
@@ -138,6 +142,7 @@ function SidebarThreadItem({
   localChildren: TaskSummary[];
   machines: MachineView[];
   inboxByTask: ReadonlyMap<string, InboxItemView[]>;
+  seenTasks: SeenTaskMap;
   activeTaskId: string;
   activeChildDrawerId: string;
   archiveArmed: boolean;
@@ -216,6 +221,7 @@ function SidebarThreadItem({
           localChildren={localChildren}
           machines={machines}
           inboxByTask={inboxByTask}
+          seenTasks={seenTasks}
           activeTaskId={activeTaskId}
           activeChildDrawerId={activeChildDrawerId}
         />
@@ -330,6 +336,7 @@ export function Sidebar({
   const setMachinesOpen = useWorkbenchStore((s) => s.setMachinesOpen);
   const setCmdkOpen = useWorkbenchStore((s) => s.setCmdkOpen);
   const workspaceNameOverride = useWorkbenchStore((s) => s.workspaceNameOverride);
+  const seenTasks = useWorkbenchStore((s) => s.seenTasks);
 
   // Reset in-place 2-step archive confirmation when clicking outside or pressing Escape.
   useEffect(() => {
@@ -525,8 +532,8 @@ export function Sidebar({
                 {open && threads.length > 0 && (
                   <div className="proj-threads">
                     {threads.slice(0, MAX_THREADS).map((t) => {
-                      const ownMark = sessionMark(t, inboxByTask.get(t.taskId));
-                      const aggregatedMark = rootSessionMark(t, allKnownTasks, inboxByTask);
+                      const ownMark = sessionMark(t, inboxByTask.get(t.taskId), seenTasks);
+                      const aggregatedMark = rootSessionMark(t, allKnownTasks, inboxByTask, seenTasks);
                       const cs = childStatsFor(t);
                       const isParentOfViewingChild =
                         viewingParentId === t.taskId || (activeTaskId === t.taskId && !!activeChildDrawerId);
@@ -544,6 +551,7 @@ export function Sidebar({
                           localChildren={cs.localKids}
                           machines={boot.machines}
                           inboxByTask={inboxByTask}
+                          seenTasks={seenTasks}
                           activeTaskId={activeTaskId}
                           activeChildDrawerId={activeChildDrawerId}
                           archiveArmed={armArchiveTaskId === t.taskId}
@@ -567,8 +575,8 @@ export function Sidebar({
               <div className="slabel">自由对话</div>
               <div className="proj-threads">
                 {scratchThreads.slice(0, MAX_THREADS).map((t) => {
-                  const ownMark = sessionMark(t, inboxByTask.get(t.taskId));
-                  const aggregatedMark = rootSessionMark(t, allKnownTasks, inboxByTask);
+                  const ownMark = sessionMark(t, inboxByTask.get(t.taskId), seenTasks);
+                  const aggregatedMark = rootSessionMark(t, allKnownTasks, inboxByTask, seenTasks);
                   const cs = childStatsFor(t);
                   const isParentOfViewingChild =
                     viewingParentId === t.taskId || (activeTaskId === t.taskId && !!activeChildDrawerId);
@@ -586,6 +594,7 @@ export function Sidebar({
                       localChildren={cs.localKids}
                       machines={boot.machines}
                       inboxByTask={inboxByTask}
+                      seenTasks={seenTasks}
                       activeTaskId={activeTaskId}
                       activeChildDrawerId={activeChildDrawerId}
                       archiveArmed={armArchiveTaskId === t.taskId}

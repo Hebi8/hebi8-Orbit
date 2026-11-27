@@ -13,6 +13,8 @@ import {
   PA_PROJECT_ID,
   SCRATCH_PROJECT_ID,
   artifactShortLabel,
+  collectParentSeenEntries,
+  effectiveReadyAt,
   indexInboxByTask,
   isVirtualProject,
   memberStateLabel,
@@ -143,6 +145,8 @@ export function SessionPage({
   const setProjectExpanded = useWorkbenchStore((s) => s.setProjectExpanded);
   const ensureParentExpanded = useWorkbenchStore((s) => s.ensureParentExpanded);
   const openReview = useWorkbenchStore((s) => s.openReview);
+  const seenTasks = useWorkbenchStore((s) => s.seenTasks);
+  const markTasksSeen = useWorkbenchStore((s) => s.markTasksSeen);
 
   const [manualCardOpen, setManualCardOpen] = useState(false);
   const [artMenuOpen, setArtMenuOpen] = useState(false);
@@ -355,6 +359,45 @@ export function SessionPage({
     };
   }, [artMenuOpen, moreMenuOpen]);
 
+  const parentChildrenForRead = useMemo(() => {
+    if (!task || isChildSession || isPA) return [];
+    const byId = new Map<
+      string,
+      {
+        taskId: string;
+        state: typeof task.state;
+        updatedAt: number;
+        openApprovalCount?: number;
+        activeAttemptState?: typeof task.activeAttemptState;
+      }
+    >();
+    for (const c of childrenList) {
+      byId.set(c.taskId, c);
+    }
+    for (const t of boot.activeTasks) {
+      if (t.parentTaskId === task.taskId && !byId.has(t.taskId)) {
+        byId.set(t.taskId, t);
+      }
+    }
+    return [...byId.values()];
+  }, [task, isChildSession, isPA, childrenList, boot.activeTasks]);
+
+  useEffect(() => {
+    if (!task) return;
+    const markVisible = () => {
+      if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return;
+      if (isChildSession) {
+        const readyAt = effectiveReadyAt(task, inboxByTask.get(task.taskId));
+        markTasksSeen([{ taskId: task.taskId, seenAtMs: Math.max(Date.now(), readyAt) }]);
+      } else {
+        markTasksSeen(collectParentSeenEntries(task, parentChildrenForRead, inboxByTask));
+      }
+    };
+    markVisible();
+    document.addEventListener('visibilitychange', markVisible);
+    return () => document.removeEventListener('visibilitychange', markVisible);
+  }, [task, isChildSession, parentChildrenForRead, inboxByTask, markTasksSeen]);
+
   const invalidateAfterTaskMut = (pid?: string) => {
     void qc.invalidateQueries({ queryKey: ['task-timeline', taskId] });
     void qc.invalidateQueries({ queryKey: ['all-tasks'] });
@@ -469,7 +512,7 @@ export function SessionPage({
     formalCodeDeliveries[formalCodeDeliveries.length - 1] ??
     codeDeliveries[codeDeliveries.length - 1];
 
-  const mark = sessionMark(task, inboxByTask.get(task.taskId) ?? []);
+  const mark = sessionMark(task, inboxByTask.get(task.taskId) ?? [], seenTasks);
   const lastAttempt = tl.attempts[tl.attempts.length - 1];
   const machineId =
     latestCode?.sourceMachineId ||

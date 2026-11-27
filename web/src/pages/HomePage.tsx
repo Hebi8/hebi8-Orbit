@@ -12,9 +12,11 @@ import {
   relTime,
   rootSessionMark,
   taskTitle,
+  type SeenTaskMap,
   type SessionMark,
 } from '../lib/format';
 import { navigate, paths } from '../lib/router';
+import { useWorkbenchStore } from '../store/useWorkbenchStore';
 
 export function projectName(projects: ProjectView[], pid: string): string {
   if (pid === SCRATCH_PROJECT_ID) return '对话';
@@ -45,6 +47,7 @@ interface HomeRowItem {
 function buildHomeRows(
   boot: BootstrapResponse,
   tasksByProject: Record<string, TaskSummary[]>,
+  seenTasks: SeenTaskMap,
 ): HomeRowItem[] {
   const inboxByTask = indexInboxByTask(boot.openInboxItems);
 
@@ -63,7 +66,7 @@ function buildHomeRows(
   for (const t of allTasks) {
     if (t.parentTaskId) continue;
     const inbox = inboxByTask.get(t.taskId) ?? [];
-    const mark = rootSessionMark(t, allTasks, inboxByTask);
+    const mark = rootSessionMark(t, allTasks, inboxByTask, seenTasks);
     seen.add(t.taskId);
     rows.push({
       key: t.taskId,
@@ -85,7 +88,7 @@ function buildHomeRows(
     orphanByKey.set(k, list);
   }
   for (const [key, list] of orphanByKey.entries()) {
-    const mark = inboxItemsMark(list);
+    const mark = inboxItemsMark(list, seenTasks);
     if (!mark) continue;
     const primary = list[0];
     rows.push({
@@ -137,8 +140,9 @@ function HomeRow({ row, projects }: { row: HomeRowItem; projects: ProjectView[] 
  * solid left arc for urgent rows (zero blur/glow), and single trailing StatusMark slot.
  */
 export function HomePage({ boot }: { boot: BootstrapResponse }) {
+  const seenTasks = useWorkbenchStore((s) => s.seenTasks);
   const tasksByProject = useManyProjectTasks(boot.projects);
-  const rows = useMemo(() => buildHomeRows(boot, tasksByProject), [boot, tasksByProject]);
+  const rows = useMemo(() => buildHomeRows(boot, tasksByProject, seenTasks), [boot, tasksByProject, seenTasks]);
 
   const urgent = rows.filter((r) => r.mark === 'failed' || r.mark === 'needs-you');
   const ready = rows.filter((r) => r.mark === 'ready');

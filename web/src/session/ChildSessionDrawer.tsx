@@ -10,8 +10,10 @@ import { collectSessionArtifacts } from '../lib/artifacts';
 import {
   childSessionMark,
   cleanMachineName,
+  effectiveReadyAt,
   indexInboxByTask,
   taskTitle,
+  type SeenTaskMap,
   type SessionMark,
 } from '../lib/format';
 import { useAnchoredPopover } from '../lib/popover';
@@ -48,6 +50,7 @@ function SubsessionSwitcher({
   nativeMembers,
   boot,
   inboxByTask,
+  seenTasks,
   onSelectChild,
   onSelectNativeMember,
 }: {
@@ -59,6 +62,7 @@ function SubsessionSwitcher({
   nativeMembers: BoardMemberCursor[];
   boot: BootstrapResponse;
   inboxByTask: ReadonlyMap<string, InboxItemView[]>;
+  seenTasks: SeenTaskMap;
   onSelectChild: (childTaskId: string) => void;
   onSelectNativeMember: (member: BoardMemberCursor) => void;
 }) {
@@ -115,7 +119,7 @@ function SubsessionSwitcher({
             <div className="ov-menu-sec">切换同级子会话</div>
             {childrenList.map((c) => {
               const isCurrent = !!activeChildId && activeChildId === c.taskId;
-              const mark = childSessionMark(c, inboxByTask.get(c.taskId));
+              const mark = childSessionMark(c, inboxByTask.get(c.taskId), seenTasks);
               const machName = machineNameOf(c.machineId);
               const adpLabel = c.preferredAdapter ? ADAPTER_LABELS[c.preferredAdapter] ?? c.preferredAdapter : '';
               const meta = [machName, adpLabel].filter(Boolean).join(' · ');
@@ -211,6 +215,8 @@ export function ChildSessionDrawer({
   onClose: () => void;
 }) {
   const openReview = useWorkbenchStore((s) => s.openReview);
+  const seenTasks = useWorkbenchStore((s) => s.seenTasks);
+  const markTaskSeen = useWorkbenchStore((s) => s.markTaskSeen);
   const tlq = useTimeline(childTaskId);
   const childTl = tlq.data;
   const inboxByTask = useMemo(() => indexInboxByTask(boot.openInboxItems), [boot.openInboxItems]);
@@ -234,6 +240,23 @@ export function ChildSessionDrawer({
     [childTaskId, childrenList],
   );
 
+  const childTask = childTl?.task;
+  const isMismatchedParent = !!childTl && childTl.task.parentTaskId !== parentTaskId;
+
+  useEffect(() => {
+    if (!childTaskId || isMismatchedParent) return;
+    if (!childTask && !childSummary) return;
+    const markVisible = () => {
+      if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return;
+      const updatedAt = Math.max(childTask?.updatedAt ?? 0, childSummary?.updatedAt ?? 0);
+      const readyAt = effectiveReadyAt({ updatedAt }, inboxByTask.get(childTaskId));
+      markTaskSeen(childTaskId, Math.max(Date.now(), readyAt));
+    };
+    markVisible();
+    document.addEventListener('visibilitychange', markVisible);
+    return () => document.removeEventListener('visibilitychange', markVisible);
+  }, [childTaskId, isMismatchedParent, childTask, childSummary, inboxByTask, markTaskSeen]);
+
   const childArtifacts = useMemo(() => collectSessionArtifacts(childTl), [childTl]);
 
   // Native subagent / swarm member read-only inspection view
@@ -253,6 +276,7 @@ export function ChildSessionDrawer({
             nativeMembers={nativeMembers}
             boot={boot}
             inboxByTask={inboxByTask}
+            seenTasks={seenTasks}
             onSelectChild={onSelectChild}
             onSelectNativeMember={onSelectNativeMember}
           />
@@ -303,13 +327,15 @@ export function ChildSessionDrawer({
     (childTl?.approvals.filter((a) => a.state === 'pending').length ?? childSummary?.openApprovalCount) || 0;
   const mark = childSessionMark(
     {
+      taskId: childTaskId,
       state: task?.state ?? childSummary?.state ?? 'queued',
       openApprovalCount: openApprovals,
+      updatedAt: Math.max(task?.updatedAt ?? 0, childSummary?.updatedAt ?? 0),
     },
     inboxByTask.get(childTaskId),
+    seenTasks,
   );
   const title = task ? taskTitle(task) : childSummary ? taskTitle(childSummary) : childTaskId;
-  const isMismatchedParent = !!childTl && childTl.task.parentTaskId !== parentTaskId;
 
   return (
     <aside className="sub-drawer" style={{ width }} aria-label={`子会话 ${title}`}>
@@ -322,6 +348,7 @@ export function ChildSessionDrawer({
           nativeMembers={nativeMembers}
           boot={boot}
           inboxByTask={inboxByTask}
+          seenTasks={seenTasks}
           onSelectChild={onSelectChild}
           onSelectNativeMember={onSelectNativeMember}
         />

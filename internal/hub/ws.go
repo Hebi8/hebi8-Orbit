@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,61 +17,207 @@ import (
 	"github.com/Hebi8/hebi8-Orbit/internal/protocol"
 )
 
-const wsPageSize = 50
+const (
+	wsPageSize            = 50
+	maxWatchedAttempts    = 64
+	clientWSMaxReadBytes  = 64 << 10
+)
 
 var errWSRevoked = errors.New("client websocket revoked")
+
+type brokerSub struct {
+	ch      chan struct{}
+	watched map[string]struct{}
+}
 
 // EventBroker is a pure signal-wake fan-out hub backed by SQLite's monotonic events table.
 // Each subscriber receives a coalescing capacity-1 wakeup signal; actual events are always
 // read sequentially from SQLite in strict ascending seq order, eliminating dropped frames,
 // out-of-order concurrent commit skips, and page truncation.
 type EventBroker struct {
-	mu   sync.RWMutex
-	subs map[chan struct{}]struct{}
+	mu          sync.RWMutex
+	subs        map[*brokerSub]struct{}
+	attemptSubs map[string]map[*brokerSub]struct{}
 }
 
 func NewEventBroker() *EventBroker {
 	return &EventBroker{
-		subs: map[chan struct{}]struct{}{},
+		subs:        map[*brokerSub]struct{}{},
+		attemptSubs: map[string]map[*brokerSub]struct{}{},
 	}
 }
 
 func (b *EventBroker) Subscribe() (<-chan struct{}, func()) {
-	ch := make(chan struct{}, 1)
+	_, ch, unsub := b.subscribeClient()
+	return ch, unsub
+}
+
+func (b *EventBroker) subscribeClient() (*brokerSub, <-chan struct{}, func()) {
+	sub := &brokerSub{
+		ch:      make(chan struct{}, 1),
+		watched: map[string]struct{}{},
+	}
 	b.mu.Lock()
-	b.subs[ch] = struct{}{}
+	b.subs[sub] = struct{}{}
 	b.mu.Unlock()
 
 	unsub := func() {
 		b.mu.Lock()
-		if _, ok := b.subs[ch]; ok {
-			delete(b.subs, ch)
-			close(ch)
+		if _, ok := b.subs[sub]; ok {
+			for aid := range sub.watched {
+				if watchers := b.attemptSubs[aid]; watchers != nil {
+					delete(watchers, sub)
+					if len(watchers) == 0 {
+						delete(b.attemptSubs, aid)
+					}
+				}
+			}
+			delete(b.subs, sub)
+			close(sub.ch)
 		}
 		b.mu.Unlock()
 	}
-	return ch, unsub
+	return sub, sub.ch, unsub
+}
+
+// SetWatchedAttempts replaces the set of attemptIds whose live raw_acp streaming events wake sub.
+func (b *EventBroker) SetWatchedAttempts(sub *brokerSub, attemptIDs []string) {
+	if sub == nil {
+		return
+	}
+	next := make(map[string]struct{}, len(attemptIDs))
+	for _, raw := range attemptIDs {
+		id := strings.TrimSpace(raw)
+		if id == "" {
+			continue
+		}
+		if _, dup := next[id]; dup {
+			continue
+		}
+		next[id] = struct{}{}
+		if len(next) >= maxWatchedAttempts {
+			break
+		}
+	}
+
+	b.mu.Lock()
+	if _, ok := b.subs[sub]; !ok {
+		b.mu.Unlock()
+		return
+	}
+	addedNew := false
+	for oldID := range sub.watched {
+		if _, keep := next[oldID]; !keep {
+			if watchers := b.attemptSubs[oldID]; watchers != nil {
+				delete(watchers, sub)
+				if len(watchers) == 0 {
+					delete(b.attemptSubs, oldID)
+				}
+			}
+		}
+	}
+	for newID := range next {
+		if _, existed := sub.watched[newID]; !existed {
+			addedNew = true
+			watchers := b.attemptSubs[newID]
+			if watchers == nil {
+				watchers = map[*brokerSub]struct{}{}
+				b.attemptSubs[newID] = watchers
+			}
+			watchers[sub] = struct{}{}
+		}
+	}
+	sub.watched = next
+	if addedNew {
+		select {
+		case sub.ch <- struct{}{}:
+		default:
+		}
+	}
+	b.mu.Unlock()
+}
+
+// WatchedAttempts returns a sorted snapshot of attemptIds currently watched by sub.
+func (b *EventBroker) WatchedAttempts(sub *brokerSub) []string {
+	if sub == nil {
+		return nil
+	}
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if len(sub.watched) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(sub.watched))
+	for id := range sub.watched {
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// AttemptWatcherCount reports how many connected clients are currently watching attemptID.
+func (b *EventBroker) AttemptWatcherCount(attemptID string) int {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return len(b.attemptSubs[attemptID])
 }
 
 // Notify wakes all connected WebSocket clients to read newly committed SQLite events.
 func (b *EventBroker) Notify() {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
-	for ch := range b.subs {
+	for sub := range b.subs {
 		select {
-		case ch <- struct{}{}:
+		case sub.ch <- struct{}{}:
 		default:
 			// Signal already pending; coalesced cleanly without losing any DB event
 		}
 	}
 }
 
-// Broadcast notifies connected subscribers when any non-raw event (or live acp.usage update) was committed.
+func isWatchableRawACPEvent(ev protocol.EventRecord) bool {
+	if ev.Visibility != protocol.VisibilityRawACP || ev.AttemptID == "" {
+		return false
+	}
+	switch ev.Kind {
+	case protocol.EventACPMessageBatch,
+		protocol.EventACPThoughtBatch,
+		protocol.EventACPToolCall,
+		protocol.EventACPToolCallUpdate,
+		protocol.EventACPUsage:
+		return true
+	default:
+		return false
+	}
+}
+
+// Broadcast notifies connected subscribers when any non-raw event (or live acp.usage update) was committed,
+// and selectively wakes clients watching a specific attemptId when raw_acp streaming events arrive.
 func (b *EventBroker) Broadcast(events ...protocol.EventRecord) {
+	var watchedAttemptIDs map[string]struct{}
 	for _, ev := range events {
 		if ev.Visibility != protocol.VisibilityRawACP || ev.Kind == protocol.EventACPUsage {
 			b.Notify()
 			return
+		}
+		if isWatchableRawACPEvent(ev) {
+			if watchedAttemptIDs == nil {
+				watchedAttemptIDs = map[string]struct{}{}
+			}
+			watchedAttemptIDs[ev.AttemptID] = struct{}{}
+		}
+	}
+	if len(watchedAttemptIDs) == 0 {
+		return
+	}
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	for aid := range watchedAttemptIDs {
+		for sub := range b.attemptSubs[aid] {
+			select {
+			case sub.ch <- struct{}{}:
+			default:
+			}
 		}
 	}
 }
@@ -281,6 +428,7 @@ func (s *Server) handleClientWS(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
+	conn.SetReadLimit(clientWSMaxReadBytes)
 	defer conn.CloseNow()
 
 	ctx, cancel := context.WithCancel(r.Context())
@@ -312,17 +460,25 @@ func (s *Server) handleClientWS(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	// Subscribe BEFORE locking replayHead so any commit happening during replay triggers a wakeup.
-	wakeCh, unsub := s.broker.Subscribe()
+	sub, wakeCh, unsub := s.broker.subscribeClient()
 	defer unsub()
 
-	// Drain client frames to process pings/closes promptly using r.Context() (NOT app ctx) so
-	// synchronous app ctx cancellation on revoke does not trigger coder/websocket's hard-EOF
-	// read-abort before our 1008 Policy Violation close frame is flushed.
+	// Drain client frames to process pings/closes and lightweight watch_attempts control messages
+	// using r.Context() (NOT app ctx) so synchronous app ctx cancellation on revoke does not trigger
+	// coder/websocket's hard-EOF read-abort before our 1008 Policy Violation close frame is flushed.
 	go func() {
 		defer cancel()
 		for {
-			if _, _, err := conn.Read(r.Context()); err != nil {
+			msgType, data, err := conn.Read(r.Context())
+			if err != nil {
 				return
+			}
+			if wsEntry.revoked.Load() || msgType != websocket.MessageText || len(data) == 0 {
+				continue
+			}
+			var cm protocol.WSClientMessage
+			if json.Unmarshal(data, &cm) == nil && cm.Type == protocol.WSClientWatchAttempts {
+				s.broker.SetWatchedAttempts(sub, cm.AttemptIDs)
 			}
 		}
 	}()
@@ -396,7 +552,8 @@ func (s *Server) handleClientWS(w http.ResponseWriter, r *http.Request) {
 			if wsEntry.revoked.Load() || ctx.Err() != nil {
 				return context.Canceled
 			}
-			batch, err := s.store.ListEventsPage(ctx, lastSentSeq, 0, wsPageSize)
+			watched := s.broker.WatchedAttempts(sub)
+			batch, err := s.store.ListEventsPageWithWatched(ctx, lastSentSeq, 0, wsPageSize, watched)
 			if err != nil {
 				return err
 			}

@@ -586,6 +586,7 @@ const (
 	EventACPMessageBatch         EventKind = "acp.message_batch"
 	EventACPThoughtBatch         EventKind = "acp.thought_batch"
 	EventACPToolCall             EventKind = "acp.tool_call"
+	EventACPToolCallUpdate       EventKind = "acp.tool_call_update"
 	EventACPUnsolicitedUpdate    EventKind = "acp.unsolicited_update"
 	EventACPUsage                EventKind = "acp.usage"
 	EventPATurn                  EventKind = "pa.turn"
@@ -637,6 +638,7 @@ var AllEventKinds = []EventKind{
 	EventACPMessageBatch,
 	EventACPThoughtBatch,
 	EventACPToolCall,
+	EventACPToolCallUpdate,
 	EventACPUnsolicitedUpdate,
 	EventACPUsage,
 	EventPATurn,
@@ -693,6 +695,17 @@ var AllWSMessageTypes = []WSMessageType{
 	WSMessageReplayEnd,
 	WSMessageEvent,
 	WSMessagePing,
+}
+
+// WSClientMessageType identifies client-to-server WebSocket control frame kinds on /ws/client.
+type WSClientMessageType string
+
+const (
+	WSClientWatchAttempts WSClientMessageType = "watch_attempts"
+)
+
+var AllWSClientMessageTypes = []WSClientMessageType{
+	WSClientWatchAttempts,
 }
 
 // Built-in virtual project identifiers for project-less free chat and PA sessions.

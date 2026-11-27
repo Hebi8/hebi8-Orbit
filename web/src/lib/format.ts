@@ -84,7 +84,120 @@ export function indexInboxByTask(items: readonly InboxItemView[]): Map<string, I
   return map;
 }
 
-export function inboxItemsMark(items?: readonly InboxItemView[]): SessionMark {
+/** Map of taskId -> latest seen timestamp (epoch ms) for read/unread blue-dot semantics. */
+export type SeenTaskMap = Readonly<Record<string, number>>;
+
+/**
+ * Computes the effective ready timestamp for a task/child:
+ * the maximum of task.updatedAt and any open `delivery_review` inbox item's createdAt.
+ */
+export function effectiveReadyAt(
+  task: { updatedAt?: number | null },
+  inboxItems?: readonly InboxItemView[],
+): number {
+  let ts = typeof task.updatedAt === 'number' && Number.isFinite(task.updatedAt) ? task.updatedAt : 0;
+  if (inboxItems) {
+    for (const it of inboxItems) {
+      if (it.category === 'delivery_review' && typeof it.createdAt === 'number' && it.createdAt > ts) {
+        ts = it.createdAt;
+      }
+    }
+  }
+  return ts;
+}
+
+/** Reports whether a `ready` (blue-dot) status is still unread given `seenTasks`. */
+export function isReadyUnseen(
+  taskId: string | undefined,
+  readyAt: number,
+  seenTasks?: SeenTaskMap,
+): boolean {
+  if (!seenTasks || !taskId) return true;
+  const seenAt = seenTasks[taskId] ?? 0;
+  if (readyAt <= 0) return seenAt <= 0;
+  return seenAt < readyAt;
+}
+
+/**
+ * Reports whether a child task is settled (not running/queued/waiting/failed and has no open approvals/blocks),
+ * so viewing its parent session may mark the child's ready state as seen together with the parent.
+ */
+export function isChildFinishedForParentRead(
+  child: Pick<TaskSummary, 'state'> & { openApprovalCount?: number; activeAttemptState?: AttemptState | null },
+  inboxItems?: readonly InboxItemView[],
+): boolean {
+  if (
+    child.state === 'running' ||
+    child.state === 'queued' ||
+    child.state === 'waiting_approval' ||
+    child.state === 'waiting_resource' ||
+    child.state === 'failed'
+  ) {
+    return false;
+  }
+  if (
+    child.activeAttemptState === 'leased' ||
+    child.activeAttemptState === 'preparing' ||
+    child.activeAttemptState === 'waiting_resource' ||
+    child.activeAttemptState === 'running' ||
+    child.activeAttemptState === 'swarm_monitoring' ||
+    child.activeAttemptState === 'waiting_approval' ||
+    child.activeAttemptState === 'failed' ||
+    child.activeAttemptState === 'expired' ||
+    child.activeAttemptState === 'needs_verification'
+  ) {
+    return false;
+  }
+  if ((child.openApprovalCount ?? 0) > 0) return false;
+  if (
+    inboxItems?.some(
+      (it) =>
+        it.category === 'approval_pending' ||
+        it.category === 'task_blocked' ||
+        it.category === 'memory_conflict',
+    )
+  ) {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Computes the batch of seen entries when a user views a parent session:
+ * marks the parent itself AND every currently finished child session as seen.
+ */
+export function collectParentSeenEntries(
+  parentTask: Pick<TaskSummary, 'taskId' | 'updatedAt'>,
+  children: ReadonlyArray<
+    Pick<TaskSummary, 'taskId' | 'state' | 'updatedAt'> & {
+      openApprovalCount?: number;
+      activeAttemptState?: AttemptState | null;
+    }
+  >,
+  inboxByTask: ReadonlyMap<string, InboxItemView[]>,
+  nowMs = Date.now(),
+): Array<{ taskId: string; seenAtMs: number }> {
+  const byId = new Map<string, number>();
+  const add = (taskId: string, seenAtMs: number) => {
+    if (!taskId) return;
+    const prev = byId.get(taskId) ?? 0;
+    if (seenAtMs > prev) byId.set(taskId, seenAtMs);
+  };
+
+  add(parentTask.taskId, Math.max(nowMs, effectiveReadyAt(parentTask, inboxByTask.get(parentTask.taskId))));
+  for (const child of children) {
+    const childInbox = inboxByTask.get(child.taskId);
+    if (!isChildFinishedForParentRead(child, childInbox)) continue;
+    add(child.taskId, Math.max(nowMs, effectiveReadyAt(child, childInbox)));
+  }
+
+  return [...byId.entries()].map(([taskId, seenAtMs]) => ({ taskId, seenAtMs }));
+}
+
+export function inboxItemsMark(
+  items?: readonly InboxItemView[],
+  seenTasks?: SeenTaskMap,
+): SessionMark {
   if (!items || items.length === 0) return null;
   let best: SessionMark = null;
   for (const it of items) {
@@ -92,7 +205,9 @@ export function inboxItemsMark(items?: readonly InboxItemView[]): SessionMark {
     if (it.category === 'approval_pending' || it.category === 'memory_conflict' || it.category === 'task_blocked') {
       m = 'needs-you';
     } else if (it.category === 'delivery_review') {
-      m = 'ready';
+      if (isReadyUnseen(it.taskId, it.createdAt ?? 0, seenTasks)) {
+        m = 'ready';
+      }
     }
     best = mergeSessionMarks(best, m);
   }
@@ -100,8 +215,9 @@ export function inboxItemsMark(items?: readonly InboxItemView[]): SessionMark {
 }
 
 export function sessionMark(
-  t: Pick<TaskSummary, 'state' | 'activeAttemptState'>,
+  t: Pick<TaskSummary, 'state' | 'activeAttemptState'> & Partial<Pick<TaskSummary, 'taskId' | 'updatedAt'>>,
   inboxItems?: readonly InboxItemView[],
+  seenTasks?: SeenTaskMap,
 ): SessionMark {
   if (
     t.state === 'failed' ||
@@ -134,7 +250,7 @@ export function sessionMark(
     return 'running';
   }
   if (t.state === 'in_review' || inboxItems?.some((it) => it.category === 'delivery_review')) {
-    return 'ready';
+    return isReadyUnseen(t.taskId, effectiveReadyAt(t, inboxItems), seenTasks) ? 'ready' : null;
   }
   return null;
 }
@@ -150,8 +266,9 @@ export function mergeSessionMarks(...marks: SessionMark[]): SessionMark {
 
 /** Derives the single trailing StatusMark for a ChildTaskView. */
 export function childSessionMark(
-  child: Pick<ChildTaskView, 'state' | 'openApprovalCount'>,
+  child: Pick<ChildTaskView, 'state' | 'openApprovalCount'> & Partial<Pick<ChildTaskView, 'taskId' | 'updatedAt'>>,
   inboxItems?: readonly InboxItemView[],
+  seenTasks?: SeenTaskMap,
 ): SessionMark {
   if (child.state === 'failed') return 'failed';
   const hasApprovalOrBlock = inboxItems?.some(
@@ -164,7 +281,7 @@ export function childSessionMark(
     return 'running';
   }
   if (child.state === 'in_review' || inboxItems?.some((it) => it.category === 'delivery_review')) {
-    return 'ready';
+    return isReadyUnseen(child.taskId, effectiveReadyAt(child, inboxItems), seenTasks) ? 'ready' : null;
   }
   return null;
 }
@@ -174,11 +291,12 @@ export function rootSessionMark(
   root: TaskSummary,
   allTasks: readonly TaskSummary[],
   inboxByTask: ReadonlyMap<string, InboxItemView[]>,
+  seenTasks?: SeenTaskMap,
 ): SessionMark {
-  let best = sessionMark(root, inboxByTask.get(root.taskId));
+  let best = sessionMark(root, inboxByTask.get(root.taskId), seenTasks);
   for (const child of allTasks) {
     if (child.parentTaskId === root.taskId) {
-      best = mergeSessionMarks(best, sessionMark(child, inboxByTask.get(child.taskId)));
+      best = mergeSessionMarks(best, sessionMark(child, inboxByTask.get(child.taskId), seenTasks));
     }
   }
   if ((root.pendingChildApprovals ?? 0) > 0) {
