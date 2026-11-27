@@ -23,6 +23,7 @@ type DynamicNetworkSettings struct {
 	WorkspaceName          string   `json:"workspaceName,omitempty"`
 	DiscoveryID            string   `json:"discoveryId,omitempty"`
 	DutyPriority           []string `json:"dutyPriority,omitempty"`
+	RemovedMachines        []string `json:"removedMachines,omitempty"`
 	ExternalGatewayEnabled *bool    `json:"externalGatewayEnabled,omitempty"`
 	ExtraOrigins           []string `json:"extraOrigins,omitempty"`
 	ExtraLogins            []string `json:"extraLogins,omitempty"`
@@ -92,6 +93,68 @@ var ErrPairingInvalid = errors.New("pairing code is invalid or expired")
 
 // ErrTooManyActiveCodes is returned when the active pairing code cap is reached.
 var ErrTooManyActiveCodes = errors.New("too many active pairing codes")
+
+// ErrCannotDeleteLocal is returned when attempting to delete the local_ws hub machine.
+var ErrCannotDeleteLocal = errors.New("cannot delete local hub machine")
+
+func loadDynamicNetworkSettingsTx(ctx context.Context, tx *sql.Tx) (DynamicNetworkSettings, error) {
+	var ns DynamicNetworkSettings
+	var raw string
+	err := tx.QueryRowContext(ctx, `SELECT value_json FROM hub_settings WHERE key = 'network_settings'`).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ns, nil
+	}
+	if err != nil {
+		return ns, err
+	}
+	if strings.TrimSpace(raw) != "" {
+		if err := json.Unmarshal([]byte(raw), &ns); err != nil {
+			return DynamicNetworkSettings{}, err
+		}
+	}
+	return ns, nil
+}
+
+func saveDynamicNetworkSettingsTx(ctx context.Context, tx *sql.Tx, ns DynamicNetworkSettings, now int64) error {
+	raw, err := json.Marshal(ns)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO hub_settings (key, value_json, updated_at)
+		VALUES ('network_settings', ?, ?)
+		ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at
+	`, string(raw), now)
+	return err
+}
+
+func loadRemovedMachinesSetTx(ctx context.Context, tx *sql.Tx) (map[string]bool, error) {
+	out := map[string]bool{}
+	ns, err := loadDynamicNetworkSettingsTx(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
+	for _, id := range ns.RemovedMachines {
+		if t := strings.TrimSpace(id); t != "" {
+			out[t] = true
+		}
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT machine_id FROM registry_machines WHERE removed_at IS NOT NULL`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		if t := strings.TrimSpace(id); t != "" {
+			out[t] = true
+		}
+	}
+	return out, rows.Err()
+}
 
 // HashSecret returns lowercase hex SHA-256 of raw secret bytes.
 func HashSecret(raw string) string {
@@ -453,13 +516,12 @@ func (s *Store) CreatePairingCode(ctx context.Context, p CreatePairingCodeParams
 			} else if err != nil {
 				return err
 			}
-			var removed sql.NullInt64
-			err := tx.QueryRowContext(ctx, `SELECT removed_at FROM registry_machines WHERE machine_id = ?`, bindID).Scan(&removed)
-			if err == nil && removed.Valid {
-				return fmt.Errorf("%w: bound machine %s was removed", ErrNotFound, bindID)
-			}
-			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			removedSet, err := loadRemovedMachinesSetTx(ctx, tx)
+			if err != nil {
 				return err
+			}
+			if removedSet[bindID] {
+				return fmt.Errorf("%w: bound machine %s was removed", ErrNotFound, bindID)
 			}
 		}
 		_, err := tx.ExecContext(ctx, `
@@ -633,6 +695,10 @@ func (s *Store) ClaimPairingCode(ctx context.Context, p ClaimPairingCodeParams) 
 		}
 
 		if p.WantRunner {
+			removedSet, err := loadRemovedMachinesSetTx(ctx, tx)
+			if err != nil {
+				return err
+			}
 			if machineID != "" {
 				// Bind to existing active machine (YAML or DB) without modifying YAML or resurrecting removed nodes
 				var exists string
@@ -643,13 +709,8 @@ func (s *Store) ClaimPairingCode(ctx context.Context, p ClaimPairingCodeParams) 
 				if err != nil {
 					return err
 				}
-				var removed sql.NullInt64
-				rErr := tx.QueryRowContext(ctx, `SELECT removed_at FROM registry_machines WHERE machine_id = ?`, machineID).Scan(&removed)
-				if rErr == nil && removed.Valid {
+				if removedSet[machineID] {
 					return ErrPairingInvalid
-				}
-				if rErr != nil && !errors.Is(rErr, sql.ErrNoRows) {
-					return rErr
 				}
 				if displayName == "" {
 					displayName = machineID
@@ -665,7 +726,7 @@ func (s *Store) ClaimPairingCode(ctx context.Context, p ClaimPairingCodeParams) 
 				if baseID == "" {
 					baseID = "node"
 				}
-				allocated, err := allocateUniqueMachineIDTx(ctx, tx, baseID, p.YAMLMachineIDs)
+				allocated, err := allocateUniqueMachineIDTx(ctx, tx, baseID, p.YAMLMachineIDs, removedSet)
 				if err != nil {
 					return err
 				}
@@ -691,10 +752,33 @@ func (s *Store) ClaimPairingCode(ctx context.Context, p ClaimPairingCodeParams) 
 					osName = strings.TrimSpace(p.Machine.OS)
 				}
 				if _, err := tx.ExecContext(ctx, `
-					INSERT INTO registry_machines (machine_id, display_name, transport_mode, role, capabilities_json, tailscale_host, ssh_alias, created_at)
-					VALUES (?, ?, 'remote_ws', ?, ?, '', '', ?)
+					INSERT INTO registry_machines (machine_id, display_name, transport_mode, role, capabilities_json, tailscale_host, ssh_alias, created_at, removed_at)
+					VALUES (?, ?, 'remote_ws', ?, ?, '', '', ?, NULL)
+					ON CONFLICT(machine_id) DO UPDATE SET
+						display_name = excluded.display_name,
+						transport_mode = excluded.transport_mode,
+						role = excluded.role,
+						capabilities_json = excluded.capabilities_json,
+						removed_at = NULL
 				`, machineID, displayName, string(machineRole), string(capsJSON), now); err != nil {
-					return fmt.Errorf("insert registry machine: %w", err)
+					return fmt.Errorf("upsert registry machine: %w", err)
+				}
+				// Clear tombstone in network_settings if this machine ID was previously deleted.
+				if removedSet[machineID] {
+					ns, err := loadDynamicNetworkSettingsTx(ctx, tx)
+					if err != nil {
+						return err
+					}
+					filtered := make([]string, 0, len(ns.RemovedMachines))
+					for _, id := range ns.RemovedMachines {
+						if strings.TrimSpace(id) != machineID {
+							filtered = append(filtered, id)
+						}
+					}
+					ns.RemovedMachines = filtered
+					if err := saveDynamicNetworkSettingsTx(ctx, tx, ns, now); err != nil {
+						return err
+					}
 				}
 				if _, err := tx.ExecContext(ctx, `
 					INSERT INTO machines (machine_id, transport_mode, status, role, os_name, capabilities_json, adapters_json, resources_json, runner_version, last_seen_at, updated_at)
@@ -804,8 +888,11 @@ func (s *Store) ClaimPairingCode(ctx context.Context, p ClaimPairingCodeParams) 
 	return out, err
 }
 
-func allocateUniqueMachineIDTx(ctx context.Context, tx *sql.Tx, base string, yamlIDs map[string]bool) (string, error) {
+func allocateUniqueMachineIDTx(ctx context.Context, tx *sql.Tx, base string, yamlIDs map[string]bool, removedSet map[string]bool) (string, error) {
 	isTaken := func(cand string) (bool, error) {
+		if removedSet != nil && removedSet[cand] {
+			return false, nil
+		}
 		if yamlIDs != nil && yamlIDs[cand] {
 			return true, nil
 		}
@@ -970,23 +1057,75 @@ func (s *Store) UpdateMachineAlias(ctx context.Context, machineID, alias, actorI
 	return ev, err
 }
 
-// RemovePairedMachine revokes credentials and soft-removes a paired machine (YAML machines must be checked by caller).
-// Returns the emitted event and all revoked client token IDs so Hub can immediately close their active WebSockets.
+// RemovePairedMachine delegates to RemoveMachine for backwards compatibility.
 func (s *Store) RemovePairedMachine(ctx context.Context, machineID, actorID string) (protocol.EventRecord, []string, error) {
+	return s.RemoveMachine(ctx, machineID, actorID)
+}
+
+// RemoveMachine revokes credentials, removes the machine from dutyPriority, records a durable
+// tombstone in network_settings.removedMachines (and registry_machines.removed_at when present)
+// so YAML reload or Hub restart never resurrects it, and marks the machine offline.
+// Deleting the Hub's own local_ws machine is forbidden (ErrCannotDeleteLocal).
+func (s *Store) RemoveMachine(ctx context.Context, machineID, actorID string) (protocol.EventRecord, []string, error) {
+	machineID = strings.TrimSpace(machineID)
 	now := time.Now().UnixMilli()
 	var ev protocol.EventRecord
 	var revokedClientIDs []string
 	err := s.WithWriteTx(ctx, func(tx *sql.Tx) error {
-		res, err := tx.ExecContext(ctx, `
-			UPDATE registry_machines SET removed_at = ?
-			WHERE machine_id = ? AND removed_at IS NULL
-		`, now, machineID)
+		var transportMode string
+		err := tx.QueryRowContext(ctx, `SELECT transport_mode FROM machines WHERE machine_id = ?`, machineID).Scan(&transportMode)
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("%w: machine %s", ErrNotFound, machineID)
+		}
 		if err != nil {
 			return err
 		}
-		if aff, _ := res.RowsAffected(); aff == 0 {
-			return fmt.Errorf("%w: paired machine %s", ErrNotFound, machineID)
+		if protocol.TransportMode(transportMode) == protocol.TransportLocalWS {
+			return fmt.Errorf("%w: %s", ErrCannotDeleteLocal, machineID)
 		}
+		removedSet, err := loadRemovedMachinesSetTx(ctx, tx)
+		if err != nil {
+			return err
+		}
+		if removedSet[machineID] {
+			return fmt.Errorf("%w: machine %s", ErrNotFound, machineID)
+		}
+
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE registry_machines SET removed_at = ?
+			WHERE machine_id = ? AND removed_at IS NULL
+		`, now, machineID); err != nil {
+			return err
+		}
+
+		// Persist tombstone and prune from dutyPriority atomically.
+		ns, err := loadDynamicNetworkSettingsTx(ctx, tx)
+		if err != nil {
+			return err
+		}
+		alreadyTombstoned := false
+		for _, id := range ns.RemovedMachines {
+			if strings.TrimSpace(id) == machineID {
+				alreadyTombstoned = true
+				break
+			}
+		}
+		if !alreadyTombstoned {
+			ns.RemovedMachines = append(ns.RemovedMachines, machineID)
+		}
+		if len(ns.DutyPriority) > 0 {
+			filteredDuty := make([]string, 0, len(ns.DutyPriority))
+			for _, id := range ns.DutyPriority {
+				if strings.TrimSpace(id) != machineID {
+					filteredDuty = append(filteredDuty, id)
+				}
+			}
+			ns.DutyPriority = filteredDuty
+		}
+		if err := saveDynamicNetworkSettingsTx(ctx, tx, ns, now); err != nil {
+			return err
+		}
+
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE pairing_codes SET state = 'revoked' WHERE bind_machine_id = ? AND state = 'pending'
 		`, machineID); err != nil {
@@ -1042,6 +1181,68 @@ func (s *Store) RemovePairedMachine(ctx context.Context, machineID, actorID stri
 		return err2
 	})
 	return ev, revokedClientIDs, err
+}
+
+// SaveMachineAgentQuotas persists the latest real agent quota snapshots reported by a Runner.
+func (s *Store) SaveMachineAgentQuotas(ctx context.Context, machineID string, quotas []protocol.AgentQuotaSnapshot) (*protocol.EventRecord, error) {
+	now := time.Now().UnixMilli()
+	if quotas == nil {
+		quotas = []protocol.AgentQuotaSnapshot{}
+	}
+	quotasJSON, err := json.Marshal(quotas)
+	if err != nil {
+		return nil, err
+	}
+	var emitted *protocol.EventRecord
+	err = s.WithWriteTx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `
+			UPDATE machines
+			SET agent_quotas_json = ?, updated_at = ?
+			WHERE machine_id = ?
+		`, string(quotasJSON), now, machineID)
+		if err != nil {
+			return err
+		}
+		if aff, _ := res.RowsAffected(); aff == 0 {
+			return fmt.Errorf("%w: machine %s", ErrNotFound, machineID)
+		}
+		ev, err := insertEventTx(ctx, tx, eventInsert{
+			StreamID:   "global",
+			ActorKind:  protocol.ActorRunner,
+			ActorID:    "runner:" + machineID,
+			Kind:       protocol.EventMachineAgentsUpdated,
+			Visibility: protocol.VisibilityTimeline,
+			Payload: map[string]any{
+				"machineId":     machineID,
+				"quotasUpdated": true,
+			},
+			CreatedAt: now,
+		})
+		if err != nil {
+			return err
+		}
+		emitted = &ev
+		return nil
+	})
+	return emitted, err
+}
+
+// GetMachineAgentQuotas returns the persisted AgentQuotaSnapshot slice for one machine.
+func (s *Store) GetMachineAgentQuotas(ctx context.Context, machineID string) ([]protocol.AgentQuotaSnapshot, error) {
+	var raw string
+	err := s.ro.QueryRowContext(ctx, `SELECT agent_quotas_json FROM machines WHERE machine_id = ?`, machineID).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	var quotas []protocol.AgentQuotaSnapshot
+	_ = json.Unmarshal([]byte(raw), &quotas)
+	if quotas == nil {
+		quotas = []protocol.AgentQuotaSnapshot{}
+	}
+	return quotas, nil
 }
 
 // SaveMachineAgentProbes stores the latest AgentProbes reported by a Runner and updates ready adapters.
@@ -1456,13 +1657,12 @@ func (s *Store) CreateClientTokenChecked(ctx context.Context, name, scope, machi
 			}
 		}
 		if trimmedMachineID != "" {
-			var removed sql.NullInt64
-			err := tx.QueryRowContext(ctx, `SELECT removed_at FROM registry_machines WHERE machine_id = ?`, trimmedMachineID).Scan(&removed)
-			if err == nil && removed.Valid {
-				return ErrForbidden
-			}
-			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			removedSet, err := loadRemovedMachinesSetTx(ctx, tx)
+			if err != nil {
 				return err
+			}
+			if removedSet[trimmedMachineID] {
+				return ErrForbidden
 			}
 		}
 		_, err := tx.ExecContext(ctx, `

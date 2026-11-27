@@ -34,7 +34,7 @@ func TestMCPServer_EndToEnd5ToolsAndSocketRoundtrip(t *testing.T) {
 	})
 
 	mux := http.NewServeMux()
-	for _, action := range []string{"spawn", "list", "send", "read", "cancel"} {
+	for _, action := range []string{"spawn", "list", "send", "read", "cancel", "board-read", "board-post"} {
 		act := action
 		mux.HandleFunc("/delegate/"+act, func(w http.ResponseWriter, r *http.Request) {
 			if r.Header.Get("X-Orbit-Delegate-Token") != "tok-secret-123" {
@@ -73,7 +73,9 @@ func TestMCPServer_EndToEnd5ToolsAndSocketRoundtrip(t *testing.T) {
 		`{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"orbit_send_child","arguments":{"child_task_id":"tsk_c1","message":"Add tests","mode":"steer"}}}`,
 		`{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"orbit_read_child","arguments":{"child_task_id":"tsk_c1","limit":5}}}`,
 		`{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"orbit_cancel_child","arguments":{"child_task_id":"tsk_c1","reason":"done"}}}`,
-		`{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"orbit_spawn_child","arguments":{}}}`,
+		`{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"orbit_board_read","arguments":{"limit":25,"before_seq":100}}}`,
+		`{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"orbit_board_post","arguments":{"body":"API contract ready","target_mention":"@parent"}}}`,
+		`{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"orbit_spawn_child","arguments":{}}}`,
 	}
 
 	var stdoutBuf bytes.Buffer
@@ -83,9 +85,9 @@ func TestMCPServer_EndToEnd5ToolsAndSocketRoundtrip(t *testing.T) {
 	}
 
 	lines := strings.Split(strings.TrimSpace(stdoutBuf.String()), "\n")
-	// 10 requests minus 1 notification = 9 responses
-	if len(lines) != 9 {
-		t.Fatalf("expected 9 JSON-RPC responses, got %d:\n%s", len(lines), stdoutBuf.String())
+	// 12 requests minus 1 notification = 11 responses
+	if len(lines) != 11 {
+		t.Fatalf("expected 11 JSON-RPC responses, got %d:\n%s", len(lines), stdoutBuf.String())
 	}
 
 	// Verify initialize (id=1)
@@ -97,7 +99,7 @@ func TestMCPServer_EndToEnd5ToolsAndSocketRoundtrip(t *testing.T) {
 		t.Fatalf("bad initialize response: %s", lines[0])
 	}
 
-	// Verify tools/list (id=3) has strictly 5 tools
+	// Verify tools/list (id=3) has strictly 7 tools (5 child delegation + 2 shared board tools)
 	var listResp struct {
 		ID     int `json:"id"`
 		Result struct {
@@ -107,8 +109,8 @@ func TestMCPServer_EndToEnd5ToolsAndSocketRoundtrip(t *testing.T) {
 	if err := json.Unmarshal([]byte(lines[2]), &listResp); err != nil {
 		t.Fatalf("decode tools/list: %v", err)
 	}
-	if len(listResp.Result.Tools) != 5 {
-		t.Fatalf("expected strictly 5 tools, got %d", len(listResp.Result.Tools))
+	if len(listResp.Result.Tools) != 7 {
+		t.Fatalf("expected strictly 7 tools, got %d", len(listResp.Result.Tools))
 	}
 	wantNames := []string{
 		"orbit_spawn_child",
@@ -116,6 +118,8 @@ func TestMCPServer_EndToEnd5ToolsAndSocketRoundtrip(t *testing.T) {
 		"orbit_send_child",
 		"orbit_read_child",
 		"orbit_cancel_child",
+		"orbit_board_read",
+		"orbit_board_post",
 	}
 	for i, w := range wantNames {
 		if listResp.Result.Tools[i].Name != w {
@@ -134,7 +138,7 @@ func TestMCPServer_EndToEnd5ToolsAndSocketRoundtrip(t *testing.T) {
 		t.Fatalf("expected orbit_cancel_child description to document parent-only cancel, got: %q", listResp.Result.Tools[4].Description)
 	}
 
-	// Verify all 5 delegate actions reached the Unix socket with properly mapped fields
+	// Verify all 7 delegate actions reached the Unix socket with properly mapped fields
 	mu.Lock()
 	defer mu.Unlock()
 	if seenCalls["spawn"]["goal"] != "Build parser" || seenCalls["spawn"]["projectId"] != "demo-app" || seenCalls["spawn"]["role"] != "backend" {
@@ -152,16 +156,22 @@ func TestMCPServer_EndToEnd5ToolsAndSocketRoundtrip(t *testing.T) {
 	if seenCalls["cancel"]["childTaskId"] != "tsk_c1" || seenCalls["cancel"]["reason"] != "done" {
 		t.Fatalf("unexpected cancel call payload: %+v", seenCalls["cancel"])
 	}
+	if seenCalls["board-read"]["limit"] != float64(25) || seenCalls["board-read"]["beforeSeq"] != float64(100) {
+		t.Fatalf("unexpected board-read call payload: %+v", seenCalls["board-read"])
+	}
+	if seenCalls["board-post"]["body"] != "API contract ready" || seenCalls["board-post"]["targetMention"] != "@parent" {
+		t.Fatalf("unexpected board-post call payload: %+v", seenCalls["board-post"])
+	}
 
-	// Verify id=9 (missing goal) returned isError=true without crashing
+	// Verify id=11 (missing goal) returned isError=true without crashing
 	var errToolResp struct {
 		ID     int `json:"id"`
 		Result struct {
 			IsError bool `json:"isError"`
 		} `json:"result"`
 	}
-	if err := json.Unmarshal([]byte(lines[8]), &errToolResp); err != nil || !errToolResp.Result.IsError {
-		t.Fatalf("expected isError=true for missing goal, got: %s", lines[8])
+	if err := json.Unmarshal([]byte(lines[10]), &errToolResp); err != nil || !errToolResp.Result.IsError {
+		t.Fatalf("expected isError=true for missing goal, got: %s", lines[10])
 	}
 }
 

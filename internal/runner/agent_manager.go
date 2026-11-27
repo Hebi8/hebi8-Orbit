@@ -84,6 +84,23 @@ func NewAgentManager(cfg AgentManagerConfig) *AgentManager {
 // MergedPATH returns the resolved search PATH including login-shell and managed adapter bins.
 func (m *AgentManager) MergedPATH() string { return m.mergedPATH }
 
+// ResolveMainCLIBin resolves the main CLI executable for adp (respecting agy flag/file/settings overrides
+// and searching the login-shell merged PATH for claude/codex).
+func (m *AgentManager) ResolveMainCLIBin(adp protocol.Adapter) string {
+	if m == nil {
+		return ""
+	}
+	if adp == protocol.AdapterAgy {
+		m.mu.RLock()
+		hubCfg := m.hubConfigs[string(adp)]
+		m.mu.RUnlock()
+		if binPath, _, _, _ := m.resolveBridgeBinary(adp, hubCfg); binPath != "" {
+			return binPath
+		}
+	}
+	return m.findInPATH(defaultMainCLIBin(adp))
+}
+
 // ConfigRev returns the last applied Hub configuration revision.
 func (m *AgentManager) ConfigRev() int64 {
 	m.mu.RLock()

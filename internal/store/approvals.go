@@ -414,6 +414,12 @@ func (s *Store) ReconcileRunnerHello(ctx context.Context, hello protocol.RunnerH
 			agentsVal = string(b)
 		}
 	}
+	var quotasVal any
+	if len(hello.AgentQuotas) > 0 {
+		if b, err := json.Marshal(hello.AgentQuotas); err == nil {
+			quotasVal = string(b)
+		}
+	}
 	var capsVal any
 	if len(hello.Capabilities) > 0 {
 		if b, err := json.Marshal(hello.Capabilities); err == nil {
@@ -437,11 +443,12 @@ func (s *Store) ReconcileRunnerHello(ctx context.Context, hello protocol.RunnerH
 			    resources_json = ?,
 			    adapters_json = COALESCE(?, adapters_json),
 			    agents_json = COALESCE(?, agents_json),
+			    agent_quotas_json = COALESCE(?, agent_quotas_json),
 			    runner_caps_json = COALESCE(?, runner_caps_json),
 			    last_seen_at = ?,
 			    updated_at = ?
 			WHERE machine_id = ?
-		`, hello.RunnerVersion, string(resJSON), adaptersVal, agentsVal, capsVal, now, now, hello.MachineID); err != nil {
+		`, hello.RunnerVersion, string(resJSON), adaptersVal, agentsVal, quotasVal, capsVal, now, now, hello.MachineID); err != nil {
 			return err
 		}
 		if prevStatus != string(protocol.MachineOnline) {

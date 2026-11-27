@@ -32,8 +32,8 @@ func (s *Server) handleGetMachineSSHCandidates(w http.ResponseWriter, r *http.Re
 
 	s.mu.RLock()
 	mCfg, inMem := s.machines.Machines[machineID]
-	yamlMachines := s.yamlMachines.Machines
 	s.mu.RUnlock()
+	yamlMachines := s.effectiveYAMLMachines()
 
 	var target sshcfg.Target
 	found := inMem
@@ -61,9 +61,7 @@ func (s *Server) handleGetMachineSSHCandidates(w http.ResponseWriter, r *http.Re
 				if target.TailscaleHost == "" {
 					target.TailscaleHost = mv.TailscaleHost
 				}
-				if target.SSHAlias == "" {
-					target.SSHAlias = mv.SSHAlias
-				}
+				target.SSHAlias = mv.SSHAlias
 				break
 			}
 		}

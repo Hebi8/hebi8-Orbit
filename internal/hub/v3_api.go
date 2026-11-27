@@ -31,9 +31,7 @@ func (s *Server) effectiveDutyPriority(ctx context.Context, machines []protocol.
 	s.mu.RUnlock()
 
 	if machines == nil {
-		s.mu.RLock()
-		yamlMachines := s.yamlMachines.Machines
-		s.mu.RUnlock()
+		yamlMachines := s.effectiveYAMLMachines()
 		if boot, err := s.store.Bootstrap(ctx, yamlMachines); err == nil {
 			machines = boot.Machines
 		}

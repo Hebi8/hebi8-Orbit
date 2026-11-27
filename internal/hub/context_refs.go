@@ -123,9 +123,7 @@ func (s *Server) decorateAttemptPromptForAttempt(
 }
 
 func (s *Server) buildPAWorkspaceSnapshot(ctx context.Context) string {
-	s.mu.RLock()
-	yamlMach := s.yamlMachines.Machines
-	s.mu.RUnlock()
+	yamlMach := s.effectiveYAMLMachines()
 	boot, err := s.store.Bootstrap(ctx, yamlMach)
 	if err != nil {
 		return ""

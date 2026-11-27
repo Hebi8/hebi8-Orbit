@@ -380,6 +380,8 @@ func (s *Server) buildRouter() http.Handler {
 		rr.Post("/delegate/send", s.handleRunnerDelegateSend)
 		rr.Post("/delegate/read", s.handleRunnerDelegateRead)
 		rr.Post("/delegate/cancel", s.handleRunnerDelegateCancel)
+		rr.Post("/delegate/board-read", s.handleRunnerDelegateBoardRead)
+		rr.Post("/delegate/board-post", s.handleRunnerDelegateBoardPost)
 	})
 
 	// Authenticated REST API
@@ -402,6 +404,7 @@ func (s *Server) buildRouter() http.Handler {
 		api.Patch("/machines/{machineId}", s.handleUpdateMachine)
 		api.Delete("/machines/{machineId}", s.handleDeleteMachine)
 		api.Post("/machines/{machineId}/agents/probe", s.handleProbeMachineAgents)
+		api.Post("/machines/{machineId}/quotas/refresh", s.handleRefreshMachineQuotas)
 		api.Post("/machines/{machineId}/agents/{adapter}/test", s.handleTestMachineAgent)
 		api.Post("/machines/{machineId}/agents/{adapter}/install", s.handleInstallMachineAgent)
 		api.Patch("/machines/{machineId}/agents/{adapter}", s.handleUpdateMachineAgent)
@@ -504,9 +507,7 @@ func (s *Server) buildRouter() http.Handler {
 }
 
 func (s *Server) handleBootstrap(w http.ResponseWriter, r *http.Request) {
-	s.mu.RLock()
-	yamlMachineMeta := s.yamlMachines.Machines
-	s.mu.RUnlock()
+	yamlMachineMeta := s.effectiveYAMLMachines()
 
 	resp, err := s.store.Bootstrap(r.Context(), yamlMachineMeta)
 	if err != nil {

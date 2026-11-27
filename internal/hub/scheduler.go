@@ -559,6 +559,7 @@ func buildOrbitSystemPromptAppend(taskID, projectID, attemptID string, isPlainFo
 			"\n\nDelegated Child Context:\n"+
 				"- You are a delegated child session of parent task %s%s (maximum sub-session depth = 1).\n"+
 				"- Do NOT spawn grandchild sessions; only sibling collaboration is allowed (`orbit_list_children`, `orbit_send_child`, `orbit_read_child`).\n"+
+				"- Use the shared task-group Board (`orbit_board_read` / `orbit_board_post`) to read shared context and post progress, decisions, or findings visible to the parent and sibling sessions.\n"+
 				"- Stay focused on your assigned scope and summarize your findings/changes clearly in your final reply; Orbit will automatically report it back to the parent session.",
 			strings.TrimSpace(parentTaskID), roleNote,
 		)
@@ -566,6 +567,7 @@ func buildOrbitSystemPromptAppend(taskID, projectID, attemptID string, isPlainFo
 		base += "\n\nOrbit Sub-Session Delegation:\n" +
 			"- When splitting independent/parallel subtasks or delegating work to another machine, model, or project, prefer Orbit sub-session tools (`orbit_spawn_child`, or `orbit child spawn` in terminal).\n" +
 			"- Delegated sub-sessions are live-observable in the Orbit UI so the user can inspect, take over, steer, or approve them directly.\n" +
+			"- Use the shared Board (`orbit_board_read` / `orbit_board_post`) to share context, decisions, and progress with all direct child sessions.\n" +
 			"- When a child session finishes, Orbit automatically delivers its summary back to you; do not poll in a loop."
 	}
 	if custom := strings.TrimSpace(projectSystemPrompt); custom != "" {
@@ -859,7 +861,8 @@ func (s *Server) consumeAndDispatchNextPendingInput(ctx context.Context, taskID,
 	if err != nil {
 		return
 	}
-	route, err := s.resolveExecutionRoute(proj, task.RequiredCapability, task.PreferredAdapter)
+	partID, locationID, _ := s.store.GetTaskLocationTarget(ctx, taskID)
+	route, err := s.resolveExecutionRouteWithLocation(proj, task.RequiredCapability, task.PreferredAdapter, "", partID, locationID)
 	if err != nil {
 		return
 	}
@@ -873,6 +876,9 @@ func (s *Server) consumeAndDispatchNextPendingInput(ctx context.Context, taskID,
 		PreferredInputID: preferredInputID,
 		MachineID:        route.MachineID,
 		Adapter:          route.Adapter,
+		PartID:           route.PartID,
+		LocationID:       route.LocationID,
+		Isolation:        route.Isolation,
 		Anchor:           anchorPtr,
 		AnchorCapability: route.Capability,
 		LeaseTTLMs:       s.leaseTTL.Milliseconds(),

@@ -93,7 +93,7 @@ export type IDEScheme = (typeof IDESchemeValues)[number];
 export const WSMessageTypeValues = ["replay", "replay_end", "event", "ping"] as const;
 export type WSMessageType = (typeof WSMessageTypeValues)[number];
 
-export const RunnerWSMessageTypeValues = ["runner.hello", "hub.welcome", "attempt.dispatch", "attempt.cancel", "approval.decision", "session.close", "runner.heartbeat", "attempt.outbox_batch", "hub.outbox_ack", "board.message", "runner.config", "runner.rpc", "runner.agents_report", "runner.rpc_result"] as const;
+export const RunnerWSMessageTypeValues = ["runner.hello", "hub.welcome", "attempt.dispatch", "attempt.cancel", "approval.decision", "session.close", "runner.heartbeat", "attempt.outbox_batch", "hub.outbox_ack", "board.message", "runner.config", "runner.rpc", "runner.agents_report", "runner.quotas_report", "runner.rpc_result"] as const;
 export type RunnerWSMessageType = (typeof RunnerWSMessageTypeValues)[number];
 
 export const OutboxFrameTypeValues = ["events", "state", "approval_request", "approval_ack", "delivery_published", "board_message", "board_member", "board_message_ack"] as const;
@@ -257,6 +257,24 @@ export interface AgentModeOption {
   description?: string;
 }
 
+export interface QuotaWindow {
+  window: string;
+  label?: string;
+  group?: string;
+  modelHints?: string[];
+  usedPercent: number;
+  remainingPercent: number;
+  resetsAt?: number;
+}
+
+export interface AgentQuotaSnapshot {
+  adapter: Adapter;
+  available: boolean;
+  windows?: QuotaWindow[];
+  fetchedAt: number;
+  error?: string;
+}
+
 export interface AgentProbe {
   adapter: Adapter;
   state: AgentState;
@@ -278,6 +296,7 @@ export interface AgentProbe {
   maxLiveWorkers?: number;
   lockedFields?: string[];
   lastTest?: AgentTestResult | null;
+  quota?: AgentQuotaSnapshot | null;
   probedAt?: number;
 }
 
@@ -298,6 +317,7 @@ export interface MachineView {
   runnerCapabilities?: string[];
   adapters?: Adapter[];
   agents?: AgentProbe[];
+  agentQuotas?: AgentQuotaSnapshot[];
   lockedFields?: string[];
   resources: Record<string, ResourceState>;
   runnerVersion?: string;
@@ -1292,6 +1312,7 @@ export interface UpdateMachineRequest {
   displayAlias?: string | null;
   role?: MachineRole | null;
   allowedRoots?: string[];
+  sshAlias?: string | null;
 }
 
 export interface UpdateMachineAgentRequest {
@@ -1307,6 +1328,12 @@ export interface MachineAgentActionResponse {
   adapter?: Adapter;
   probe?: AgentProbe | null;
   agents: AgentProbe[];
+  agentQuotas?: AgentQuotaSnapshot[];
+}
+
+export interface MachineQuotasResponse {
+  machineId: string;
+  agentQuotas: AgentQuotaSnapshot[];
 }
 
 export interface DirEntryView {
@@ -1675,6 +1702,12 @@ export interface RunnerAgentsReportFrame {
   agents: AgentProbe[];
 }
 
+export interface RunnerQuotasReportFrame {
+  type: RunnerWSMessageType;
+  machineId: string;
+  quotas: AgentQuotaSnapshot[];
+}
+
 export interface RunnerRPCFrame {
   type: RunnerWSMessageType;
   requestId: string;
@@ -1702,6 +1735,7 @@ export interface RunnerHelloFrame {
   capabilities?: string[];
   adapters?: Adapter[];
   agentProbes?: AgentProbe[];
+  agentQuotas?: AgentQuotaSnapshot[];
   configRev?: number;
   liveAttempts: LiveAttemptInfo[];
   livePendingApprovalIds: string[];

@@ -417,12 +417,11 @@ func (s *Server) handleClaimPairingCode(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	s.mu.RLock()
-	yamlIDs := make(map[string]bool, len(s.yamlMachines.Machines))
-	for id := range s.yamlMachines.Machines {
+	effYAML := s.effectiveYAMLMachines()
+	yamlIDs := make(map[string]bool, len(effYAML))
+	for id := range effYAML {
 		yamlIDs[id] = true
 	}
-	s.mu.RUnlock()
 
 	res, err := s.store.ClaimPairingCode(r.Context(), store.ClaimPairingCodeParams{
 		CodeHash:       store.HashSecret(normalized),

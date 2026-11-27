@@ -54,8 +54,9 @@ type AgentProbe struct {
 	AuthChecked    bool              `json:"authChecked,omitempty"`
 	MaxLiveWorkers int               `json:"maxLiveWorkers,omitempty"`
 	LockedFields   []string          `json:"lockedFields,omitempty"`
-	LastTest       *AgentTestResult  `json:"lastTest,omitempty"`
-	ProbedAt       int64             `json:"probedAt,omitempty"`
+	LastTest       *AgentTestResult    `json:"lastTest,omitempty"`
+	Quota          *AgentQuotaSnapshot `json:"quota,omitempty"`
+	ProbedAt       int64               `json:"probedAt,omitempty"`
 }
 
 // RunnerAgentConfig carries Hub-managed dynamic overrides for one adapter on a machine.
@@ -88,6 +89,13 @@ type RunnerAgentsReportFrame struct {
 	Agents    []AgentProbe        `json:"agents"`
 }
 
+// RunnerQuotasReportFrame reports real collected agent usage quotas from Runner to Hub.
+type RunnerQuotasReportFrame struct {
+	Type      RunnerWSMessageType  `json:"type"`
+	MachineID string               `json:"machineId"`
+	Quotas    []AgentQuotaSnapshot `json:"quotas"`
+}
+
 // RunnerRPCFrame sends a control-plane RPC request from Hub to a live Runner.
 type RunnerRPCFrame struct {
 	Type      RunnerWSMessageType `json:"type"`
@@ -118,6 +126,7 @@ type RunnerHelloFrame struct {
 	Capabilities             []string                  `json:"capabilities,omitempty"`
 	Adapters                 []Adapter                 `json:"adapters,omitempty"`
 	AgentProbes              []AgentProbe              `json:"agentProbes,omitempty"`
+	AgentQuotas              []AgentQuotaSnapshot      `json:"agentQuotas,omitempty"`
 	ConfigRev                int64                     `json:"configRev,omitempty"`
 	LiveAttempts             []LiveAttemptInfo         `json:"liveAttempts"`
 	LivePendingApprovalIDs   []string                  `json:"livePendingApprovalIds"`

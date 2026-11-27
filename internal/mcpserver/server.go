@@ -208,6 +208,29 @@ func ToolDefinitions() []mcpToolDef {
 				"required": []string{"child_task_id"},
 			},
 		},
+		{
+			Name:        "orbit_board_read",
+			Description: "Read recent messages and member states from the shared Board of this task group (accessible by the top-level parent session and its direct child sessions).",
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"before_seq": map[string]any{"type": "integer", "description": "Optional pagination cursor: return messages strictly before this seq"},
+					"limit":      map[string]any{"type": "integer", "description": "Max recent board messages to return (default 50)"},
+				},
+			},
+		},
+		{
+			Name:        "orbit_board_post",
+			Description: "Post a progress update, decision, finding, or shared context message to the shared Board of this task group (parent and direct child sessions).",
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"body":           map[string]any{"type": "string", "description": "Message body to post to the shared Board"},
+					"target_mention": map[string]any{"type": "string", "description": "Optional @mention targeting a sibling title/taskId or @parent"},
+				},
+				"required": []string{"body"},
+			},
+		},
 	}
 }
 
@@ -445,6 +468,29 @@ func (s *Server) executeTool(ctx context.Context, name string, args map[string]a
 		}
 		if v := strArg(args, "reason"); v != "" {
 			payload["reason"] = v
+		}
+
+	case "orbit_board_read":
+		action = "board-read"
+		payload = map[string]any{}
+		if n, ok := intArg(args, "before_seq", "beforeSeq"); ok && n > 0 {
+			payload["beforeSeq"] = n
+		}
+		if n, ok := intArg(args, "limit"); ok && n > 0 {
+			payload["limit"] = n
+		}
+
+	case "orbit_board_post":
+		body := strArg(args, "body", "message")
+		if body == "" {
+			return "body is required", true
+		}
+		action = "board-post"
+		payload = map[string]any{
+			"body": body,
+		}
+		if v := strArg(args, "target_mention", "targetMention", "target"); v != "" {
+			payload["targetMention"] = v
 		}
 
 	default:

@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"gopkg.in/yaml.v3"
 
 	"github.com/Hebi8/hebi8-Orbit/internal/discovery"
 	"github.com/Hebi8/hebi8-Orbit/internal/gitops"
@@ -45,12 +47,28 @@ func (s *Server) refreshEffectiveRegistry(ctx context.Context) error {
 		return err
 	}
 
+	removedSet := map[string]bool{}
+	for _, id := range dynNet.RemovedMachines {
+		if t := strings.TrimSpace(id); t != "" {
+			removedSet[t] = true
+		}
+	}
+
 	s.mu.Lock()
 	mergedMachines := make(map[string]protocol.MachineConfig, len(s.yamlMachines.Machines)+len(dynMachines))
 	for id, m := range dynMachines {
+		if removedSet[id] {
+			continue
+		}
 		mergedMachines[id] = m
 	}
 	for id, m := range s.yamlMachines.Machines {
+		if removedSet[id] {
+			continue
+		}
+		if _, isPaired := dynMachines[id]; isPaired {
+			continue
+		}
 		mergedMachines[id] = m
 	}
 
@@ -89,13 +107,31 @@ func (s *Server) effectiveWorkspaceName() string {
 	return "Home LAN"
 }
 
-func (s *Server) enrichMachineViews(ctx context.Context, machines []protocol.MachineView) []protocol.MachineView {
-	s.mu.RLock()
-	yamlMachines := make(map[string]protocol.MachineConfig, len(s.yamlMachines.Machines))
-	for k, v := range s.yamlMachines.Machines {
-		yamlMachines[k] = v
+func (s *Server) effectiveYAMLMachinesLocked() map[string]protocol.MachineConfig {
+	removedSet := map[string]bool{}
+	for _, id := range s.dynNet.RemovedMachines {
+		if t := strings.TrimSpace(id); t != "" {
+			removedSet[t] = true
+		}
 	}
-	s.mu.RUnlock()
+	out := make(map[string]protocol.MachineConfig, len(s.yamlMachines.Machines))
+	for k, v := range s.yamlMachines.Machines {
+		if removedSet[k] {
+			continue
+		}
+		out[k] = v
+	}
+	return out
+}
+
+func (s *Server) effectiveYAMLMachines() map[string]protocol.MachineConfig {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.effectiveYAMLMachinesLocked()
+}
+
+func (s *Server) enrichMachineViews(ctx context.Context, machines []protocol.MachineView) []protocol.MachineView {
+	yamlMachines := s.effectiveYAMLMachines()
 
 	out := make([]protocol.MachineView, len(machines))
 	for i, mv := range machines {
@@ -117,6 +153,18 @@ func (s *Server) enrichMachineViews(ctx context.Context, machines []protocol.Mac
 
 		settings, _, _ := s.store.GetMachineAgentSettings(ctx, mv.MachineID)
 		mv.Agents = mergeMachineAgents(mv, ym, inYAML, settings)
+		if len(mv.AgentQuotas) > 0 {
+			qByAdp := make(map[protocol.Adapter]protocol.AgentQuotaSnapshot, len(mv.AgentQuotas))
+			for _, q := range mv.AgentQuotas {
+				qByAdp[q.Adapter] = q
+			}
+			for j := range mv.Agents {
+				if q, ok := qByAdp[mv.Agents[j].Adapter]; ok {
+					qCopy := q
+					mv.Agents[j].Quota = &qCopy
+				}
+			}
+		}
 		out[i] = mv
 	}
 	return out
@@ -230,9 +278,7 @@ func (s *Server) buildSetupStatus(ctx context.Context, machines []protocol.Machi
 }
 
 func (s *Server) handleListMachines(w http.ResponseWriter, r *http.Request) {
-	s.mu.RLock()
-	yamlMachines := s.yamlMachines.Machines
-	s.mu.RUnlock()
+	yamlMachines := s.effectiveYAMLMachines()
 
 	boot, err := s.store.Bootstrap(r.Context(), yamlMachines)
 	if err != nil {
@@ -257,9 +303,8 @@ func (s *Server) handleUpdateMachine(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.mu.RLock()
-	ym, inYAML := s.yamlMachines.Machines[machineID]
-	s.mu.RUnlock()
+	yamlMachines := s.effectiveYAMLMachines()
+	ym, inYAML := yamlMachines[machineID]
 	if inYAML {
 		lockedKeys := map[string]bool{
 			"transport":     true,
@@ -284,7 +329,7 @@ func (s *Server) handleUpdateMachine(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusBadRequest, "ERR_INVALID_JSON", "invalid request body")
 		return
 	}
-	if req.DisplayAlias != nil || req.Role != nil || req.AllowedRoots != nil {
+	if req.DisplayAlias != nil || req.Role != nil || req.AllowedRoots != nil || req.SSHAlias != nil {
 		ev, err := s.store.UpdateMachineMetadata(r.Context(), machineID, req, actorFromContext(r.Context()))
 		if errors.Is(err, store.ErrNotFound) {
 			writeAPIError(w, http.StatusNotFound, "ERR_MACHINE_NOT_FOUND", err.Error())
@@ -304,16 +349,42 @@ func (s *Server) handleUpdateMachine(w http.ResponseWriter, r *http.Request) {
 	s.handleListMachines(w, r)
 }
 
+func removeMachineFromYAMLFile(configDir, machineID string) error {
+	configDir = strings.TrimSpace(configDir)
+	if configDir == "" {
+		return nil
+	}
+	machPath := filepath.Join(configDir, "machines.yaml")
+	cfg, err := protocol.LoadMachinesConfig(machPath)
+	if err != nil {
+		return err
+	}
+	if _, exists := cfg.Machines[machineID]; !exists {
+		return nil
+	}
+	delete(cfg.Machines, machineID)
+	out, err := yaml.Marshal(&cfg)
+	if err != nil {
+		return err
+	}
+	tmpPath := machPath + ".tmp"
+	if err := os.WriteFile(tmpPath, out, 0o600); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, machPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	return nil
+}
+
 func (s *Server) handleDeleteMachine(w http.ResponseWriter, r *http.Request) {
 	machineID := chi.URLParam(r, "machineId")
-	s.mu.RLock()
-	_, inYAML := s.yamlMachines.Machines[machineID]
-	s.mu.RUnlock()
-	if inYAML {
-		writeAPIError(w, http.StatusConflict, "ERR_FILE_MANAGED", "machine is configured in machines.yaml and cannot be removed from UI")
+	ev, revokedClientIDs, err := s.store.RemoveMachine(r.Context(), machineID, actorFromContext(r.Context()))
+	if errors.Is(err, store.ErrCannotDeleteLocal) {
+		writeAPIError(w, http.StatusConflict, "ERR_CANNOT_DELETE_LOCAL", "local hub machine cannot be removed")
 		return
 	}
-	ev, revokedClientIDs, err := s.store.RemovePairedMachine(r.Context(), machineID, actorFromContext(r.Context()))
 	if errors.Is(err, store.ErrNotFound) {
 		writeAPIError(w, http.StatusNotFound, "ERR_MACHINE_NOT_FOUND", err.Error())
 		return
@@ -322,6 +393,15 @@ func (s *Server) handleDeleteMachine(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusInternalServerError, "ERR_REMOVE_MACHINE", err.Error())
 		return
 	}
+
+	// Best-effort sync removal from ConfigDir/machines.yaml if present & writable;
+	// durable tombstone in SQLite network_settings guarantees no resurrection even if YAML is read-only.
+	s.mu.Lock()
+	delete(s.yamlMachines.Machines, machineID)
+	cfgDir := s.hubCfg.ConfigDir
+	s.mu.Unlock()
+	_ = removeMachineFromYAMLFile(cfgDir, machineID)
+
 	for _, cid := range revokedClientIDs {
 		s.revokeClientTokenSessions(cid)
 	}
@@ -359,9 +439,55 @@ func (s *Server) handleProbeMachineAgents(w http.ResponseWriter, r *http.Request
 			s.broker.Broadcast(*ev)
 		}
 	}
+	quotas := decodeQuotasFromRPC(res.Data)
+	if len(quotas) > 0 {
+		if ev, err := s.store.SaveMachineAgentQuotas(r.Context(), machineID, quotas); err == nil && ev != nil {
+			s.broker.Broadcast(*ev)
+		}
+	}
 	writeJSON(w, http.StatusOK, protocol.MachineAgentActionResponse{
-		MachineID: machineID,
-		Agents:    probes,
+		MachineID:   machineID,
+		Agents:      probes,
+		AgentQuotas: quotas,
+	})
+}
+
+func (s *Server) handleRefreshMachineQuotas(w http.ResponseWriter, r *http.Request) {
+	machineID := chi.URLParam(r, "machineId")
+	s.mu.RLock()
+	_, exists := s.machines.Machines[machineID]
+	s.mu.RUnlock()
+	if !exists {
+		writeAPIError(w, http.StatusNotFound, "ERR_MACHINE_NOT_FOUND", "machine not found")
+		return
+	}
+	if !s.runners.IsConnected(machineID) {
+		writeAPIError(w, http.StatusServiceUnavailable, "ERR_MACHINE_OFFLINE", "machine runner is not connected")
+		return
+	}
+	if !s.runners.HasCapability(machineID, protocol.RunnerCapQuotasV1) {
+		writeAPIError(w, http.StatusNotImplemented, "ERR_CAPABILITY_UNSUPPORTED", "runner version does not support quota probing")
+		return
+	}
+	res, err := s.runners.CallRPC(r.Context(), machineID, "probe_quotas", map[string]any{"force": true}, 25*time.Second)
+	if err != nil {
+		writeAPIError(w, http.StatusBadGateway, "ERR_RUNNER_RPC", err.Error())
+		return
+	}
+	if !res.OK {
+		writeAPIError(w, http.StatusBadGateway, "ERR_RUNNER_QUOTAS", res.Error)
+		return
+	}
+	quotas := decodeQuotasFromRPC(res.Data)
+	if quotas == nil {
+		quotas = []protocol.AgentQuotaSnapshot{}
+	}
+	if ev, err := s.store.SaveMachineAgentQuotas(r.Context(), machineID, quotas); err == nil && ev != nil {
+		s.broker.Broadcast(*ev)
+	}
+	writeJSON(w, http.StatusOK, protocol.MachineQuotasResponse{
+		MachineID:   machineID,
+		AgentQuotas: quotas,
 	})
 }
 
@@ -461,9 +587,8 @@ func (s *Server) handleUpdateMachineAgent(w http.ResponseWriter, r *http.Request
 	}
 
 	// Enforce YAML field locks: return 409 ERR_FILE_MANAGED if caller modifies YAML-managed fields.
-	s.mu.RLock()
-	ym, inYAML := s.yamlMachines.Machines[machineID]
-	s.mu.RUnlock()
+	yamlMachines := s.effectiveYAMLMachines()
+	ym, inYAML := yamlMachines[machineID]
 	if inYAML {
 		if yCfg, ok := ym.Adapters[string(adp)]; ok {
 			if req.Bin != nil && strings.TrimSpace(yCfg.Bin) != "" && strings.TrimSpace(*req.Bin) != strings.TrimSpace(yCfg.Bin) {
@@ -1084,9 +1209,7 @@ func (s *Server) handleCompleteOnboarding(w http.ResponseWriter, r *http.Request
 	}
 	s.broker.Notify()
 
-	s.mu.RLock()
-	yamlMachines := s.yamlMachines.Machines
-	s.mu.RUnlock()
+	yamlMachines := s.effectiveYAMLMachines()
 	boot, _ := s.store.Bootstrap(r.Context(), yamlMachines)
 	enriched := s.enrichMachineViews(r.Context(), boot.Machines)
 	setup := s.buildSetupStatus(r.Context(), enriched, clientMachineIDFromContext(r.Context()))
@@ -1095,6 +1218,25 @@ func (s *Server) handleCompleteOnboarding(w http.ResponseWriter, r *http.Request
 		Completed: true,
 		Setup:     setup,
 	})
+}
+
+func decodeQuotasFromRPC(data map[string]any) []protocol.AgentQuotaSnapshot {
+	if data == nil {
+		return nil
+	}
+	raw, ok := data["agentQuotas"]
+	if !ok {
+		return nil
+	}
+	b, err := json.Marshal(raw)
+	if err != nil {
+		return nil
+	}
+	var quotas []protocol.AgentQuotaSnapshot
+	if json.Unmarshal(b, &quotas) != nil {
+		return nil
+	}
+	return quotas
 }
 
 func decodeProbesFromRPC(data map[string]any) []protocol.AgentProbe {

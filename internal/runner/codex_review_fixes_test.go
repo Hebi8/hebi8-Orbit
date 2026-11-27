@@ -906,26 +906,22 @@ func TestAutoDeliverTransientError_NeedsVerificationWaitsForDelivery(t *testing.
 	}))
 	defer fakeHub.Close()
 
+	var r *Runner
 	drv := &stubAdapterDriver{}
 	drv.onPrompt = func(_ context.Context, sid acp.SessionId, wt, _ string) (acp.PromptResponse, error) {
-		// Record an unresolved non-zero tool failure via session update AND edit worktree
-		_ = drv.updateHandler(ctx, acp.SessionNotification{
-			SessionId: sid,
-			Update: acp.SessionUpdate{
-				ToolCall: &acp.SessionUpdateToolCall{
-					ToolCallId: "tc_fail_1",
-					Title:      "run_tests",
-					Status:     acp.ToolCallStatusCompleted,
-					RawInput:   json.RawMessage(`{"command":"go test ./..."}`),
-					RawOutput:  json.RawMessage(`{"exitCode":1}`),
-				},
-			},
-		})
-		_ = os.WriteFile(filepath.Join(wt, "main.txt"), []byte("v2 with test failure\n"), 0o644)
+		// Record an unresolved rejected tool permission AND edit worktree
+		r.mu.Lock()
+		att := r.attempts["att_nv_retry"]
+		r.mu.Unlock()
+		if att != nil {
+			att.tracker.RecordToolRejection()
+		}
+		_ = os.WriteFile(filepath.Join(wt, "main.txt"), []byte("v2 with rejected tool\n"), 0o644)
 		return acp.PromptResponse{StopReason: acp.StopReasonEndTurn}, nil
 	}
 
-	r, err := New(ctx, Config{
+	var err error
+	r, err = New(ctx, Config{
 		MachineID:             "remote-node",
 		HubHTTPURL:            fakeHub.URL,
 		DataDir:               dataDir,

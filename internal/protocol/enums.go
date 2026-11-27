@@ -758,6 +758,7 @@ const (
 	RunnerMsgConfig          RunnerWSMessageType = "runner.config"
 	RunnerMsgRPC             RunnerWSMessageType = "runner.rpc"
 	RunnerMsgAgentsReport    RunnerWSMessageType = "runner.agents_report"
+	RunnerMsgQuotasReport    RunnerWSMessageType = "runner.quotas_report"
 	RunnerMsgRPCResult       RunnerWSMessageType = "runner.rpc_result"
 )
 
@@ -775,6 +776,7 @@ var AllRunnerWSMessageTypes = []RunnerWSMessageType{
 	RunnerMsgConfig,
 	RunnerMsgRPC,
 	RunnerMsgAgentsReport,
+	RunnerMsgQuotasReport,
 	RunnerMsgRPCResult,
 }
 
@@ -1085,6 +1087,7 @@ const (
 	RunnerCapFSV1      = "fs.v1"
 	RunnerCapBundleV1  = "bundle.v1"
 	RunnerCapFSPlainV1 = "fs.plain.v1"
+	RunnerCapQuotasV1  = "quotas.v1"
 )
 
 // PinnedBridgePackages defines the exact whitelisted npm packages installed into <dataDir>/acp-adapters.

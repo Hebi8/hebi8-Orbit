@@ -504,13 +504,14 @@ func applyStateFrameTx(
 	resumeState := stringField(item.Payload, "resumeState")
 	sessionLocked := boolField(item.Payload, "sessionLocked")
 	unresolvedRejected := int64Field(item.Payload, "unresolvedRejectedToolCount")
-	unresolvedNonZero := int64Field(item.Payload, "unresolvedNonZeroExitCount")
 
 	// B1: Hub-side authoritative adjudication of succeeded claims.
 	// - Abnormal ACP stop_reason (e.g. refusal / max_tokens / max_turn_requests) cannot succeed.
 	// - Non-_scratch project / annotation turns MUST have a verified output_delivery_id before succeeding
 	//   or marking queued annotations as addressed.
-	// - Unresolved tool rejections or non-zero exits require verification rather than clean success.
+	// - Unresolved tool approval rejections require verification rather than clean success.
+	//   Routine non-zero shell exit codes (e.g. grep/ls/test returning exit code 1) are recorded in telemetry
+	//   but do NOT block clean end_turn completion or lock the session.
 	if newState == protocol.AttemptSucceeded {
 		if stopReason != "" && stopReason != "end_turn" {
 			newState = protocol.AttemptFailed
@@ -537,13 +538,13 @@ func applyStateFrameTx(
 				if errDetail == "" {
 					errDetail = "批注修订轮未产出已核验变更，已释放未处理批注"
 				}
-			} else if unresolvedRejected > 0 || unresolvedNonZero > 0 {
+			} else if unresolvedRejected > 0 {
 				newState = protocol.AttemptNeedsVerification
 				if errCode == "" {
 					errCode = "UNRESOLVED_TOOL_FAILURE"
 				}
 				if errDetail == "" {
-					errDetail = "本轮存在未解决的工具拒绝或非零失败，请人工核对后再决定是否续跑"
+					errDetail = "本轮存在未解决的工具审批拒绝，请人工核对后再决定是否续跑"
 				}
 			}
 		}

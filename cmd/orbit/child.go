@@ -43,16 +43,20 @@ func runChild(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		return runChildSend(ctx, args[1:], stdout, stderr)
 	case "cancel", "stop":
 		return runChildCancel(ctx, args[1:], stdout, stderr)
+	case "board":
+		return runChildBoard(ctx, args[1:], stdout, stderr)
 	case "-h", "--help", "help":
 		fmt.Fprintln(stdout, `Usage:
   orbit child spawn --goal "..." [--title "..."] [--role "..."] [--project <id>] [--machine <id>] [--adapter agy|claude|codex] [--model <m>] [--effort <lvl>] [--mode <mode>] [--worktree[=true|false]] [--parent <taskId>] [--no-notify] [--json]
   orbit child ls [--parent <taskId>] [--archived] [--targets] [--json]
   orbit child show <childTaskId> [--limit 10] [--json]
   orbit child send <childTaskId> --message "..." [--steer] [--mode queue|steer] [--json]
-  orbit child cancel <childTaskId> [--reason "..."] [--json]`)
+  orbit child cancel <childTaskId> [--reason "..."] [--json]
+  orbit child board [read] [--parent <taskId>] [--limit 50] [--before-seq N] [--json]
+  orbit child board post --body "..." [--target "@..."] [--parent <taskId>] [--json]`)
 		return nil
 	default:
-		return fmt.Errorf("unknown child subcommand %q (try: spawn, ls, show, send, cancel)", args[0])
+		return fmt.Errorf("unknown child subcommand %q (try: spawn, ls, show, send, cancel, board)", args[0])
 	}
 }
 
@@ -408,5 +412,148 @@ func runChildCancel(ctx context.Context, args []string, stdout, stderr io.Writer
 		return writeRawJSON(stdout, raw)
 	}
 	fmt.Fprintf(stdout, "Cancellation requested for child %s\n", childID)
+	return nil
+}
+
+func runChildBoard(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	if len(args) > 0 {
+		switch args[0] {
+		case "post", "send", "write":
+			return runChildBoardPost(ctx, args[1:], stdout, stderr)
+		case "read", "ls", "list", "show":
+			return runChildBoardRead(ctx, args[1:], stdout, stderr)
+		}
+	}
+	return runChildBoardRead(ctx, args, stdout, stderr)
+}
+
+func runChildBoardRead(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("child board read", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	var (
+		parentID   = fs.String("parent", "", "parent task ID (defaults to ORBIT_TASK_ID)")
+		beforeSeq  = fs.Int64("before-seq", 0, "return messages before this seq")
+		limit      = fs.Int("limit", 50, "max board messages to return")
+		hubURLFlag = fs.String("hub", "", "orbit-hub base URL")
+		tokenFlag  = fs.String("token", "", "optional X-Orbit-Dev-Token / client token")
+		configDir  = fs.String("config-dir", "", "orbit config directory")
+		dataDirFlg = fs.String("data-dir", "", "orbit data directory")
+		jsonOut    = fs.Bool("json", false, "output JSON")
+	)
+	if err := parseFlagsPermuted(fs, args); err != nil {
+		return err
+	}
+
+	var raw []byte
+	var err error
+	if sock, tok, ok := useDelegateSocket(*hubURLFlag); ok && strings.TrimSpace(*parentID) == "" {
+		payload := map[string]any{"limit": *limit}
+		if *beforeSeq > 0 {
+			payload["beforeSeq"] = *beforeSeq
+		}
+		raw, err = mcpserver.NewSocketBackend(sock, tok).CallDelegate(ctx, "board-read", payload)
+	} else {
+		pid := strings.TrimSpace(*parentID)
+		if pid == "" {
+			pid = strings.TrimSpace(os.Getenv("ORBIT_TASK_ID"))
+		}
+		if pid == "" {
+			return fmt.Errorf("--parent <taskId> is required outside an Orbit session")
+		}
+		q := url.Values{}
+		if *limit > 0 {
+			q.Set("limit", strconv.Itoa(*limit))
+		}
+		if *beforeSeq > 0 {
+			q.Set("beforeSeq", strconv.FormatInt(*beforeSeq, 10))
+		}
+		path := "/api/tasks/" + url.PathEscape(pid) + "/board"
+		if qs := q.Encode(); qs != "" {
+			path += "?" + qs
+		}
+		c := newHubClient(*configDir, *dataDirFlg, *hubURLFlag, *tokenFlag)
+		raw, err = c.doJSON(ctx, http.MethodGet, path, nil)
+	}
+	if err != nil {
+		return err
+	}
+	if *jsonOut {
+		return writeRawJSON(stdout, raw)
+	}
+	var board protocol.TaskBoardResponse
+	if err := json.Unmarshal(raw, &board); err != nil {
+		return err
+	}
+	if len(board.Messages) == 0 {
+		fmt.Fprintln(stdout, "(no board messages)")
+		return nil
+	}
+	for _, m := range board.Messages {
+		mention := ""
+		if m.TargetMention != "" {
+			mention = " @" + strings.TrimPrefix(m.TargetMention, "@")
+		}
+		fmt.Fprintf(stdout, "#%d [%s]%s: %s\n", m.Seq, m.AuthorName, mention, m.Body)
+	}
+	return nil
+}
+
+func runChildBoardPost(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("child board post", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	var (
+		parentID   = fs.String("parent", "", "parent task ID (defaults to ORBIT_TASK_ID)")
+		bodyFlag   = fs.String("body", "", "board message body")
+		targetFlag = fs.String("target", "", "optional @mention target (sibling title/taskId or @parent)")
+		hubURLFlag = fs.String("hub", "", "orbit-hub base URL")
+		tokenFlag  = fs.String("token", "", "optional X-Orbit-Dev-Token / client token")
+		configDir  = fs.String("config-dir", "", "orbit config directory")
+		dataDirFlg = fs.String("data-dir", "", "orbit data directory")
+		jsonOut    = fs.Bool("json", false, "output JSON")
+	)
+	if err := parseFlagsPermuted(fs, args); err != nil {
+		return err
+	}
+	body := strings.TrimSpace(*bodyFlag)
+	if body == "" && fs.NArg() > 0 {
+		body = strings.TrimSpace(strings.Join(fs.Args(), " "))
+	}
+	if body == "" {
+		return fmt.Errorf("--body is required")
+	}
+
+	var raw []byte
+	var err error
+	if sock, tok, ok := useDelegateSocket(*hubURLFlag); ok && strings.TrimSpace(*parentID) == "" {
+		payload := map[string]any{"body": body}
+		if v := strings.TrimSpace(*targetFlag); v != "" {
+			payload["targetMention"] = v
+		}
+		raw, err = mcpserver.NewSocketBackend(sock, tok).CallDelegate(ctx, "board-post", payload)
+	} else {
+		pid := strings.TrimSpace(*parentID)
+		if pid == "" {
+			pid = strings.TrimSpace(os.Getenv("ORBIT_TASK_ID"))
+		}
+		if pid == "" {
+			return fmt.Errorf("--parent <taskId> is required outside an Orbit session")
+		}
+		c := newHubClient(*configDir, *dataDirFlg, *hubURLFlag, *tokenFlag)
+		raw, err = c.doJSON(ctx, http.MethodPost, "/api/tasks/"+url.PathEscape(pid)+"/board/messages", protocol.PostBoardMessageRequest{
+			TargetMention: strings.TrimSpace(*targetFlag),
+			Body:          body,
+		})
+	}
+	if err != nil {
+		return err
+	}
+	if *jsonOut {
+		return writeRawJSON(stdout, raw)
+	}
+	var msg protocol.BoardMessage
+	if err := json.Unmarshal(raw, &msg); err != nil {
+		return err
+	}
+	fmt.Fprintf(stdout, "Posted board message #%d (%s)\n", msg.Seq, msg.MessageID)
 	return nil
 }

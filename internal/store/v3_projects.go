@@ -1306,15 +1306,23 @@ func (s *Store) ListDismissedSuggestions(ctx context.Context, projectID string) 
 	return out, rows.Err()
 }
 
-// UpdateMachineMetadata updates display_alias, role, and/or allowed_roots_json on a machine.
+// UpdateMachineMetadata updates display_alias, role, allowed_roots_json, and/or ssh_alias on a machine.
 func (s *Store) UpdateMachineMetadata(ctx context.Context, machineID string, req protocol.UpdateMachineRequest, actorID string) (protocol.EventRecord, error) {
 	now := time.Now().UnixMilli()
 	var ev protocol.EventRecord
 	err := s.WithWriteTx(ctx, func(tx *sql.Tx) error {
+		removedSet, err := loadRemovedMachinesSetTx(ctx, tx)
+		if err != nil {
+			return err
+		}
+		if removedSet[machineID] {
+			return fmt.Errorf("%w: machine %s", ErrNotFound, machineID)
+		}
 		var curAlias, curRole, curRootsJSON string
-		err := tx.QueryRowContext(ctx, `
-			SELECT display_alias, role, allowed_roots_json FROM machines WHERE machine_id = ?
-		`, machineID).Scan(&curAlias, &curRole, &curRootsJSON)
+		var curSSHAlias sql.NullString
+		err = tx.QueryRowContext(ctx, `
+			SELECT display_alias, role, allowed_roots_json, ssh_alias FROM machines WHERE machine_id = ?
+		`, machineID).Scan(&curAlias, &curRole, &curRootsJSON, &curSSHAlias)
 		if errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("%w: machine %s", ErrNotFound, machineID)
 		}
@@ -1347,14 +1355,29 @@ func (s *Store) UpdateMachineMetadata(ctx context.Context, machineID string, req
 			}
 			curRootsJSON = string(b)
 		}
+		if req.SSHAlias != nil {
+			curSSHAlias = sql.NullString{String: strings.TrimSpace(*req.SSHAlias), Valid: true}
+		}
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE machines
-			SET display_alias = ?, role = ?, allowed_roots_json = ?, updated_at = ?
+			SET display_alias = ?, role = ?, allowed_roots_json = ?, ssh_alias = ?, updated_at = ?
 			WHERE machine_id = ?
-		`, curAlias, curRole, curRootsJSON, now, machineID); err != nil {
+		`, curAlias, curRole, curRootsJSON, curSSHAlias, now, machineID); err != nil {
 			return err
 		}
-		_, _ = tx.ExecContext(ctx, `UPDATE registry_machines SET role = ? WHERE machine_id = ?`, curRole, machineID)
+		if curSSHAlias.Valid {
+			_, _ = tx.ExecContext(ctx, `UPDATE registry_machines SET role = ?, ssh_alias = ? WHERE machine_id = ?`, curRole, curSSHAlias.String, machineID)
+		} else {
+			_, _ = tx.ExecContext(ctx, `UPDATE registry_machines SET role = ? WHERE machine_id = ?`, curRole, machineID)
+		}
+		payload := map[string]any{
+			"machineId":    machineID,
+			"displayAlias": curAlias,
+			"role":         curRole,
+		}
+		if curSSHAlias.Valid {
+			payload["sshAlias"] = curSSHAlias.String
+		}
 		var err2 error
 		ev, err2 = insertEventTx(ctx, tx, eventInsert{
 			StreamID:   "global",
@@ -1362,12 +1385,8 @@ func (s *Store) UpdateMachineMetadata(ctx context.Context, machineID string, req
 			ActorID:    actorID,
 			Kind:       protocol.EventMachineStateChanged,
 			Visibility: protocol.VisibilityTimeline,
-			Payload: map[string]any{
-				"machineId":    machineID,
-				"displayAlias": curAlias,
-				"role":         curRole,
-			},
-			CreatedAt: now,
+			Payload:    payload,
+			CreatedAt:  now,
 		})
 		return err2
 	})

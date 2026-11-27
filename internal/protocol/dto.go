@@ -89,6 +89,26 @@ type ProjectView struct {
 	UpdatedAt         int64                          `json:"updatedAt"`
 }
 
+// QuotaWindow describes one rate-limit window (e.g. 5h or 7d) for an agent adapter or model group.
+type QuotaWindow struct {
+	Window           string   `json:"window"`
+	Label            string   `json:"label,omitempty"`
+	Group            string   `json:"group,omitempty"`
+	ModelHints       []string `json:"modelHints,omitempty"`
+	UsedPercent      float64  `json:"usedPercent"`
+	RemainingPercent float64  `json:"remainingPercent"`
+	ResetsAt         int64    `json:"resetsAt,omitempty"`
+}
+
+// AgentQuotaSnapshot captures real usage quota windows collected on a Runner for one adapter.
+type AgentQuotaSnapshot struct {
+	Adapter   Adapter       `json:"adapter"`
+	Available bool          `json:"available"`
+	Windows   []QuotaWindow `json:"windows,omitempty"`
+	FetchedAt int64         `json:"fetchedAt"`
+	Error     string        `json:"error,omitempty"`
+}
+
 // MachineView is the runtime view of a registered machine.
 type MachineView struct {
 	MachineID          string                   `json:"machineId"`
@@ -107,6 +127,7 @@ type MachineView struct {
 	RunnerCapabilities []string                 `json:"runnerCapabilities,omitempty"`
 	Adapters           []Adapter                `json:"adapters,omitempty"`
 	Agents             []AgentProbe             `json:"agents,omitempty"`
+	AgentQuotas        []AgentQuotaSnapshot     `json:"agentQuotas,omitempty"`
 	LockedFields       []string                 `json:"lockedFields,omitempty"`
 	Resources          map[string]ResourceState `json:"resources"`
 	RunnerVersion      string                   `json:"runnerVersion,omitempty"`
@@ -1200,11 +1221,12 @@ type ListMachinesResponse struct {
 	Machines []MachineView `json:"machines"`
 }
 
-// UpdateMachineRequest updates mutable metadata (display alias, role, allowed roots) on a machine.
+// UpdateMachineRequest updates mutable metadata (display alias, role, allowed roots, ssh alias) on a machine.
 type UpdateMachineRequest struct {
 	DisplayAlias *string      `json:"displayAlias,omitempty"`
 	Role         *MachineRole `json:"role,omitempty"`
 	AllowedRoots []string     `json:"allowedRoots,omitempty"`
+	SSHAlias     *string      `json:"sshAlias,omitempty"`
 }
 
 // UpdateMachineAgentRequest patches dynamic per-machine agent overrides stored in SQLite.
@@ -1218,10 +1240,17 @@ type UpdateMachineAgentRequest struct {
 
 // MachineAgentActionResponse returns updated agent probe(s) after probe/test/install/update.
 type MachineAgentActionResponse struct {
-	MachineID string       `json:"machineId"`
-	Adapter   Adapter      `json:"adapter,omitempty"`
-	Probe     *AgentProbe  `json:"probe,omitempty"`
-	Agents    []AgentProbe `json:"agents"`
+	MachineID   string               `json:"machineId"`
+	Adapter     Adapter              `json:"adapter,omitempty"`
+	Probe       *AgentProbe          `json:"probe,omitempty"`
+	Agents      []AgentProbe         `json:"agents"`
+	AgentQuotas []AgentQuotaSnapshot `json:"agentQuotas,omitempty"`
+}
+
+// MachineQuotasResponse is returned by POST /api/machines/{machineId}/quotas/refresh.
+type MachineQuotasResponse struct {
+	MachineID   string               `json:"machineId"`
+	AgentQuotas []AgentQuotaSnapshot `json:"agentQuotas"`
 }
 
 // DirEntryView describes one child directory returned by safe machine directory browsing.

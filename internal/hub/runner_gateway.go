@@ -552,7 +552,7 @@ func (s *Server) handleRunnerWS(w http.ResponseWriter, r *http.Request) {
 		ServerTime:          time.Now().UnixMilli(),
 		HeartbeatIntervalMs: s.heartbeatInterval.Milliseconds(),
 		LeaseTtlMs:          s.leaseTTL.Milliseconds(),
-		Capabilities:        []string{protocol.RunnerCapAgentsV1, protocol.RunnerCapFSV1, protocol.RunnerCapFSPlainV1},
+		Capabilities:        []string{protocol.RunnerCapAgentsV1, protocol.RunnerCapFSV1, protocol.RunnerCapFSPlainV1, protocol.RunnerCapQuotasV1},
 		Config:              cfgPayload,
 		Reconcile:           recRes.Reconcile,
 	}
@@ -716,6 +716,15 @@ func (s *Server) handleRunnerWS(w http.ResponseWriter, r *http.Request) {
 			}
 			rc.setAdapters(ready)
 			if ev, err := s.store.SaveMachineAgentProbes(ctx, hello.MachineID, rep.Agents, nil); err == nil && ev != nil {
+				s.broker.Broadcast(*ev)
+			}
+
+		case protocol.RunnerMsgQuotasReport:
+			var rep protocol.RunnerQuotasReportFrame
+			if err := json.Unmarshal(data, &rep); err != nil {
+				continue
+			}
+			if ev, err := s.store.SaveMachineAgentQuotas(ctx, hello.MachineID, rep.Quotas); err == nil && ev != nil {
 				s.broker.Broadcast(*ev)
 			}
 

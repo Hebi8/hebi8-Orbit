@@ -49,6 +49,7 @@ import type {
   ListMachinesResponse,
   LogoutClientResponse,
   MachineAgentActionResponse,
+  MachineQuotasResponse,
   MachineView,
   NetworkDiscoverResponse,
   NetworkSettingsView,
@@ -722,6 +723,13 @@ export const api = {
 
   probeMachineAgents(machineId: string): Promise<MachineAgentActionResponse> {
     return apiFetch<MachineAgentActionResponse>(`/api/machines/${enc(machineId)}/agents/probe`, {
+      method: 'POST',
+      json: {},
+    });
+  },
+
+  refreshMachineQuotas(machineId: string): Promise<MachineQuotasResponse> {
+    return apiFetch<MachineQuotasResponse>(`/api/machines/${enc(machineId)}/quotas/refresh`, {
       method: 'POST',
       json: {},
     });

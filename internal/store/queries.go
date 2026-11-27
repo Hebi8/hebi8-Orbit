@@ -21,7 +21,14 @@ import (
 func (s *Store) SyncRegistry(ctx context.Context, dataDir string, projects protocol.ProjectsConfig, machines protocol.MachinesConfig) error {
 	now := time.Now().UnixMilli()
 	return s.WithWriteTx(ctx, func(tx *sql.Tx) error {
+		removedSet, err := loadRemovedMachinesSetTx(ctx, tx)
+		if err != nil {
+			return err
+		}
 		for machineID, m := range machines.Machines {
+			if removedSet[machineID] {
+				continue
+			}
 			caps := m.Capabilities
 			if caps == nil {
 				caps = []string{}
@@ -198,19 +205,25 @@ func (s *Store) Bootstrap(ctx context.Context, machineMeta map[string]protocol.M
 			}
 			cRows.Close()
 		}
+		removedSet, err := loadRemovedMachinesSetTx(ctx, tx)
+		if err != nil {
+			return fmt.Errorf("load removed machines: %w", err)
+		}
 		regInfo := map[string]struct {
 			displayName string
+			sshAlias    string
 			removed     bool
 		}{}
-		if rRows, err := tx.QueryContext(ctx, `SELECT machine_id, display_name, removed_at IS NOT NULL FROM registry_machines`); err == nil {
+		if rRows, err := tx.QueryContext(ctx, `SELECT machine_id, display_name, ssh_alias, removed_at IS NOT NULL FROM registry_machines`); err == nil {
 			for rRows.Next() {
-				var mid, dn string
+				var mid, dn, sa string
 				var rem bool
-				if rRows.Scan(&mid, &dn, &rem) == nil {
+				if rRows.Scan(&mid, &dn, &sa, &rem) == nil {
 					regInfo[mid] = struct {
 						displayName string
+						sshAlias    string
 						removed     bool
-					}{displayName: dn, removed: rem}
+					}{displayName: dn, sshAlias: sa, removed: rem}
 				}
 			}
 			rRows.Close()
@@ -220,7 +233,7 @@ func (s *Store) Bootstrap(ctx context.Context, machineMeta map[string]protocol.M
 		mRows, err := tx.QueryContext(ctx, `
 			SELECT machine_id, transport_mode, status, role, os_name, allowed_roots_json,
 			       capabilities_json, adapters_json, resources_json,
-			       agents_json, display_alias, runner_caps_json,
+			       agents_json, agent_quotas_json, display_alias, ssh_alias, runner_caps_json,
 			       runner_version, last_seen_at, updated_at
 			FROM machines
 			ORDER BY machine_id ASC
@@ -232,23 +245,22 @@ func (s *Store) Bootstrap(ctx context.Context, machineMeta map[string]protocol.M
 
 		for mRows.Next() {
 			var mv protocol.MachineView
-			var transport, status, roleStr, osName, allowedRootsJSON, capsJSON, adaptersJSON, resJSON, agentsJSON, displayAlias, runnerCapsJSON string
-			var runnerVer sql.NullString
+			var transport, status, roleStr, osName, allowedRootsJSON, capsJSON, adaptersJSON, resJSON, agentsJSON, agentQuotasJSON, displayAlias, runnerCapsJSON string
+			var sshAliasDB, runnerVer sql.NullString
 			var lastSeen sql.NullInt64
 			if err := mRows.Scan(
 				&mv.MachineID, &transport, &status, &roleStr, &osName, &allowedRootsJSON,
 				&capsJSON, &adaptersJSON, &resJSON,
-				&agentsJSON, &displayAlias, &runnerCapsJSON,
+				&agentsJSON, &agentQuotasJSON, &displayAlias, &sshAliasDB, &runnerCapsJSON,
 				&runnerVer, &lastSeen, &mv.UpdatedAt,
 			); err != nil {
 				return err
 			}
-			cfg, inYAML := machineMeta[mv.MachineID]
-			ri, inReg := regInfo[mv.MachineID]
-			// Hide soft-removed paired machines unless declared in YAML
-			if !inYAML && inReg && ri.removed {
+			if removedSet[mv.MachineID] {
 				continue
 			}
+			cfg, inYAML := machineMeta[mv.MachineID]
+			ri, inReg := regInfo[mv.MachineID]
 
 			mv.TransportMode = protocol.TransportMode(transport)
 			mv.Status = protocol.MachineStatus(status)
@@ -278,6 +290,12 @@ func (s *Store) Bootstrap(ctx context.Context, machineMeta map[string]protocol.M
 				if inReg && ri.displayName != "" {
 					mv.DisplayName = ri.displayName
 				}
+				if inReg && ri.sshAlias != "" {
+					mv.SSHAlias = ri.sshAlias
+				}
+			}
+			if sshAliasDB.Valid {
+				mv.SSHAlias = strings.TrimSpace(sshAliasDB.String)
 			}
 			if dbCreds[mv.MachineID] {
 				mv.HasCredentials = true
@@ -305,6 +323,7 @@ func (s *Store) Bootstrap(ctx context.Context, machineMeta map[string]protocol.M
 			if mv.Agents == nil {
 				mv.Agents = []protocol.AgentProbe{}
 			}
+			_ = json.Unmarshal([]byte(agentQuotasJSON), &mv.AgentQuotas)
 			_ = json.Unmarshal([]byte(runnerCapsJSON), &mv.RunnerCapabilities)
 			if mv.RunnerCapabilities == nil {
 				mv.RunnerCapabilities = []string{}

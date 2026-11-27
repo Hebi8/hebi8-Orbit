@@ -98,7 +98,7 @@ func startLocalSocketServer(
 		_ = json.NewEncoder(w).Encode(resp)
 	})
 
-	for _, action := range []string{"spawn", "list", "send", "read", "cancel"} {
+	for _, action := range []string{"spawn", "list", "send", "read", "cancel", "board-read", "board-post"} {
 		act := action
 		mux.HandleFunc("/delegate/"+act, func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodPost {

@@ -63,6 +63,7 @@ type Config struct {
 	PermissionPolicy        PermissionDecisionPolicy
 	ResourceProbe           ResourceProbeFunc
 	AgentManager            *AgentManager
+	QuotaCollector          *QuotaCollector
 	ScopedDriverFactory     func(adapter protocol.Adapter, projectEnv map[string]string) (AcpAdapterDriver, error)
 	AllowedBrowseRoots      []string
 	// Test hooks for deterministic R3 crash simulation
@@ -169,6 +170,9 @@ type Runner struct {
 	driverStarted  map[protocol.Adapter]bool
 	supportedAdps  []protocol.Adapter
 	agentMgr       *AgentManager
+	quotaCollector *QuotaCollector
+	quotaRefreshMu sync.Mutex
+	lastPostQuota  time.Time
 	coalescer      *ChunkCoalescer
 	sockSrv        *localSocketServer
 	httpClient     *http.Client
@@ -289,6 +293,14 @@ func New(ctx context.Context, cfg Config) (*Runner, error) {
 		return nil, err
 	}
 
+	qc := cfg.QuotaCollector
+	if qc == nil && cfg.AgentManager != nil {
+		qc = NewQuotaCollector(QuotaCollectorConfig{
+			ResolveMainCLI: cfg.AgentManager.ResolveMainCLIBin,
+			MergedPATH:     cfg.AgentManager.MergedPATH(),
+		})
+	}
+
 	r := &Runner{
 		cfg:               cfg,
 		instanceID:        "run_" + ulid.Make().String(),
@@ -299,6 +311,7 @@ func New(ctx context.Context, cfg Config) (*Runner, error) {
 		driverStarted:     map[protocol.Adapter]bool{},
 		supportedAdps:     append([]protocol.Adapter(nil), cfg.SupportedAdapters...),
 		agentMgr:          cfg.AgentManager,
+		quotaCollector:    qc,
 		httpClient:        &http.Client{Timeout: 30 * time.Second},
 		sessions:          map[string]*sessionSlot{},
 		slotMeta:          map[string]liveSlotMeta{},
@@ -755,19 +768,12 @@ func (r *Runner) executeAttempt(ctx context.Context, att *attemptContext) {
 		"state": string(protocol.AttemptPreparing),
 	})
 
-	// 2. Acquire exclusive machine resources atomically in lexicographical order
+	// 2. Acquire explicitly configured exclusive machine resources atomically in lexicographical order
 	isInPlace := dispatch.IsPlainFolder || dispatch.Isolation == protocol.IsolationInPlace
 	reqResources := append([]string(nil), dispatch.RequiredResources...)
-	if isInPlace {
-		locKey := strings.TrimSpace(dispatch.LocationID)
-		if locKey == "" && strings.TrimSpace(dispatch.RepoPath) != "" {
-			locKey = canonicalPath(protocol.ExpandPath(dispatch.RepoPath))
-		}
-		if locKey != "" {
-			reqResources = append(reqResources, "location:"+locKey)
-		}
-	}
 	if len(reqResources) > 0 {
+		waited := false
+		lastWaitingReason := ""
 		for {
 			if err := ctx.Err(); err != nil {
 				r.finalizeAttemptDurable(att, protocol.AttemptCancelled, map[string]any{
@@ -781,10 +787,14 @@ func (r *Runner) executeAttempt(ctx context.Context, att *attemptContext) {
 			if ok {
 				break
 			}
-			r.setAttemptState(att, protocol.AttemptWaitingResource, map[string]any{
-				"state":         string(protocol.AttemptWaitingResource),
-				"waitingReason": reason,
-			})
+			if !waited || reason != lastWaitingReason {
+				waited = true
+				lastWaitingReason = reason
+				r.setAttemptState(att, protocol.AttemptWaitingResource, map[string]any{
+					"state":         string(protocol.AttemptWaitingResource),
+					"waitingReason": reason,
+				})
+			}
 			select {
 			case <-ctx.Done():
 				r.finalizeAttemptDurable(att, protocol.AttemptCancelled, map[string]any{
@@ -796,9 +806,11 @@ func (r *Runner) executeAttempt(ctx context.Context, att *attemptContext) {
 			case <-time.After(1 * time.Second):
 			}
 		}
-		r.setAttemptState(att, protocol.AttemptPreparing, map[string]any{
-			"state": string(protocol.AttemptPreparing),
-		})
+		if waited {
+			r.setAttemptState(att, protocol.AttemptPreparing, map[string]any{
+				"state": string(protocol.AttemptPreparing),
+			})
+		}
 	}
 
 	// 3. Prepare isolated worktree and fixed review base SHA
@@ -1133,10 +1145,10 @@ func (r *Runner) executeAttempt(ctx context.Context, att *attemptContext) {
 			termErrCode := ""
 			termErrDetail := ""
 			var finalPayload map[string]any
-			if unresRej > 0 || unresNonZero > 0 {
+			if unresRej > 0 {
 				termState = protocol.AttemptNeedsVerification
 				termErrCode = "UNRESOLVED_TOOL_FAILURE"
-				termErrDetail = "本轮存在未解决的工具拒绝或非零失败，请人工核对后再决定是否续跑"
+				termErrDetail = "本轮存在未解决的工具审批拒绝，请人工核对后再决定是否续跑"
 				finalPayload = map[string]any{
 					"state":                       string(protocol.AttemptNeedsVerification),
 					"stopReason":                  string(acp.StopReasonEndTurn),
@@ -1196,7 +1208,7 @@ func (r *Runner) executeAttempt(ctx context.Context, att *attemptContext) {
 			autoDeliveryID = dlvID
 		}
 	}
-	if unresRej > 0 || unresNonZero > 0 {
+	if unresRej > 0 {
 		r.isolateAndCloseSession(slot, sid)
 		nvPayload := map[string]any{
 			"state":                       string(protocol.AttemptNeedsVerification),
@@ -1204,7 +1216,7 @@ func (r *Runner) executeAttempt(ctx context.Context, att *attemptContext) {
 			"completionSource":            string(protocol.CompletionPromptEndTurn),
 			"sessionLocked":               true,
 			"errorCode":                   "UNRESOLVED_TOOL_FAILURE",
-			"errorDetail":                 "本轮存在未解决的工具拒绝或非零失败，请人工核对后再决定是否续跑",
+			"errorDetail":                 "本轮存在未解决的工具审批拒绝，请人工核对后再决定是否续跑",
 			"rejectedToolCount":           rejCount,
 			"nonZeroExitCount":            nonZeroCount,
 			"unresolvedRejectedToolCount": unresRej,
@@ -2237,6 +2249,16 @@ type localDelegateCancelInput struct {
 	Reason      string `json:"reason,omitempty"`
 }
 
+type localDelegateBoardReadInput struct {
+	BeforeSeq int64 `json:"beforeSeq,omitempty"`
+	Limit     int   `json:"limit,omitempty"`
+}
+
+type localDelegateBoardPostInput struct {
+	Body          string `json:"body"`
+	TargetMention string `json:"targetMention,omitempty"`
+}
+
 type hubDelegateSpawnPayload struct {
 	ParentTaskID    string `json:"parentTaskId"`
 	ParentAttemptID string `json:"parentAttemptId"`
@@ -2270,6 +2292,20 @@ type hubDelegateCancelPayload struct {
 	ParentAttemptID string `json:"parentAttemptId"`
 	ChildTaskID     string `json:"childTaskId"`
 	Reason          string `json:"reason,omitempty"`
+}
+
+type hubDelegateBoardReadPayload struct {
+	ParentTaskID    string `json:"parentTaskId"`
+	ParentAttemptID string `json:"parentAttemptId"`
+	BeforeSeq       int64  `json:"beforeSeq,omitempty"`
+	Limit           int    `json:"limit,omitempty"`
+}
+
+type hubDelegateBoardPostPayload struct {
+	ParentTaskID    string `json:"parentTaskId"`
+	ParentAttemptID string `json:"parentAttemptId"`
+	Body            string `json:"body"`
+	TargetMention   string `json:"targetMention,omitempty"`
 }
 
 func decodeStrictLocalDelegateJSON(rawBody []byte, dst any) error {
@@ -2377,7 +2413,7 @@ func (r *Runner) HandleLocalDelegate(ctx context.Context, action, delegateToken 
 	if effectiveMode == "" {
 		effectiveMode = desiredMode
 	}
-	if (action == "spawn" || action == "send" || action == "cancel") && isReadOnlySessionMode(effectiveMode) {
+	if (action == "spawn" || action == "send" || action == "cancel" || action == "board-post") && isReadOnlySessionMode(effectiveMode) {
 		return http.StatusForbidden, nil, fmt.Errorf("delegate action %q is forbidden in %s mode", action, effectiveMode)
 	}
 
@@ -2456,6 +2492,28 @@ func (r *Runner) HandleLocalDelegate(ctx context.Context, action, delegateToken 
 			ParentAttemptID: snap.AttemptID,
 			ChildTaskID:     in.ChildTaskID,
 			Reason:          in.Reason,
+		}
+	case "board-read":
+		var in localDelegateBoardReadInput
+		if err := decodeStrictLocalDelegateJSON(rawBody, &in); err != nil {
+			return http.StatusBadRequest, nil, fmt.Errorf("invalid delegate board-read JSON: %w", err)
+		}
+		upstreamPayload = hubDelegateBoardReadPayload{
+			ParentTaskID:    snap.TaskID,
+			ParentAttemptID: snap.AttemptID,
+			BeforeSeq:       in.BeforeSeq,
+			Limit:           in.Limit,
+		}
+	case "board-post":
+		var in localDelegateBoardPostInput
+		if err := decodeStrictLocalDelegateJSON(rawBody, &in); err != nil {
+			return http.StatusBadRequest, nil, fmt.Errorf("invalid delegate board-post JSON: %w", err)
+		}
+		upstreamPayload = hubDelegateBoardPostPayload{
+			ParentTaskID:    snap.TaskID,
+			ParentAttemptID: snap.AttemptID,
+			Body:            in.Body,
+			TargetMention:   in.TargetMention,
 		}
 	default:
 		return http.StatusNotFound, nil, fmt.Errorf("unknown delegate action %q", action)
@@ -3832,10 +3890,12 @@ var orbitBuiltinMCPTools = map[string]bool{
 	"orbit_send_child":    true,
 	"orbit_read_child":    true,
 	"orbit_cancel_child":  true,
+	"orbit_board_read":    true,
+	"orbit_board_post":    true,
 }
 
 func isReadOnlyOrbitMCPTool(canonical string) bool {
-	return canonical == "orbit_list_children" || canonical == "orbit_read_child"
+	return canonical == "orbit_list_children" || canonical == "orbit_read_child" || canonical == "orbit_board_read"
 }
 
 // matchOrbitBuiltinMCPTool recognizes ONLY Orbit's 5 first-party stdio MCP delegation tools
@@ -4255,6 +4315,25 @@ func (r *Runner) completeInMemoryFinalize(att *attemptContext, terminalState pro
 
 	if cancelFn != nil {
 		cancelFn()
+	}
+
+	if r.quotaCollector != nil && r.runCtx != nil && r.runCtx.Err() == nil {
+		r.quotaRefreshMu.Lock()
+		now := time.Now()
+		shouldRefresh := now.Sub(r.lastPostQuota) >= 30*time.Second
+		if shouldRefresh {
+			r.lastPostQuota = now
+		}
+		r.quotaRefreshMu.Unlock()
+		if shouldRefresh {
+			r.wg.Add(1)
+			go func() {
+				defer r.wg.Done()
+				qctx, qcancel := context.WithTimeout(r.runCtx, 20*time.Second)
+				defer qcancel()
+				r.refreshAndReportQuotas(qctx, true)
+			}()
+		}
 	}
 }
 
@@ -4723,6 +4802,24 @@ func (r *Runner) connectAndServeWS(ctx context.Context) error {
 			}
 		}()
 	}
+	if r.quotaCollector != nil {
+		ioWG.Add(1)
+		go func() {
+			defer ioWG.Done()
+			// Non-blocking startup quota collection + periodic refresh every 3 minutes.
+			r.refreshAndReportQuotas(connCtx, false)
+			ticker := time.NewTicker(3 * time.Minute)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-connCtx.Done():
+					return
+				case <-ticker.C:
+					r.refreshAndReportQuotas(connCtx, true)
+				}
+			}
+		}()
+	}
 	// Write pump
 	ioWG.Add(1)
 	go func() {
@@ -4949,12 +5046,17 @@ func (r *Runner) buildRunnerHello(ctx context.Context) protocol.RunnerHelloFrame
 
 	hostname, _ := os.Hostname()
 	var agentProbes []protocol.AgentProbe
+	var agentQuotas []protocol.AgentQuotaSnapshot
 	var configRev int64
 	caps := []string{protocol.RunnerCapFSV1, protocol.RunnerCapBundleV1, protocol.RunnerCapFSPlainV1}
 	if r.agentMgr != nil {
 		caps = append(caps, protocol.RunnerCapAgentsV1)
 		agentProbes = r.agentMgr.SnapshotProbes()
 		configRev = r.agentMgr.ConfigRev()
+	}
+	if r.quotaCollector != nil {
+		caps = append(caps, protocol.RunnerCapQuotasV1)
+		agentQuotas = r.quotaCollector.Snapshot()
 	}
 
 	return protocol.RunnerHelloFrame{
@@ -4969,6 +5071,7 @@ func (r *Runner) buildRunnerHello(ctx context.Context) protocol.RunnerHelloFrame
 		Capabilities:             caps,
 		Adapters:                 r.supportedAdapters(),
 		AgentProbes:              agentProbes,
+		AgentQuotas:              agentQuotas,
 		ConfigRev:                configRev,
 		LiveAttempts:             liveAttempts,
 		LivePendingApprovalIDs:   liveApprovals,
@@ -4989,6 +5092,28 @@ func (r *Runner) sendAgentsReport(probes []protocol.AgentProbe, configRev int64)
 	})
 }
 
+func (r *Runner) sendQuotasReport(quotas []protocol.AgentQuotaSnapshot) {
+	if r.quotaCollector == nil {
+		return
+	}
+	_ = r.sendWSJSON(protocol.RunnerQuotasReportFrame{
+		Type:      protocol.RunnerMsgQuotasReport,
+		MachineID: r.cfg.MachineID,
+		Quotas:    quotas,
+	})
+}
+
+func (r *Runner) refreshAndReportQuotas(ctx context.Context, force bool) []protocol.AgentQuotaSnapshot {
+	if r.quotaCollector == nil {
+		return nil
+	}
+	quotas := r.quotaCollector.CollectAll(ctx, protocol.Phase1ImplementedSessionAdapters, force)
+	if ctx.Err() == nil && len(quotas) > 0 {
+		r.sendQuotasReport(quotas)
+	}
+	return quotas
+}
+
 func (r *Runner) handleRunnerRPC(ctx context.Context, req protocol.RunnerRPCFrame) {
 	res := protocol.RunnerRPCResultFrame{
 		Type:      protocol.RunnerMsgRPCResult,
@@ -5007,8 +5132,40 @@ func (r *Runner) handleRunnerRPC(ctx context.Context, req protocol.RunnerRPCFram
 			} else {
 				probes = r.agentMgr.SnapshotProbes()
 			}
+			data := map[string]any{"agents": probes}
+			if r.quotaCollector != nil {
+				if quotas := r.quotaCollector.Snapshot(); len(quotas) > 0 {
+					data["agentQuotas"] = quotas
+				}
+				if r.runCtx != nil && r.runCtx.Err() == nil {
+					r.wg.Add(1)
+					go func() {
+						defer r.wg.Done()
+						qctx, qcancel := context.WithTimeout(r.runCtx, 20*time.Second)
+						defer qcancel()
+						r.refreshAndReportQuotas(qctx, true)
+					}()
+				}
+			}
 			res.OK = true
-			res.Data = map[string]any{"agents": probes}
+			res.Data = data
+		}
+
+	case "probe_quotas":
+		force := true
+		if v, ok := req.Args["force"].(bool); ok {
+			force = v
+		}
+		if r.quotaCollector == nil {
+			res.OK = true
+			res.Data = map[string]any{"agentQuotas": []protocol.AgentQuotaSnapshot{}}
+		} else {
+			quotas := r.refreshAndReportQuotas(ctx, force)
+			if quotas == nil {
+				quotas = []protocol.AgentQuotaSnapshot{}
+			}
+			res.OK = true
+			res.Data = map[string]any{"agentQuotas": quotas}
 		}
 
 	case "test_agent":
@@ -5281,7 +5438,7 @@ func (r *Runner) retryPendingDeliveries(ctx context.Context) {
 					}
 					errDetail := pd.TerminalErrorDetail
 					if errDetail == "" {
-						errDetail = "本轮存在未解决的工具拒绝或非零失败，请人工核对后再决定是否续跑"
+						errDetail = "本轮存在未解决的工具审批拒绝，请人工核对后再决定是否续跑"
 					}
 					finalPayload["errorCode"] = errCode
 					finalPayload["errorDetail"] = errDetail
@@ -5326,7 +5483,7 @@ func (r *Runner) retryPendingDeliveries(ctx context.Context) {
 						}
 						errDetail := pd.TerminalErrorDetail
 						if errDetail == "" {
-							errDetail = "本轮存在未解决的工具拒绝或非零失败，请人工核对后再决定是否续跑"
+							errDetail = "本轮存在未解决的工具审批拒绝，请人工核对后再决定是否续跑"
 						}
 						finalPayload["errorCode"] = errCode
 						finalPayload["errorDetail"] = errDetail

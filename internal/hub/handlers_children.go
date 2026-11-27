@@ -220,6 +220,22 @@ type runnerDelegateCancelRequest struct {
 	Reason          string `json:"reason,omitempty"`
 }
 
+type runnerDelegateBoardReadRequest struct {
+	ParentTaskID    string `json:"parentTaskId"`
+	ParentAttemptID string `json:"parentAttemptId"`
+	BoardTaskID     string `json:"boardTaskId,omitempty"`
+	BeforeSeq       int64  `json:"beforeSeq,omitempty"`
+	Limit           int    `json:"limit,omitempty"`
+}
+
+type runnerDelegateBoardPostRequest struct {
+	ParentTaskID    string `json:"parentTaskId"`
+	ParentAttemptID string `json:"parentAttemptId"`
+	BoardTaskID     string `json:"boardTaskId,omitempty"`
+	Body            string `json:"body"`
+	TargetMention   string `json:"targetMention,omitempty"`
+}
+
 // verifyRunnerParentControl enforces live ownership across ALL 5 /api/runner/delegate/* endpoints:
 // parent task exists & is unarchived, parentAttemptId is provided and currently the parent's active
 // non-terminal attempt executing on runnerMachineID.
@@ -366,9 +382,7 @@ func (s *Server) handleRunnerDelegateList(w http.ResponseWriter, r *http.Request
 		Children:     children,
 	}
 	if req.IncludeTargets && callerTask.ProjectID != protocol.PAProjectID {
-		s.mu.RLock()
-		yamlMachines := s.yamlMachines.Machines
-		s.mu.RUnlock()
+		yamlMachines := s.effectiveYAMLMachines()
 		if boot, bErr := s.store.Bootstrap(r.Context(), yamlMachines); bErr == nil {
 			machines := s.enrichMachineViews(r.Context(), boot.Machines)
 			for _, m := range machines {
@@ -560,4 +574,71 @@ func (s *Server) handleRunnerDelegateCancel(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	writeJSON(w, status, resp)
+}
+
+func (s *Server) handleRunnerDelegateBoardRead(w http.ResponseWriter, r *http.Request) {
+	runnerMachineID := strings.TrimSpace(r.Header.Get("X-Orbit-Machine-Id"))
+	var req runnerDelegateBoardReadRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<16)).Decode(&req); err != nil {
+		writeAPIError(w, http.StatusBadRequest, "ERR_INVALID_JSON", "invalid request body")
+		return
+	}
+	guard := &store.RunnerParentControlGuard{
+		MachineID:       runnerMachineID,
+		ParentTaskID:    strings.TrimSpace(req.ParentTaskID),
+		ParentAttemptID: strings.TrimSpace(req.ParentAttemptID),
+	}
+	board, err := s.store.GetRunnerDelegateBoard(r.Context(), guard, strings.TrimSpace(req.BoardTaskID), req.BeforeSeq, req.Limit)
+	if errors.Is(err, store.ErrForbidden) {
+		writeAPIError(w, http.StatusForbidden, "ERR_FORBIDDEN", err.Error())
+		return
+	}
+	if errors.Is(err, store.ErrNotFound) {
+		writeAPIError(w, http.StatusNotFound, "ERR_TASK_NOT_FOUND", err.Error())
+		return
+	}
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, "ERR_BOARD_GET", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, board)
+}
+
+func (s *Server) handleRunnerDelegateBoardPost(w http.ResponseWriter, r *http.Request) {
+	runnerMachineID := strings.TrimSpace(r.Header.Get("X-Orbit-Machine-Id"))
+	var req runnerDelegateBoardPostRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+		writeAPIError(w, http.StatusBadRequest, "ERR_INVALID_JSON", "invalid request body")
+		return
+	}
+	guard := &store.RunnerParentControlGuard{
+		MachineID:       runnerMachineID,
+		ParentTaskID:    strings.TrimSpace(req.ParentTaskID),
+		ParentAttemptID: strings.TrimSpace(req.ParentAttemptID),
+	}
+	extKey := ""
+	if idemp := strings.TrimSpace(r.Header.Get("Idempotency-Key")); idemp != "" {
+		extKey = "board:" + idemp
+	}
+	msg, ev, err := s.store.PostRunnerDelegateBoardMessage(r.Context(), guard, strings.TrimSpace(req.BoardTaskID), req.Body, req.TargetMention, extKey)
+	if errors.Is(err, store.ErrForbidden) {
+		writeAPIError(w, http.StatusForbidden, "ERR_FORBIDDEN", err.Error())
+		return
+	}
+	if errors.Is(err, store.ErrInvalidInput) {
+		writeAPIError(w, http.StatusBadRequest, "ERR_INVALID_INPUT", err.Error())
+		return
+	}
+	if errors.Is(err, store.ErrNotFound) {
+		writeAPIError(w, http.StatusNotFound, "ERR_TASK_NOT_FOUND", err.Error())
+		return
+	}
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, "ERR_BOARD_POST", err.Error())
+		return
+	}
+	if ev != nil {
+		s.broker.Broadcast(*ev)
+	}
+	writeJSON(w, http.StatusCreated, msg)
 }

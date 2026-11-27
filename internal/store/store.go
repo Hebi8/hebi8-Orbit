@@ -451,6 +451,14 @@ func applySchema(ctx context.Context, db *sql.DB) error {
 		return fmt.Errorf("ensure pending_delivery_cleanups table/trigger: %w", err)
 	}
 
+	// Idempotently ensure additive columns for machine sshAlias overrides and real agent usage quotas.
+	if err := ensureColumnTx(ctx, tx, "machines", "ssh_alias", "TEXT"); err != nil {
+		return err
+	}
+	if err := ensureColumnTx(ctx, tx, "machines", "agent_quotas_json", "TEXT NOT NULL DEFAULT '[]'"); err != nil {
+		return err
+	}
+
 	// Idempotently ensure the built-in virtual _scratch project exists on every startup.
 	if err := ensureScratchProjectTx(ctx, tx, now); err != nil {
 		return err

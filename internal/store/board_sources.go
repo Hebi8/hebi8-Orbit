@@ -809,6 +809,142 @@ func (s *Store) PostBoardMessage(ctx context.Context, taskID, authorName, target
 	return msg, emitted, err
 }
 
+func resolveDelegateBoardScopeTx(ctx context.Context, tx *sql.Tx, callerTaskID, expectedBoardTaskID string) (boardTaskID, boardProjectID, authorName string, err error) {
+	var callerProj, callerTitle string
+	var parentIDNull, roleNull sql.NullString
+	var archivedAt sql.NullInt64
+	if err := tx.QueryRowContext(ctx, `
+		SELECT project_id, parent_task_id, title, delegated_role, archived_at
+		FROM tasks WHERE task_id = ?
+	`, callerTaskID).Scan(&callerProj, &parentIDNull, &callerTitle, &roleNull, &archivedAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", "", "", fmt.Errorf("%w: task %s not found", ErrForbidden, callerTaskID)
+		}
+		return "", "", "", err
+	}
+	if archivedAt.Valid {
+		return "", "", "", fmt.Errorf("%w: task %s is archived", ErrForbidden, callerTaskID)
+	}
+
+	parentID := strings.TrimSpace(parentIDNull.String)
+	if parentID == "" {
+		boardTaskID = callerTaskID
+		boardProjectID = callerProj
+		authorName = strings.TrimSpace(callerTitle)
+		if authorName == "" {
+			authorName = "parent"
+		}
+	} else {
+		var parentProj string
+		var grandParentNull sql.NullString
+		var parentArchived sql.NullInt64
+		if err := tx.QueryRowContext(ctx, `
+			SELECT project_id, parent_task_id, archived_at
+			FROM tasks WHERE task_id = ?
+		`, parentID).Scan(&parentProj, &grandParentNull, &parentArchived); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return "", "", "", fmt.Errorf("%w: parent task %s not found", ErrForbidden, parentID)
+			}
+			return "", "", "", err
+		}
+		if parentArchived.Valid {
+			return "", "", "", fmt.Errorf("%w: parent task %s is archived", ErrForbidden, parentID)
+		}
+		if strings.TrimSpace(grandParentNull.String) != "" {
+			return "", "", "", fmt.Errorf("%w: shared board access is limited to max depth = 1", ErrForbidden)
+		}
+		if parentProj == protocol.PAProjectID {
+			return "", "", "", fmt.Errorf("%w: PA/Hebi8 sessions do not share child boards", ErrForbidden)
+		}
+		boardTaskID = parentID
+		boardProjectID = parentProj
+		authorName = strings.TrimSpace(callerTitle)
+		if authorName == "" {
+			authorName = strings.TrimSpace(roleNull.String)
+		}
+		if authorName == "" {
+			authorName = callerTaskID
+		}
+	}
+
+	if exp := strings.TrimSpace(expectedBoardTaskID); exp != "" && exp != boardTaskID {
+		return "", "", "", fmt.Errorf("%w: task %s cannot access board of %s (owned board is %s)", ErrForbidden, callerTaskID, exp, boardTaskID)
+	}
+	return boardTaskID, boardProjectID, authorName, nil
+}
+
+// GetRunnerDelegateBoard reads the shared task-group Board for an active top-level parent
+// or direct child session, enforcing v4 single-depth and cross-parent isolation.
+func (s *Store) GetRunnerDelegateBoard(
+	ctx context.Context,
+	guard *RunnerParentControlGuard,
+	expectedBoardTaskID string,
+	beforeSeq int64,
+	limit int,
+) (protocol.TaskBoardResponse, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 500 {
+		limit = 500
+	}
+	var boardTaskID string
+	err := s.WithReadTx(ctx, func(tx *sql.Tx) error {
+		if err := verifyRunnerParentControlTx(ctx, tx, guard); err != nil {
+			return err
+		}
+		var err error
+		boardTaskID, _, _, err = resolveDelegateBoardScopeTx(ctx, tx, strings.TrimSpace(guard.ParentTaskID), expectedBoardTaskID)
+		return err
+	})
+	if err != nil {
+		return protocol.TaskBoardResponse{}, err
+	}
+	return s.GetTaskBoardPage(ctx, boardTaskID, beforeSeq, limit)
+}
+
+// PostRunnerDelegateBoardMessage atomically verifies runner session control and v4 single-depth
+// board scope, normalizes authorName to the caller's title/role, and posts to the common parent's Board.
+func (s *Store) PostRunnerDelegateBoardMessage(
+	ctx context.Context,
+	guard *RunnerParentControlGuard,
+	expectedBoardTaskID string,
+	body string,
+	targetMention string,
+	externalKey string,
+) (protocol.BoardMessage, *protocol.EventRecord, error) {
+	var msg protocol.BoardMessage
+	var emitted *protocol.EventRecord
+	now := time.Now().UnixMilli()
+	body = strings.TrimSpace(body)
+	if body == "" {
+		return msg, nil, fmt.Errorf("%w: message body is required", ErrInvalidInput)
+	}
+	mention := strings.TrimPrefix(strings.TrimSpace(targetMention), "@")
+
+	err := s.WithWriteTx(ctx, func(tx *sql.Tx) error {
+		if err := verifyRunnerParentControlTx(ctx, tx, guard); err != nil {
+			return err
+		}
+		boardTaskID, boardProjectID, authorName, err := resolveDelegateBoardScopeTx(ctx, tx, strings.TrimSpace(guard.ParentTaskID), expectedBoardTaskID)
+		if err != nil {
+			return err
+		}
+		if mention != "" && strings.HasPrefix(mention, "tsk_") && mention != boardTaskID {
+			ok, err := isDirectChildTaskTx(ctx, tx, boardTaskID, mention)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				return fmt.Errorf("%w: targetMention %s is outside parent task %s board scope", ErrForbidden, mention, boardTaskID)
+			}
+		}
+		msg, emitted, err = insertBoardMessageTx(ctx, tx, boardTaskID, boardProjectID, authorName, mention, body, externalKey, now)
+		return err
+	})
+	return msg, emitted, err
+}
+
 // GetWorkerStream returns the drill-down event stream for a specific swarm member or child worker task.
 func (s *Store) GetWorkerStream(ctx context.Context, taskID, workerName string) (protocol.WorkerStreamResponse, error) {
 	resp := protocol.WorkerStreamResponse{
