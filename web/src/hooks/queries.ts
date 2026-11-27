@@ -2,7 +2,12 @@ import { useEffect } from 'react';
 import { useQueries, useQuery, useQueryClient, type QueryClient } from '@tanstack/react-query';
 import type { EventRecord, MachineView, ProjectView, TaskSummary } from '../generated/protocol';
 import { api } from '../lib/api';
-import { attemptWatchRegistry, mergeAttemptRawEvents } from '../lib/attemptStream';
+import {
+  attemptWatchRegistry,
+  createAttemptRawSyncController,
+  mergeAttemptRawEvents,
+  type AttemptRawSyncController,
+} from '../lib/attemptStream';
 import { useWorkbenchStore } from '../store/useWorkbenchStore';
 
 export function useBootstrap(enabled = true) {
@@ -259,20 +264,28 @@ export function useHebi8Expand(nodeId: string | undefined, opts?: { offset?: num
   });
 }
 
-const hydratedAttemptsByClient = new WeakMap<QueryClient, Set<string>>();
+const rawSyncByClient = new WeakMap<QueryClient, AttemptRawSyncController>();
 
-function getHydratedSet(qc: QueryClient): Set<string> {
-  let set = hydratedAttemptsByClient.get(qc);
-  if (!set) {
-    set = new Set<string>();
-    hydratedAttemptsByClient.set(qc, set);
+export function getAttemptRawSyncController(qc: QueryClient): AttemptRawSyncController {
+  let ctrl = rawSyncByClient.get(qc);
+  if (!ctrl) {
+    ctrl = createAttemptRawSyncController();
+    rawSyncByClient.set(qc, ctrl);
   }
-  return set;
+  return ctrl;
+}
+
+/** Marks an attempt as requiring a contiguous HTTP catchup from its independent `httpCursor` and refetches if active. */
+export function scheduleAttemptRawCatchup(qc: QueryClient, attemptId: string, targetSeq = 0) {
+  if (!attemptId) return;
+  getAttemptRawSyncController(qc).markNeedsCatchup(attemptId, targetSeq);
+  void qc.invalidateQueries({ queryKey: ['attempt-raw', attemptId], exact: true, refetchType: 'active' });
 }
 
 /**
  * Real-time raw ACP stream for one attempt:
- * - Initial load fetches historical raw events via `GET /api/attempts/:id/raw?afterSeq=`.
+ * - Tracks an independent contiguous `httpCursor` per attempt (NEVER advanced by high-seq WS pushes).
+ * - Multi-page catchup continues cleanly across passes for >10,000-frame attempts until a short page is reached.
  * - While `opts.live` is true, registers `attemptId` in `attemptWatchRegistry` so `/ws/client`
  *   pushes live `raw_acp` chunks directly into `['attempt-raw', attemptId]` in-place (zero 2s polling).
  * - Automatically falls back to 2s HTTP polling only while WS is disconnected/reconnecting.
@@ -281,6 +294,7 @@ export function useAttemptRaw(attemptId: string | undefined, opts: { enabled: bo
   const qc = useQueryClient();
   const wsStatus = useWorkbenchStore((s) => s.wsStatus);
   const watching = !!attemptId && opts.enabled && opts.live;
+  const syncCtrl = getAttemptRawSyncController(qc);
 
   useEffect(() => {
     if (!watching || !attemptId) return;
@@ -292,32 +306,18 @@ export function useAttemptRaw(attemptId: string | undefined, opts: { enabled: bo
     enabled: !!attemptId && opts.enabled,
     queryFn: async () => {
       const id = attemptId!;
-      const hydrated = getHydratedSet(qc);
-      const prev = qc.getQueryData<EventRecord[]>(['attempt-raw', id]) ?? [];
-      // Always start at 0 until at least one HTTP hydration has succeeded, even if live WS frames arrived first.
-      let after = hydrated.has(id) && prev.length ? prev[prev.length - 1].seq : 0;
-      const fetched: EventRecord[] = [];
-      for (let page = 0; page < 20; page++) {
-        const res = await api.getAttemptRaw(id, after, 500);
-        const evs = res.events ?? [];
-        for (const ev of evs) {
-          if (ev.seq > after) {
-            fetched.push(ev);
-            after = ev.seq;
-          }
-        }
-        if (evs.length < 500) break;
-      }
-      hydrated.add(id);
-      if (hydrated.size > 500) {
-        const oldest = hydrated.values().next().value;
-        if (oldest) hydrated.delete(oldest);
-      }
+      const res = await syncCtrl.fetchNextPass(id, (aid, afterSeq, limit) => api.getAttemptRaw(aid, afterSeq, limit));
       // Re-read cache after async fetch so live WS chunks that landed in-flight are never overwritten.
-      const latest = qc.getQueryData<EventRecord[]>(['attempt-raw', id]) ?? prev;
-      return mergeAttemptRawEvents(latest, fetched);
+      const latest = qc.getQueryData<EventRecord[]>(['attempt-raw', id]);
+      const merged = mergeAttemptRawEvents(latest, res.fetched);
+      if (res.needsMore) {
+        window.setTimeout(() => {
+          void qc.invalidateQueries({ queryKey: ['attempt-raw', id], exact: true, refetchType: 'active' });
+        }, 0);
+      }
+      return merged;
     },
     refetchInterval: watching && wsStatus !== 'live' ? 2000 : false,
-    staleTime: opts.live ? 0 : 60_000,
+    staleTime: opts.live || !syncCtrl.isCaughtUp(attemptId) ? 0 : 60_000,
   });
 }

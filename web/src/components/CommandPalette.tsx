@@ -36,6 +36,7 @@ export function CommandPalette({ boot }: { boot: BootstrapResponse }) {
   const qc = useQueryClient();
   const setOpen = useWorkbenchStore((s) => s.setCmdkOpen);
   const toggleTheme = useWorkbenchStore((s) => s.toggleTheme);
+  const seenTasks = useWorkbenchStore((s) => s.seenTasks);
   const [q, setQ] = useState('');
   const [act, setAct] = useState(0);
   const [out, setOut] = useState<Out>(null);
@@ -96,7 +97,7 @@ export function CommandPalette({ boot }: { boot: BootstrapResponse }) {
     const threads = allTasks
       .filter((t) => !t.parentTaskId)
       .filter((t) => (k ? match(`${t.title} ${t.goal}`) : true))
-      .map((t) => ({ t, mark: rootSessionMark(t, allTasks, inboxByTask) }))
+      .map((t) => ({ t, mark: rootSessionMark(t, allTasks, inboxByTask, seenTasks) }))
       .sort((a, b) => displayMarkRank(a.mark) - displayMarkRank(b.mark) || b.t.updatedAt - a.t.updatedAt)
       .slice(0, k ? 10 : 6);
 
@@ -143,7 +144,7 @@ export function CommandPalette({ boot }: { boot: BootstrapResponse }) {
     return list;
     // chat/brief mutate fns are stable per hook instance
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [q, boot, tasksBy, inboxByTask]);
+  }, [q, boot, tasksBy, inboxByTask, seenTasks]);
 
   useEffect(() => setAct(0), [q]);
   const groups: string[] = [];

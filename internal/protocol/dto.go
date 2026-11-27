@@ -153,18 +153,19 @@ type SetupStatusView struct {
 
 // InboxItemView represents an open or historical low-noise inbox card.
 type InboxItemView struct {
-	InboxID    string        `json:"inboxId"`
-	ProjectID  string        `json:"projectId"`
-	TaskID     string        `json:"taskId,omitempty"`
-	Category   InboxCategory `json:"category"`
-	RefID      string        `json:"refId"`
-	Title      string        `json:"title"`
-	Summary    string        `json:"summary"`
-	Priority   int           `json:"priority"`
-	State      InboxState    `json:"state"`
-	CreatedAt  int64         `json:"createdAt"`
-	UpdatedAt  int64         `json:"updatedAt"`
-	ResolvedAt *int64        `json:"resolvedAt,omitempty"`
+	InboxID     string        `json:"inboxId"`
+	ProjectID   string        `json:"projectId"`
+	TaskID      string        `json:"taskId,omitempty"`
+	TaskVersion int64         `json:"taskVersion,omitempty"`
+	Category    InboxCategory `json:"category"`
+	RefID       string        `json:"refId"`
+	Title       string        `json:"title"`
+	Summary     string        `json:"summary"`
+	Priority    int           `json:"priority"`
+	State       InboxState    `json:"state"`
+	CreatedAt   int64         `json:"createdAt"`
+	UpdatedAt   int64         `json:"updatedAt"`
+	ResolvedAt  *int64        `json:"resolvedAt,omitempty"`
 }
 
 // BootstrapResponse is captured in a single read-only SQLite transaction.
@@ -354,6 +355,7 @@ type ChildTaskView struct {
 	FilesChanged         int       `json:"filesChanged,omitempty"`
 	Insertions           int       `json:"insertions,omitempty"`
 	Deletions            int       `json:"deletions,omitempty"`
+	Version              int64     `json:"version"`
 	CreatedAt            int64     `json:"createdAt"`
 	UpdatedAt            int64     `json:"updatedAt"`
 	ArchivedAt           *int64    `json:"archivedAt,omitempty"`
@@ -430,6 +432,7 @@ type TaskSummary struct {
 	DeliveryCount         int           `json:"deliveryCount"`
 	QueuedInputCount      int           `json:"queuedInputCount"`
 	WorkerCount           int           `json:"workerCount"`
+	Version               int64         `json:"version"`
 	CreatedBy             TaskCreatedBy `json:"createdBy"`
 	CreatedAt             int64         `json:"createdAt"`
 	UpdatedAt             int64         `json:"updatedAt"`
@@ -631,6 +634,8 @@ type WSServerMessage struct {
 	Events        []EventRecord `json:"events,omitempty"`
 	Event         *EventRecord  `json:"event,omitempty"`
 	ReplayHeadSeq int64         `json:"replayHeadSeq,omitempty"`
+	AttemptIDs    []string      `json:"attemptIds,omitempty"`
+	Seq           int64         `json:"seq,omitempty"`
 	ServerTime    int64         `json:"serverTime,omitempty"`
 }
 

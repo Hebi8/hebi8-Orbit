@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -53,6 +55,46 @@ func sendClientWSControl(t *testing.T, ctx context.Context, conn *websocket.Conn
 	}
 }
 
+func readUntilWatchAck(t *testing.T, ctx context.Context, conn *websocket.Conn, wantAttemptIDs []string) (protocol.WSServerMessage, []protocol.EventRecord) {
+	t.Helper()
+	wantSorted := append([]string(nil), wantAttemptIDs...)
+	slices.Sort(wantSorted)
+	var seenEvents []protocol.EventRecord
+	for {
+		rctx, cancel := context.WithTimeout(ctx, 4*time.Second)
+		_, data, err := conn.Read(rctx)
+		cancel()
+		if err != nil {
+			t.Fatalf("waiting for watch_ack %v failed: %v", wantSorted, err)
+		}
+		var msg protocol.WSServerMessage
+		if err := json.Unmarshal(data, &msg); err != nil {
+			t.Fatal(err)
+		}
+		if msg.Type == protocol.WSMessageEvent && msg.Event != nil {
+			seenEvents = append(seenEvents, *msg.Event)
+			continue
+		}
+		if msg.Type == protocol.WSMessageWatchAck && slices.Equal(msg.AttemptIDs, wantSorted) {
+			return msg, seenEvents
+		}
+	}
+}
+
+func fetchAttemptRawHTTP(t *testing.T, baseURL, attemptID string, afterSeq int64) []protocol.EventRecord {
+	t.Helper()
+	url := fmt.Sprintf("%s/api/attempts/%s/raw?afterSeq=%d&limit=500", baseURL, attemptID, afterSeq)
+	resp, body := doJSONReq(t, http.MethodGet, url, nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET %s failed: %d %s", url, resp.StatusCode, string(body))
+	}
+	var out protocol.AttemptRawEventsResponse
+	if err := json.Unmarshal(body, &out); err != nil {
+		t.Fatalf("decode raw response: %v", err)
+	}
+	return out.Events
+}
+
 func TestClientWS_WatchAttemptsStreamsRawACPOnDemandOnly(t *testing.T) {
 	srv, st, ts, runnerToken := setupSubsessionHub(t)
 	ctx := context.Background()
@@ -96,20 +138,17 @@ func TestClientWS_WatchAttemptsStreamsRawACPOnDemandOnly(t *testing.T) {
 	idleConn := dialClientWSAtSeq(t, ctx, ts.URL, headSeq)
 	defer idleConn.CloseNow()
 
-	// watcherConn subscribes ONLY to task1's attempt; idleConn does NOT subscribe to any attempt.
+	// watcherConn subscribes ONLY to task1's attempt and receives watch_ack; idleConn stays unsubscribed.
 	sendClientWSControl(t, ctx, watcherConn, protocol.WSClientMessage{
 		Type:       protocol.WSClientWatchAttempts,
 		AttemptIDs: []string{task1.Attempt.AttemptID},
 	})
-
-	// Wait briefly so Hub processes watch_attempts before outbox frames arrive (deterministic even without wait,
-	// since SetWatchedAttempts wakes drainLive, but ensures watch_attempts is active for live push latency test).
-	deadlineSub := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadlineSub) {
-		if srv.EventBroker().AttemptWatcherCount(task1.Attempt.AttemptID) == 1 {
-			break
-		}
-		time.Sleep(5 * time.Millisecond)
+	ack1, _ := readUntilWatchAck(t, ctx, watcherConn, []string{task1.Attempt.AttemptID})
+	if ack1.Seq < headSeq {
+		t.Fatalf("expected watch_ack seq >= %d, got %d", headSeq, ack1.Seq)
+	}
+	if srv.EventBroker().AttemptWatcherCount(task1.Attempt.AttemptID) != 1 {
+		t.Fatalf("expected watcher count 1 after watch_ack")
 	}
 
 	now := time.Now().UnixMilli()
@@ -243,16 +282,11 @@ func TestClientWS_WatchAttemptsStreamsRawACPOnDemandOnly(t *testing.T) {
 		protocol.EventACPToolCallUpdate,
 		protocol.EventACPMessageBatch,
 	}
-	if len(watcherRawKinds) != len(wantKinds) {
+	if !slices.Equal(watcherRawKinds, wantKinds) {
 		t.Fatalf("watcherConn expected %v, got %v", wantKinds, watcherRawKinds)
 	}
-	for i := range wantKinds {
-		if watcherRawKinds[i] != wantKinds[i] {
-			t.Fatalf("watcherConn raw event[%d] = %s, want %s", i, watcherRawKinds[i], wantKinds[i])
-		}
-	}
 
-	// 2. idleConn MUST receive ONLY task2's timeline sentinel and ZERO raw_acp events.
+	// 2. idleConn MUST receive ONLY task2's timeline sentinel and ZERO raw_acp or watch_ack frames.
 	gotIdleSentinel := false
 	for !gotIdleSentinel {
 		rctx, rcancel := context.WithTimeout(ctx, 4*time.Second)
@@ -265,6 +299,9 @@ func TestClientWS_WatchAttemptsStreamsRawACPOnDemandOnly(t *testing.T) {
 		if err := json.Unmarshal(data, &msg); err != nil {
 			t.Fatal(err)
 		}
+		if msg.Type == protocol.WSMessageWatchAck {
+			t.Fatalf("unsubscribed idleConn must not receive watch_ack")
+		}
 		if msg.Type != protocol.WSMessageEvent || msg.Event == nil {
 			continue
 		}
@@ -276,17 +313,14 @@ func TestClientWS_WatchAttemptsStreamsRawACPOnDemandOnly(t *testing.T) {
 		}
 	}
 
-	// 3. Unwatching task1 stops pushing subsequent raw_acp events to watcherConn.
+	// 3. Unwatching task1 emits watch_ack([]) and stops pushing subsequent raw_acp events to watcherConn.
 	sendClientWSControl(t, ctx, watcherConn, protocol.WSClientMessage{
 		Type:       protocol.WSClientWatchAttempts,
 		AttemptIDs: []string{},
 	})
-	deadlineUnsub := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadlineUnsub) {
-		if srv.EventBroker().AttemptWatcherCount(task1.Attempt.AttemptID) == 0 {
-			break
-		}
-		time.Sleep(5 * time.Millisecond)
+	_, _ = readUntilWatchAck(t, ctx, watcherConn, []string{})
+	if srv.EventBroker().AttemptWatcherCount(task1.Attempt.AttemptID) != 0 {
+		t.Fatalf("expected watcher count 0 after unwatch ack")
 	}
 
 	sendRunnerJSON(t, ctx, runnerConn, protocol.AttemptOutboxBatchFrame{
@@ -337,5 +371,287 @@ func TestClientWS_WatchAttemptsStreamsRawACPOnDemandOnly(t *testing.T) {
 		if msg.Event.AttemptID == task1.Attempt.AttemptID && msg.Event.Kind == protocol.EventAttemptStateChanged {
 			break
 		}
+	}
+}
+
+func TestClientWS_WatchAckClosesReplayAndDynamicWatchGapWindow(t *testing.T) {
+	_, st, ts, runnerToken := setupSubsessionHub(t)
+	ctx := context.Background()
+
+	runnerWSURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/ws/runner"
+	runnerConn := dialTestRunnerWS(t, ctx, runnerWSURL, "hub-node", "ri_watch_gap", runnerToken)
+	defer runnerConn.CloseNow()
+
+	task1, err := st.CreateTask(ctx, store.CreateTaskParams{
+		ProjectID:     "demo-app",
+		Title:         "Gap Window Task",
+		Goal:          "No dropped raw chunks",
+		MachineID:     "hub-node",
+		Adapter:       protocol.AdapterAgy,
+		CreateAttempt: true,
+		LeaseTTLMs:    60000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	task2, err := st.CreateTask(ctx, store.CreateTaskParams{
+		ProjectID:     "demo-app",
+		Title:         "Other Task Advancing Global Seq",
+		Goal:          "Bump lastSentSeq",
+		MachineID:     "hub-node",
+		Adapter:       protocol.AdapterAgy,
+		CreateAttempt: true,
+		LeaseTTLMs:    60000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now().UnixMilli()
+	// 1. Seed chunk 1 ("c1") and simulate client initial HTTP fetch up to httpCursor = c1.Seq (analogous to HTTP=100).
+	sendRunnerJSON(t, ctx, runnerConn, protocol.AttemptOutboxBatchFrame{
+		Type:       protocol.RunnerMsgOutboxBatch,
+		AttemptID:  task1.Attempt.AttemptID,
+		LeaseToken: task1.Attempt.LeaseToken,
+		Items: []protocol.OutboxItem{
+			{
+				OutboxSeq: 1,
+				EventID:   "ev_gap_c1",
+				FrameType: protocol.OutboxFrameEvents,
+				TS:        now,
+				Payload: map[string]any{
+					"kind":       string(protocol.EventACPMessageBatch),
+					"visibility": string(protocol.VisibilityRawACP),
+					"actorKind":  string(protocol.ActorAgent),
+					"actorId":    "agy",
+					"payload":    map[string]any{"text": "chunk-100"},
+				},
+			},
+		},
+	})
+
+	var initialHTTP []protocol.EventRecord
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		initialHTTP = fetchAttemptRawHTTP(t, ts.URL, task1.Attempt.AttemptID, 0)
+		if len(initialHTTP) == 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(initialHTTP) != 1 {
+		t.Fatalf("expected 1 initial raw chunk, got %d", len(initialHTTP))
+	}
+	httpCursor := initialHTTP[0].Seq
+
+	// 2. Connect WS WITHOUT watching task1 yet (or before watch_attempts takes effect).
+	clientConn := dialClientWSAtSeq(t, ctx, ts.URL, httpCursor)
+	defer clientConn.CloseNow()
+
+	// 3. Emit chunk 2 ("chunk-101") on task1 AND a non-raw state event on task2 so clientConn's global lastSentSeq
+	//    advances strictly PAST chunk-101 while task1 is still unwatched (exact dynamic-watch gap scenario!).
+	sendRunnerJSON(t, ctx, runnerConn, protocol.AttemptOutboxBatchFrame{
+		Type:       protocol.RunnerMsgOutboxBatch,
+		AttemptID:  task1.Attempt.AttemptID,
+		LeaseToken: task1.Attempt.LeaseToken,
+		Items: []protocol.OutboxItem{
+			{
+				OutboxSeq: 2,
+				EventID:   "ev_gap_c2",
+				FrameType: protocol.OutboxFrameEvents,
+				TS:        now + 1,
+				Payload: map[string]any{
+					"kind":       string(protocol.EventACPMessageBatch),
+					"visibility": string(protocol.VisibilityRawACP),
+					"actorKind":  string(protocol.ActorAgent),
+					"actorId":    "agy",
+					"payload":    map[string]any{"text": "chunk-101"},
+				},
+			},
+		},
+	})
+	sendRunnerJSON(t, ctx, runnerConn, protocol.AttemptOutboxBatchFrame{
+		Type:       protocol.RunnerMsgOutboxBatch,
+		AttemptID:  task2.Attempt.AttemptID,
+		LeaseToken: task2.Attempt.LeaseToken,
+		Items: []protocol.OutboxItem{
+			{
+				OutboxSeq: 1,
+				EventID:   "ev_gap_other_state",
+				FrameType: protocol.OutboxFrameState,
+				TS:        now + 2,
+				Payload:   map[string]any{"state": string(protocol.AttemptRunning)},
+			},
+		},
+	})
+
+	// Wait until clientConn receives task2's state event (proving Hub's lastSentSeq has already passed chunk-101!).
+	var advancedGlobalSeq int64
+	for {
+		rctx, rcancel := context.WithTimeout(ctx, 4*time.Second)
+		_, data, err := clientConn.Read(rctx)
+		rcancel()
+		if err != nil {
+			t.Fatalf("read task2 sentinel: %v", err)
+		}
+		var msg protocol.WSServerMessage
+		if err := json.Unmarshal(data, &msg); err != nil {
+			t.Fatal(err)
+		}
+		if msg.Type == protocol.WSMessageEvent && msg.Event != nil && msg.Event.EventID == "ev_gap_other_state" {
+			advancedGlobalSeq = msg.Event.Seq
+			break
+		}
+	}
+
+	// 4. Now client dynamically subscribes to task1 -> Hub MUST emit watch_ack with seq >= advancedGlobalSeq.
+	sendClientWSControl(t, ctx, clientConn, protocol.WSClientMessage{
+		Type:       protocol.WSClientWatchAttempts,
+		AttemptIDs: []string{task1.Attempt.AttemptID},
+	})
+	ack, _ := readUntilWatchAck(t, ctx, clientConn, []string{task1.Attempt.AttemptID})
+	if ack.Seq < advancedGlobalSeq {
+		t.Fatalf("expected watch_ack.Seq >= %d, got %d", advancedGlobalSeq, ack.Seq)
+	}
+
+	// 5. Runner emits chunk 3 ("chunk-102") -> WS pushes chunk-102 immediately BEFORE client completes HTTP catchup.
+	sendRunnerJSON(t, ctx, runnerConn, protocol.AttemptOutboxBatchFrame{
+		Type:       protocol.RunnerMsgOutboxBatch,
+		AttemptID:  task1.Attempt.AttemptID,
+		LeaseToken: task1.Attempt.LeaseToken,
+		Items: []protocol.OutboxItem{
+			{
+				OutboxSeq: 3,
+				EventID:   "ev_gap_c3",
+				FrameType: protocol.OutboxFrameEvents,
+				TS:        now + 3,
+				Payload: map[string]any{
+					"kind":       string(protocol.EventACPMessageBatch),
+					"visibility": string(protocol.VisibilityRawACP),
+					"actorKind":  string(protocol.ActorAgent),
+					"actorId":    "agy",
+					"payload":    map[string]any{"text": "chunk-102"},
+				},
+			},
+		},
+	})
+
+	var wsChunk3 protocol.EventRecord
+	for {
+		rctx, rcancel := context.WithTimeout(ctx, 4*time.Second)
+		_, data, err := clientConn.Read(rctx)
+		rcancel()
+		if err != nil {
+			t.Fatalf("read live chunk-102: %v", err)
+		}
+		var msg protocol.WSServerMessage
+		if err := json.Unmarshal(data, &msg); err != nil {
+			t.Fatal(err)
+		}
+		if msg.Type == protocol.WSMessageEvent && msg.Event != nil && msg.Event.EventID == "ev_gap_c3" {
+			wsChunk3 = *msg.Event
+			break
+		}
+	}
+
+	// 6. Client honors watch_ack by catching up over HTTP starting from its independent httpCursor (NOT wsChunk3.Seq!).
+	catchup := fetchAttemptRawHTTP(t, ts.URL, task1.Attempt.AttemptID, httpCursor)
+	bySeq := map[int64]protocol.EventRecord{
+		initialHTTP[0].Seq: initialHTTP[0],
+		wsChunk3.Seq:       wsChunk3,
+	}
+	for _, ev := range catchup {
+		bySeq[ev.Seq] = ev
+	}
+	var gotIDs []string
+	var seqs []int64
+	for seq := range bySeq {
+		seqs = append(seqs, seq)
+	}
+	slices.Sort(seqs)
+	for _, seq := range seqs {
+		gotIDs = append(gotIDs, bySeq[seq].EventID)
+	}
+	wantIDs := []string{"ev_gap_c1", "ev_gap_c2", "ev_gap_c3"}
+	if !slices.Equal(gotIDs, wantIDs) {
+		t.Fatalf("gap recovery mismatch: got %v, want %v", gotIDs, wantIDs)
+	}
+}
+
+func TestStore_MonotonicTaskVersionWatermarkAdvancesAcrossSkewedRunnerClocks(t *testing.T) {
+	_, st, ts, runnerToken := setupSubsessionHub(t)
+	ctx := context.Background()
+
+	runnerWSURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/ws/runner"
+	runnerConn := dialTestRunnerWS(t, ctx, runnerWSURL, "hub-node", "ri_version_wm", runnerToken)
+	defer runnerConn.CloseNow()
+
+	parent, err := st.CreateTask(ctx, store.CreateTaskParams{
+		ProjectID:     "demo-app",
+		Title:         "Parent Watermark",
+		Goal:          "Check monotonic version",
+		MachineID:     "hub-node",
+		Adapter:       protocol.AdapterAgy,
+		CreateAttempt: true,
+		LeaseTTLMs:    60000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := st.CreateTask(ctx, store.CreateTaskParams{
+		ProjectID:     "demo-app",
+		ParentTaskID:  parent.Task.TaskID,
+		Title:         "Child Watermark",
+		Goal:          "Skewed runner clock child",
+		MachineID:     "hub-node",
+		Adapter:       protocol.AdapterAgy,
+		CreateAttempt: true,
+		LeaseTTLMs:    60000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if parent.Task.Version < 1 || child.Task.Version < 1 {
+		t.Fatalf("expected initial versions >= 1, got parent=%d child=%d", parent.Task.Version, child.Task.Version)
+	}
+	vChildBefore := child.Task.Version
+
+	// Runner reports attempt completion with a clock skewed 1 hour INTO THE PAST.
+	pastSkewTS := time.Now().Add(-1 * time.Hour).UnixMilli()
+	sendRunnerJSON(t, ctx, runnerConn, protocol.AttemptOutboxBatchFrame{
+		Type:       protocol.RunnerMsgOutboxBatch,
+		AttemptID:  child.Attempt.AttemptID,
+		LeaseToken: child.Attempt.LeaseToken,
+		Items: []protocol.OutboxItem{
+			{
+				OutboxSeq: 1,
+				EventID:   "ev_child_skewed_done",
+				FrameType: protocol.OutboxFrameState,
+				TS:        pastSkewTS,
+				Payload:   map[string]any{"state": string(protocol.AttemptSucceeded)},
+			},
+		},
+	})
+
+	var childAfter protocol.ChildTaskView
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		kids, err := st.ListChildTasks(ctx, parent.Task.TaskID, false)
+		if err == nil && len(kids) == 1 && kids[0].State == protocol.TaskStateInReview {
+			childAfter = kids[0]
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	if childAfter.State != protocol.TaskStateInReview {
+		t.Fatalf("child did not transition to in_review")
+	}
+	if childAfter.Version <= vChildBefore {
+		t.Fatalf("expected child Version to strictly increase past %d despite skewed Runner TS, got %d", vChildBefore, childAfter.Version)
+	}
+	// Hub also keeps UpdatedAt on Hub server clock (not Runner's 1-hour-past TS).
+	if childAfter.UpdatedAt <= pastSkewTS+30*60*1000 {
+		t.Fatalf("expected Hub server UpdatedAt (not Runner pastSkewTS=%d), got %d", pastSkewTS, childAfter.UpdatedAt)
 	}
 }

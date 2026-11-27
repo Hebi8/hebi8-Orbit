@@ -343,11 +343,13 @@ func (s *Store) Bootstrap(ctx context.Context, machineMeta map[string]protocol.M
 
 		// Open Inbox Items
 		iRows, err := tx.QueryContext(ctx, `
-			SELECT inbox_id, project_id, task_id, category, ref_id, title, summary,
-			       priority, state, created_at, updated_at, resolved_at
-			FROM inbox_items
-			WHERE state = 'open'
-			ORDER BY priority ASC, updated_at DESC
+			SELECT i.inbox_id, i.project_id, i.task_id, i.category, i.ref_id, i.title, i.summary,
+			       i.priority, i.state, i.created_at, i.updated_at, i.resolved_at,
+			       COALESCE(t.version, 0)
+			FROM inbox_items i
+			LEFT JOIN tasks t ON t.task_id = i.task_id
+			WHERE i.state = 'open'
+			ORDER BY i.priority ASC, i.updated_at DESC
 		`)
 		if err != nil {
 			return fmt.Errorf("query inbox_items: %w", err)
@@ -429,7 +431,7 @@ func scanInboxItem(scanner interface{ Scan(...any) error }) (protocol.InboxItemV
 	if err := scanner.Scan(
 		&item.InboxID, &item.ProjectID, &taskID, &cat, &item.RefID,
 		&item.Title, &item.Summary, &item.Priority, &state,
-		&item.CreatedAt, &item.UpdatedAt, &resolvedAt,
+		&item.CreatedAt, &item.UpdatedAt, &resolvedAt, &item.TaskVersion,
 	); err != nil {
 		return item, err
 	}
@@ -513,7 +515,7 @@ const taskSummarySelectSQL = `
 		       (SELECT COUNT(*) FROM board_members bm WHERE bm.task_id = t.task_id AND bm.state IN ('working', 'waiting'))
 		       + (SELECT COUNT(*) FROM tasks ct WHERE ct.parent_task_id = t.task_id AND ct.archived_at IS NULL AND ct.state NOT IN ('done', 'cancelled')
 		          AND NOT EXISTS (SELECT 1 FROM board_members bm2 WHERE bm2.task_id = t.task_id AND bm2.worker_task_id = ct.task_id)) AS worker_count,
-		       t.created_by, t.created_at, t.updated_at, t.archived_at
+		       t.version, t.created_by, t.created_at, t.updated_at, t.archived_at
 		FROM tasks t
 		LEFT JOIN attempts a ON a.attempt_id = t.active_attempt_id
 		LEFT JOIN deliveries d ON d.delivery_id = t.latest_delivery_id
@@ -577,7 +579,7 @@ func scanTaskSummary(scanner interface{ Scan(...any) error }) (protocol.TaskSumm
 		&activeAttID, &activeAttState, &latestDlvID, &latestHead,
 		&ts.OpenAnnotationCount, &ts.DeliveryCount,
 		&ts.QueuedInputCount, &ts.WorkerCount,
-		&createdBy, &ts.CreatedAt, &ts.UpdatedAt, &archivedAt,
+		&ts.Version, &createdBy, &ts.CreatedAt, &ts.UpdatedAt, &archivedAt,
 	); err != nil {
 		return ts, err
 	}
@@ -1718,9 +1720,12 @@ func loadManualImportExisting(ctx context.Context, tx *sql.Tx, taskID, attemptID
 	res.Delivery = dlv
 
 	iRow := tx.QueryRowContext(ctx, `
-		SELECT inbox_id, project_id, task_id, category, ref_id, title, summary,
-		       priority, state, created_at, updated_at, resolved_at
-		FROM inbox_items WHERE inbox_id = ?
+		SELECT i.inbox_id, i.project_id, i.task_id, i.category, i.ref_id, i.title, i.summary,
+		       i.priority, i.state, i.created_at, i.updated_at, i.resolved_at,
+		       COALESCE(t.version, 0)
+		FROM inbox_items i
+		LEFT JOIN tasks t ON t.task_id = i.task_id
+		WHERE i.inbox_id = ?
 	`, "inb:dlv:"+deliveryID)
 	inbox, err := scanInboxItem(iRow)
 	if err == nil {
@@ -2714,6 +2719,11 @@ func (s *Store) ReopenDeliveryReview(ctx context.Context, deliveryID, actorID st
 			return err
 		}
 		if changed, _ := res.RowsAffected(); changed > 0 {
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE tasks SET version = version + 1, updated_at = ? WHERE task_id = ?
+			`, now, taskID); err != nil {
+				return err
+			}
 			if actorID == "" {
 				actorID = "human"
 			}

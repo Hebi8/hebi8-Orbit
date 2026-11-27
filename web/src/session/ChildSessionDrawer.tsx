@@ -10,7 +10,7 @@ import { collectSessionArtifacts } from '../lib/artifacts';
 import {
   childSessionMark,
   cleanMachineName,
-  effectiveReadyAt,
+  effectiveReadyWatermark,
   indexInboxByTask,
   taskTitle,
   type SeenTaskMap,
@@ -242,20 +242,24 @@ export function ChildSessionDrawer({
 
   const childTask = childTl?.task;
   const isMismatchedParent = !!childTl && childTl.task.parentTaskId !== parentTaskId;
+  const childReadyWatermark =
+    childTaskId && !isMismatchedParent && (childTask || childSummary)
+      ? effectiveReadyWatermark(
+          { version: Math.max(childTask?.version ?? 0, childSummary?.version ?? 0) },
+          inboxByTask.get(childTaskId),
+        )
+      : 0;
 
   useEffect(() => {
-    if (!childTaskId || isMismatchedParent) return;
-    if (!childTask && !childSummary) return;
+    if (!childTaskId || childReadyWatermark <= 0) return;
     const markVisible = () => {
       if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return;
-      const updatedAt = Math.max(childTask?.updatedAt ?? 0, childSummary?.updatedAt ?? 0);
-      const readyAt = effectiveReadyAt({ updatedAt }, inboxByTask.get(childTaskId));
-      markTaskSeen(childTaskId, Math.max(Date.now(), readyAt));
+      markTaskSeen(childTaskId, childReadyWatermark);
     };
     markVisible();
     document.addEventListener('visibilitychange', markVisible);
     return () => document.removeEventListener('visibilitychange', markVisible);
-  }, [childTaskId, isMismatchedParent, childTask, childSummary, inboxByTask, markTaskSeen]);
+  }, [childTaskId, childReadyWatermark, markTaskSeen]);
 
   const childArtifacts = useMemo(() => collectSessionArtifacts(childTl), [childTl]);
 
@@ -330,7 +334,7 @@ export function ChildSessionDrawer({
       taskId: childTaskId,
       state: task?.state ?? childSummary?.state ?? 'queued',
       openApprovalCount: openApprovals,
-      updatedAt: Math.max(task?.updatedAt ?? 0, childSummary?.updatedAt ?? 0),
+      version: Math.max(task?.version ?? 0, childSummary?.version ?? 0),
     },
     inboxByTask.get(childTaskId),
     seenTasks,

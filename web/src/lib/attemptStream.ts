@@ -7,6 +7,9 @@ const STREAMABLE_RAW_ACP_KINDS = new Set<string>([
   'acp.tool_call_update',
 ]);
 
+export const ATTEMPT_RAW_PAGE_SIZE = 500;
+export const ATTEMPT_RAW_MAX_PAGES_PER_PASS = 20;
+
 /** Reports whether an EventRecord is a live raw_acp streaming frame merged directly into ['attempt-raw', attemptId]. */
 export function isStreamableRawACPEvent(ev: Pick<EventRecord, 'kind' | 'attemptId'>): boolean {
   return !!ev.attemptId && STREAMABLE_RAW_ACP_KINDS.has(ev.kind);
@@ -77,6 +80,109 @@ function dedupeAndSortBySeq(events: readonly EventRecord[]): EventRecord[] {
     if (ev.eventId) seenEventIds.add(ev.eventId);
   }
   return [...bySeq.values()].sort((a, b) => a.seq - b.seq);
+}
+
+export interface AttemptHttpSyncState {
+  /** Highest seq continuously covered by sequential HTTP GET /api/attempts/:id/raw pages (NEVER advanced by WS frames). */
+  httpCursor: number;
+  /** True only after an HTTP pass finishes on a short page (< pageSize) with no mid-flight catchup bump. */
+  caughtUp: boolean;
+  /** Incremented whenever watch_ack or WS reconnect requires an HTTP catchup pass starting from httpCursor. */
+  catchupGen: number;
+  /** Highest Hub seq observed via watch_ack / reconnect that HTTP must cover through. */
+  requiredSeq: number;
+}
+
+export interface AttemptRawSyncController {
+  getState: (attemptId: string) => AttemptHttpSyncState;
+  isCaughtUp: (attemptId: string | undefined) => boolean;
+  markNeedsCatchup: (attemptId: string, targetSeq?: number) => void;
+  fetchNextPass: (
+    attemptId: string,
+    fetchPage: (attemptId: string, afterSeq: number, limit: number) => Promise<{ events?: EventRecord[] }>,
+    opts?: { pageSize?: number; maxPages?: number },
+  ) => Promise<{ fetched: EventRecord[]; httpCursor: number; needsMore: boolean }>;
+}
+
+const MAX_TRACKED_ATTEMPTS = 500;
+
+/**
+ * Maintains strictly contiguous HTTP pagination cursors per attemptId, completely isolated from
+ * high-seq live WS pushes:
+ * - WS events merge directly into the cache WITHOUT advancing `httpCursor`, so gaps between
+ *   an initial HTTP fetch and a later `watch_ack` are always filled cleanly from `httpCursor`.
+ * - Long attempts exceeding `maxPages * pageSize` frames stay `caughtUp = false` and return
+ *   `needsMore = true` so callers schedule continuation passes until a short page is reached.
+ */
+export function createAttemptRawSyncController(): AttemptRawSyncController {
+  const states = new Map<string, AttemptHttpSyncState>();
+
+  const getState = (attemptId: string): AttemptHttpSyncState => {
+    let st = states.get(attemptId);
+    if (!st) {
+      st = { httpCursor: 0, caughtUp: false, catchupGen: 0, requiredSeq: 0 };
+      states.set(attemptId, st);
+      if (states.size > MAX_TRACKED_ATTEMPTS) {
+        const oldest = states.keys().next().value;
+        if (oldest && oldest !== attemptId) states.delete(oldest);
+      }
+    }
+    return st;
+  };
+
+  return {
+    getState,
+    isCaughtUp(attemptId: string | undefined) {
+      if (!attemptId) return false;
+      const st = states.get(attemptId);
+      return !!st?.caughtUp;
+    },
+    markNeedsCatchup(attemptId: string, targetSeq = 0) {
+      if (!attemptId) return;
+      const st = getState(attemptId);
+      st.caughtUp = false;
+      st.catchupGen += 1;
+      if (targetSeq > st.requiredSeq) {
+        st.requiredSeq = targetSeq;
+      }
+    },
+    async fetchNextPass(attemptId, fetchPage, opts) {
+      const pageSize = opts?.pageSize ?? ATTEMPT_RAW_PAGE_SIZE;
+      const maxPages = opts?.maxPages ?? ATTEMPT_RAW_MAX_PAGES_PER_PASS;
+      const st = getState(attemptId);
+      const startGen = st.catchupGen;
+      let cursor = st.httpCursor;
+      const fetched: EventRecord[] = [];
+      let hitPageBudget = false;
+
+      for (let page = 0; page < maxPages; page++) {
+        const res = await fetchPage(attemptId, cursor, pageSize);
+        const evs = res.events ?? [];
+        for (const ev of evs) {
+          if (ev.seq > cursor) {
+            fetched.push(ev);
+            cursor = ev.seq;
+          }
+        }
+        if (evs.length < pageSize) {
+          hitPageBudget = false;
+          break;
+        }
+        hitPageBudget = true;
+      }
+
+      if (cursor > st.httpCursor) {
+        st.httpCursor = cursor;
+      }
+      const needsMore = hitPageBudget || st.catchupGen !== startGen;
+      st.caughtUp = !needsMore;
+      return {
+        fetched,
+        httpCursor: st.httpCursor,
+        needsMore,
+      };
+    },
+  };
 }
 
 export type WatchAttemptListener = (attemptIds: string[]) => void;

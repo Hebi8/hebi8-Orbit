@@ -1,5 +1,13 @@
 import { create } from 'zustand';
 import type { IDEScheme } from '../generated/protocol';
+import {
+  SEEN_TASKS_STORAGE_KEY,
+  mergeSeenTaskMaps,
+  parseSeenTasksJSON,
+  persistMergedSeenTasks,
+  readSeenTasksFromStorage,
+  type SeenTaskEntry,
+} from '../lib/seenStorage';
 
 export type ThemeMode = 'dark' | 'light';
 export type WSConnectionStatus = 'connecting' | 'live' | 'reconnecting';
@@ -52,21 +60,15 @@ function readJSON<T>(key: string, fallback: T): T {
 
 const PROMPT_CACHE_KEY = 'orbit.promptCache';
 const PROMPT_CACHE_MAX = 400;
-const SEEN_TASKS_KEY = 'orbit.seenTasks';
-const SEEN_TASKS_MAX = 2000;
 const REVIEW_RATIO_MIN = 36;
 const REVIEW_RATIO_MAX = 78;
 
-function readSeenTasks(): Record<string, number> {
-  const raw = readJSON<Record<string, unknown>>(SEEN_TASKS_KEY, {});
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
-  const out: Record<string, number> = {};
-  for (const [k, v] of Object.entries(raw)) {
-    if (typeof v === 'number' && Number.isFinite(v) && v > 0) {
-      out[k] = v;
-    }
+function getBrowserLocalStorage(): Storage | null {
+  try {
+    return typeof localStorage !== 'undefined' ? localStorage : null;
+  } catch {
+    return null;
   }
-  return out;
 }
 
 function readRatio(key: string, fallback: number): number {
@@ -130,8 +132,9 @@ interface WorkbenchState {
   ensureParentExpanded: (parentTaskId: string) => void;
   dismissFailoverBanner: (key: string) => void;
   rememberPrompt: (key: string, body: string) => void;
-  markTaskSeen: (taskId: string, seenAtMs?: number) => void;
-  markTasksSeen: (entries: Array<{ taskId: string; seenAtMs?: number }>) => void;
+  markTaskSeen: (taskId: string, watermark: number) => void;
+  markTasksSeen: (entries: ReadonlyArray<SeenTaskEntry>) => void;
+  syncSeenTasksFromStorage: (raw: string | null) => void;
   toggleAnnotationSelected: (taskId: string, annotationId: string, selected: boolean) => void;
   clearDeselectedAnnotations: (taskId: string) => void;
   showToast: (text: string, tone?: 'info' | 'err', action?: ToastAction) => void;
@@ -164,7 +167,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
   expandedParents: readJSON<Record<string, boolean>>('orbit.expandedParents', {}),
   failoverBannerDismissedKey: null,
   promptCache: readJSON<Record<string, string>>(PROMPT_CACHE_KEY, {}),
-  seenTasks: readSeenTasks(),
+  seenTasks: readSeenTasksFromStorage(getBrowserLocalStorage()),
   deselectedAnnotations: {},
   toast: null,
 
@@ -262,36 +265,23 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
     writeLS(PROMPT_CACHE_KEY, JSON.stringify(next));
     set({ promptCache: next });
   },
-  markTaskSeen: (taskId, seenAtMs) => {
-    if (!taskId) return;
-    get().markTasksSeen([{ taskId, seenAtMs }]);
+  markTaskSeen: (taskId, watermark) => {
+    if (!taskId || !Number.isFinite(watermark) || watermark <= 0) return;
+    get().markTasksSeen([{ taskId, watermark }]);
   },
   markTasksSeen: (entries) => {
     if (!entries || entries.length === 0) return;
-    const cur = get().seenTasks;
-    const now = Date.now();
-    let next: Record<string, number> | null = null;
-    for (const entry of entries) {
-      const id = entry.taskId?.trim();
-      if (!id) continue;
-      const candidate = typeof entry.seenAtMs === 'number' && Number.isFinite(entry.seenAtMs) ? entry.seenAtMs : now;
-      const prev = (next ?? cur)[id] ?? 0;
-      const merged = Math.max(prev, candidate);
-      if (merged > prev) {
-        if (!next) next = { ...cur };
-        next[id] = merged;
-      }
+    const { nextMem } = persistMergedSeenTasks(getBrowserLocalStorage(), get().seenTasks, entries);
+    if (nextMem) {
+      set({ seenTasks: nextMem });
     }
-    if (!next) return;
-    const keys = Object.keys(next);
-    if (keys.length > SEEN_TASKS_MAX) {
-      keys.sort((a, b) => next![a] - next![b]);
-      for (const k of keys.slice(0, keys.length - SEEN_TASKS_MAX)) {
-        delete next[k];
-      }
+  },
+  syncSeenTasksFromStorage: (raw) => {
+    const incoming = parseSeenTasksJSON(raw);
+    const merged = mergeSeenTaskMaps(get().seenTasks, incoming);
+    if (merged) {
+      set({ seenTasks: merged });
     }
-    writeLS(SEEN_TASKS_KEY, JSON.stringify(next));
-    set({ seenTasks: next });
   },
   toggleAnnotationSelected: (taskId, annotationId, selected) =>
     set((s) => {
@@ -319,4 +309,12 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
 
 export function toast(text: string, tone: 'info' | 'err' = 'info', action?: ToastAction) {
   useWorkbenchStore.getState().showToast(text, tone, action);
+}
+
+if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+  window.addEventListener('storage', (e: StorageEvent) => {
+    if (e.key === SEEN_TASKS_STORAGE_KEY && e.newValue !== null) {
+      useWorkbenchStore.getState().syncSeenTasksFromStorage(e.newValue);
+    }
+  });
 }

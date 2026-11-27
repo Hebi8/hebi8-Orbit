@@ -688,6 +688,7 @@ const (
 	WSMessageReplayEnd WSMessageType = "replay_end"
 	WSMessageEvent     WSMessageType = "event"
 	WSMessagePing      WSMessageType = "ping"
+	WSMessageWatchAck  WSMessageType = "watch_ack"
 )
 
 var AllWSMessageTypes = []WSMessageType{
@@ -695,6 +696,7 @@ var AllWSMessageTypes = []WSMessageType{
 	WSMessageReplayEnd,
 	WSMessageEvent,
 	WSMessagePing,
+	WSMessageWatchAck,
 }
 
 // WSClientMessageType identifies client-to-server WebSocket control frame kinds on /ws/client.

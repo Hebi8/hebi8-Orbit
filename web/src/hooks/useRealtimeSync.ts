@@ -12,6 +12,7 @@ import type {
 import { api, getStoredClientToken, getStoredDevToken } from '../lib/api';
 import { attemptWatchRegistry, isStreamableRawACPEvent, mergeAttemptRawEvents } from '../lib/attemptStream';
 import { useWorkbenchStore } from '../store/useWorkbenchStore';
+import { scheduleAttemptRawCatchup } from './queries';
 
 const strField = (payload: Record<string, unknown> | undefined, key: string): string => {
   const v = payload?.[key];
@@ -438,8 +439,17 @@ export function useRealtimeSync(snapshotSeq: number | undefined) {
             liveBuffer.length = 0;
             if (needsReconnectCatchup) {
               needsReconnectCatchup = false;
+              const targetSeq = typeof msg.replayHeadSeq === 'number' ? msg.replayHeadSeq : 0;
               for (const aid of attemptWatchRegistry.getIds()) {
-                void queryClient.invalidateQueries({ queryKey: ['attempt-raw', aid] });
+                scheduleAttemptRawCatchup(queryClient, aid, targetSeq);
+              }
+            }
+          } else if (msg.type === 'watch_ack') {
+            const activeWatched = new Set(attemptWatchRegistry.getIds());
+            const ackSeq = typeof msg.seq === 'number' ? msg.seq : 0;
+            for (const aid of msg.attemptIds ?? []) {
+              if (activeWatched.has(aid)) {
+                scheduleAttemptRawCatchup(queryClient, aid, ackSeq);
               }
             }
           } else if (msg.type === 'event' && msg.event) {

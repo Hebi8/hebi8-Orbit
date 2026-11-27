@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { Archive, ArchiveRestore, ArrowLeft, Layers, MessageSquare, MoreHorizontal, Trash2 } from 'lucide-react';
-import type { BoardMemberCursor, BootstrapResponse } from '../generated/protocol';
+import type { BoardMemberCursor, BootstrapResponse, ChildTaskView } from '../generated/protocol';
 import { CardIcon } from '../components/Icons';
 import { IdeOpenButton } from '../components/IdeOpenButton';
 import { PageHeader, type PageHeaderCrumb } from '../components/PageHeader';
@@ -14,7 +14,7 @@ import {
   SCRATCH_PROJECT_ID,
   artifactShortLabel,
   collectParentSeenEntries,
-  effectiveReadyAt,
+  effectiveReadyWatermark,
   indexInboxByTask,
   isVirtualProject,
   memberStateLabel,
@@ -32,6 +32,7 @@ import { RightCard } from './RightCard';
 import { SessionConversation } from './SessionConversation';
 
 const CODE_KINDS = new Set(['code_diff', 'mixed', 'workspace_snapshot']);
+const EMPTY_CHILDREN: ChildTaskView[] = [];
 const SUB_DRAWER_WIDTH_KEY = 'orbit.subDrawerWidth';
 const SUB_DRAWER_MIN = 340;
 const SUB_DRAWER_NARROW_MIN = 260;
@@ -178,7 +179,7 @@ export function SessionPage({
   const members = tl?.boardMembers ?? [];
   const hasSwarm = !isChildSession && !isPA && (members.length > 0 || (task?.workerCount ?? 0) > 0);
   const childrenQ = useTaskChildren(taskId, !!tl && !isChildSession && !isPA);
-  const childrenList = isChildSession || isPA ? [] : (childrenQ.data?.children ?? tl?.children ?? []);
+  const childrenList = isChildSession || isPA ? EMPTY_CHILDREN : (childrenQ.data?.children ?? tl?.children ?? EMPTY_CHILDREN);
   const hasBoardMessages = !isChildSession && !isPA && (tl?.boardMessageCount ?? 0) > 0;
   const boardQ = useBoard(
     taskId,
@@ -359,44 +360,52 @@ export function SessionPage({
     };
   }, [artMenuOpen, moreMenuOpen]);
 
-  const parentChildrenForRead = useMemo(() => {
-    if (!task || isChildSession || isPA) return [];
+  const seenEntries = useMemo(() => {
+    if (!task) return [];
+    if (isChildSession) {
+      const wm = effectiveReadyWatermark(task, inboxByTask.get(task.taskId));
+      return wm > 0 ? [{ taskId: task.taskId, watermark: wm }] : [];
+    }
     const byId = new Map<
       string,
       {
         taskId: string;
         state: typeof task.state;
-        updatedAt: number;
+        version: number;
         openApprovalCount?: number;
         activeAttemptState?: typeof task.activeAttemptState;
       }
     >();
-    for (const c of childrenList) {
-      byId.set(c.taskId, c);
-    }
-    for (const t of boot.activeTasks) {
-      if (t.parentTaskId === task.taskId && !byId.has(t.taskId)) {
-        byId.set(t.taskId, t);
+    if (!isPA) {
+      for (const c of childrenList) {
+        byId.set(c.taskId, c);
+      }
+      for (const t of boot.activeTasks) {
+        if (t.parentTaskId === task.taskId && !byId.has(t.taskId)) {
+          byId.set(t.taskId, t);
+        }
       }
     }
-    return [...byId.values()];
-  }, [task, isChildSession, isPA, childrenList, boot.activeTasks]);
+    return collectParentSeenEntries(task, [...byId.values()], inboxByTask);
+  }, [task, isChildSession, isPA, childrenList, boot.activeTasks, inboxByTask]);
+
+  const seenSyncSig = useMemo(
+    () => seenEntries.map((e) => `${e.taskId}:${e.watermark}`).join(','),
+    [seenEntries],
+  );
+  const seenEntriesRef = useRef(seenEntries);
+  seenEntriesRef.current = seenEntries;
 
   useEffect(() => {
-    if (!task) return;
+    if (!seenSyncSig) return;
     const markVisible = () => {
       if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return;
-      if (isChildSession) {
-        const readyAt = effectiveReadyAt(task, inboxByTask.get(task.taskId));
-        markTasksSeen([{ taskId: task.taskId, seenAtMs: Math.max(Date.now(), readyAt) }]);
-      } else {
-        markTasksSeen(collectParentSeenEntries(task, parentChildrenForRead, inboxByTask));
-      }
+      markTasksSeen(seenEntriesRef.current);
     };
     markVisible();
     document.addEventListener('visibilitychange', markVisible);
     return () => document.removeEventListener('visibilitychange', markVisible);
-  }, [task, isChildSession, parentChildrenForRead, inboxByTask, markTasksSeen]);
+  }, [seenSyncSig, markTasksSeen]);
 
   const invalidateAfterTaskMut = (pid?: string) => {
     void qc.invalidateQueries({ queryKey: ['task-timeline', taskId] });

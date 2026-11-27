@@ -6,7 +6,7 @@ import { DiffIcon } from '../components/Icons';
 import { StatusMark } from '../components/StatusMark';
 import { useTimeline } from '../hooks/queries';
 import { collectSessionArtifacts } from '../lib/artifacts';
-import { artifactShortLabel, effectiveReadyAt, indexInboxByTask, sessionMark, taskTitle } from '../lib/format';
+import { artifactShortLabel, effectiveReadyWatermark, indexInboxByTask, sessionMark, taskTitle } from '../lib/format';
 import { useAnchoredPopover } from '../lib/popover';
 import { SessionConversation } from '../session/SessionConversation';
 import { useWorkbenchStore } from '../store/useWorkbenchStore';
@@ -59,17 +59,20 @@ export function ReviewOverlay({ boot }: { boot: BootstrapResponse }) {
   });
 
   const reviewTask = tl?.task;
+  const reviewTaskId = review && reviewTask ? reviewTask.taskId : '';
+  const reviewReadyWatermark =
+    review && reviewTask ? effectiveReadyWatermark(reviewTask, inboxByTask.get(reviewTask.taskId)) : 0;
+
   useEffect(() => {
-    if (!review || !reviewTask) return;
+    if (!reviewTaskId || reviewReadyWatermark <= 0) return;
     const markVisible = () => {
       if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return;
-      const readyAt = effectiveReadyAt(reviewTask, inboxByTask.get(reviewTask.taskId));
-      markTaskSeen(reviewTask.taskId, Math.max(Date.now(), readyAt));
+      markTaskSeen(reviewTaskId, reviewReadyWatermark);
     };
     markVisible();
     document.addEventListener('visibilitychange', markVisible);
     return () => document.removeEventListener('visibilitychange', markVisible);
-  }, [review, reviewTask, inboxByTask, markTaskSeen]);
+  }, [reviewTaskId, reviewReadyWatermark, markTaskSeen]);
 
   if (!review) return null;
 

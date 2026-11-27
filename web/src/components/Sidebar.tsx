@@ -74,6 +74,7 @@ function SidebarChildTree({
         deliveryCount: t.deliveryCount,
         attemptCount: 0,
         openApprovalCount: t.state === 'waiting_approval' ? 1 : 0,
+        version: t.version,
         createdAt: t.createdAt,
         updatedAt: t.updatedAt,
       }),

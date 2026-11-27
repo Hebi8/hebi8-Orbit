@@ -671,6 +671,7 @@ func applyStateFrameTx(
 	case protocol.AttemptSucceeded:
 		res.AttemptSucceeded = true
 		res.AutoConsumeQueue = true
+		hubNow := time.Now().UnixMilli()
 		// B9: Persist pending_queue_drain=1 inside the terminal transaction so Hub restarts
 		// between Outbox commit and queue consumption still deterministically drain the queue.
 		if _, err := tx.ExecContext(ctx, `
@@ -679,13 +680,13 @@ func applyStateFrameTx(
 			    pending_queue_drain = 1, pending_steer_input_id = NULL,
 			    version = version + 1, updated_at = ?
 			WHERE task_id = ? AND active_attempt_id = ?
-		`, ts, att.TaskID, att.AttemptID); err != nil {
+		`, hubNow, att.TaskID, att.AttemptID); err != nil {
 			return err
 		}
 		_, _ = tx.ExecContext(ctx, `
 			UPDATE inbox_items SET state = 'resolved', resolved_at = ?, updated_at = ?
 			WHERE inbox_id = ? AND state = 'open'
-		`, ts, ts, "inb:blk:"+att.AttemptID)
+		`, hubNow, hubNow, "inb:blk:"+att.AttemptID)
 
 		// B1: ONLY mark queued annotations addressed when a verified output delivery exists.
 		if att.OutputDeliveryID != "" {
@@ -1073,10 +1074,12 @@ func applyDeliveryPublishedFrameTx(
 		return err
 	}
 	// B4: Strictly guard latest_delivery_id mutation by active_attempt_id = att.AttemptID.
+	// Use Hub server clock for task/inbox projection timestamps so cross-machine Runner clock skew never leaks in.
+	hubNow := time.Now().UnixMilli()
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE tasks SET latest_delivery_id = ?, version = version + 1, updated_at = ?
 		WHERE task_id = ? AND active_attempt_id = ?
-	`, deliveryID, ts, att.TaskID, att.AttemptID); err != nil {
+	`, deliveryID, hubNow, att.TaskID, att.AttemptID); err != nil {
 		return err
 	}
 
@@ -1096,7 +1099,7 @@ func applyDeliveryPublishedFrameTx(
 			priority, state, created_at, updated_at
 		) VALUES (?, ?, ?, 'delivery_review', ?, ?, ?, 2, 'open', ?, ?)
 		ON CONFLICT(inbox_id) DO NOTHING
-	`, inboxID, att.ProjectID, att.TaskID, deliveryID, inboxTitle, inboxSummary, ts, ts); err != nil {
+	`, inboxID, att.ProjectID, att.TaskID, deliveryID, inboxTitle, inboxSummary, hubNow, hubNow); err != nil {
 		return err
 	}
 

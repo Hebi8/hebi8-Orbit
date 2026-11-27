@@ -90,7 +90,7 @@ export type EventKind = (typeof EventKindValues)[number];
 export const IDESchemeValues = ["cursor", "vscode", "zed", "antigravity"] as const;
 export type IDEScheme = (typeof IDESchemeValues)[number];
 
-export const WSMessageTypeValues = ["replay", "replay_end", "event", "ping"] as const;
+export const WSMessageTypeValues = ["replay", "replay_end", "event", "ping", "watch_ack"] as const;
 export type WSMessageType = (typeof WSMessageTypeValues)[number];
 
 export const WSClientMessageTypeValues = ["watch_attempts"] as const;
@@ -347,6 +347,7 @@ export interface InboxItemView {
   inboxId: string;
   projectId: string;
   taskId?: string;
+  taskVersion?: number;
   category: InboxCategory;
   refId: string;
   title: string;
@@ -573,6 +574,7 @@ export interface ChildTaskView {
   filesChanged?: number;
   insertions?: number;
   deletions?: number;
+  version: number;
   createdAt: number;
   updatedAt: number;
   archivedAt?: number | null;
@@ -644,6 +646,7 @@ export interface TaskSummary {
   deliveryCount: number;
   queuedInputCount: number;
   workerCount: number;
+  version: number;
   createdBy: TaskCreatedBy;
   createdAt: number;
   updatedAt: number;
@@ -931,6 +934,8 @@ export interface WSServerMessage {
   events?: EventRecord[];
   event?: EventRecord | null;
   replayHeadSeq?: number;
+  attemptIds?: string[];
+  seq?: number;
   serverTime?: number;
 }
 

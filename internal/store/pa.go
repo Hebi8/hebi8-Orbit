@@ -641,17 +641,23 @@ func (s *Store) BuildPABrief(
 		var err error
 		if projectID != "" {
 			iRows, err = tx.QueryContext(ctx, `
-				SELECT inbox_id, project_id, task_id, category, ref_id, title, summary,
-				       priority, state, created_at, updated_at, resolved_at
-				FROM inbox_items WHERE state = 'open' AND project_id = ?
-				ORDER BY priority ASC, updated_at DESC LIMIT 50
+				SELECT i.inbox_id, i.project_id, i.task_id, i.category, i.ref_id, i.title, i.summary,
+				       i.priority, i.state, i.created_at, i.updated_at, i.resolved_at,
+				       COALESCE(t.version, 0)
+				FROM inbox_items i
+				LEFT JOIN tasks t ON t.task_id = i.task_id
+				WHERE i.state = 'open' AND i.project_id = ?
+				ORDER BY i.priority ASC, i.updated_at DESC LIMIT 50
 			`, projectID)
 		} else {
 			iRows, err = tx.QueryContext(ctx, `
-				SELECT inbox_id, project_id, task_id, category, ref_id, title, summary,
-				       priority, state, created_at, updated_at, resolved_at
-				FROM inbox_items WHERE state = 'open'
-				ORDER BY priority ASC, updated_at DESC LIMIT 50
+				SELECT i.inbox_id, i.project_id, i.task_id, i.category, i.ref_id, i.title, i.summary,
+				       i.priority, i.state, i.created_at, i.updated_at, i.resolved_at,
+				       COALESCE(t.version, 0)
+				FROM inbox_items i
+				LEFT JOIN tasks t ON t.task_id = i.task_id
+				WHERE i.state = 'open'
+				ORDER BY i.priority ASC, i.updated_at DESC LIMIT 50
 			`)
 		}
 		if err != nil {

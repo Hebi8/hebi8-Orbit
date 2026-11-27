@@ -26,8 +26,9 @@ const (
 var errWSRevoked = errors.New("client websocket revoked")
 
 type brokerSub struct {
-	ch      chan struct{}
-	watched map[string]struct{}
+	ch       chan struct{}
+	watched  map[string]struct{}
+	watchGen uint64
 }
 
 // EventBroker is a pure signal-wake fan-out hub backed by SQLite's monotonic events table.
@@ -105,7 +106,6 @@ func (b *EventBroker) SetWatchedAttempts(sub *brokerSub, attemptIDs []string) {
 		b.mu.Unlock()
 		return
 	}
-	addedNew := false
 	for oldID := range sub.watched {
 		if _, keep := next[oldID]; !keep {
 			if watchers := b.attemptSubs[oldID]; watchers != nil {
@@ -118,7 +118,6 @@ func (b *EventBroker) SetWatchedAttempts(sub *brokerSub, attemptIDs []string) {
 	}
 	for newID := range next {
 		if _, existed := sub.watched[newID]; !existed {
-			addedNew = true
 			watchers := b.attemptSubs[newID]
 			if watchers == nil {
 				watchers = map[*brokerSub]struct{}{}
@@ -128,30 +127,36 @@ func (b *EventBroker) SetWatchedAttempts(sub *brokerSub, attemptIDs []string) {
 		}
 	}
 	sub.watched = next
-	if addedNew {
-		select {
-		case sub.ch <- struct{}{}:
-		default:
-		}
+	sub.watchGen++
+	select {
+	case sub.ch <- struct{}{}:
+	default:
 	}
 	b.mu.Unlock()
 }
 
-// WatchedAttempts returns a sorted snapshot of attemptIds currently watched by sub.
-func (b *EventBroker) WatchedAttempts(sub *brokerSub) []string {
+// WatchSnapshot returns the monotonic watch generation and a sorted snapshot of watched attemptIds.
+func (b *EventBroker) WatchSnapshot(sub *brokerSub) (uint64, []string) {
 	if sub == nil {
-		return nil
+		return 0, nil
 	}
 	b.mu.RLock()
 	defer b.mu.RUnlock()
+	gen := sub.watchGen
 	if len(sub.watched) == 0 {
-		return nil
+		return gen, nil
 	}
 	out := make([]string, 0, len(sub.watched))
 	for id := range sub.watched {
 		out = append(out, id)
 	}
 	sort.Strings(out)
+	return gen, out
+}
+
+// WatchedAttempts returns a sorted snapshot of attemptIds currently watched by sub.
+func (b *EventBroker) WatchedAttempts(sub *brokerSub) []string {
+	_, out := b.WatchSnapshot(sub)
 	return out
 }
 
@@ -546,9 +551,45 @@ func (s *Server) handleClientWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var lastAckedWatchGen uint64
+	flushWatchAck := func() error {
+		for {
+			if wsEntry.revoked.Load() || ctx.Err() != nil {
+				return context.Canceled
+			}
+			gen, watched := s.broker.WatchSnapshot(sub)
+			if gen == lastAckedWatchGen {
+				return nil
+			}
+			ackSeq, err := s.store.MaxEventSeq(ctx)
+			if err != nil {
+				return err
+			}
+			if lastSentSeq > ackSeq {
+				ackSeq = lastSentSeq
+			}
+			ackIDs := watched
+			if ackIDs == nil {
+				ackIDs = []string{}
+			}
+			if err := wsEntry.writeData(protocol.WSServerMessage{
+				Type:       protocol.WSMessageWatchAck,
+				AttemptIDs: ackIDs,
+				Seq:        ackSeq,
+				ServerTime: time.Now().UnixMilli(),
+			}, nil); err != nil {
+				return err
+			}
+			lastAckedWatchGen = gen
+		}
+	}
+
 	// Helper: drain all newly committed SQLite events with seq > lastSentSeq in paginated ascending order
 	drainLive := func() error {
 		for {
+			if err := flushWatchAck(); err != nil {
+				return err
+			}
 			if wsEntry.revoked.Load() || ctx.Err() != nil {
 				return context.Canceled
 			}
