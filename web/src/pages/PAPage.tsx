@@ -101,7 +101,6 @@ function Hebi8MainView({
   const hebi8SshHost = useMdLinkRecommendedSshHost(
     hebi8FileCtx.machineId,
     boot.machines,
-    boot.setup?.currentMachineId,
     drawerOpen && !!hebi8FileCtx.machineId,
   );
 
@@ -340,7 +339,6 @@ function Hebi8MainView({
                 machineId={hebi8FileCtx.machineId}
                 worktreePath={hebi8FileCtx.worktreePath}
                 machines={boot.machines}
-                localMachineId={boot.setup?.currentMachineId}
                 ideScheme={hebi8FileCtx.ideScheme}
                 recommendedSshHost={hebi8SshHost}
               >

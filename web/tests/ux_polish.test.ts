@@ -32,7 +32,12 @@ import {
   sessionMark,
   type SeenTaskMap,
 } from '../src/lib/format.ts';
-import { buildFileIDEJump, resolveSessionFileContext } from '../src/lib/ide.ts';
+import {
+  buildFileIDEJump,
+  resolveBoardMessageFileContext,
+  resolveClientLocalMachineId,
+  resolveSessionFileContext,
+} from '../src/lib/ide.ts';
 import {
   classifyMdHref,
   findFootnoteTargetInContainer,
@@ -715,11 +720,20 @@ test('Markdown link classification & file path parsing support file://, absolute
     isRelative: false,
   });
 
-  // 4. mailto: external links
+  // 4. mailto: external links (including percent-decoded header injection & control-char checks)
   assert.equal(classifyMdHref('mailto:user@example.com'), 'external');
   assert.equal(classifyMdHref('mailto:user@example.com?subject=Orbit'), 'external');
+  assert.equal(classifyMdHref('mailto:user@example.com?subject=Orbit%20Report&body=Line%201%0D%0ALine%202'), 'external');
+  assert.equal(classifyMdHref('mailto:user@example.com?body=Hello%0AWorld'), 'external');
   assert.equal(classifyMdHref('mailto:'), 'unsafe');
   assert.equal(classifyMdHref('mailto:javascript:alert(1)'), 'unsafe');
+  assert.equal(classifyMdHref('mailto:user%0a@example.com'), 'unsafe');
+  assert.equal(classifyMdHref('mailto:user%00@example.com'), 'unsafe');
+  assert.equal(classifyMdHref('mailto:user@example.com?subject=Hi%0d%0aBcc:evil@example.com'), 'unsafe');
+  assert.equal(classifyMdHref('mailto:user@example.com?cc=a@example.com%0ab@example.com'), 'unsafe');
+  assert.equal(classifyMdHref('mailto:user@example.com?bcc=a@example.com%00'), 'unsafe');
+  assert.equal(classifyMdHref('mailto:user@example.com?sub%0aject=hi'), 'unsafe');
+  assert.equal(classifyMdHref('mailto:user@example.com?body=Null%00Byte'), 'unsafe');
   assert.equal(parseMdFileHref('mailto:user@example.com'), null);
   assert.equal(parseMdFileHref('https://example.com/docs'), null);
 
@@ -1025,5 +1039,121 @@ test('buildFileIDEJump generates local and Remote-SSH URIs for Cursor, VS Code, 
       machines,
     }),
     { machineId: 'mac-node', worktreePath: undefined, ideScheme: 'zed' },
+  );
+
+  // 6. Remote client connecting to Linux Hub MUST NOT let Hub's currentMachineId override client localMachineId
+  assert.equal(
+    resolveClientLocalMachineId({
+      machines,
+      storedLocalId: 'mac-node',
+      hubCurrentMachineId: 'hub-node',
+      hostname: 'orbit.example.ts.net',
+    }),
+    'mac-node',
+  );
+  assert.equal(
+    resolveClientLocalMachineId({
+      machines,
+      storedLocalId: '',
+      hubCurrentMachineId: 'hub-node',
+      hostname: 'orbit.example.ts.net',
+    }),
+    '',
+  );
+  assert.equal(
+    resolveClientLocalMachineId({
+      machines,
+      storedLocalId: '',
+      hubCurrentMachineId: 'hub-node',
+      hostname: '127.0.0.1',
+    }),
+    'hub-node',
+  );
+  const macToLinuxHub = buildFileIDEJump({
+    scheme: 'cursor',
+    path: '/home/orbit/main.go',
+    line: 42,
+    machineId: 'hub-node',
+    localMachineId: 'mac-node',
+    hubCurrentMachineId: 'hub-node',
+    hostname: 'orbit.example.ts.net',
+    machines,
+    customSshHost: '',
+  });
+  assert.equal(macToLinuxHub?.mode, 'ssh');
+  assert.equal(macToLinuxHub?.uri, 'cursor://vscode-remote/ssh-remote+hub-ssh/home/orbit/main.go:42');
+
+  // 7. Historical artifact deliveryId resolves its exact delivery & matching attempt (not latest attempt)
+  const newerDelivery: DeliveryView = {
+    ...delivery,
+    deliveryId: 'dlv_2',
+    attemptId: 'att_2',
+    sourceMachineId: 'hub-node',
+    manifest: { filesChanged: 1, insertions: 1, deletions: 0, worktreePath: '/home/orbit/wt/dlv2' },
+  };
+  assert.deepEqual(
+    resolveSessionFileContext({
+      task: { requiredCapability: 'primary-dev', latestDeliveryId: 'dlv_2' },
+      attempts: [
+        { attemptId: 'att_1', machineId: 'aux-node', worktreePath: '/home/orbit/wt/att1', outputDeliveryId: 'dlv_1' },
+        { attemptId: 'att_2', machineId: 'hub-node', worktreePath: '/home/orbit/wt/att2', outputDeliveryId: 'dlv_2' },
+      ],
+      deliveryId: 'dlv_1',
+      deliveries: [delivery, newerDelivery],
+      project,
+      machines,
+    }),
+    { machineId: 'aux-node', worktreePath: '/home/orbit/wt/att1', ideScheme: 'zed' },
+  );
+  // Historical delivery without matching attempt row still resolves directly from that delivery (not latest attempt)
+  assert.deepEqual(
+    resolveSessionFileContext({
+      task: { requiredCapability: 'primary-dev', latestDeliveryId: 'dlv_2' },
+      attempts: [
+        { attemptId: 'att_2', machineId: 'hub-node', worktreePath: '/home/orbit/wt/att2', outputDeliveryId: 'dlv_2' },
+      ],
+      deliveryId: 'dlv_1',
+      deliveries: [delivery, newerDelivery],
+      project,
+      machines,
+    }),
+    { machineId: 'aux-node', worktreePath: '/home/orbit/wt/dlv', ideScheme: 'zed' },
+  );
+
+  // 8. BoardPanel sender scoping: child senders use their own machineId and NEVER inherit parent worktreePath (even same machine)
+  const boardChildren: ChildTaskView[] = [
+    makeChild({ taskId: 'tsk_c_remote', parentTaskId: 'tsk_p', title: 'Aux Worker', machineId: 'aux-node' }),
+    makeChild({ taskId: 'tsk_c_same', parentTaskId: 'tsk_p', title: 'Same Host Child', machineId: 'hub-node' }),
+  ];
+  assert.deepEqual(
+    resolveBoardMessageFileContext({
+      authorName: 'human',
+      parentTaskId: 'tsk_p',
+      parentTaskTitle: 'Main Task',
+      parentMachineId: 'hub-node',
+      parentWorktreePath: '/home/orbit/parent-wt',
+      childrenList: boardChildren,
+    }),
+    { machineId: 'hub-node', worktreePath: '/home/orbit/parent-wt' },
+  );
+  assert.deepEqual(
+    resolveBoardMessageFileContext({
+      authorName: 'tsk_c_remote',
+      parentTaskId: 'tsk_p',
+      parentMachineId: 'hub-node',
+      parentWorktreePath: '/home/orbit/parent-wt',
+      childrenList: boardChildren,
+    }),
+    { machineId: 'aux-node', worktreePath: undefined },
+  );
+  assert.deepEqual(
+    resolveBoardMessageFileContext({
+      authorName: 'Same Host Child',
+      parentTaskId: 'tsk_p',
+      parentMachineId: 'hub-node',
+      parentWorktreePath: '/home/orbit/parent-wt',
+      childrenList: boardChildren,
+    }),
+    { machineId: 'hub-node', worktreePath: undefined },
   );
 });

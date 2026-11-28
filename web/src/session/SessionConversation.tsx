@@ -227,7 +227,6 @@ export function SessionConversation({
   const recommendedSshHost = useMdLinkRecommendedSshHost(
     sessionFileCtx.machineId,
     boot?.machines,
-    boot?.setup?.currentMachineId,
   );
   const needsVerifyAttemptId = !task.activeAttemptId && lastAttempt?.state === 'needs_verification' ? lastAttempt.attemptId : undefined;
   const pendingInputs = [...tl.pendingInputs].sort((a, b) => a.position - b.position || a.createdAt - b.createdAt);
@@ -297,7 +296,6 @@ export function SessionConversation({
       machineId={sessionFileCtx.machineId}
       worktreePath={sessionFileCtx.worktreePath}
       machines={boot?.machines}
-      localMachineId={boot?.setup?.currentMachineId}
       ideScheme={sessionFileCtx.ideScheme}
       recommendedSshHost={recommendedSshHost}
     >

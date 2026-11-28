@@ -61,26 +61,37 @@ export function ReviewOverlay({ boot }: { boot: BootstrapResponse }) {
   });
 
   const reviewTask = tl?.task;
+  const activeArtifact = useMemo(
+    () =>
+      review?.tab === 'art'
+        ? sessionArtifacts.find((a) => a.artifactId === review.artifactId) ??
+          sessionArtifacts.find((a) => a.deliveryId === review.deliveryId) ??
+          sessionArtifacts[0]
+        : undefined,
+    [review?.tab, review?.artifactId, review?.deliveryId, sessionArtifacts],
+  );
+  const activeDeliveryId = (review?.tab === 'art' ? activeArtifact?.deliveryId : undefined) ?? review?.deliveryId;
   const reviewProject = useMemo(
     () => (reviewTask ? boot.projects.find((p) => p.projectId === reviewTask.projectId) : undefined),
     [boot.projects, reviewTask],
   );
-  const reviewFileCtx = useMemo(() => {
-    const lastAtt = tl?.attempts?.[tl.attempts.length - 1];
-    return resolveSessionFileContext({
-      task: reviewTask,
-      attempt: lastAtt,
-      deliveries: tl?.deliveries,
-      project: reviewProject,
-      machines: boot.machines,
-      runtimeConfig: tl?.runtimeConfig,
-      activeDutyMachineId: boot.setup?.activeDutyMachineId,
-    });
-  }, [reviewTask, tl?.attempts, tl?.deliveries, tl?.runtimeConfig, reviewProject, boot.machines, boot.setup?.activeDutyMachineId]);
+  const reviewFileCtx = useMemo(
+    () =>
+      resolveSessionFileContext({
+        task: reviewTask,
+        attempts: tl?.attempts,
+        deliveryId: activeDeliveryId,
+        deliveries: tl?.deliveries,
+        project: reviewProject,
+        machines: boot.machines,
+        runtimeConfig: tl?.runtimeConfig,
+        activeDutyMachineId: boot.setup?.activeDutyMachineId,
+      }),
+    [reviewTask, tl?.attempts, activeDeliveryId, tl?.deliveries, tl?.runtimeConfig, reviewProject, boot.machines, boot.setup?.activeDutyMachineId],
+  );
   const reviewSshHost = useMdLinkRecommendedSshHost(
     reviewFileCtx.machineId,
     boot.machines,
-    boot.setup?.currentMachineId,
     !!review && review.tab === 'art' && !!reviewFileCtx.machineId,
   );
   const reviewTaskId = review && reviewTask ? reviewTask.taskId : '';
@@ -110,12 +121,6 @@ export function ReviewOverlay({ boot }: { boot: BootstrapResponse }) {
     deliveries.find((d) => CODE_KINDS.has(d.kind));
 
   const openDiffComments = (tl?.annotations ?? []).filter((a) => a.status === 'open' && a.source !== 'ryugi').length;
-  const activeArtifact =
-    review.tab === 'art'
-      ? sessionArtifacts.find((a) => a.artifactId === review.artifactId) ??
-        sessionArtifacts.find((a) => a.deliveryId === review.deliveryId) ??
-        sessionArtifacts[0]
-      : undefined;
 
   const ratio = reviewRatios[review.tab];
 
@@ -254,7 +259,6 @@ export function ReviewOverlay({ boot }: { boot: BootstrapResponse }) {
                 machineId={reviewFileCtx.machineId}
                 worktreePath={reviewFileCtx.worktreePath}
                 machines={boot.machines}
-                localMachineId={boot.setup?.currentMachineId}
                 ideScheme={reviewFileCtx.ideScheme}
                 recommendedSshHost={reviewSshHost}
               >

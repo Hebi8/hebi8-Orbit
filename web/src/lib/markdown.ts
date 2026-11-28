@@ -79,6 +79,9 @@ function normalizeHomePosix(p: string): string {
   return stack.length > 0 ? `~/${stack.join('/')}` : '~';
 }
 
+/** Matches ASCII control chars other than CR/LF/TAB (still forbidden even inside `mailto:` `body`). */
+const STRICT_BODY_CONTROL_CHAR_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/;
+
 function isSafeMailtoHref(s: string): boolean {
   if (!/^mailto:/i.test(s)) return false;
   const body = s.slice(7);
@@ -86,11 +89,37 @@ function isSafeMailtoHref(s: string): boolean {
   const qIdx = body.indexOf('?');
   const addrPart = qIdx >= 0 ? body.slice(0, qIdx) : body;
   const queryPart = qIdx >= 0 ? body.slice(qIdx + 1) : '';
-  if (!addrPart) {
-    return queryPart.length > 0;
+  if (!addrPart && !queryPart) return false;
+
+  if (addrPart) {
+    const recipients = addrPart.split(',');
+    for (const r of recipients) {
+      if (!MAILTO_RECIPIENT_RE.test(r)) return false;
+      const decoded = decodePercentSafe(r);
+      if (CONTROL_CHAR_RE.test(decoded) || !MAILTO_RECIPIENT_RE.test(decoded)) {
+        return false;
+      }
+    }
   }
-  const recipients = addrPart.split(',');
-  return recipients.length > 0 && recipients.every((r) => MAILTO_RECIPIENT_RE.test(r));
+
+  if (queryPart) {
+    for (const pair of queryPart.split('&')) {
+      if (!pair) continue;
+      const eqIdx = pair.indexOf('=');
+      const rawKey = eqIdx >= 0 ? pair.slice(0, eqIdx) : pair;
+      const rawVal = eqIdx >= 0 ? pair.slice(eqIdx + 1) : '';
+      const decodedKey = decodePercentSafe(rawKey);
+      const decodedVal = decodePercentSafe(rawVal);
+      if (CONTROL_CHAR_RE.test(decodedKey)) return false;
+      if (decodedKey.toLowerCase() === 'body') {
+        if (STRICT_BODY_CONTROL_CHAR_RE.test(decodedVal)) return false;
+      } else if (CONTROL_CHAR_RE.test(decodedVal)) {
+        return false;
+      }
+    }
+  }
+
+  return true;
 }
 
 /**

@@ -19,7 +19,7 @@ import {
   getCustomSshAlias,
   ideLabel,
   launchIDE,
-  resolveEffectiveLocalMachineId,
+  resolveClientLocalMachineId,
 } from '../lib/ide';
 import {
   classifyMdHref,
@@ -40,7 +40,7 @@ export {
 
 export interface MdLinkContextValue {
   machineId?: string;
-  worktreePath?: string;
+  worktreePath?: string | null;
   machines?: MachineView[];
   localMachineId?: string;
   ideScheme?: IDEScheme;
@@ -54,35 +54,53 @@ const EMPTY_MACHINES: MachineView[] = [];
 /**
  * Provides execution-machine and working-directory context so `<Md />` file links
  * can resolve relative paths and jump straight into the user's preferred IDE (local or Remote-SSH).
+ * Passing `worktreePath={undefined}` or `worktreePath={null}` explicitly clears any outer `worktreePath`
+ * even when staying on the same machine (preventing parent/child worktree bleed-through).
  */
-export function MdLinkProvider({
-  machineId,
-  worktreePath,
-  machines,
-  localMachineId,
-  ideScheme,
-  recommendedSshHost,
-  children,
-}: MdLinkContextValue & { children: ReactNode }) {
+export function MdLinkProvider(props: MdLinkContextValue & { children: ReactNode }) {
+  const {
+    machineId,
+    worktreePath,
+    machines,
+    localMachineId,
+    ideScheme,
+    recommendedSshHost,
+    children,
+  } = props;
+  const hasMachineId = 'machineId' in props;
+  const hasWorktreePath = 'worktreePath' in props;
+  const hasMachines = 'machines' in props;
+  const hasLocalMachineId = 'localMachineId' in props;
+  const hasIdeScheme = 'ideScheme' in props;
+  const hasRecommendedSsh = 'recommendedSshHost' in props;
+
   const parent = useContext(MdLinkContext);
   const value = useMemo<MdLinkContextValue>(() => {
-    const resolvedMachineId = machineId !== undefined ? machineId : parent.machineId;
+    const resolvedMachineId = hasMachineId ? machineId || undefined : parent.machineId;
     const machineChanged = resolvedMachineId !== parent.machineId;
     return {
       machineId: resolvedMachineId,
-      worktreePath:
-        worktreePath !== undefined ? worktreePath : machineChanged ? undefined : parent.worktreePath,
-      machines: machines !== undefined ? machines : parent.machines,
-      localMachineId: localMachineId !== undefined ? localMachineId : parent.localMachineId,
-      ideScheme: ideScheme !== undefined ? ideScheme : parent.ideScheme,
-      recommendedSshHost:
-        recommendedSshHost !== undefined
-          ? recommendedSshHost
-          : machineChanged
-            ? undefined
-            : parent.recommendedSshHost,
+      worktreePath: hasWorktreePath
+        ? worktreePath || undefined
+        : machineChanged
+          ? undefined
+          : parent.worktreePath,
+      machines: hasMachines ? machines : parent.machines,
+      localMachineId: hasLocalMachineId ? localMachineId : parent.localMachineId,
+      ideScheme: hasIdeScheme ? ideScheme : parent.ideScheme,
+      recommendedSshHost: hasRecommendedSsh
+        ? recommendedSshHost || undefined
+        : machineChanged
+          ? undefined
+          : parent.recommendedSshHost,
     };
   }, [
+    hasMachineId,
+    hasWorktreePath,
+    hasMachines,
+    hasLocalMachineId,
+    hasIdeScheme,
+    hasRecommendedSsh,
     machineId,
     worktreePath,
     machines,
@@ -121,7 +139,12 @@ function MdFileLink({ id, rawHref, children }: { id?: string; rawHref: string; c
   const parsed = useMemo(() => parseMdFileHref(rawHref, ctx.worktreePath), [rawHref, ctx.worktreePath]);
   const machines = ctx.machines ?? EMPTY_MACHINES;
   const scheme: IDEScheme = preferredIDE || ctx.ideScheme || 'cursor';
-  const effectiveLocalId = resolveEffectiveLocalMachineId(machines, ctx.localMachineId || storedLocalId);
+  // Strictly prefer the client's stored localMachineId (aligned with IdeOpenButton);
+  // never let a remote Hub's machine identity override local detection.
+  const effectiveLocalId = resolveClientLocalMachineId({
+    machines,
+    storedLocalId: storedLocalId || ctx.localMachineId,
+  });
 
   const customAlias = useMemo(() => {
     void sshAliasRev;

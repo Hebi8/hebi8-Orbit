@@ -768,45 +768,55 @@ export function Turn({
   const turnRecommendedSsh = useMdLinkRecommendedSshHost(
     turnMachineId,
     machines ?? parentLinkCtx.machines,
-    parentLinkCtx.localMachineId,
     turnMachineDiffers,
   );
 
-  const childResultMachineId = useMemo(() => {
-    if (!isChildResult || !attempt.childResult?.childTaskId) return undefined;
+  const childResultCtx = useMemo(() => {
+    if (!isChildResult) return null;
+    const childTaskId = attempt.childResult?.childTaskId;
+    const childDeliveryId = attempt.childResult?.deliveryId;
+    const childDelivery =
+      childDeliveryId && childTaskId
+        ? tl.deliveries.find((d) => d.deliveryId === childDeliveryId && d.taskId === childTaskId)
+        : undefined;
     const pool = childrenList ?? tl.children ?? [];
-    return pool.find((c) => c.taskId === attempt.childResult?.childTaskId)?.machineId || undefined;
-  }, [isChildResult, attempt.childResult?.childTaskId, childrenList, tl.children]);
-  const childResultMachineDiffers = !!childResultMachineId && childResultMachineId !== turnMachineId;
+    const matchedChild = childTaskId ? pool.find((c) => c.taskId === childTaskId) : undefined;
+    const machineId = childDelivery?.sourceMachineId || matchedChild?.machineId || turnMachineId;
+    const rawChildWorktree = childDelivery?.manifest?.worktreePath?.trim() ?? '';
+    const worktreePath =
+      rawChildWorktree.startsWith('/') || rawChildWorktree.startsWith('~/') ? rawChildWorktree : undefined;
+    return { machineId, worktreePath };
+  }, [isChildResult, attempt.childResult?.childTaskId, attempt.childResult?.deliveryId, tl.deliveries, childrenList, tl.children, turnMachineId]);
+  const childResultMachineDiffers = !!childResultCtx?.machineId && childResultCtx.machineId !== turnMachineId;
   const childResultRecommendedSsh = useMdLinkRecommendedSshHost(
-    childResultMachineId,
+    childResultCtx?.machineId,
     machines ?? parentLinkCtx.machines,
-    parentLinkCtx.localMachineId,
     childResultMachineDiffers,
   );
+
+  const delegatedSenderCtx = useMemo(() => {
+    if (!delegatedInbound) return null;
+    const sibMatch = (siblingChildren ?? tl.siblingChildren ?? []).find((s) => s.taskId === delegatedInbound.fromId);
+    const machineId = sibMatch?.machineId || turnMachineId;
+    return { machineId, worktreePath: undefined as string | undefined };
+  }, [delegatedInbound, siblingChildren, tl.siblingChildren, turnMachineId]);
+  const delegatedMachineDiffers = !!delegatedSenderCtx?.machineId && delegatedSenderCtx.machineId !== turnMachineId;
+  const delegatedRecommendedSsh = useMdLinkRecommendedSshHost(
+    delegatedSenderCtx?.machineId,
+    machines ?? parentLinkCtx.machines,
+    delegatedMachineDiffers,
+  );
+
+  const effectiveTurnSsh = turnMachineDiffers ? turnRecommendedSsh : parentLinkCtx.recommendedSshHost;
 
   const turnContent = (
     <div className="turn" id={`turn-${attempt.attemptId}`} data-turn={index}>
       {!isPA && isChildResult ? (
-        childResultMachineDiffers ? (
-          <MdLinkProvider machineId={childResultMachineId} recommendedSshHost={childResultRecommendedSsh}>
-            <InboundCommRail
-              title={attempt.childResult?.childTitle || attempt.childResult?.childTaskId || '子会话'}
-              bodyMd={childResultMd}
-              time={hhmm(attempt.startedAt)}
-              isFailed={
-                attempt.childResult?.childState === 'failed' ||
-                attempt.childResult?.childState === 'expired' ||
-                attempt.childResult?.childState === 'cancelled'
-              }
-              insertions={attempt.childResult?.insertions ?? 0}
-              deletions={attempt.childResult?.deletions ?? 0}
-              targetTaskId={attempt.childResult?.childTaskId}
-              openLinkLabel={onOpenChild ? '分屏查看' : '打开会话'}
-              onOpenTarget={onOpenChild}
-            />
-          </MdLinkProvider>
-        ) : (
+        <MdLinkProvider
+          machineId={childResultCtx?.machineId}
+          worktreePath={childResultCtx?.worktreePath}
+          recommendedSshHost={childResultMachineDiffers ? childResultRecommendedSsh : effectiveTurnSsh}
+        >
           <InboundCommRail
             title={attempt.childResult?.childTitle || attempt.childResult?.childTaskId || '子会话'}
             bodyMd={childResultMd}
@@ -822,16 +832,22 @@ export function Turn({
             openLinkLabel={onOpenChild ? '分屏查看' : '打开会话'}
             onOpenTarget={onOpenChild}
           />
-        )
+        </MdLinkProvider>
       ) : !isPA && delegatedInbound ? (
-        <InboundCommRail
-          title={delegatedInbound.senderTitle}
-          bodyMd={stripSystemWakeupBoilerplate(prompt.text || attempt.promptText || '')}
-          time={hhmm(attempt.startedAt)}
-          targetTaskId={delegatedInbound.fromId}
-          openLinkLabel={delegatedInbound.relation === 'sibling' && onOpenChild ? '切换查看' : '打开会话'}
-          onOpenTarget={delegatedInbound.relation === 'sibling' ? onOpenChild : undefined}
-        />
+        <MdLinkProvider
+          machineId={delegatedSenderCtx?.machineId}
+          worktreePath={undefined}
+          recommendedSshHost={delegatedMachineDiffers ? delegatedRecommendedSsh : effectiveTurnSsh}
+        >
+          <InboundCommRail
+            title={delegatedInbound.senderTitle}
+            bodyMd={stripSystemWakeupBoilerplate(prompt.text || attempt.promptText || '')}
+            time={hhmm(attempt.startedAt)}
+            targetTaskId={delegatedInbound.fromId}
+            openLinkLabel={delegatedInbound.relation === 'sibling' && onOpenChild ? '切换查看' : '打开会话'}
+            onOpenTarget={delegatedInbound.relation === 'sibling' ? onOpenChild : undefined}
+          />
+        </MdLinkProvider>
       ) : (
         <div className="it u">
           {attempt.refTasks && attempt.refTasks.length > 0 && (

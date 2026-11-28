@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { Check, ChevronDown, Maximize2, X } from 'lucide-react';
-import type { BoardMemberCursor, BootstrapResponse, ChildTaskView, InboxItemView } from '../generated/protocol';
+import type { BoardMemberCursor, BootstrapResponse, ChildTaskView, IDEScheme, InboxItemView } from '../generated/protocol';
 import { MdLinkProvider } from '../components/Md';
 import { StatusMark } from '../components/StatusMark';
 import { useMdLinkRecommendedSshHost, useTimeline } from '../hooks/queries';
@@ -194,6 +194,9 @@ function SubsessionSwitcher({
 export function ChildSessionDrawer({
   boot,
   parentTaskId,
+  parentMachineId,
+  parentWorktreePath,
+  parentIdeScheme,
   childTaskId,
   nativeMember,
   childrenList,
@@ -206,6 +209,9 @@ export function ChildSessionDrawer({
   boot: BootstrapResponse;
   parentTaskId: string;
   parentProjectId?: string;
+  parentMachineId?: string;
+  parentWorktreePath?: string;
+  parentIdeScheme?: IDEScheme;
   childTaskId?: string;
   nativeMember?: BoardMemberCursor;
   childrenList: ChildTaskView[];
@@ -263,11 +269,13 @@ export function ChildSessionDrawer({
   }, [childTaskId, childReadyWatermark, markTaskSeen]);
 
   const childArtifacts = useMemo(() => collectSessionArtifacts(childTl), [childTl]);
+  const nativeMachineId = nativeMember?.machineId || parentMachineId;
+  const nativeWorktreePath =
+    nativeMachineId && parentMachineId && nativeMachineId !== parentMachineId ? undefined : parentWorktreePath;
   const nativeSshHost = useMdLinkRecommendedSshHost(
-    nativeMember?.machineId,
+    nativeMachineId,
     boot.machines,
-    boot.setup?.currentMachineId,
-    !childTaskId && !!nativeMember?.machineId,
+    !childTaskId && !!nativeMember && !!nativeMachineId,
   );
 
   // Native subagent / swarm member read-only inspection view
@@ -317,9 +325,10 @@ export function ChildSessionDrawer({
           )}
           <div className="csd-native-stream">
             <MdLinkProvider
-              machineId={nativeMember.machineId}
+              machineId={nativeMachineId}
+              worktreePath={nativeWorktreePath}
               machines={boot.machines}
-              localMachineId={boot.setup?.currentMachineId}
+              ideScheme={parentIdeScheme}
               recommendedSshHost={nativeSshHost}
             >
               <WorkerStream taskId={parentTaskId} worker={nativeMember.memberName} member={nativeMember} inDrawer />

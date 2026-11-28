@@ -523,7 +523,7 @@ export function SessionPage({
 
   const mark = sessionMark(task, inboxByTask.get(task.taskId) ?? [], seenTasks);
   const lastAttempt = tl.attempts[tl.attempts.length - 1];
-  const boardFileCtx = resolveSessionFileContext({
+  const sessionFileCtx = resolveSessionFileContext({
     task,
     attempt: lastAttempt,
     deliveries: tl.deliveries,
@@ -971,6 +971,9 @@ export function SessionPage({
               boot={boot}
               parentTaskId={taskId}
               parentProjectId={task.projectId}
+              parentMachineId={sessionFileCtx.machineId}
+              parentWorktreePath={sessionFileCtx.worktreePath}
+              parentIdeScheme={sessionFileCtx.ideScheme}
               childTaskId={effectiveChildId}
               nativeMember={activeNativeMember}
               childrenList={childrenList}
@@ -992,14 +995,14 @@ export function SessionPage({
               {boardOpen ? (
                 <BoardPanel
                   taskId={taskId}
+                  parentTaskTitle={task.title}
                   board={boardQ.data}
                   fallbackMembers={members}
                   childrenList={childrenList}
                   machines={boot.machines}
-                  machineId={boardFileCtx.machineId}
-                  worktreePath={boardFileCtx.worktreePath}
-                  localMachineId={boot.setup?.currentMachineId}
-                  ideScheme={boardFileCtx.ideScheme}
+                  machineId={sessionFileCtx.machineId}
+                  worktreePath={sessionFileCtx.worktreePath}
+                  ideScheme={sessionFileCtx.ideScheme}
                   inboxByTask={inboxByTask}
                   worker={effectiveWorker}
                   onOpenChild={openChildDrawer}

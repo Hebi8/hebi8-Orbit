@@ -26,6 +26,7 @@ import {
   type SessionMark,
 } from '../lib/format';
 import { resolveManualBoardMention } from '../lib/boardMention';
+import { resolveBoardMessageFileContext } from '../lib/ide';
 import { useImeGuard } from '../lib/ime';
 import { navigate, paths } from '../lib/router';
 import { toast, useWorkbenchStore } from '../store/useWorkbenchStore';
@@ -58,16 +59,70 @@ function nativeMemberMark(m: BoardMemberCursor): SessionMark {
   }
 }
 
+function BoardMessageMd({
+  body,
+  authorName,
+  parentTaskId,
+  parentTaskTitle,
+  parentMachineId,
+  parentWorktreePath,
+  childrenList,
+  members,
+  machines,
+  ideScheme,
+  parentRecommendedSsh,
+}: {
+  body: string;
+  authorName: string;
+  parentTaskId: string;
+  parentTaskTitle?: string;
+  parentMachineId?: string;
+  parentWorktreePath?: string;
+  childrenList: ChildTaskView[];
+  members: BoardMemberCursor[];
+  machines: MachineView[];
+  ideScheme?: IDEScheme;
+  parentRecommendedSsh?: string;
+}) {
+  const senderCtx = useMemo(
+    () =>
+      resolveBoardMessageFileContext({
+        authorName,
+        parentTaskId,
+        parentTaskTitle,
+        parentMachineId,
+        parentWorktreePath,
+        childrenList,
+        members,
+      }),
+    [authorName, parentTaskId, parentTaskTitle, parentMachineId, parentWorktreePath, childrenList, members],
+  );
+  const machineDiffers = !!senderCtx.machineId && senderCtx.machineId !== parentMachineId;
+  const senderSshHost = useMdLinkRecommendedSshHost(senderCtx.machineId, machines, machineDiffers);
+
+  return (
+    <MdLinkProvider
+      machineId={senderCtx.machineId}
+      worktreePath={senderCtx.worktreePath}
+      machines={machines}
+      ideScheme={ideScheme}
+      recommendedSshHost={machineDiffers ? senderSshHost : parentRecommendedSsh}
+    >
+      <Md text={body} />
+    </MdLinkProvider>
+  );
+}
+
 /** Expanded right panel: ordered #seq shared board with first-class child sessions, native swarm cursors, and @mention composer. */
 export function BoardPanel({
   taskId,
+  parentTaskTitle,
   board,
   fallbackMembers,
   childrenList = [],
   machines = [],
   machineId,
   worktreePath,
-  localMachineId,
   ideScheme,
   inboxByTask,
   worker,
@@ -76,13 +131,13 @@ export function BoardPanel({
   onSelectMember,
 }: {
   taskId: string;
+  parentTaskTitle?: string;
   board?: TaskBoardResponse;
   fallbackMembers: BoardMemberCursor[];
   childrenList?: ChildTaskView[];
   machines?: MachineView[];
   machineId?: string;
   worktreePath?: string;
-  localMachineId?: string;
   ideScheme?: IDEScheme;
   inboxByTask?: ReadonlyMap<string, InboxItemView[]>;
   worker?: string;
@@ -93,7 +148,7 @@ export function BoardPanel({
   const qc = useQueryClient();
   const seenTasks = useWorkbenchStore((s) => s.seenTasks);
   const ime = useImeGuard();
-  const recommendedSshHost = useMdLinkRecommendedSshHost(machineId, machines, localMachineId);
+  const recommendedSshHost = useMdLinkRecommendedSshHost(machineId, machines);
   const members = board?.members ?? fallbackMembers;
   const [olderMessages, setOlderMessages] = useState<TaskBoardResponse['messages']>([]);
   const [olderHasMore, setOlderHasMore] = useState<boolean | null>(null);
@@ -280,14 +335,6 @@ export function BoardPanel({
       : participants.find((p) => p.mentionValue === target)?.label.replace(/^@/, '') || formatActorOrMention(target);
 
   return (
-    <MdLinkProvider
-      machineId={machineId}
-      worktreePath={worktreePath}
-      machines={machines}
-      localMachineId={localMachineId}
-      ideScheme={ideScheme}
-      recommendedSshHost={recommendedSshHost}
-    >
       <aside className="board" aria-label="共享消息板">
       <div className="bh">
         <span className="t">共享消息板</span>
@@ -366,7 +413,19 @@ export function BoardPanel({
                     </span>
                   )}
                   <div className="body2 bm-body">
-                    <Md text={msg.body} />
+                    <BoardMessageMd
+                      body={msg.body}
+                      authorName={msg.authorName}
+                      parentTaskId={taskId}
+                      parentTaskTitle={parentTaskTitle}
+                      parentMachineId={machineId}
+                      parentWorktreePath={worktreePath}
+                      childrenList={childrenList}
+                      members={members}
+                      machines={machines}
+                      ideScheme={ideScheme}
+                      parentRecommendedSsh={recommendedSshHost}
+                    />
                   </div>
                   <div className="bell">
                     <span>{hhmm(msg.createdAt)}</span>
@@ -439,6 +498,5 @@ export function BoardPanel({
         </div>
       </div>
     </aside>
-    </MdLinkProvider>
   );
 }

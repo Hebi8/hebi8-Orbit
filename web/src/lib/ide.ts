@@ -1,4 +1,6 @@
 import type {
+  BoardMemberCursor,
+  ChildTaskView,
   DeliveryView,
   IDEScheme,
   MachineView,
@@ -80,19 +82,41 @@ export function formatVsCodeRemoteAuthority(target: string): string {
 }
 
 /**
+ * Resolves the client's effective local machine ID for IDE URI generation (`IdeOpenButton`, `<Md />`, SSH query hook):
+ * - Strictly prefers the client's explicit `storedLocalId` (set by local device identity / Settings override),
+ *   so a remote Hub's `setup.currentMachineId` can NEVER override the client machine and misclassify a remote
+ *   Linux machine as local.
+ * - Falls back to loopback detection (`localhost`/`127.0.0.1`/`::1`) only when `storedLocalId` is empty,
+ *   ignoring `hubCurrentMachineId` whenever connected over a non-loopback remote origin.
+ */
+export function resolveClientLocalMachineId(params: {
+  machines: MachineView[];
+  storedLocalId?: string;
+  hubCurrentMachineId?: string;
+  hostname?: string;
+}): string {
+  const stored = (params.storedLocalId ?? '').trim();
+  if (stored) return stored;
+  const host =
+    params.hostname !== undefined
+      ? params.hostname
+      : typeof window !== 'undefined'
+        ? window.location.hostname
+        : '';
+  const isLoopback = host === '127.0.0.1' || host === 'localhost' || host === '::1';
+  if (!isLoopback) return '';
+  const hubLocal = (params.hubCurrentMachineId ?? '').trim();
+  if (hubLocal) return hubLocal;
+  const localWs = params.machines.find((m) => m.transportMode === 'local_ws');
+  return localWs ? localWs.machineId : '';
+}
+
+/**
  * Best-effort local machine detection: if opened on localhost/127.0.0.1, matches the hub's local_ws machine;
  * otherwise honours an explicit localMachineId override if set.
  */
 export function resolveEffectiveLocalMachineId(machines: MachineView[], storedLocalId: string): string {
-  if (storedLocalId) return storedLocalId;
-  if (typeof window !== 'undefined') {
-    const h = window.location.hostname;
-    if (h === '127.0.0.1' || h === 'localhost' || h === '::1') {
-      const localWs = machines.find((m) => m.transportMode === 'local_ws');
-      if (localWs) return localWs.machineId;
-    }
-  }
-  return '';
+  return resolveClientLocalMachineId({ machines, storedLocalId });
 }
 
 /**
@@ -320,6 +344,8 @@ export function buildFileIDEJump(params: {
   column?: number;
   machineId?: string;
   localMachineId?: string;
+  hubCurrentMachineId?: string;
+  hostname?: string;
   machines?: MachineView[];
   recommendedSshHost?: string;
   customSshHost?: string;
@@ -331,6 +357,8 @@ export function buildFileIDEJump(params: {
     column,
     machineId,
     localMachineId = '',
+    hubCurrentMachineId,
+    hostname,
     machines = [],
     recommendedSshHost,
     customSshHost,
@@ -349,7 +377,12 @@ export function buildFileIDEJump(params: {
   const lineSuffix = validLine ? (validCol ? `:${validLine}:${validCol}` : `:${validLine}`) : '';
 
   const targetMachine = (machineId ?? '').trim();
-  const effectiveLocal = resolveEffectiveLocalMachineId(machines, localMachineId);
+  const effectiveLocal = resolveClientLocalMachineId({
+    machines,
+    storedLocalId: localMachineId,
+    hubCurrentMachineId,
+    hostname,
+  });
   const proto: IDEScheme = scheme || 'cursor';
   const isLocal = !targetMachine || (effectiveLocal !== '' && effectiveLocal === targetMachine);
 
@@ -384,31 +417,59 @@ export function buildFileIDEJump(params: {
   };
 }
 
-/** Resolves the effective execution machine, working directory, and project IDE scheme for a session or turn. */
+/** Resolves the effective execution machine, working directory, and project IDE scheme for a session, turn, or specific delivery. */
 export function resolveSessionFileContext(params: {
   task?: { requiredCapability?: string; latestDeliveryId?: string };
   attempt?: { machineId?: string; worktreePath?: string; partId?: string; locationId?: string; outputDeliveryId?: string };
+  attempts?: Array<{
+    attemptId: string;
+    machineId?: string;
+    worktreePath?: string;
+    partId?: string;
+    locationId?: string;
+    outputDeliveryId?: string;
+  }>;
+  deliveryId?: string;
   deliveries?: DeliveryView[];
   project?: ProjectView;
   machines?: MachineView[];
   runtimeConfig?: Record<string, string>;
   activeDutyMachineId?: string;
 }): { machineId?: string; worktreePath?: string; ideScheme?: IDEScheme } {
-  const { task, attempt, deliveries = [], project, machines = [], runtimeConfig, activeDutyMachineId } = params;
+  const {
+    task,
+    attempt,
+    attempts,
+    deliveryId,
+    deliveries = [],
+    project,
+    machines = [],
+    runtimeConfig,
+    activeDutyMachineId,
+  } = params;
+
+  const explicitDelivery = deliveryId ? deliveries.find((d) => d.deliveryId === deliveryId) : undefined;
+  const effectiveAttempt =
+    attempt ??
+    (explicitDelivery
+      ? (attempts?.find((a) => a.attemptId === explicitDelivery.attemptId) ??
+        attempts?.find((a) => a.outputDeliveryId === explicitDelivery.deliveryId))
+      : attempts?.[attempts.length - 1]);
 
   const matchedDelivery =
-    (attempt?.outputDeliveryId
-      ? deliveries.find((d) => d.deliveryId === attempt.outputDeliveryId)
+    explicitDelivery ??
+    (effectiveAttempt?.outputDeliveryId
+      ? deliveries.find((d) => d.deliveryId === effectiveAttempt.outputDeliveryId)
       : undefined) ??
     (task?.latestDeliveryId ? deliveries.find((d) => d.deliveryId === task.latestDeliveryId) : undefined) ??
     [...deliveries].reverse().find((d) => !!d.manifest?.worktreePath) ??
     deliveries[deliveries.length - 1];
 
-  const matchedPart = attempt?.partId
-    ? project?.parts?.find((p) => p.partId === attempt.partId)
+  const matchedPart = effectiveAttempt?.partId
+    ? project?.parts?.find((p) => p.partId === effectiveAttempt.partId)
     : project?.parts?.[0];
-  const matchedLoc = attempt?.locationId
-    ? matchedPart?.locations?.find((l) => l.locationId === attempt.locationId)
+  const matchedLoc = effectiveAttempt?.locationId
+    ? matchedPart?.locations?.find((l) => l.locationId === effectiveAttempt.locationId)
     : undefined;
   const defaultLoc = matchedPart?.locations?.find((l) => l.isDefault) ?? matchedPart?.locations?.[0];
 
@@ -424,7 +485,8 @@ export function resolveSessionFileContext(params: {
       : undefined;
 
   const machineId =
-    attempt?.machineId ||
+    effectiveAttempt?.machineId ||
+    (explicitDelivery ? explicitDelivery.sourceMachineId : undefined) ||
     runtimeMachine ||
     matchedDelivery?.sourceMachineId ||
     matchedLoc?.machineId ||
@@ -450,7 +512,7 @@ export function resolveSessionFileContext(params: {
   const anchorRepoPath =
     anchor?.repoPath && (!machineId || !anchor.machine || anchor.machine === machineId) ? anchor.repoPath : '';
   const rawWorktree =
-    attempt?.worktreePath || deliveryWorktree || matchedLocPath || machineLoc?.absPath || defaultLocPath || anchorRepoPath || '';
+    effectiveAttempt?.worktreePath || deliveryWorktree || matchedLocPath || machineLoc?.absPath || defaultLocPath || anchorRepoPath || '';
 
   const trimmedDir = rawWorktree.trim();
   const worktreePath = trimmedDir.startsWith('/') || trimmedDir.startsWith('~/') ? trimmedDir : undefined;
@@ -460,6 +522,75 @@ export function resolveSessionFileContext(params: {
     worktreePath,
     ideScheme: project?.ideScheme,
   };
+}
+
+/**
+ * Resolves the sender-scoped machine and worktree context for a shared-board message:
+ * - Human / parent messages keep the parent session's `machineId` and `worktreePath`.
+ * - Child-session and worker messages use the sender's `machineId` (when known) and clear `worktreePath`
+ *   to `undefined` unless an exact sender worktree is known, so relative links fall back to clipboard copy
+ *   instead of mistakenly opening the reader's worktree.
+ */
+export function resolveBoardMessageFileContext(params: {
+  authorName: string;
+  parentTaskId?: string;
+  parentTaskTitle?: string;
+  parentMachineId?: string;
+  parentWorktreePath?: string;
+  childrenList?: ChildTaskView[];
+  members?: BoardMemberCursor[];
+}): { machineId?: string; worktreePath?: string } {
+  const {
+    authorName,
+    parentTaskId,
+    parentTaskTitle,
+    parentMachineId,
+    parentWorktreePath,
+    childrenList = [],
+    members = [],
+  } = params;
+
+  const author = (authorName ?? '').trim();
+  const authorBare = author.startsWith('@') ? author.slice(1).trim() : author;
+  const lower = authorBare.toLowerCase();
+
+  if (
+    lower === 'human' ||
+    lower === 'user' ||
+    lower === 'parent' ||
+    lower === 'coordinator' ||
+    (parentTaskId && authorBare === parentTaskId)
+  ) {
+    return { machineId: parentMachineId, worktreePath: parentWorktreePath };
+  }
+
+  const matchedChild = childrenList.find(
+    (c) => c.taskId === authorBare || (c.title && c.title.trim() === authorBare),
+  );
+  const matchedMember = members.find(
+    (m) =>
+      (matchedChild && m.workerTaskId === matchedChild.taskId) ||
+      m.workerTaskId === authorBare ||
+      m.memberName === authorBare,
+  );
+  const childByMember =
+    matchedChild ??
+    (matchedMember?.workerTaskId
+      ? childrenList.find((c) => c.taskId === matchedMember.workerTaskId)
+      : undefined);
+
+  if (childByMember || matchedMember) {
+    return {
+      machineId: childByMember?.machineId || matchedMember?.machineId || parentMachineId,
+      worktreePath: undefined,
+    };
+  }
+
+  if (parentTaskTitle && authorBare === parentTaskTitle.trim()) {
+    return { machineId: parentMachineId, worktreePath: parentWorktreePath };
+  }
+
+  return { machineId: parentMachineId, worktreePath: undefined };
 }
 
 /** Hands a custom-scheme IDE URI to the OS without leaving the SPA. */
