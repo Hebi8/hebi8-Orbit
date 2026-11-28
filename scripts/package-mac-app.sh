@@ -81,27 +81,54 @@ EOF
 
 # Signing: Developer ID if secrets present, otherwise clean ad-hoc signing
 KEYCHAIN=""
+TMP_SECRETS=""
 cleanup() {
   if [[ -n "$KEYCHAIN" ]]; then
     security delete-keychain "$KEYCHAIN" >/dev/null 2>&1 || true
   fi
+  if [[ -n "$TMP_SECRETS" ]]; then
+    rm -rf "$TMP_SECRETS" >/dev/null 2>&1 || true
+  fi
 }
 trap cleanup EXIT
 
-if [[ -n "${APPLE_CERTIFICATE_P12:-}" && -n "${APPLE_SIGNING_IDENTITY:-}" ]]; then
+SIGN_IDENTITY=""
+if [[ -n "${APPLE_CERTIFICATE_P12:-}" ]]; then
   echo "==> Importing Developer ID certificate into temporary keychain"
-  TMP_CERT="$(mktemp -d)"
-  KEYCHAIN="${TMP_CERT}/orbit-sign.keychain-db"
+  TMP_SECRETS="$(mktemp -d)"
+  chmod 700 "$TMP_SECRETS"
+  KEYCHAIN="${TMP_SECRETS}/h8o-sign.keychain-db"
   KC_PASS="$(openssl rand -hex 24)"
-  echo "$APPLE_CERTIFICATE_P12" | base64 --decode > "${TMP_CERT}/cert.p12"
+  printf '%s' "$APPLE_CERTIFICATE_P12" | base64 --decode > "${TMP_SECRETS}/cert.p12"
   security create-keychain -p "$KC_PASS" "$KEYCHAIN"
   security set-keychain-settings -lut 21600 "$KEYCHAIN"
   security unlock-keychain -p "$KC_PASS" "$KEYCHAIN"
-  security import "${TMP_CERT}/cert.p12" -k "$KEYCHAIN" -P "${APPLE_CERTIFICATE_PASSWORD:-}" -T /usr/bin/codesign
+  security import "${TMP_SECRETS}/cert.p12" -f pkcs12 -k "$KEYCHAIN" -P "${APPLE_CERTIFICATE_PASSWORD:-}" -T /usr/bin/codesign
+  rm -f "${TMP_SECRETS}/cert.p12"
   security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KC_PASS" "$KEYCHAIN" >/dev/null 2>&1 || true
+  # shellcheck disable=SC2046
   security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
 
-  codesign --force --deep --options runtime --timestamp --keychain "$KEYCHAIN" --sign "$APPLE_SIGNING_IDENTITY" "$APP_DIR"
+  if [[ -n "${APPLE_SIGNING_IDENTITY:-}" ]]; then
+    SIGN_IDENTITY="$APPLE_SIGNING_IDENTITY"
+  else
+    SIGN_IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN" \
+      | grep '"Developer ID Application: ' | head -n 1 | awk '{print $2}' || true)"
+  fi
+  if [[ -z "$SIGN_IDENTITY" ]]; then
+    echo "ERROR: Imported certificate does not contain a Developer ID Application identity" >&2
+    exit 1
+  fi
+
+  echo "==> Signing embedded binaries and hebi8-Orbit.app with Developer ID"
+  for bin in \
+    "${APP_DIR}/Contents/Resources/bin/h8o-hub" \
+    "${APP_DIR}/Contents/Resources/bin/h8o-runner" \
+    "${APP_DIR}/Contents/Resources/bin/h8o" \
+    "${APP_DIR}/Contents/MacOS/h8o-client"; do
+    codesign --force --options runtime --timestamp --keychain "$KEYCHAIN" --sign "$SIGN_IDENTITY" "$bin"
+  done
+  codesign --force --options runtime --timestamp --keychain "$KEYCHAIN" --sign "$SIGN_IDENTITY" "$APP_DIR"
   codesign --verify --deep --strict "$APP_DIR"
 else
   echo "==> Ad-hoc signing hebi8-Orbit.app (no Developer ID secrets configured)"
@@ -111,24 +138,45 @@ fi
 ZIP_PATH="${OUT_DIR}/h8o-client-${VERSION}-darwin-arm64.zip"
 DMG_PATH="${OUT_DIR}/h8o-client-${VERSION}-darwin-arm64.dmg"
 
-ditto -c -k --keepParent "$APP_DIR" "$ZIP_PATH"
-
 DMG_STAGE="$(mktemp -d)"
 cp -R "$APP_DIR" "${DMG_STAGE}/hebi8-Orbit.app"
 ln -s /Applications "${DMG_STAGE}/Applications"
 hdiutil create -volname "hebi8-Orbit" -srcfolder "$DMG_STAGE" -ov -format UDZO "$DMG_PATH"
 rm -rf "$DMG_STAGE"
 
-if [[ -n "${APPLE_SIGNING_IDENTITY:-}" && -n "${APPLE_NOTARY_APPLE_ID:-}" && -n "${APPLE_NOTARY_PASSWORD:-}" && -n "${APPLE_NOTARY_TEAM_ID:-}" ]]; then
-  echo "==> Submitting DMG for Apple notarization"
-  codesign --force --timestamp --keychain "$KEYCHAIN" --sign "$APPLE_SIGNING_IDENTITY" "$DMG_PATH"
-  xcrun notarytool submit "$DMG_PATH" \
-    --apple-id "$APPLE_NOTARY_APPLE_ID" \
-    --password "$APPLE_NOTARY_PASSWORD" \
-    --team-id "$APPLE_NOTARY_TEAM_ID" \
-    --wait
-  xcrun stapler staple "$DMG_PATH"
+if [[ -n "$SIGN_IDENTITY" ]]; then
+  codesign --force --timestamp --keychain "$KEYCHAIN" --sign "$SIGN_IDENTITY" "$DMG_PATH"
+  if [[ -n "${APPLE_API_KEY_P8_BASE64:-}" && -n "${APPLE_API_KEY_ID:-}" && -n "${APPLE_API_ISSUER_ID:-}" ]]; then
+    echo "==> Submitting DMG for Apple notarization (App Store Connect API key)"
+    API_KEY_FILE="${TMP_SECRETS}/AuthKey_${APPLE_API_KEY_ID}.p8"
+    printf '%s' "$APPLE_API_KEY_P8_BASE64" | base64 --decode > "$API_KEY_FILE"
+    chmod 600 "$API_KEY_FILE"
+    xcrun notarytool submit "$DMG_PATH" \
+      --key "$API_KEY_FILE" \
+      --key-id "$APPLE_API_KEY_ID" \
+      --issuer "$APPLE_API_ISSUER_ID" \
+      --wait
+    rm -f "$API_KEY_FILE"
+    xcrun stapler staple "$DMG_PATH"
+    xcrun stapler staple "$APP_DIR"
+    xcrun stapler validate "$DMG_PATH"
+    xcrun stapler validate "$APP_DIR"
+  elif [[ -n "${APPLE_NOTARY_APPLE_ID:-}" && -n "${APPLE_NOTARY_PASSWORD:-}" && -n "${APPLE_NOTARY_TEAM_ID:-}" ]]; then
+    echo "==> Submitting DMG for Apple notarization (Apple ID)"
+    xcrun notarytool submit "$DMG_PATH" \
+      --apple-id "$APPLE_NOTARY_APPLE_ID" \
+      --password "$APPLE_NOTARY_PASSWORD" \
+      --team-id "$APPLE_NOTARY_TEAM_ID" \
+      --wait
+    xcrun stapler staple "$DMG_PATH"
+    xcrun stapler staple "$APP_DIR"
+    xcrun stapler validate "$DMG_PATH"
+    xcrun stapler validate "$APP_DIR"
+  fi
 fi
+
+# Package ZIP after optional notarization/stapling so both DMG and ZIP carry stapled tickets
+ditto -c -k --keepParent "$APP_DIR" "$ZIP_PATH"
 
 echo "==> Packaged:"
 ls -lh "$ZIP_PATH" "$DMG_PATH"
