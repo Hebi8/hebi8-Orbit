@@ -2,7 +2,7 @@
 # Install hebi8/orbit binaries (`h8o`, plus optional `h8o-hub` & `h8o-runner`) from GitHub Releases.
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/Hebi8/hebi8-Orbit/main/scripts/install.sh | bash
-#   curl -fsSL ... | bash -s -- --all --version v0.2.0
+#   curl -fsSL ... | bash -s -- --all --version v0.3.0
 set -euo pipefail
 
 REPO="${ORBIT_REPO:-Hebi8/hebi8-Orbit}"

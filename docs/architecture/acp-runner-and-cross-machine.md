@@ -130,7 +130,7 @@ stateDiagram-v2
 
 - **实测事实**：`NewSessionRequest.Meta` 传入 `{"antigravity": {"systemPrompt": {"append": "..."}}}` 在 `agy` 原生生效，且在后续 Swarm 异步唤醒中持续生效。
 - **强制实现规范**：
-  - 仅注入 < 400 tokens 的精简契约：当前项目/任务 ID、工作目录即为隔离 worktree、遵守 4A 单真源（项目架构决定落仓库 `docs/`）、显式交付命令 `orbit deliver --summary "..."`（全员 `swarm kill` 后加 `--final`）及子会话编排指引。
+  - 仅注入 < 400 tokens 的精简契约：当前项目/任务 ID、工作目录即为隔离 worktree、遵守 4A 单真源（项目架构决定落仓库 `docs/`）、显式交付命令 `h8o deliver --summary "..."`（全员 `swarm kill` 后加 `--final`）及子会话编排指引。
   - **严禁修改用户仓库的 `AGENTS.md` / `CLAUDE.md`**。
   - 若适配器不支持 `_meta` append，驱动层自动在首轮 `conn.Prompt` 前置紧凑 `<orbit_contract>` 块。
 

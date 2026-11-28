@@ -768,7 +768,7 @@ export function NewThreadPage({
                     className={`nt-wt-toggle ${useWorktree ? 'on' : ''}`}
                     title={
                       useWorktree
-                        ? '已开启 Worktree 隔离；完成后由 Orbit 自动打包交付改动'
+                        ? '已开启 Worktree 隔离；完成后由 hebi8/orbit 自动打包交付改动'
                         : '未开启 Worktree；与当前项目目录文件直接保持同步'
                     }
                   >
