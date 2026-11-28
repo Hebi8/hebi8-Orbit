@@ -174,8 +174,8 @@ func TestBuildHebi8FoldOpening_SixSectionsDeterminismAndBudget(t *testing.T) {
 		"第四条最近原话：现在帮我做一次折叠换代并继续讨论下一步。",
 		"好的，折叠完成后我会用最新开场无缝接上当前语境。",
 		"2026-11-26T10:30:00Z",
-		"orbit hebi8 expand <nodeId>",
-		"orbit hebi8 pin <nodeId>",
+		"h8o hebi8 expand <nodeId>",
+		"h8o hebi8 pin <nodeId>",
 	}
 	for _, want := range mustContain {
 		if !strings.Contains(out1, want) {
@@ -205,7 +205,7 @@ func TestBuildHebi8FoldOpening_SixSectionsDeterminismAndBudget(t *testing.T) {
 	if len([]rune(tightOut)) > 3200 {
 		t.Fatalf("expected tight opening <= 3200 runes, got %d", len([]rune(tightOut)))
 	}
-	if !strings.Contains(tightOut, "## 6. 这一次") || !strings.Contains(tightOut, "orbit hebi8 expand <nodeId>") {
+	if !strings.Contains(tightOut, "## 6. 这一次") || !strings.Contains(tightOut, "h8o hebi8 expand <nodeId>") {
 		t.Fatalf("tight opening must preserve section 6 guidance")
 	}
 	// Every trimmed occurrence of longSentence must end on '。' rather than a half-sentence fragment!

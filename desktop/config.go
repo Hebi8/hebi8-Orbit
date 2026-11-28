@@ -457,7 +457,7 @@ func sameOriginStrings(a, b string) bool {
 	return sameOrigin(ua, b)
 }
 
-// ParseJoinInput parses either a pasted `orbit join <url> <code>`, an invite link
+// ParseJoinInput parses either a pasted `h8o join <url> <code>`, an invite link
 // `<url>/#/join/<code>`, `<url> <code>`, or a plain Hub address `<url>`.
 func ParseJoinInput(raw string) (hubURL, code string, noRunnerHint bool, err error) {
 	hubURL, code, noRunnerHint, _, err = ParseJoinInputWithScope(raw)
@@ -472,7 +472,7 @@ func ParseJoinInputWithScope(raw string) (hubURL, code string, noRunnerHint bool
 		return "", "", false, false, fmt.Errorf("请输入地址或粘贴邀请命令")
 	}
 	tokens := strings.Fields(s)
-	if len(tokens) >= 2 && strings.EqualFold(filepath.Base(tokens[0]), "orbit") && strings.EqualFold(tokens[1], "join") {
+	if len(tokens) >= 2 && strings.EqualFold(filepath.Base(tokens[0]), "h8o") && strings.EqualFold(tokens[1], "join") {
 		tokens = tokens[2:]
 	}
 

@@ -259,7 +259,7 @@ func (s *Server) createTaskInternalWithGuards(
 		route.MachineCfg.Transport != "" && route.MachineCfg.Transport != protocol.TransportLocalWS &&
 		s.runners.IsConnected(route.MachineID) && !s.runners.HasCapability(route.MachineID, protocol.RunnerCapBundleV1) {
 		return resp, nil, http.StatusUpgradeRequired, "ERR_RUNNER_UPGRADE_REQUIRED", fmt.Errorf(
-			"machine %s is running an older orbit-runner without bundle.v1 delivery support; please upgrade orbit-runner on %s",
+			"machine %s is running an older h8o-runner without bundle.v1 delivery support; please upgrade h8o-runner on %s",
 			route.MachineID, route.MachineID,
 		)
 	}
@@ -719,7 +719,7 @@ func (s *Server) followupTaskInternalWithTrigger(
 		route.MachineCfg.Transport != "" && route.MachineCfg.Transport != protocol.TransportLocalWS &&
 		s.runners.IsConnected(route.MachineID) && !s.runners.HasCapability(route.MachineID, protocol.RunnerCapBundleV1) {
 		return resp, nil, http.StatusUpgradeRequired, "ERR_RUNNER_UPGRADE_REQUIRED", fmt.Errorf(
-			"machine %s is running an older orbit-runner without bundle.v1 delivery support; please upgrade orbit-runner on %s",
+			"machine %s is running an older h8o-runner without bundle.v1 delivery support; please upgrade h8o-runner on %s",
 			route.MachineID, route.MachineID,
 		)
 	}

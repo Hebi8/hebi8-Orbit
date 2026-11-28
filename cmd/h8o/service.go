@@ -16,9 +16,9 @@ import (
 func runService(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" || args[0] == "help" {
 		fmt.Fprintln(stdout, `Usage:
-  orbit service install [hub|runner|all] [--config-dir <dir>] [--machine <id>] [--force]
-  orbit service uninstall [hub|runner|all]
-  orbit service status [hub|runner|all]`)
+  h8o service install [hub|runner|all] [--config-dir <dir>] [--machine <id>] [--force]
+  h8o service uninstall [hub|runner|all]
+  h8o service status [hub|runner|all]`)
 		return nil
 	}
 	sub := args[0]
@@ -87,7 +87,7 @@ func installServiceUnit(ctx context.Context, kind, cfgDir, dataDir, machineID st
 func uninstallServiceUnit(ctx context.Context, kind string, w io.Writer) error {
 	switch runtime.GOOS {
 	case "linux":
-		unit := "orbit-" + kind + ".service"
+		unit := "h8o-" + kind + ".service"
 		_ = exec.CommandContext(ctx, "systemctl", "--user", "disable", "--now", unit).Run()
 		home, _ := os.UserHomeDir()
 		unitPath := filepath.Join(home, ".config", "systemd", "user", unit)
@@ -96,7 +96,7 @@ func uninstallServiceUnit(ctx context.Context, kind string, w io.Writer) error {
 		fmt.Fprintf(w, "✓ 已卸载 %s\n", unit)
 		return nil
 	case "darwin":
-		label := "io.github.hebi8.orbit-" + kind
+		label := "io.github.hebi8.h8o-" + kind
 		home, _ := os.UserHomeDir()
 		plistPath := filepath.Join(home, "Library", "LaunchAgents", label+".plist")
 		uid := strconv.Itoa(os.Getuid())
@@ -112,7 +112,7 @@ func uninstallServiceUnit(ctx context.Context, kind string, w io.Writer) error {
 func printServiceStatus(ctx context.Context, kind string, w io.Writer) {
 	switch runtime.GOOS {
 	case "linux":
-		unit := "orbit-" + kind + ".service"
+		unit := "h8o-" + kind + ".service"
 		out, err := exec.CommandContext(ctx, "systemctl", "--user", "is-active", unit).Output()
 		state := strings.TrimSpace(string(out))
 		if err != nil && state == "" {
@@ -120,7 +120,7 @@ func printServiceStatus(ctx context.Context, kind string, w io.Writer) {
 		}
 		fmt.Fprintf(w, "  %-22s %s\n", unit, state)
 	case "darwin":
-		label := "io.github.hebi8.orbit-" + kind
+		label := "io.github.hebi8.h8o-" + kind
 		uid := strconv.Itoa(os.Getuid())
 		err := exec.CommandContext(ctx, "launchctl", "print", "gui/"+uid+"/"+label).Run()
 		state := "active"
@@ -129,7 +129,7 @@ func printServiceStatus(ctx context.Context, kind string, w io.Writer) {
 		}
 		fmt.Fprintf(w, "  %-30s %s\n", label, state)
 	default:
-		fmt.Fprintf(w, "  orbit-%s: unsupported on %s\n", kind, runtime.GOOS)
+		fmt.Fprintf(w, "  h8o-%s: unsupported on %s\n", kind, runtime.GOOS)
 	}
 }
 
@@ -138,7 +138,7 @@ func installSystemdUserUnit(ctx context.Context, kind, cfgDir, machineID string,
 	if err != nil {
 		return err
 	}
-	unitName := "orbit-" + kind + ".service"
+	unitName := "h8o-" + kind + ".service"
 	unitDir := filepath.Join(home, ".config", "systemd", "user")
 	unitPath := filepath.Join(unitDir, unitName)
 
@@ -151,7 +151,7 @@ func installSystemdUserUnit(ctx context.Context, kind, cfgDir, machineID string,
 		return nil
 	}
 
-	binName := "orbit-" + kind
+	binName := "h8o-" + kind
 	binPath, err := locateSiblingOrPathBin(binName)
 	if err != nil {
 		return err
@@ -159,9 +159,9 @@ func installSystemdUserUnit(ctx context.Context, kind, cfgDir, machineID string,
 	execStart := fmt.Sprintf("%s --config-dir %s", binPath, cfgDir)
 	after := "network-online.target"
 	if kind == "runner" {
-		after = "network-online.target orbit-hub.service"
+		after = "network-online.target h8o-hub.service"
 		if machineID != "" {
-			execStart = fmt.Sprintf("%s --config-dir %s --orbit-bin-dir %s", binPath, cfgDir, filepath.Dir(binPath))
+			execStart = fmt.Sprintf("%s --config-dir %s --h8o-bin-dir %s", binPath, cfgDir, filepath.Dir(binPath))
 		}
 	}
 	pathEnv := os.Getenv("PATH")
@@ -170,7 +170,7 @@ func installSystemdUserUnit(ctx context.Context, kind, cfgDir, machineID string,
 	}
 
 	content := fmt.Sprintf(`[Unit]
-Description=hebi8-Orbit %s
+Description=hebi8/orbit %s
 After=%s
 
 [Service]
@@ -203,13 +203,13 @@ func installLaunchAgent(ctx context.Context, kind, cfgDir, dataDir, _ string, fo
 	if err != nil {
 		return err
 	}
-	label := "io.github.hebi8.orbit-" + kind
+	label := "io.github.hebi8.h8o-" + kind
 	agentsDir := filepath.Join(home, "Library", "LaunchAgents")
 	plistPath := filepath.Join(agentsDir, label+".plist")
 	uid := strconv.Itoa(os.Getuid())
 
 	if _, err := os.Stat(plistPath); err != nil || force {
-		binPath, err := locateSiblingOrPathBin("orbit-" + kind)
+		binPath, err := locateSiblingOrPathBin("h8o-" + kind)
 		if err != nil {
 			return err
 		}
@@ -222,7 +222,7 @@ func installLaunchAgent(ctx context.Context, kind, cfgDir, dataDir, _ string, fo
 		}
 		argsXML := fmt.Sprintf("    <string>%s</string>\n    <string>--config-dir</string>\n    <string>%s</string>\n", binPath, cfgDir)
 		if kind == "runner" {
-			argsXML += fmt.Sprintf("    <string>--orbit-bin-dir</string>\n    <string>%s</string>\n", filepath.Dir(binPath))
+			argsXML += fmt.Sprintf("    <string>--h8o-bin-dir</string>\n    <string>%s</string>\n", filepath.Dir(binPath))
 		}
 		pathParts := []string{
 			filepath.Dir(binPath),

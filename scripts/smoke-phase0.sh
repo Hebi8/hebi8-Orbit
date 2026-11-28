@@ -2,12 +2,12 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-HUB_BIN="${HUB_BIN:-$ROOT_DIR/bin/orbit-hub}"
-CLI_BIN="${CLI_BIN:-$ROOT_DIR/bin/orbit}"
+HUB_BIN="${HUB_BIN:-$ROOT_DIR/bin/h8o-hub}"
+CLI_BIN="${CLI_BIN:-$ROOT_DIR/bin/h8o}"
 RYUGI_BIN="${RYUGI_BIN:-$(command -v ryugi)}"
 
 if [ ! -x "$HUB_BIN" ] || [ ! -x "$CLI_BIN" ]; then
-  echo "error: build bin/orbit-hub and bin/orbit first (make build)" >&2
+  echo "error: build bin/h8o-hub and bin/h8o first (make build)" >&2
   exit 1
 fi
 if [ -z "$RYUGI_BIN" ] || [ ! -x "$RYUGI_BIN" ]; then
@@ -102,7 +102,7 @@ git -C "$WORK_REPO" add -A
 git -C "$WORK_REPO" commit -m "initial commit" >/dev/null
 INITIAL_BASE_SHA="$(git -C "$WORK_REPO" rev-parse HEAD)"
 
-# 2. Launch real orbit-hub with isolated RYUGI_SERVER_HOME
+# 2. Launch real h8o-hub with isolated RYUGI_SERVER_HOME
 HUB_URL="http://127.0.0.1:${HUB_PORT}"
 "$HUB_BIN" \
   --config-dir "$CFG_DIR" \
@@ -124,7 +124,7 @@ for _ in $(seq 1 40); do
   sleep 0.25
 done
 curl -sf "${HUB_URL}/api/health" >/dev/null
-curl -sf "${HUB_URL}/" | grep -q "hebi8-Orbit"
+curl -sf "${HUB_URL}/" | grep -q "hebi8/orbit"
 
 # 3. Make dirty working tree edits + untracked file + external attachment
 cat > "$WORK_REPO/app.go" <<'EOF'
@@ -165,7 +165,7 @@ V1_JSON="$("$CLI_BIN" deliver \
 
 STATUS_AFTER="$(git -C "$WORK_REPO" status --porcelain)"
 if [ "$STATUS_BEFORE" != "$STATUS_AFTER" ]; then
-  echo "FAIL: repo git status was polluted by orbit deliver!" >&2
+  echo "FAIL: repo git status was polluted by h8o deliver!" >&2
   exit 1
 fi
 echo "[OK] v1 zero-pollution git status verified"
@@ -365,5 +365,5 @@ curl -sf -X POST "${HUB_URL}/api/deliveries/${DLV_V2}/complete-review" -H "X-Orb
   python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["inboxState"]=="resolved", d'
 
 "$CLI_BIN" status --hub "$HUB_URL" | grep -q "demo-app"
-echo "[OK] Both diff_drawer and ryugi annotations + complete-review + orbit status verified"
+echo "[OK] Both diff_drawer and ryugi annotations + complete-review + h8o status verified"
 echo "=== PHASE 0 E2E SMOKE PASSED ==="

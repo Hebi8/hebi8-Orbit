@@ -161,7 +161,7 @@ func TestOrbitCLI_ResumeReusesExactFixedHeadSHA(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected first deliver against unreachable hub to fail")
 	}
-	if !strings.Contains(errBuf.String(), "orbit deliver --resume "+dlvID) {
+	if !strings.Contains(errBuf.String(), "h8o deliver --resume "+dlvID) {
 		t.Fatalf("expected stderr recovery hint with --resume, got:\n%s", errBuf.String())
 	}
 

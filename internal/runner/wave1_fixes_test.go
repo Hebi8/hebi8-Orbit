@@ -365,14 +365,20 @@ func TestRunner_LocalDelegateBoardReadPostAndPlanGuard(t *testing.T) {
 		return acp.PromptResponse{StopReason: acp.StopReasonEndTurn}, nil
 	}
 
+	fakeH8oBin := filepath.Join(tmp, "h8o")
+	if err := os.WriteFile(fakeH8oBin, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
 	sockPath := filepath.Join(tmp, "runner-board.sock")
 	r, err := runner.New(ctx, runner.Config{
-		MachineID:   "hub-node",
-		HubHTTPURL:  hubSrv.URL,
-		BearerToken: "runner-tok-board",
-		DataDir:     tmp,
-		SocketPath:  sockPath,
-		Driver:      drv,
+		MachineID:    "hub-node",
+		HubHTTPURL:   hubSrv.URL,
+		BearerToken:  "runner-tok-board",
+		DataDir:      tmp,
+		SocketPath:   sockPath,
+		OrbitBinPath: fakeH8oBin,
+		Driver:       drv,
 	})
 	if err != nil {
 		t.Fatal(err)

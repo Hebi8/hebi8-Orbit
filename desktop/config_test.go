@@ -95,9 +95,9 @@ func TestParseJoinInput(t *testing.T) {
 		wantCode string
 		wantNoR  bool
 	}{
-		{"orbit join https://orbit.example.ts.net K7QM-2XPA", "https://orbit.example.ts.net", "K7QM-2XPA", false},
+		{"h8o join https://orbit.example.ts.net K7QM-2XPA", "https://orbit.example.ts.net", "K7QM-2XPA", false},
 		{"https://orbit.example.ts.net/#/join/K7QM-2XPA", "https://orbit.example.ts.net", "K7QM-2XPA", false},
-		{"orbit join https://orbit.example.ts.net K7QM-2XPA --no-runner", "https://orbit.example.ts.net", "K7QM-2XPA", true},
+		{"h8o join https://orbit.example.ts.net K7QM-2XPA --no-runner", "https://orbit.example.ts.net", "K7QM-2XPA", true},
 		{"https://orbit.example.ts.net", "https://orbit.example.ts.net", "", false},
 	}
 	for _, tc := range cases {
@@ -111,7 +111,7 @@ func TestParseJoinInput(t *testing.T) {
 	}
 
 	// Verify --runner-only and ?scope=runner / ?scope=client hints
-	u, c, noR, rOnly, err := ParseJoinInputWithScope("orbit join https://orbit.example.ts.net K7QM-2XPA --runner-only")
+	u, c, noR, rOnly, err := ParseJoinInputWithScope("h8o join https://orbit.example.ts.net K7QM-2XPA --runner-only")
 	if err != nil || u != "https://orbit.example.ts.net" || c != "K7QM-2XPA" || noR || !rOnly {
 		t.Fatalf("unexpected runner-only parse: %q %q noR=%v rOnly=%v err=%v", u, c, noR, rOnly, err)
 	}
@@ -360,14 +360,14 @@ func TestStartOrAttachLocalFailsWithoutStoppingRemoteRunnerWhenSaveFails(t *test
 	mgr := NewRuntimeManager()
 	fakeDone := make(chan struct{})
 	mgr.mu.Lock()
-	mgr.procs = append(mgr.procs, &managedProc{name: "orbit-runner-remote", done: fakeDone})
+	mgr.procs = append(mgr.procs, &managedProc{name: "h8o-runner-remote", done: fakeDone})
 	mgr.mu.Unlock()
 
 	_, err := mgr.SwitchNetwork(t.Context(), dir, "local")
 	if err == nil {
 		t.Fatalf("expected SwitchNetwork('local') to return error when SaveClientConfig fails")
 	}
-	if !mgr.hasManaged("orbit-runner-remote") {
-		t.Fatalf("expected existing orbit-runner-remote to remain untouched when SaveClientConfig fails")
+	if !mgr.hasManaged("h8o-runner-remote") {
+		t.Fatalf("expected existing h8o-runner-remote to remain untouched when SaveClientConfig fails")
 	}
 }

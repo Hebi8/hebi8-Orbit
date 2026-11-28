@@ -96,7 +96,7 @@ func runInit(ctx context.Context, args []string, stdin io.Reader, stdout, stderr
 	}
 	reader := bufio.NewReader(stdin)
 
-	fmt.Fprintf(stdout, "hebi8-Orbit Init (%s)\n", Version)
+	fmt.Fprintf(stdout, "hebi8/orbit Init (%s)\n", Version)
 	fmt.Fprintf(stdout, "Config directory: %s\n\n", cfgDirAbs)
 
 	discoveredDefaultURL := existingClientHubURL(cfgDirAbs)
@@ -153,7 +153,7 @@ func runInit(ctx context.Context, args []string, stdin io.Reader, stdout, stderr
 			return runJoin(ctx, []string{"--config-dir", cfgDirAbs, "--data-dir", dataDir, raw}, stdout, stderr)
 		}
 		if pErr == nil && hubURL != "" {
-			fmt.Fprintln(stdout, "  在目标设备运行 orbit pair 或在设置中点「添加机器」获取配对码。")
+			fmt.Fprintln(stdout, "  在目标设备运行 h8o pair 或在设置中点「添加机器」获取配对码。")
 			pairCode, err := promptLine(reader, stdout, "配对码（XXXX-XXXX，留空仅保存地址）", "")
 			if err != nil {
 				return err
@@ -210,10 +210,10 @@ func initConnectMode(ctx context.Context, cfgDirAbs, rawURL, devToken string, fo
 	}
 
 	fmt.Fprintln(stdout, "\nNext steps:")
-	fmt.Fprintln(stdout, "  orbit status                  # Inspect inbox, projects, and online machines")
-	fmt.Fprintln(stdout, "  orbit doctor                  # Run full local environment check")
-	fmt.Fprintln(stdout, "  orbit open                    # Open the web workbench")
-	fmt.Fprintln(stdout, "  orbit tasks list              # View active tasks")
+	fmt.Fprintln(stdout, "  h8o status                  # Inspect inbox, projects, and online machines")
+	fmt.Fprintln(stdout, "  h8o doctor                  # Run full local environment check")
+	fmt.Fprintln(stdout, "  h8o open                    # Open the web workbench")
+	fmt.Fprintln(stdout, "  h8o tasks list              # View active tasks")
 	return nil
 }
 
@@ -331,14 +331,14 @@ func initHubMode(cfgDirAbs, dataDir, machineFlag, workspaceName, listenAddr, ori
 	fmt.Fprintf(stdout, "  [OK  ] client.yaml    -> http://%s\n", listenAddr)
 	if len(adapters) == 0 {
 		fmt.Fprintln(stdout, "\n  [WARN] No ACP adapters (agy / claude-agent-acp / codex-acp) were found in PATH.")
-		fmt.Fprintln(stdout, "         Install at least one adapter and re-run `orbit init --hub --force` or edit machines.yaml.")
+		fmt.Fprintln(stdout, "         Install at least one adapter and re-run `h8o init --hub --force` or edit machines.yaml.")
 	}
 
 	fmt.Fprintln(stdout, "\nStart Hub and Runner:")
-	fmt.Fprintf(stdout, "  orbit-hub --config-dir %s\n", cfgDirAbs)
-	fmt.Fprintf(stdout, "  orbit-runner --machine-id %s --config-dir %s\n", machineID, cfgDirAbs)
+	fmt.Fprintf(stdout, "  h8o-hub --config-dir %s\n", cfgDirAbs)
+	fmt.Fprintf(stdout, "  h8o-runner --machine-id %s --config-dir %s\n", machineID, cfgDirAbs)
 	fmt.Fprintln(stdout, "\nThen verify:")
-	fmt.Fprintln(stdout, "  orbit doctor && orbit status")
+	fmt.Fprintln(stdout, "  h8o doctor && h8o status")
 	return nil
 }
 
@@ -411,11 +411,11 @@ func initRunnerMode(ctx context.Context, cfgDirAbs, rawHubURL, machineFlag, toke
 	fmt.Fprintf(stdout, "  [OK  ] machines.yaml  adapters=[%s]\n", strings.Join(sortedAdapterNames(adapters), ", "))
 
 	if generatedToken {
-		fmt.Fprintf(stdout, "\n1. On the Hub host, add this tokenHash under machines.%s in ~/.config/hebi8-orbit/machines.yaml (then restart orbit-hub):\n", machineID)
+		fmt.Fprintf(stdout, "\n1. On the Hub host, add this tokenHash under machines.%s in ~/.config/hebi8-orbit/machines.yaml (then restart h8o-hub):\n", machineID)
 		fmt.Fprintf(stdout, "   tokenHash: %q\n", tokenHash)
 	}
 	fmt.Fprintln(stdout, "\n2. Start the runner on this machine:")
-	fmt.Fprintf(stdout, "   orbit-runner --machine-id %s --hub %s --config-dir %s\n", machineID, wsURL, cfgDirAbs)
+	fmt.Fprintf(stdout, "   h8o-runner --machine-id %s --hub-ws %s --config-dir %s\n", machineID, wsURL, cfgDirAbs)
 	return nil
 }
 
@@ -454,7 +454,7 @@ func initProjectMode(cfgDirAbs, dataDir, dir, machineFlag, idOverride, nameOverr
 			return err
 		}
 		fmt.Fprintf(stdout, "  [OK  ] Registered project %q (%s) in %s\n", projID, projCfg.Anchors[projCfg.DefaultCapability].RepoPath, projectsPath)
-		fmt.Fprintln(stdout, "         Restart orbit-hub to pick up the updated projects.yaml.")
+		fmt.Fprintln(stdout, "         Restart h8o-hub to pick up the updated projects.yaml.")
 		return nil
 	}
 

@@ -75,13 +75,13 @@ jobs:
 
           build_unix() {
             local os="$1" arch="$2"
-            local stage="dist/stage/orbit-${VERSION}-${os}-${arch}"
+            local stage="dist/stage/h8o-${VERSION}-${os}-${arch}"
             mkdir -p "$stage"
-            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -trimpath -ldflags "$LDFLAGS" -o "$stage/orbit" ./cmd/orbit
-            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -trimpath -ldflags "$LDFLAGS" -o "$stage/orbit-hub" ./cmd/orbit-hub
-            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -trimpath -ldflags "$LDFLAGS" -o "$stage/orbit-runner" ./cmd/orbit-runner
+            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -trimpath -ldflags "$LDFLAGS" -o "$stage/h8o" ./cmd/h8o
+            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -trimpath -ldflags "$LDFLAGS" -o "$stage/h8o-hub" ./cmd/h8o-hub
+            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -trimpath -ldflags "$LDFLAGS" -o "$stage/h8o-runner" ./cmd/h8o-runner
             cp README.md "$stage/"
-            tar -C dist/stage -czf "dist/release/hebi8-orbit-${VERSION}-${os}-${arch}.tar.gz" "orbit-${VERSION}-${os}-${arch}"
+            tar -C dist/stage -czf "dist/release/hebi8-orbit-${VERSION}-${os}-${arch}.tar.gz" "h8o-${VERSION}-${os}-${arch}"
           }
 
           build_unix linux amd64
@@ -90,21 +90,21 @@ jobs:
           build_unix darwin amd64
 
           # Windows CLI + desktop client
-          mkdir -p "dist/stage/orbit-cli-${VERSION}-windows-amd64"
+          mkdir -p "dist/stage/h8o-cli-${VERSION}-windows-amd64"
           CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "$LDFLAGS" \
-            -o "dist/stage/orbit-cli-${VERSION}-windows-amd64/orbit.exe" ./cmd/orbit
-          (cd dist/stage && zip -rq "../release/orbit-cli-${VERSION}-windows-amd64.zip" "orbit-cli-${VERSION}-windows-amd64")
+            -o "dist/stage/h8o-cli-${VERSION}-windows-amd64/h8o.exe" ./cmd/h8o
+          (cd dist/stage && zip -rq "../release/h8o-cli-${VERSION}-windows-amd64.zip" "h8o-cli-${VERSION}-windows-amd64")
 
           # Linux & Windows pure-Go desktop client (mygo)
-          mkdir -p "dist/stage/orbit-client-${VERSION}-linux-amd64"
+          mkdir -p "dist/stage/h8o-client-${VERSION}-linux-amd64"
           (cd desktop && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "$LDFLAGS" \
-            -o "../dist/stage/orbit-client-${VERSION}-linux-amd64/orbit-client" .)
-          tar -C dist/stage -czf "dist/release/orbit-client-${VERSION}-linux-amd64.tar.gz" "orbit-client-${VERSION}-linux-amd64"
+            -o "../dist/stage/h8o-client-${VERSION}-linux-amd64/h8o-client" .)
+          tar -C dist/stage -czf "dist/release/h8o-client-${VERSION}-linux-amd64.tar.gz" "h8o-client-${VERSION}-linux-amd64"
 
-          mkdir -p "dist/stage/orbit-client-${VERSION}-windows-amd64"
+          mkdir -p "dist/stage/h8o-client-${VERSION}-windows-amd64"
           (cd desktop && CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "$LDFLAGS -H=windowsgui" \
-            -o "../dist/stage/orbit-client-${VERSION}-windows-amd64/orbit-client.exe" .)
-          (cd dist/stage && zip -rq "../release/orbit-client-${VERSION}-windows-amd64.zip" "orbit-client-${VERSION}-windows-amd64")
+            -o "../dist/stage/h8o-client-${VERSION}-windows-amd64/h8o-client.exe" .)
+          (cd dist/stage && zip -rq "../release/h8o-client-${VERSION}-windows-amd64.zip" "h8o-client-${VERSION}-windows-amd64")
 
       - uses: actions/upload-artifact@v4
         with:
@@ -112,7 +112,7 @@ jobs:
           path: dist/release/*
 
   build-macos-client:
-    name: Package macOS Desktop Client (Orbit.app + DMG)
+    name: Package macOS Desktop Client (hebi8-Orbit.app + DMG)
     needs: verify
     runs-on: macos-latest
     steps:
@@ -133,7 +133,7 @@ jobs:
           pnpm --dir web install --frozen-lockfile
           make build-web
 
-      - name: Build & package Orbit.app + DMG (darwin/arm64)
+      - name: Build & package hebi8-Orbit.app + DMG (darwin/arm64)
         env:
           INPUT_TAG: ${{ inputs.tag }}
           APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}

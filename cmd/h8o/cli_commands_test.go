@@ -131,12 +131,12 @@ func TestCLICommands_VersionTasksApprovalsPAArtifactsDoctor(t *testing.T) {
 		t.Helper()
 		var out, errBuf bytes.Buffer
 		if err := run(ctx, args, &out, &errBuf); err != nil {
-			t.Fatalf("orbit %v failed: %v (stderr=%s)", args, err, errBuf.String())
+			t.Fatalf("h8o %v failed: %v (stderr=%s)", args, err, errBuf.String())
 		}
 		return out.String()
 	}
 
-	if out := runCmd("version"); !strings.Contains(out, "orbit ") {
+	if out := runCmd("version"); !strings.Contains(out, "h8o ") {
 		t.Fatalf("unexpected version output: %q", out)
 	}
 	if out := runCmd("tasks", "list", "--hub", ts.URL); !strings.Contains(out, "tsk_1") {
@@ -270,7 +270,7 @@ func TestCLIHebi8Commands(t *testing.T) {
 		t.Helper()
 		var out, errBuf bytes.Buffer
 		if err := run(ctx, args, &out, &errBuf); err != nil {
-			t.Fatalf("orbit %v failed: %v (stderr=%s)", args, err, errBuf.String())
+			t.Fatalf("h8o %v failed: %v (stderr=%s)", args, err, errBuf.String())
 		}
 		return out.String()
 	}
@@ -316,7 +316,7 @@ func TestCLIHebi8MainErrorDoesNotFallbackAndPassesMachine(t *testing.T) {
 		t.Fatalf("expected error on 500 from /api/hebi8/main")
 	}
 	if createdLegacy {
-		t.Fatalf("P2-16 REGRESSION: orbit hebi8 fell back to POST /api/projects/_pa/tasks on HTTP 500")
+		t.Fatalf("P2-16 REGRESSION: h8o hebi8 fell back to POST /api/projects/_pa/tasks on HTTP 500")
 	}
 
 	// 2. 404 on GET /api/hebi8/main falls back cleanly to POST /api/projects/_pa/tasks

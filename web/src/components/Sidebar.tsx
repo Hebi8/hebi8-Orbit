@@ -28,7 +28,7 @@ import {
 import { resolveEffectiveLocalMachineId } from '../lib/ide';
 import { navigate, paths, type Route } from '../lib/router';
 import { toast, useWorkbenchStore } from '../store/useWorkbenchStore';
-import { CaretIcon, DirectLocalIcon, PAIcon } from './Icons';
+import { BrandMark, BrandWordmark, CaretIcon, DirectLocalIcon, PAIcon } from './Icons';
 import { StatusMark } from './StatusMark';
 
 const MAX_THREADS = 8;
@@ -459,8 +459,8 @@ export function Sidebar({
     <aside className="side">
       <div className="side-in">
         <div className="brand">
-          <span className="brand-mark" />
-          <b>Orbit</b>
+          <BrandMark />
+          <BrandWordmark />
           <div className="brand-acts">
             <button type="button" className="ib" title="快速跳转 (⌘K)" aria-label="搜索" onClick={() => setCmdkOpen(true)}>
               <Search size={13.5} strokeWidth={1.6} />

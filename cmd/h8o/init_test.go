@@ -71,7 +71,7 @@ func TestParseJoinInput(t *testing.T) {
 			wantCode: "K7QM-2XPA",
 		},
 		{
-			args:     []string{"orbit join https://orbit.example.ts.net K7QM-2XPA --no-runner"},
+			args:     []string{"h8o join https://orbit.example.ts.net K7QM-2XPA --no-runner"},
 			wantURL:  "https://orbit.example.ts.net",
 			wantCode: "K7QM-2XPA",
 			wantNoR:  true,
@@ -188,7 +188,7 @@ func TestInitRunnerGeneratesTokenAndSnippet(t *testing.T) {
 }
 
 func TestParseFlagsPermuted(t *testing.T) {
-	// Case 1: orbit join <url> <code> --service
+	// Case 1: h8o join <url> <code> --service
 	fsJoin := flag.NewFlagSet("join", flag.ContinueOnError)
 	useService := fsJoin.Bool("service", false, "")
 	noRunner := fsJoin.Bool("no-runner", false, "")
@@ -202,7 +202,7 @@ func TestParseFlagsPermuted(t *testing.T) {
 		t.Fatalf("unexpected join positional args: %q", got)
 	}
 
-	// Case 2: orbit agents test agy --machine mini --json
+	// Case 2: h8o agents test agy --machine mini --json
 	fsAgents := flag.NewFlagSet("agents", flag.ContinueOnError)
 	machine := fsAgents.String("machine", "", "")
 	jsonOut := fsAgents.Bool("json", false, "")

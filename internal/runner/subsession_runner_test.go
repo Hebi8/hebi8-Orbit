@@ -44,7 +44,7 @@ func TestRunner_DelegateSocketTokenIsolationAndAntiSpoofing(t *testing.T) {
 	defer hubSrv.Close()
 
 	// Create a fake executable for orbit binary path so MCP server injection also activates
-	fakeOrbitBin := filepath.Join(tmp, "orbit")
+	fakeOrbitBin := filepath.Join(tmp, "h8o")
 	if err := os.WriteFile(fakeOrbitBin, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -443,7 +443,7 @@ func TestRunner_AutoAllowOrbitBuiltinMCPTools(t *testing.T) {
 	defer cancel()
 
 	tmp := t.TempDir()
-	fakeOrbitBin := filepath.Join(tmp, "orbit")
+	fakeOrbitBin := filepath.Join(tmp, "h8o")
 	if err := os.WriteFile(fakeOrbitBin, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -572,7 +572,7 @@ func TestRunner_MCPAutoAllowHardeningAndPlanSocketGuard(t *testing.T) {
 	defer cancel()
 
 	tmp := t.TempDir()
-	fakeOrbitBin := filepath.Join(tmp, "orbit")
+	fakeOrbitBin := filepath.Join(tmp, "h8o")
 	if err := os.WriteFile(fakeOrbitBin, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -773,7 +773,7 @@ func TestRunner_DelegateTokenRevokedOnConfigFailureAndCloseError(t *testing.T) {
 	defer cancel()
 
 	tmp := t.TempDir()
-	fakeOrbitBin := filepath.Join(tmp, "orbit")
+	fakeOrbitBin := filepath.Join(tmp, "h8o")
 	if err := os.WriteFile(fakeOrbitBin, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -856,7 +856,7 @@ func TestRunner_AdapterSwitchOnSameSlotRotatesDelegateToken(t *testing.T) {
 	defer cancel()
 
 	tmp := t.TempDir()
-	fakeOrbitBin := filepath.Join(tmp, "orbit")
+	fakeOrbitBin := filepath.Join(tmp, "h8o")
 	if err := os.WriteFile(fakeOrbitBin, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -981,7 +981,7 @@ func TestRunner_ColdRecoveryRevokesFailedResumeAndLoadTokens(t *testing.T) {
 	defer cancel()
 
 	tmp := t.TempDir()
-	fakeOrbitBin := filepath.Join(tmp, "orbit")
+	fakeOrbitBin := filepath.Join(tmp, "h8o")
 	if err := os.WriteFile(fakeOrbitBin, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -1138,7 +1138,7 @@ func TestRunner_DriverMCPFallbackRevokesInitialDelegateToken(t *testing.T) {
 			defer cancel()
 
 			tmp := t.TempDir()
-			fakeOrbitBin := filepath.Join(tmp, "orbit")
+			fakeOrbitBin := filepath.Join(tmp, "h8o")
 			if err := os.WriteFile(fakeOrbitBin, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
 				t.Fatal(err)
 			}
@@ -1255,7 +1255,7 @@ func TestAgyAcpDriver_NoMCPFallbackOnTransportOrTimeoutErrors(t *testing.T) {
 	}{
 		{name: "timeout", rejectErr: errors.New("context deadline exceeded: upstream timeout")},
 		{name: "mcp_startup_exit_status", rejectErr: errors.New("failed to start mcp server: exit status 1")},
-		{name: "mcp_spawn_permission_denied", rejectErr: errors.New("spawn orbit mcp-serve: permission denied")},
+		{name: "mcp_spawn_permission_denied", rejectErr: errors.New("spawn h8o mcp-serve: permission denied")},
 		{name: "non_mcp_invalid_params_unknown_field", rejectErr: errors.New("invalid params: unknown field foo")},
 		{name: "non_mcp_jsonrpc_32602", rejectErr: errors.New("rpc error -32602: invalid params for cwd")},
 	} {

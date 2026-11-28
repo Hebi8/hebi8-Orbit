@@ -4,6 +4,7 @@ import { ArrowLeftRight, Check, Laptop, Plus, RefreshCw } from 'lucide-react';
 import type { BootstrapResponse, ProjectView } from '../generated/protocol';
 import { AgentList } from '../components/AgentList';
 import { ProjectDirPicker } from '../components/AddProjectModal';
+import { BrandMark, BrandWordmark } from '../components/Icons';
 import { PairDialog } from '../components/PairDialog';
 import { api, errMsg, isDesktopShell, openDesktopSetup } from '../lib/api';
 import { SCRATCH_PROJECT_ID, cleanMachineName, isVirtualProject } from '../lib/format';
@@ -176,8 +177,8 @@ export function OnboardingPage({ boot }: { boot: BootstrapResponse }) {
       <div className="onb-card">
         <div className="onb-top">
           <div className="brand" style={{ margin: 0, padding: 0 }}>
-            <span className="brand-mark" />
-            <b>Orbit</b>
+            <BrandMark />
+            <BrandWordmark />
           </div>
           <div className="onb-dots" aria-label={`步骤 ${step}`}>
             <span className={`onb-dot ${step === 1 ? 'on' : ''}`} />
@@ -235,7 +236,7 @@ export function OnboardingPage({ boot }: { boot: BootstrapResponse }) {
               </button>
               {inDesktop && (
                 <button type="button" className="onb-link" onClick={() => openDesktopSetup()}>
-                  <ArrowLeftRight size={13} strokeWidth={1.6} /> 切换到已有 Orbit 网络
+                  <ArrowLeftRight size={13} strokeWidth={1.6} /> 切换到已有 hebi8/orbit 网络
                 </button>
               )}
             </div>

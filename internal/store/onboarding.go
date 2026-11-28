@@ -335,7 +335,7 @@ func (s *Store) CreateClientToken(ctx context.Context, name, scope, machineID st
 		scope = "client"
 	}
 	if strings.TrimSpace(name) == "" {
-		name = "orbit-client"
+		name = "h8o-client"
 	}
 	secret, err := randomSecretHex(32)
 	if err != nil {
@@ -1690,7 +1690,7 @@ func (s *Store) CreateClientTokenChecked(ctx context.Context, name, scope, machi
 		scope = "browser"
 	}
 	if strings.TrimSpace(name) == "" {
-		name = "orbit-client"
+		name = "h8o-client"
 	}
 	secret, err := randomSecretHex(32)
 	if err != nil {

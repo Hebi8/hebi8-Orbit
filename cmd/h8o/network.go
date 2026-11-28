@@ -25,8 +25,8 @@ import (
 )
 
 // parseFlagsPermuted reorders flag tokens ahead of positional arguments so CLI
-// invocations like `orbit join <url> <code> --service` and
-// `orbit agents test agy --machine mini` work regardless of flag placement.
+// invocations like `h8o join <url> <code> --service` and
+// `h8o agents test agy --machine mini` work regardless of flag placement.
 func parseFlagsPermuted(fs *flag.FlagSet, args []string) error {
 	var flagArgs []string
 	var posArgs []string
@@ -74,7 +74,7 @@ func parseFlagsPermuted(fs *flag.FlagSet, args []string) error {
 
 // parseJoinInput parses either:
 // - "<hubURL> <code|XXXX-XXXX>"
-// - "orbit join <hubURL> <code> [--no-runner|--runner-only]" (full pasted command)
+// - "h8o join <hubURL> <code> [--no-runner|--runner-only]" (full pasted command)
 // - "<hubURL>/#/join/<code>[?scope=client|runner]" (pasted invite link)
 func parseJoinInput(args []string, explicitCode string) (hubURL, code string, noRunnerHint bool, err error) {
 	hubURL, code, noRunnerHint, _, err = parseJoinInputWithScope(args, explicitCode)
@@ -86,8 +86,8 @@ func parseJoinInputWithScope(args []string, explicitCode string) (hubURL, code s
 	joined = strings.Trim(joined, `"'`)
 	tokens := strings.Fields(joined)
 
-	// Strip optional leading "orbit join"
-	if len(tokens) >= 2 && strings.EqualFold(filepath.Base(tokens[0]), "orbit") && strings.EqualFold(tokens[1], "join") {
+	// Strip optional leading "h8o join"
+	if len(tokens) >= 2 && strings.EqualFold(filepath.Base(tokens[0]), "h8o") && strings.EqualFold(tokens[1], "join") {
 		tokens = tokens[2:]
 	}
 
@@ -116,7 +116,7 @@ func parseJoinInputWithScope(args []string, explicitCode string) (hubURL, code s
 	}
 
 	if len(positional) == 0 {
-		return "", "", false, false, fmt.Errorf("usage: orbit join <hub-url> <pair-code>")
+		return "", "", false, false, fmt.Errorf("usage: h8o join <hub-url> <pair-code>")
 	}
 
 	rawURL := positional[0]
@@ -247,19 +247,19 @@ func runUp(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		}
 	} else {
 		if !attached {
-			pid, err := spawnDetachedBinary("orbit-hub", []string{"--config-dir", cfgDir}, filepath.Join(dataDir, "logs", "hub.log"))
+			pid, err := spawnDetachedBinary("h8o-hub", []string{"--config-dir", cfgDir}, filepath.Join(dataDir, "logs", "hub.log"))
 			if err != nil {
-				return fmt.Errorf("start orbit-hub: %w", err)
+				return fmt.Errorf("start h8o-hub: %w", err)
 			}
 			hubPID = pid
 		}
 		if !waitForOrbitHub(ctx, hubURL, 10*time.Second) {
-			return fmt.Errorf("orbit-hub did not become ready at %s (check %s)", hubURL, filepath.Join(dataDir, "logs", "hub.log"))
+			return fmt.Errorf("h8o-hub did not become ready at %s (check %s)", hubURL, filepath.Join(dataDir, "logs", "hub.log"))
 		}
 		if !*noRunner && !isLocalRunnerRunning(dataDir, machineID) {
-			pid, err := spawnDetachedBinary("orbit-runner", []string{"--machine-id", machineID, "--config-dir", cfgDir}, filepath.Join(dataDir, "logs", "runner.log"))
+			pid, err := spawnDetachedBinary("h8o-runner", []string{"--machine-id", machineID, "--config-dir", cfgDir}, filepath.Join(dataDir, "logs", "runner.log"))
 			if err != nil {
-				return fmt.Errorf("start orbit-runner: %w", err)
+				return fmt.Errorf("start h8o-runner: %w", err)
 			}
 			runnerPID = pid
 		}
@@ -284,11 +284,11 @@ func runUp(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	}
 
 	if attached {
-		fmt.Fprintf(stdout, "已连接到本机 Orbit (%s · 机器 %s)\n", hubURL, machineID)
+		fmt.Fprintf(stdout, "已连接到本机 hebi8/orbit (%s · 机器 %s)\n", hubURL, machineID)
 	} else {
-		fmt.Fprintf(stdout, "本机 Orbit 已启动 (%s · 机器 %s)\n", hubURL, machineID)
+		fmt.Fprintf(stdout, "本机 hebi8/orbit 已启动 (%s · 机器 %s)\n", hubURL, machineID)
 	}
-	fmt.Fprintln(stdout, "打开工作台：orbit open")
+	fmt.Fprintln(stdout, "打开工作台：h8o open")
 	return nil
 }
 
@@ -302,7 +302,7 @@ func runPair(ctx context.Context, args []string, stdout, stderr io.Writer) error
 		machineID       = fs.String("machine", "", "Bind credentials to an existing machine ID (e.g. mini)")
 		ttlSec          = fs.Int("ttl", 600, "Pairing code expiry in seconds")
 		noWait          = fs.Bool("no-wait", false, "Return immediately without waiting for machine to connect")
-		hubURLFlag      = fs.String("hub", "", "orbit-hub base URL")
+		hubURLFlag      = fs.String("hub", "", "h8o-hub base URL")
 		tokenFlag       = fs.String("token", "", "optional auth token")
 		configDir       = fs.String("config-dir", "", "orbit config directory")
 		dataDirFlg      = fs.String("data-dir", "", "orbit data directory")
@@ -346,7 +346,7 @@ func runPair(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	if scope == protocol.PairingScopeRunner {
 		fmt.Fprintf(stdout, "（仅限执行节点，请在目标机器终端运行；配对码 %s，%d 分钟内有效。）\n", resp.Code, *ttlSec/60)
 	} else {
-		fmt.Fprintf(stdout, "或在那台机器的 Orbit 桌面端选「连到已有的」并粘贴上面这一行（配对码 %s，%d 分钟内有效）。\n", resp.Code, *ttlSec/60)
+		fmt.Fprintf(stdout, "或在那台机器的 hebi8/orbit 桌面端选「配对加入其他网络」并粘贴上面这一行（配对码 %s，%d 分钟内有效）。\n", resp.Code, *ttlSec/60)
 	}
 
 	if !*noWait {
@@ -445,7 +445,7 @@ func runJoin(ctx context.Context, args []string, stdout, stderr io.Writer) error
 		nameFlag   = fs.String("name", "", "Machine name override")
 		noRunner   = fs.Bool("no-runner", false, "Connect as client only without starting local Runner")
 		runnerOnly = fs.Bool("runner-only", false, "Join as Runner execution node only without client credentials")
-		noStart    = fs.Bool("no-start", false, "Save credentials without launching orbit-runner")
+		noStart    = fs.Bool("no-start", false, "Save credentials without launching h8o-runner")
 		useService = fs.Bool("service", false, "Install and start background Runner service")
 		configDir  = fs.String("config-dir", "", "orbit config directory")
 		dataDirFlg = fs.String("data-dir", "", "orbit data directory")
@@ -469,7 +469,7 @@ func runJoin(ctx context.Context, args []string, stdout, stderr io.Writer) error
 		return fmt.Errorf("--no-runner and --runner-only cannot both be set")
 	}
 	if code == "" {
-		return fmt.Errorf("missing pairing code (usage: orbit join <hub-url> <pair-code>)")
+		return fmt.Errorf("missing pairing code (usage: h8o join <hub-url> <pair-code>)")
 	}
 
 	cfgDir := resolveConfigDir(*configDir)
@@ -574,12 +574,12 @@ func runJoin(ctx context.Context, args []string, stdout, stderr io.Writer) error
 		if *useService {
 			if err := installAndStartService(ctx, "runner", remoteRunnerDir, remoteDataDir, claimed.MachineID, io.Discard); err != nil {
 				fmt.Fprintf(stderr, "警告：安装后台服务失败（%v），改为直接启动 Runner\n", err)
-				_, _ = spawnDetachedBinary("orbit-runner", []string{"--config-dir", remoteRunnerDir}, filepath.Join(remoteDataDir, "logs", "runner.log"))
+				_, _ = spawnDetachedBinary("h8o-runner", []string{"--config-dir", remoteRunnerDir}, filepath.Join(remoteDataDir, "logs", "runner.log"))
 			}
 		} else {
 			if err := os.MkdirAll(filepath.Join(remoteDataDir, "logs"), 0o755); err == nil {
-				if _, err := spawnDetachedBinary("orbit-runner", []string{"--config-dir", remoteRunnerDir}, filepath.Join(remoteDataDir, "logs", "runner.log")); err != nil {
-					fmt.Fprintf(stderr, "警告：未能自动启动 orbit-runner（%v），可手动运行：orbit-runner --config-dir %s\n", err, remoteRunnerDir)
+				if _, err := spawnDetachedBinary("h8o-runner", []string{"--config-dir", remoteRunnerDir}, filepath.Join(remoteDataDir, "logs", "runner.log")); err != nil {
+					fmt.Fprintf(stderr, "警告：未能自动启动 h8o-runner（%v），可手动运行：h8o-runner --config-dir %s\n", err, remoteRunnerDir)
 				}
 			}
 		}
@@ -610,7 +610,7 @@ func runJoin(ctx context.Context, args []string, stdout, stderr io.Writer) error
 			}
 		}
 	}
-	fmt.Fprintln(stdout, "\n打开工作台：orbit open")
+	fmt.Fprintln(stdout, "\n打开工作台：h8o open")
 	return nil
 }
 
@@ -626,11 +626,11 @@ func runAgents(ctx context.Context, args []string, stdout, stderr io.Writer) err
 	}
 	if sub == "help" || sub == "-h" || sub == "--help" {
 		fmt.Fprintln(stdout, `Usage:
-  orbit agents [list] [--machine <id>] [--json]
-  orbit agents check [--machine <id>]
-  orbit agents test <agy|claude|codex> [--machine <id>]
-  orbit agents install <claude|codex> [--machine <id>]
-  orbit agents enable|disable <agy|claude|codex> [--machine <id>]`)
+  h8o agents [list] [--machine <id>] [--json]
+  h8o agents check [--machine <id>]
+  h8o agents test <agy|claude|codex> [--machine <id>]
+  h8o agents install <claude|codex> [--machine <id>]
+  h8o agents enable|disable <agy|claude|codex> [--machine <id>]`)
 		return nil
 	}
 
@@ -638,7 +638,7 @@ func runAgents(ctx context.Context, args []string, stdout, stderr io.Writer) err
 	fs.SetOutput(stderr)
 	var (
 		machineFlag = fs.String("machine", "", "Target machine ID (defaults to local/sole machine)")
-		hubURLFlag  = fs.String("hub", "", "orbit-hub base URL")
+		hubURLFlag  = fs.String("hub", "", "h8o-hub base URL")
 		tokenFlag   = fs.String("token", "", "optional auth token")
 		configDir   = fs.String("config-dir", "", "orbit config directory")
 		dataDirFlg  = fs.String("data-dir", "", "orbit data directory")
@@ -693,7 +693,7 @@ func runAgents(ctx context.Context, args []string, stdout, stderr io.Writer) err
 
 	case "test":
 		if fs.NArg() < 1 {
-			return fmt.Errorf("usage: orbit agents test <agy|claude|codex> [--machine <id>]")
+			return fmt.Errorf("usage: h8o agents test <agy|claude|codex> [--machine <id>]")
 		}
 		adp := strings.TrimSpace(fs.Arg(0))
 		raw, err := c.doJSON(ctx, http.MethodPost, "/api/machines/"+url.PathEscape(targetMachine)+"/agents/"+url.PathEscape(adp)+"/test", map[string]any{})
@@ -714,7 +714,7 @@ func runAgents(ctx context.Context, args []string, stdout, stderr io.Writer) err
 
 	case "install":
 		if fs.NArg() < 1 {
-			return fmt.Errorf("usage: orbit agents install <claude|codex> [--machine <id>]")
+			return fmt.Errorf("usage: h8o agents install <claude|codex> [--machine <id>]")
 		}
 		adp := strings.TrimSpace(fs.Arg(0))
 		fmt.Fprintf(stdout, "正在 %s 上安装 %s 连接组件…\n", targetMachine, adp)
@@ -731,7 +731,7 @@ func runAgents(ctx context.Context, args []string, stdout, stderr io.Writer) err
 
 	case "enable", "disable":
 		if fs.NArg() < 1 {
-			return fmt.Errorf("usage: orbit agents %s <agy|claude|codex> [--machine <id>]", sub)
+			return fmt.Errorf("usage: h8o agents %s <agy|claude|codex> [--machine <id>]", sub)
 		}
 		adp := strings.TrimSpace(fs.Arg(0))
 		en := sub == "enable"
@@ -760,7 +760,7 @@ func runMachines(ctx context.Context, args []string, stdout, stderr io.Writer) e
 	fs := flag.NewFlagSet("machines", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	var (
-		hubURLFlag = fs.String("hub", "", "orbit-hub base URL")
+		hubURLFlag = fs.String("hub", "", "h8o-hub base URL")
 		tokenFlag  = fs.String("token", "", "optional auth token")
 		configDir  = fs.String("config-dir", "", "orbit config directory")
 		dataDirFlg = fs.String("data-dir", "", "orbit data directory")
@@ -794,7 +794,7 @@ func runMachines(ctx context.Context, args []string, stdout, stderr io.Writer) e
 
 	case "rename":
 		if fs.NArg() < 2 {
-			return fmt.Errorf("usage: orbit machines rename <machineId> <alias>")
+			return fmt.Errorf("usage: h8o machines rename <machineId> <alias>")
 		}
 		mid := strings.TrimSpace(fs.Arg(0))
 		alias := strings.TrimSpace(fs.Arg(1))
@@ -812,7 +812,7 @@ func runMachines(ctx context.Context, args []string, stdout, stderr io.Writer) e
 
 	case "rm", "remove", "delete":
 		if fs.NArg() < 1 {
-			return fmt.Errorf("usage: orbit machines rm <machineId>")
+			return fmt.Errorf("usage: h8o machines rm <machineId>")
 		}
 		mid := strings.TrimSpace(fs.Arg(0))
 		raw, err := c.doJSON(ctx, http.MethodDelete, "/api/machines/"+url.PathEscape(mid), nil)
@@ -845,7 +845,7 @@ func runProjects(ctx context.Context, args []string, stdout, stderr io.Writer) e
 		idFlag      = fs.String("id", "", "Project ID override")
 		adapterFlag = fs.String("adapter", "", "Default adapter override")
 		yamlFlag    = fs.Bool("yaml", false, "Write legacy projects.yaml instead of Hub API")
-		hubURLFlag  = fs.String("hub", "", "orbit-hub base URL")
+		hubURLFlag  = fs.String("hub", "", "h8o-hub base URL")
 		tokenFlag   = fs.String("token", "", "optional auth token")
 		configDir   = fs.String("config-dir", "", "orbit config directory")
 		dataDirFlg  = fs.String("data-dir", "", "orbit data directory")
@@ -920,7 +920,7 @@ func runProjects(ctx context.Context, args []string, stdout, stderr io.Writer) e
 
 	case "rm", "remove", "delete":
 		if fs.NArg() < 1 {
-			return fmt.Errorf("usage: orbit projects rm <projectId>")
+			return fmt.Errorf("usage: h8o projects rm <projectId>")
 		}
 		pid := strings.TrimSpace(fs.Arg(0))
 		raw, err := c.doJSON(ctx, http.MethodDelete, "/api/projects/"+url.PathEscape(pid), nil)
@@ -1429,7 +1429,7 @@ func agentHumanHint(ag protocol.AgentProbe) string {
 		if ag.HintCode == "missing_npm" {
 			return "需要 Node.js (npm) 才能安装连接组件"
 		}
-		return "已装主程序，还差连接组件（orbit agents install " + string(ag.Adapter) + "）"
+		return "已装主程序，还差连接组件（h8o agents install " + string(ag.Adapter) + "）"
 	case protocol.AgentStateNeedsLogin:
 		return "需要在这台机器上登录一次"
 	case protocol.AgentStateDisabled:

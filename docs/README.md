@@ -9,7 +9,7 @@
 | [overview-and-stack.md](architecture/overview-and-stack.md) | 系统总览、网络拓扑、四界单真源（4A）、纯 Go (`CGO_ENABLED=0`) + `mygo` 桌面壳技术栈、内置子会话 MCP/CLI 与仓库结构 |
 | [data-model-and-contracts.md](architecture/data-model-and-contracts.md) | SQLite WAL Schema（三类生命周期拆表、复合外键、部分唯一索引）、防 GC 与配套备份、YAML 注册表、REST/WS 与统一有序 Outbox 契约 |
 | [acp-runner-and-cross-machine.md](architecture/acp-runner-and-cross-machine.md) | 薄 ACP Runner 状态机、5 条 ACP Spike 硬边界、三适配器隔离层、零污染跨机 Git Checkpoint、Ryugi Sidecar 桥接、独占资源闸门与正向 SSH 部署协议 |
-| [onboarding-and-machine-setup.md](architecture/onboarding-and-machine-setup.md) | 零门槛本机起跑、一次性配对码与动态注册、每机 Agent 自动探测/装桥/热配置、CLI 与 `Orbit.app` 收口 |
+| [onboarding-and-machine-setup.md](architecture/onboarding-and-machine-setup.md) | 零门槛本机起跑、一次性配对码与动态注册、每机 Agent 自动探测/装桥/热配置、CLI (`h8o`) 与 `hebi8-Orbit.app` 收口 |
 | [peer-mesh-and-v3-spec.md](architecture/peer-mesh-and-v3-spec.md) | v3（Route X）去中心对等网（签名账本 + 确定性值班节点）、3 层 Project 模型（`Project → Part → Location`）、普通文件夹原位执行与对应 UI/交互规范（与 `ux/` 互为补充） |
 
 ## 当前有效 UX 规格（`ux/`）
@@ -35,5 +35,5 @@
 ## 本地 Ryugi 画板与 PoC 双向对齐说明
 
 - 可交互 UX 设计画板保存在仓库本地 `.ryugi/artifacts/artboard/`（如 `.ryugi/artifacts/artboard/orbit-ux-v4/`），由 `.gitignore` 忽略，**不进入 Git 公开提交**。
-- 预览与评审使用独立外部 Ryugi 实例，不触碰 `orbit-hub` 自身托管的 Ryugi Sidecar 进程。
+- 预览与评审使用独立外部 Ryugi 实例，不触碰 `h8o-hub` 自身托管的 Ryugi Sidecar 进程。
 - UI 结构变更遵循**增量演进与双向同步**：不在既有画板上推倒重写；改动 `web/src/` 交互/组件后同步更新活跃 Ryugi 画板，画板拍板的新交互落地 `web/src/` 时保持组件与像素同构（详见 [AGENTS.md](../AGENTS.md)）。

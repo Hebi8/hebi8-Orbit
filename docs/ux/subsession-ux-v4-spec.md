@@ -185,7 +185,7 @@
   - `web/src/windows/ReviewOverlay.tsx` & `web/src/windows/CodeReviewPane.tsx`：统一/分栏 Diff + 高亮、`Checkpoint` 发送前撤销、`×` 关闭键、全宽行内批注卡片。
   - `web/src/pages/PAPage.tsx` & `web/src/components/Hebi8LineDrawer.tsx`：PA 暂不挂子会话、独立跨目录提示卡片、顶栏单一树形图标、底部按需快速汇总建议条、`HEAD` 置顶 Git-Tree。
   - `web/src/pages/ProjectPage.tsx`、`web/src/components/DirBrowseModal.tsx`、`web/src/pages/SettingsPage.tsx`：去冗余默认隔离策略、Part/路径独立编辑删除、Codex 风格目录选择器、主控顺位左侧简洁拖拽手柄调序、全量非本机离线/YAML/SSH 设备展开管理与两步删除、故障横幅 `×` 关闭。
-- **不可破坏的底层能力**：保留一等子会话协议基线（`parent_task_id`、内置 5 工具 stdio MCP `orbit mcp-serve`、`orbit child` CLI、`child_result` 持久异步唤醒、跨机 steer；同时在业务层约束最大层级 = 1）、Hebi8 Fold-Rollover 后端存储、3 层 Project 模型、普通文件夹轻量快照与 SSH Config 解析。
+- **不可破坏的底层能力**：保留一等子会话协议基线（`parent_task_id`、内置 5 工具 stdio MCP `h8o mcp-serve`、`h8o child` CLI、`child_result` 持久异步唤醒、跨机 steer；同时在业务层约束最大层级 = 1）、Hebi8 Fold-Rollover 后端存储、3 层 Project 模型、普通文件夹轻量快照与 SSH Config 解析。
 
 ---
 

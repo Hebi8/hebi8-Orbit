@@ -2163,7 +2163,7 @@ func (s *Store) ConsumeNextPendingInput(ctx context.Context, p ConsumeNextPendin
 
 func buildAnnotationBatchPrompt(anns []protocol.AnnotationView, extraMessage string) string {
 	var b strings.Builder
-	b.WriteString("请逐条处理以下审阅批注，并在完成后运行 `orbit deliver --summary \"...\" --final`：\n")
+	b.WriteString("请逐条处理以下审阅批注，并在完成后运行 `h8o deliver --summary \"...\" --final`：\n")
 	if strings.TrimSpace(extraMessage) != "" {
 		b.WriteString("\n补充说明: " + strings.TrimSpace(extraMessage) + "\n")
 	}

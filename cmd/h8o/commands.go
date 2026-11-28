@@ -126,12 +126,12 @@ func runTasks(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		return runTasksRetry(ctx, args[1:], stdout, stderr)
 	case "-h", "--help", "help":
 		fmt.Fprintln(stdout, `Usage:
-  orbit tasks [list] [--project <id>] [--json]
-  orbit tasks new (--project <id> | --chat) --goal "..." [--title "..."] [--parent <taskId>] [--role "..."] [--machine <id>] [--worktree[=true|false]] [--adapter agy|claude|codex] [--model <m>] [--effort <lvl>] [--mode <mode>] [--capability <cap>] [--dirty] [--json]
-  orbit tasks show <taskId> [--json]
-  orbit tasks followup <taskId> --message "..." [--mode queue|steer|fork_new_session] [--adapter <adp>] [--model <m>] [--json]
-  orbit tasks cancel <taskId> [--reason "..."]
-  orbit tasks retry <taskId> [--verified-site]`)
+  h8o tasks [list] [--project <id>] [--json]
+  h8o tasks new (--project <id> | --chat) --goal "..." [--title "..."] [--parent <taskId>] [--role "..."] [--machine <id>] [--worktree[=true|false]] [--adapter agy|claude|codex] [--model <m>] [--effort <lvl>] [--mode <mode>] [--capability <cap>] [--dirty] [--json]
+  h8o tasks show <taskId> [--json]
+  h8o tasks followup <taskId> --message "..." [--mode queue|steer|fork_new_session] [--adapter <adp>] [--model <m>] [--json]
+  h8o tasks cancel <taskId> [--reason "..."]
+  h8o tasks retry <taskId> [--verified-site]`)
 		return nil
 	default:
 		return fmt.Errorf("unknown tasks subcommand %q (try: list, new, show, followup, cancel, retry)", args[0])
@@ -143,7 +143,7 @@ func runTasksList(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	fs.SetOutput(stderr)
 	var (
 		projectID  = fs.String("project", "", "filter by project ID (defaults to active tasks across all projects)")
-		hubURLFlag = fs.String("hub", "", "orbit-hub base URL")
+		hubURLFlag = fs.String("hub", "", "h8o-hub base URL")
 		tokenFlag  = fs.String("token", "", "optional X-Orbit-Dev-Token")
 		configDir  = fs.String("config-dir", "", "orbit config directory")
 		dataDirFlg = fs.String("data-dir", "", "orbit data directory")
@@ -256,7 +256,7 @@ func runTasksNew(ctx context.Context, args []string, stdout, stderr io.Writer) e
 		mode       = fs.String("mode", "", "optional permission mode override (ask|auto|full)")
 		capability = fs.String("capability", "", "optional required machine capability")
 		dirty      = fs.Bool("dirty", false, "import dirty workspace snapshot from local repo")
-		hubURLFlag = fs.String("hub", "", "orbit-hub base URL")
+		hubURLFlag = fs.String("hub", "", "h8o-hub base URL")
 		tokenFlag  = fs.String("token", "", "optional X-Orbit-Dev-Token")
 		configDir  = fs.String("config-dir", "", "orbit config directory")
 		dataDirFlg = fs.String("data-dir", "", "orbit data directory")
@@ -335,7 +335,7 @@ func runTasksShow(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	fs := flag.NewFlagSet("tasks show", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	var (
-		hubURLFlag = fs.String("hub", "", "orbit-hub base URL")
+		hubURLFlag = fs.String("hub", "", "h8o-hub base URL")
 		tokenFlag  = fs.String("token", "", "optional X-Orbit-Dev-Token")
 		configDir  = fs.String("config-dir", "", "orbit config directory")
 		dataDirFlg = fs.String("data-dir", "", "orbit data directory")
@@ -345,7 +345,7 @@ func runTasksShow(ctx context.Context, args []string, stdout, stderr io.Writer) 
 		return err
 	}
 	if fs.NArg() < 1 {
-		return fmt.Errorf("usage: orbit tasks show <taskId>")
+		return fmt.Errorf("usage: h8o tasks show <taskId>")
 	}
 	taskID := strings.TrimSpace(fs.Arg(0))
 
@@ -396,7 +396,7 @@ func runTasksFollowup(ctx context.Context, args []string, stdout, stderr io.Writ
 		mode       = fs.String("mode", "queue", "queue | steer | fork_new_session")
 		adapter    = fs.String("adapter", "", "optional adapter override (agy|claude|codex)")
 		model      = fs.String("model", "", "optional model override")
-		hubURLFlag = fs.String("hub", "", "orbit-hub base URL")
+		hubURLFlag = fs.String("hub", "", "h8o-hub base URL")
 		tokenFlag  = fs.String("token", "", "optional X-Orbit-Dev-Token")
 		configDir  = fs.String("config-dir", "", "orbit config directory")
 		dataDirFlg = fs.String("data-dir", "", "orbit data directory")
@@ -406,7 +406,7 @@ func runTasksFollowup(ctx context.Context, args []string, stdout, stderr io.Writ
 		return err
 	}
 	if fs.NArg() < 1 {
-		return fmt.Errorf("usage: orbit tasks followup <taskId> --message \"...\"")
+		return fmt.Errorf("usage: h8o tasks followup <taskId> --message \"...\"")
 	}
 	taskID := strings.TrimSpace(fs.Arg(0))
 	msg := strings.TrimSpace(*message)
@@ -454,8 +454,8 @@ func runTasksCancel(ctx context.Context, args []string, stdout, stderr io.Writer
 	fs := flag.NewFlagSet("tasks cancel", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	var (
-		reason     = fs.String("reason", "cancelled via orbit CLI", "cancellation reason")
-		hubURLFlag = fs.String("hub", "", "orbit-hub base URL")
+		reason     = fs.String("reason", "cancelled via h8o CLI", "cancellation reason")
+		hubURLFlag = fs.String("hub", "", "h8o-hub base URL")
 		tokenFlag  = fs.String("token", "", "optional X-Orbit-Dev-Token")
 		configDir  = fs.String("config-dir", "", "orbit config directory")
 		dataDirFlg = fs.String("data-dir", "", "orbit data directory")
@@ -465,7 +465,7 @@ func runTasksCancel(ctx context.Context, args []string, stdout, stderr io.Writer
 		return err
 	}
 	if fs.NArg() < 1 {
-		return fmt.Errorf("usage: orbit tasks cancel <taskId>")
+		return fmt.Errorf("usage: h8o tasks cancel <taskId>")
 	}
 	taskID := strings.TrimSpace(fs.Arg(0))
 	c := newHubClient(*configDir, *dataDirFlg, *hubURLFlag, *tokenFlag)
@@ -485,7 +485,7 @@ func runTasksRetry(ctx context.Context, args []string, stdout, stderr io.Writer)
 	fs.SetOutput(stderr)
 	var (
 		verified   = fs.Bool("verified-site", false, "confirm workspace was inspected after needs_verification")
-		hubURLFlag = fs.String("hub", "", "orbit-hub base URL")
+		hubURLFlag = fs.String("hub", "", "h8o-hub base URL")
 		tokenFlag  = fs.String("token", "", "optional X-Orbit-Dev-Token")
 		configDir  = fs.String("config-dir", "", "orbit config directory")
 		dataDirFlg = fs.String("data-dir", "", "orbit data directory")
@@ -495,7 +495,7 @@ func runTasksRetry(ctx context.Context, args []string, stdout, stderr io.Writer)
 		return err
 	}
 	if fs.NArg() < 1 {
-		return fmt.Errorf("usage: orbit tasks retry <taskId>")
+		return fmt.Errorf("usage: h8o tasks retry <taskId>")
 	}
 	taskID := strings.TrimSpace(fs.Arg(0))
 	c := newHubClient(*configDir, *dataDirFlg, *hubURLFlag, *tokenFlag)
@@ -525,9 +525,9 @@ func runApprovals(ctx context.Context, args []string, stdout, stderr io.Writer) 
 		return runApprovalDecide(ctx, false, args[1:], stdout, stderr)
 	case "-h", "--help", "help":
 		fmt.Fprintln(stdout, `Usage:
-  orbit approvals [list] [--json]
-  orbit approvals allow <approvalId> [--option <id>] [--note "..."]
-  orbit approvals reject <approvalId> [--option <id>] [--note "..."]`)
+  h8o approvals [list] [--json]
+  h8o approvals allow <approvalId> [--option <id>] [--note "..."]
+  h8o approvals reject <approvalId> [--option <id>] [--note "..."]`)
 		return nil
 	default:
 		return fmt.Errorf("unknown approvals subcommand %q (try: list, allow, reject)", args[0])
@@ -538,7 +538,7 @@ func runApprovalsList(ctx context.Context, args []string, stdout, stderr io.Writ
 	fs := flag.NewFlagSet("approvals list", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	var (
-		hubURLFlag = fs.String("hub", "", "orbit-hub base URL")
+		hubURLFlag = fs.String("hub", "", "h8o-hub base URL")
 		tokenFlag  = fs.String("token", "", "optional X-Orbit-Dev-Token")
 		configDir  = fs.String("config-dir", "", "orbit config directory")
 		dataDirFlg = fs.String("data-dir", "", "orbit data directory")
@@ -577,7 +577,7 @@ func runApprovalDecide(ctx context.Context, allow bool, args []string, stdout, s
 	var (
 		optionID   = fs.String("option", "", "explicit optionId (defaults to matching allow/reject option)")
 		note       = fs.String("note", "", "optional decision note")
-		hubURLFlag = fs.String("hub", "", "orbit-hub base URL")
+		hubURLFlag = fs.String("hub", "", "h8o-hub base URL")
 		tokenFlag  = fs.String("token", "", "optional X-Orbit-Dev-Token")
 		configDir  = fs.String("config-dir", "", "orbit config directory")
 		dataDirFlg = fs.String("data-dir", "", "orbit data directory")
@@ -692,12 +692,12 @@ func runHebi8(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 			return runHebi8Line(ctx, args[1:], stdout, stderr)
 		case "-h", "--help", "help":
 			fmt.Fprintln(stdout, `Usage:
-  orbit hebi8 [--ref <taskId>] [--adapter <adp>] [--model <m>] [--no-wait] [--json] "<message>"
-  orbit hebi8 fold [--title "..."] [--summary "..."] [--tags "a,b"] [--json]
-  orbit hebi8 line [--json]
-  orbit hebi8 expand <nodeId> [--offset 0] [--limit 20] [--json]
-  orbit hebi8 pin <nodeId> [--unpin] [--json]
-  orbit hebi8 --brief [--json]`)
+  h8o hebi8 [--ref <taskId>] [--adapter <adp>] [--model <m>] [--no-wait] [--json] "<message>"
+  h8o hebi8 fold [--title "..."] [--summary "..."] [--tags "a,b"] [--json]
+  h8o hebi8 line [--json]
+  h8o hebi8 expand <nodeId> [--offset 0] [--limit 20] [--json]
+  h8o hebi8 pin <nodeId> [--unpin] [--json]
+  h8o hebi8 --brief [--json]`)
 			return nil
 		}
 	}
@@ -711,7 +711,7 @@ func runHebi8Fold(ctx context.Context, args []string, stdout, stderr io.Writer) 
 		titleFlag   = fs.String("title", "", "optional segment title (<=60 chars)")
 		summaryFlag = fs.String("summary", "", "optional first-person summary body")
 		tagsFlag    = fs.String("tags", "", "optional comma-separated tags")
-		hubURLFlag  = fs.String("hub", "", "orbit-hub base URL")
+		hubURLFlag  = fs.String("hub", "", "h8o-hub base URL")
 		tokenFlag   = fs.String("token", "", "optional auth token")
 		configDir   = fs.String("config-dir", "", "orbit config directory")
 		dataDirFlg  = fs.String("data-dir", "", "orbit data directory")
@@ -758,7 +758,7 @@ func runHebi8Line(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	fs := flag.NewFlagSet("hebi8 line", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	var (
-		hubURLFlag = fs.String("hub", "", "orbit-hub base URL")
+		hubURLFlag = fs.String("hub", "", "h8o-hub base URL")
 		tokenFlag  = fs.String("token", "", "optional auth token")
 		configDir  = fs.String("config-dir", "", "orbit config directory")
 		dataDirFlg = fs.String("data-dir", "", "orbit data directory")
@@ -803,7 +803,7 @@ func runHebi8Expand(ctx context.Context, args []string, stdout, stderr io.Writer
 	var (
 		offsetFlag = fs.Int("offset", 0, "turn pagination offset for segment nodes")
 		limitFlag  = fs.Int("limit", 20, "turn pagination limit for segment nodes")
-		hubURLFlag = fs.String("hub", "", "orbit-hub base URL")
+		hubURLFlag = fs.String("hub", "", "h8o-hub base URL")
 		tokenFlag  = fs.String("token", "", "optional auth token")
 		configDir  = fs.String("config-dir", "", "orbit config directory")
 		dataDirFlg = fs.String("data-dir", "", "orbit data directory")
@@ -813,7 +813,7 @@ func runHebi8Expand(ctx context.Context, args []string, stdout, stderr io.Writer
 		return err
 	}
 	if fs.NArg() < 1 {
-		return fmt.Errorf("usage: orbit hebi8 expand <nodeId> [--offset 0] [--limit 20] [--json]")
+		return fmt.Errorf("usage: h8o hebi8 expand <nodeId> [--offset 0] [--limit 20] [--json]")
 	}
 	nodeID := strings.TrimSpace(fs.Arg(0))
 	c := newHubClient(*configDir, *dataDirFlg, *hubURLFlag, *tokenFlag)
@@ -856,7 +856,7 @@ func runHebi8Pin(ctx context.Context, args []string, stdout, stderr io.Writer) e
 	fs.SetOutput(stderr)
 	var (
 		unpinFlag  = fs.Bool("unpin", false, "unpin the specified node")
-		hubURLFlag = fs.String("hub", "", "orbit-hub base URL")
+		hubURLFlag = fs.String("hub", "", "h8o-hub base URL")
 		tokenFlag  = fs.String("token", "", "optional auth token")
 		configDir  = fs.String("config-dir", "", "orbit config directory")
 		dataDirFlg = fs.String("data-dir", "", "orbit data directory")
@@ -866,7 +866,7 @@ func runHebi8Pin(ctx context.Context, args []string, stdout, stderr io.Writer) e
 		return err
 	}
 	if fs.NArg() < 1 {
-		return fmt.Errorf("usage: orbit hebi8 pin <nodeId> [--unpin] [--json]")
+		return fmt.Errorf("usage: h8o hebi8 pin <nodeId> [--unpin] [--json]")
 	}
 	nodeID := strings.TrimSpace(fs.Arg(0))
 	c := newHubClient(*configDir, *dataDirFlg, *hubURLFlag, *tokenFlag)
@@ -909,7 +909,7 @@ func runPA(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		modeFlag    = fs.String("mode", "", "optional permission mode override")
 		noWait      = fs.Bool("no-wait", false, "dispatch without waiting for assistant reply")
 		timeoutSec  = fs.Int("timeout", 180, "max seconds to wait for assistant reply")
-		hubURLFlag  = fs.String("hub", "", "orbit-hub base URL")
+		hubURLFlag  = fs.String("hub", "", "h8o-hub base URL")
 		tokenFlag   = fs.String("token", "", "optional auth token")
 		configDir   = fs.String("config-dir", "", "orbit config directory")
 		dataDirFlg  = fs.String("data-dir", "", "orbit data directory")
@@ -946,7 +946,7 @@ func runPA(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 
 	msg := strings.TrimSpace(strings.Join(fs.Args(), " "))
 	if msg == "" {
-		return fmt.Errorf("usage: orbit hebi8 [--ref <taskId>] [--adapter <adp>] [--brief] \"<message>\"")
+		return fmt.Errorf("usage: h8o hebi8 [--ref <taskId>] [--adapter <adp>] [--brief] \"<message>\"")
 	}
 
 	// Legacy /api/pa/chat path ONLY if caller explicitly passed --thread
@@ -1217,7 +1217,7 @@ func runArtifacts(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	var (
 		projectID  = fs.String("project", "", "filter by project ID")
 		kindFilter = fs.String("kind", "", "filter by artifact kind (design|markdown|pptx|docx|spreadsheet|file)")
-		hubURLFlag = fs.String("hub", "", "orbit-hub base URL")
+		hubURLFlag = fs.String("hub", "", "h8o-hub base URL")
 		tokenFlag  = fs.String("token", "", "optional X-Orbit-Dev-Token")
 		configDir  = fs.String("config-dir", "", "orbit config directory")
 		dataDirFlg = fs.String("data-dir", "", "orbit data directory")
@@ -1269,7 +1269,7 @@ func runDoctor(ctx context.Context, args []string, stdout, stderr io.Writer) err
 	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	var (
-		hubURLFlag = fs.String("hub", "", "orbit-hub base URL")
+		hubURLFlag = fs.String("hub", "", "h8o-hub base URL")
 		tokenFlag  = fs.String("token", "", "optional X-Orbit-Dev-Token")
 		configDir  = fs.String("config-dir", "", "orbit config directory")
 		dataDirFlg = fs.String("data-dir", "", "orbit data directory")
@@ -1316,7 +1316,7 @@ func runDoctor(ctx context.Context, args []string, stdout, stderr io.Writer) err
 		enc, _ := json.MarshalIndent(checks, "", "  ")
 		return writeRawJSON(stdout, enc)
 	}
-	fmt.Fprintf(stdout, "hebi8-Orbit Doctor (orbit %s)\n", Version)
+	fmt.Fprintf(stdout, "hebi8/orbit Doctor (h8o %s)\n", Version)
 	for _, ch := range checks {
 		mark := "OK  "
 		if !ch.OK {
@@ -1331,7 +1331,7 @@ func runOpen(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	fs := flag.NewFlagSet("open", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	var (
-		hubURLFlag = fs.String("hub", "", "orbit-hub base URL")
+		hubURLFlag = fs.String("hub", "", "h8o-hub base URL")
 		configDir  = fs.String("config-dir", "", "orbit config directory")
 		dataDirFlg = fs.String("data-dir", "", "orbit data directory")
 		printOnly  = fs.Bool("print", false, "print URL instead of launching browser")

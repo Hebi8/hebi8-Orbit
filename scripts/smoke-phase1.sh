@@ -2,13 +2,13 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-HUB_BIN="${HUB_BIN:-$ROOT_DIR/bin/orbit-hub}"
-RUNNER_BIN="${RUNNER_BIN:-$ROOT_DIR/bin/orbit-runner}"
-CLI_BIN="${CLI_BIN:-$ROOT_DIR/bin/orbit}"
+HUB_BIN="${HUB_BIN:-$ROOT_DIR/bin/h8o-hub}"
+RUNNER_BIN="${RUNNER_BIN:-$ROOT_DIR/bin/h8o-runner}"
+CLI_BIN="${CLI_BIN:-$ROOT_DIR/bin/h8o}"
 AGY_BIN="${AGY_BIN:-$(command -v agy || true)}"
 
 if [ ! -x "$HUB_BIN" ] || [ ! -x "$RUNNER_BIN" ] || [ ! -x "$CLI_BIN" ]; then
-  echo "error: build bin/orbit-hub, bin/orbit-runner, and bin/orbit first (make build)" >&2
+  echo "error: build bin/h8o-hub, bin/h8o-runner, and bin/h8o first (make build)" >&2
   exit 1
 fi
 if [ -z "$AGY_BIN" ] || [ ! -x "$AGY_BIN" ]; then
@@ -159,7 +159,7 @@ for _ in $(seq 1 40); do
   sleep 0.25
 done
 curl -sf "${HUB_URL}/api/health" >/dev/null
-echo "[OK] orbit-hub healthy at ${HUB_URL}"
+echo "[OK] h8o-hub healthy at ${HUB_URL}"
 
 # 2b. Verify Runner channel security (B5), adapter guard (B18), and WS ticket (S6)
 NO_TOK_STATUS="$(curl -s -o /dev/null -w '%{http_code}' "${HUB_URL}/ws/runner")"
@@ -187,7 +187,7 @@ WS_TICKET="$(curl -sf -X POST "${HUB_URL}/api/ws-ticket" -H "X-Orbit-Request: 1"
 python3 -c 'import json, sys; d = json.loads(sys.argv[1]); assert d.get("ticket") and d.get("expiresAt", 0) > 0, d' "$WS_TICKET"
 echo "[OK] security & API guards verified (/ws/runner 401/403, adapter=claude 501, /api/ws-ticket)"
 
-# 3. Launch temporary orbit-runner with real agy acp
+# 3. Launch temporary h8o-runner with real agy acp
 "$RUNNER_BIN" \
   --machine-id hub-node \
   --hub-ws "$HUB_WS" \
@@ -197,7 +197,7 @@ echo "[OK] security & API guards verified (/ws/runner 401/403, adapter=claude 50
   --data-dir "$DATA_DIR" \
   --sock "$SOCK_PATH" \
   --agy-bin "$AGY_BIN" \
-  --orbit-bin-dir "$ROOT_DIR/bin" \
+  --h8o-bin-dir "$ROOT_DIR/bin" \
   >"$TMP_ROOT/runner.log" 2>&1 &
 RUNNER_PID=$!
 
@@ -219,17 +219,17 @@ sys.exit(1)
   sleep 0.25
 done
 if [ "$RUNNER_READY" -ne 1 ]; then
-  echo "FAIL: orbit-runner did not register online with hub" >&2
+  echo "FAIL: h8o-runner did not register online with hub" >&2
   exit 1
 fi
-echo "[OK] orbit-runner connected to hub via /ws/runner (real agy ACP initialized)"
+echo "[OK] h8o-runner connected to hub via /ws/runner (real agy ACP initialized)"
 
-# 4. Create task via REST API -> real agy edits app.go in isolated worktree and runs `orbit deliver --final`
+# 4. Create task via REST API -> real agy edits app.go in isolated worktree and runs `h8o deliver --final`
 CREATE_PAYLOAD="$(python3 -c '
 import json
 print(json.dumps({
     "title": "Phase 1 Smoke Greet Helper",
-    "goal": "Edit app.go in this worktree to add a exported function `Greet() string` that returns \"hello orbit\". Then run the shell command: orbit deliver --summary \"Added Greet helper\" --final. Do not spawn subagents or swarm workers; stop right after orbit deliver succeeds."
+    "goal": "Edit app.go in this worktree to add a exported function `Greet() string` that returns \"hello orbit\". Then run the shell command: h8o deliver --summary \"Added Greet helper\" --final. Do not spawn subagents or swarm workers; stop right after h8o deliver succeeds."
 }))
 ')"
 
@@ -286,7 +286,7 @@ print(att.get("completionSource") or "", dlv_id, dlv_head)
 ' "$TL")
 
 if [ -z "$DLV_ID" ]; then
-  echo "FAIL: agy did not produce a delivery via orbit deliver --final: $TL" >&2
+  echo "FAIL: agy did not produce a delivery via h8o deliver --final: $TL" >&2
   exit 1
 fi
 echo "[OK] real agy attempt succeeded (completionSource=${COMP_SRC}, delivery=${DLV_ID}, head=${DLV_HEAD:0:7})"
@@ -320,7 +320,7 @@ if [ -n "$(git -C "$WORK_REPO" status --porcelain)" ]; then
 fi
 echo "[OK] original repository working tree has zero pollution"
 
-# 9. Verify `orbit brief` (Brief Me)
+# 9. Verify `h8o brief` (Brief Me)
 BRIEF_JSON="$("$CLI_BIN" brief --hub "$HUB_URL" --json)"
 python3 -c '
 import json, sys
@@ -329,6 +329,6 @@ assert d["snapshotSeq"] > 0, d
 assert len(d["recentDeliveries"]) >= 1, d
 assert any(x["deliveryId"] == sys.argv[2] for x in d["recentDeliveries"]), d
 ' "$BRIEF_JSON" "$DLV_ID"
-echo "[OK] orbit brief (POST /api/pa/brief) verified with live delivery"
+echo "[OK] h8o brief (POST /api/pa/brief) verified with live delivery"
 
 echo "=== PHASE 1 REAL AGY ACP SMOKE PASSED ==="

@@ -576,7 +576,7 @@ func buildOrbitSystemPromptAppend(taskID, projectID, attemptID string, isPlainFo
 		)
 	default:
 		base += "\n\nOrbit Sub-Session Delegation:\n" +
-			"- When splitting independent/parallel subtasks or delegating work to another machine, model, or project, prefer Orbit sub-session tools (`orbit_spawn_child`, or `orbit child spawn` in terminal).\n" +
+			"- When splitting independent/parallel subtasks or delegating work to another machine, model, or project, prefer Orbit sub-session tools (`orbit_spawn_child`, or `h8o child spawn` in terminal).\n" +
 			"- Delegated sub-sessions are live-observable in the Orbit UI so the user can inspect, take over, steer, or approve them directly.\n" +
 			"- Use the shared Board (`orbit_board_read` / `orbit_board_post`) to share context, decisions, and progress with all direct child sessions.\n" +
 			"- When a child session finishes, Orbit automatically delivers its summary back to you; do not poll in a loop."

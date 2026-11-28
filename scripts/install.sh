@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install hebi8-Orbit binaries (`orbit`, plus optional `orbit-hub` & `orbit-runner`) from GitHub Releases.
+# Install hebi8/orbit binaries (`h8o`, plus optional `h8o-hub` & `h8o-runner`) from GitHub Releases.
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/Hebi8/hebi8-Orbit/main/scripts/install.sh | bash
 #   curl -fsSL ... | bash -s -- --all --version v0.2.0
@@ -45,7 +45,7 @@ echo "Downloading ${URL}..."
 curl -fsSL "$URL" -o "${TMP}/${ARCHIVE}"
 tar -xzf "${TMP}/${ARCHIVE}" -C "$TMP"
 
-STAGE="${TMP}/orbit-${VERSION}-${OS}-${ARCH}"
+STAGE="${TMP}/h8o-${VERSION}-${OS}-${ARCH}"
 mkdir -p "$INSTALL_DIR"
 
 install_bin() {
@@ -55,10 +55,10 @@ install_bin() {
   echo "Installed ${INSTALL_DIR}/${name}"
 }
 
-install_bin orbit
+install_bin h8o
 if [[ "$INSTALL_ALL" -eq 1 ]]; then
-  install_bin orbit-hub
-  install_bin orbit-runner
+  install_bin h8o-hub
+  install_bin h8o-runner
 fi
 
-echo "Done! Run 'orbit version' and 'orbit doctor' to verify."
+echo "Done! Run 'h8o version' and 'h8o doctor' to verify."

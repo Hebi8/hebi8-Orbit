@@ -2179,16 +2179,28 @@ func (r *Runner) resolveOrbitBinaryPath() string {
 			}
 		}
 	}
-	if exe, err := os.Executable(); err == nil && exe != "" {
-		cand := filepath.Join(filepath.Dir(exe), "orbit")
-		if runtime.GOOS == "windows" {
-			cand += ".exe"
+	binName := "h8o"
+	if runtime.GOOS == "windows" {
+		binName += ".exe"
+	}
+	if r.cfg.AgentManager != nil {
+		if dir := strings.TrimSpace(r.cfg.AgentManager.cfg.OrbitBinDir); dir != "" {
+			cand := filepath.Join(dir, binName)
+			if fi, err := os.Stat(cand); err == nil && !fi.IsDir() {
+				if abs, err := filepath.Abs(cand); err == nil {
+					return abs
+				}
+				return cand
+			}
 		}
+	}
+	if exe, err := os.Executable(); err == nil && exe != "" {
+		cand := filepath.Join(filepath.Dir(exe), binName)
 		if fi, err := os.Stat(cand); err == nil && !fi.IsDir() {
 			return cand
 		}
 	}
-	if p, err := exec.LookPath("orbit"); err == nil && p != "" {
+	if p, err := exec.LookPath(binName); err == nil && p != "" {
 		if abs, err := filepath.Abs(p); err == nil {
 			return abs
 		}
@@ -2615,7 +2627,7 @@ func (r *Runner) onSwarmIdleTimeout(att *attemptContext, slot *sessionSlot) {
 		"completionSource": string(protocol.CompletionQuietTimeout),
 		"sessionLocked":    true,
 		"errorCode":        "SWARM_IDLE_TIMEOUT",
-		"errorDetail":      "Swarm 静默超时未收到显式 orbit deliver --final，已保留全部尾帧并锁定旧会话，请人工核对时间线",
+		"errorDetail":      "Swarm 静默超时未收到显式 h8o deliver --final，已保留全部尾帧并锁定旧会话，请人工核对时间线",
 	})
 }
 
@@ -4128,7 +4140,7 @@ func isReadOnlyOrbitMCPTool(canonical string) bool {
 }
 
 // matchOrbitBuiltinMCPTool recognizes ONLY Orbit's 5 first-party stdio MCP delegation tools
-// exposed by `orbit mcp-serve` under the session's randomized per-session server name
+// exposed by `h8o mcp-serve` under the session's randomized per-session server name
 // (e.g. "orbit7c4e91a2", across agy/claude/codex naming conventions).
 // Strictly inspects structured ToolCall.Name (never Title), requires the exact per-session
 // server namespace prefix (rejecting static "orbit" or foreign server names), and excludes

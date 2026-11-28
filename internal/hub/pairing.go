@@ -258,7 +258,7 @@ func (s *Server) handleCreatePairingCode(w http.ResponseWriter, r *http.Request)
 		}
 	}
 	origin := s.liveEffectiveHubOrigin(tsShared, tsOrigin)
-	joinCmd := fmt.Sprintf("orbit join %s %s", origin, formatted)
+	joinCmd := fmt.Sprintf("h8o join %s %s", origin, formatted)
 	joinLink := fmt.Sprintf("%s/#/join/%s", origin, formatted)
 	switch scope {
 	case protocol.PairingScopeClient:

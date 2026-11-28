@@ -3,6 +3,7 @@ import { X } from 'lucide-react';
 import { AddProjectModal } from './components/AddProjectModal';
 import { CommandPalette } from './components/CommandPalette';
 import { DeviceRoleIcon } from './components/DeviceRoleIcon';
+import { BrandMark, BrandWordmark } from './components/Icons';
 import { MachinesPopover } from './components/MachinesPopover';
 import { MobileTabs } from './components/MobileTabs';
 import { Sidebar } from './components/Sidebar';
@@ -127,7 +128,7 @@ function BootError({ error, onRetry }: { error: unknown; onRetry: () => void }) 
       const res = await api.pairClient(trimmed, deviceName);
       setStoredClientToken(res.clientToken);
       setStoredDevToken('');
-      toast(`已配对并登录到 ${res.workspaceName || 'Orbit'}`);
+      toast(`已配对并登录到 ${res.workspaceName || 'hebi8/orbit'}`);
       onRetry();
     } catch (e) {
       setPairErr(errMsg(e));
@@ -140,8 +141,8 @@ function BootError({ error, onRetry }: { error: unknown; onRetry: () => void }) 
     <div className="auth-gate">
       <div className="auth-gate-card">
         <div className="brand" style={{ padding: 0, marginBottom: 14 }}>
-          <span className="brand-mark" />
-          <b>hebi8-Orbit</b>
+          <BrandMark />
+          <BrandWordmark />
         </div>
 
         {isUnauth ? (
@@ -198,7 +199,7 @@ function BootError({ error, onRetry }: { error: unknown; onRetry: () => void }) 
               </div>
             </div>
             <div className="auth-gate-tip">
-              在目标主机运行 <code className="mono">orbit pair --client</code> 或在「设置 → 机器与 Agent → 添加机器」获取配对码。
+              在目标主机运行 <code className="mono">h8o pair --client</code> 或在「设置 → 机器与 Agent → 添加机器」获取配对码。
             </div>
             <div style={{ marginTop: 12 }}>
               <button type="button" className="lk faint" style={{ fontSize: 11.5 }} onClick={() => setShowManual((v) => !v)}>
@@ -315,14 +316,14 @@ function AuthHandoffScreen({ code }: { code: string }) {
 
 function JoinHintScreen({ code, scope }: { code: string; scope?: string }) {
   const flag = scope === 'client' ? ' --no-runner' : scope === 'runner' ? ' --runner-only' : '';
-  const cmd = `orbit join ${window.location.origin} ${code}${flag}`;
+  const cmd = `h8o join ${window.location.origin} ${code}${flag}`;
   return (
     <div className="empty" style={{ maxWidth: 480, margin: '18vh auto 0', textAlign: 'left' }}>
       <div className="brand" style={{ padding: 0, marginBottom: 14 }}>
-        <span className="brand-mark" />
-        <b>hebi8-Orbit</b>
+        <BrandMark />
+        <BrandWordmark />
       </div>
-      <p style={{ marginBottom: 10 }}>在要加入的机器终端运行这条命令，或粘贴到桌面端「连到已有的 Orbit」：</p>
+      <p style={{ marginBottom: 10 }}>在要加入的机器终端运行这条命令，或粘贴到桌面端「配对加入其他网络」：</p>
       <div className="pair-cmd-box">
         <code className="mono ell">{cmd}</code>
         <button

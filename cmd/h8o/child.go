@@ -44,13 +44,13 @@ func runChild(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		return runChildBoard(ctx, args[1:], stdout, stderr)
 	case "-h", "--help", "help":
 		fmt.Fprintln(stdout, `Usage:
-  orbit child spawn --goal "..." [--title "..."] [--role "..."] [--project <id>] [--machine <id>] [--adapter agy|claude|codex] [--model <m>] [--effort <lvl>] [--mode <mode>] [--worktree[=true|false]] [--parent <taskId>] [--no-notify] [--json]
-  orbit child ls [--parent <taskId>] [--archived] [--targets] [--json]
-  orbit child show <childTaskId> [--limit 10] [--json]
-  orbit child send <childTaskId> --message "..." [--steer] [--mode queue|steer] [--json]
-  orbit child cancel <childTaskId> [--reason "..."] [--json]
-  orbit child board [read] [--parent <taskId>] [--limit 50] [--before-seq N] [--json]
-  orbit child board post --body "..." [--target "@..."] [--parent <taskId>] [--json]`)
+  h8o child spawn --goal "..." [--title "..."] [--role "..."] [--project <id>] [--machine <id>] [--adapter agy|claude|codex] [--model <m>] [--effort <lvl>] [--mode <mode>] [--worktree[=true|false]] [--parent <taskId>] [--no-notify] [--json]
+  h8o child ls [--parent <taskId>] [--archived] [--targets] [--json]
+  h8o child show <childTaskId> [--limit 10] [--json]
+  h8o child send <childTaskId> --message "..." [--steer] [--mode queue|steer] [--json]
+  h8o child cancel <childTaskId> [--reason "..."] [--json]
+  h8o child board [read] [--parent <taskId>] [--limit 50] [--before-seq N] [--json]
+  h8o child board post --body "..." [--target "@..."] [--parent <taskId>] [--json]`)
 		return nil
 	default:
 		return fmt.Errorf("unknown child subcommand %q (try: spawn, ls, show, send, cancel, board)", args[0])
@@ -73,7 +73,7 @@ func runChildSpawn(ctx context.Context, args []string, stdout, stderr io.Writer)
 		mode       = fs.String("mode", "", "optional permission mode override")
 		capability = fs.String("capability", "", "optional required capability")
 		noNotify   = fs.Bool("no-notify", false, "disable automatic parent notification on finish")
-		hubURLFlag = fs.String("hub", "", "orbit-hub base URL")
+		hubURLFlag = fs.String("hub", "", "h8o-hub base URL")
 		tokenFlag  = fs.String("token", "", "optional X-Orbit-Dev-Token / client token")
 		configDir  = fs.String("config-dir", "", "orbit config directory")
 		dataDirFlg = fs.String("data-dir", "", "orbit data directory")
@@ -194,7 +194,7 @@ func runChildList(ctx context.Context, args []string, stdout, stderr io.Writer) 
 		parentID   = fs.String("parent", "", "parent task ID (defaults to ORBIT_TASK_ID)")
 		archived   = fs.Bool("archived", false, "include archived child sessions")
 		targets    = fs.Bool("targets", false, "include available machines/projects (delegate socket mode)")
-		hubURLFlag = fs.String("hub", "", "orbit-hub base URL")
+		hubURLFlag = fs.String("hub", "", "h8o-hub base URL")
 		tokenFlag  = fs.String("token", "", "optional X-Orbit-Dev-Token / client token")
 		configDir  = fs.String("config-dir", "", "orbit config directory")
 		dataDirFlg = fs.String("data-dir", "", "orbit data directory")
@@ -255,7 +255,7 @@ func runChildShow(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	fs.SetOutput(stderr)
 	var (
 		limit      = fs.Int("limit", 10, "max recent turns to display")
-		hubURLFlag = fs.String("hub", "", "orbit-hub base URL")
+		hubURLFlag = fs.String("hub", "", "h8o-hub base URL")
 		tokenFlag  = fs.String("token", "", "optional X-Orbit-Dev-Token / client token")
 		configDir  = fs.String("config-dir", "", "orbit config directory")
 		dataDirFlg = fs.String("data-dir", "", "orbit data directory")
@@ -265,7 +265,7 @@ func runChildShow(ctx context.Context, args []string, stdout, stderr io.Writer) 
 		return err
 	}
 	if fs.NArg() < 1 {
-		return fmt.Errorf("usage: orbit child show <childTaskId>")
+		return fmt.Errorf("usage: h8o child show <childTaskId>")
 	}
 	childID := strings.TrimSpace(fs.Arg(0))
 
@@ -317,7 +317,7 @@ func runChildSend(ctx context.Context, args []string, stdout, stderr io.Writer) 
 		message    = fs.String("message", "", "follow-up message")
 		steer      = fs.Bool("steer", false, "interrupt current turn and steer immediately")
 		modeFlag   = fs.String("mode", "", "queue | steer")
-		hubURLFlag = fs.String("hub", "", "orbit-hub base URL")
+		hubURLFlag = fs.String("hub", "", "h8o-hub base URL")
 		tokenFlag  = fs.String("token", "", "optional X-Orbit-Dev-Token / client token")
 		configDir  = fs.String("config-dir", "", "orbit config directory")
 		dataDirFlg = fs.String("data-dir", "", "orbit data directory")
@@ -327,7 +327,7 @@ func runChildSend(ctx context.Context, args []string, stdout, stderr io.Writer) 
 		return err
 	}
 	if fs.NArg() < 1 {
-		return fmt.Errorf("usage: orbit child send <childTaskId> --message \"...\" [--steer]")
+		return fmt.Errorf("usage: h8o child send <childTaskId> --message \"...\" [--steer]")
 	}
 	childID := strings.TrimSpace(fs.Arg(0))
 	msg := strings.TrimSpace(*message)
@@ -374,8 +374,8 @@ func runChildCancel(ctx context.Context, args []string, stdout, stderr io.Writer
 	fs := flag.NewFlagSet("child cancel", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	var (
-		reason     = fs.String("reason", "cancelled via orbit child CLI", "cancellation reason")
-		hubURLFlag = fs.String("hub", "", "orbit-hub base URL")
+		reason     = fs.String("reason", "cancelled via h8o child CLI", "cancellation reason")
+		hubURLFlag = fs.String("hub", "", "h8o-hub base URL")
 		tokenFlag  = fs.String("token", "", "optional X-Orbit-Dev-Token / client token")
 		configDir  = fs.String("config-dir", "", "orbit config directory")
 		dataDirFlg = fs.String("data-dir", "", "orbit data directory")
@@ -385,7 +385,7 @@ func runChildCancel(ctx context.Context, args []string, stdout, stderr io.Writer
 		return err
 	}
 	if fs.NArg() < 1 {
-		return fmt.Errorf("usage: orbit child cancel <childTaskId> [--reason \"...\"]")
+		return fmt.Errorf("usage: h8o child cancel <childTaskId> [--reason \"...\"]")
 	}
 	childID := strings.TrimSpace(fs.Arg(0))
 
@@ -431,7 +431,7 @@ func runChildBoardRead(ctx context.Context, args []string, stdout, stderr io.Wri
 		parentID   = fs.String("parent", "", "parent task ID (defaults to ORBIT_TASK_ID)")
 		beforeSeq  = fs.Int64("before-seq", 0, "return messages before this seq")
 		limit      = fs.Int("limit", 50, "max board messages to return")
-		hubURLFlag = fs.String("hub", "", "orbit-hub base URL")
+		hubURLFlag = fs.String("hub", "", "h8o-hub base URL")
 		tokenFlag  = fs.String("token", "", "optional X-Orbit-Dev-Token / client token")
 		configDir  = fs.String("config-dir", "", "orbit config directory")
 		dataDirFlg = fs.String("data-dir", "", "orbit data directory")
@@ -505,7 +505,7 @@ func runChildBoardPost(ctx context.Context, args []string, stdout, stderr io.Wri
 		parentID   = fs.String("parent", "", "parent task ID (defaults to ORBIT_TASK_ID)")
 		bodyFlag   = fs.String("body", "", "board message body")
 		targetFlag = fs.String("target", "", "optional @mention target (sibling title/taskId or @parent)")
-		hubURLFlag = fs.String("hub", "", "orbit-hub base URL")
+		hubURLFlag = fs.String("hub", "", "h8o-hub base URL")
 		tokenFlag  = fs.String("token", "", "optional X-Orbit-Dev-Token / client token")
 		configDir  = fs.String("config-dir", "", "orbit config directory")
 		dataDirFlg = fs.String("data-dir", "", "orbit data directory")

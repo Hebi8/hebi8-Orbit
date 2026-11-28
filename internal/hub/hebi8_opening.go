@@ -96,7 +96,7 @@ func BuildHebi8FoldOpening(in Hebi8FoldOpeningInput) string {
 	sec6 := fmt.Sprintf(
 		"## 6. 这一次\n"+
 			"当前绝对时间：%s\n"+
-			"以上摘要是缓存，原文是证据；需要历史细节时可运行 `orbit hebi8 expand <nodeId>` 查看下层节点或原文，重要节点可运行 `orbit hebi8 pin <nodeId>` 钉住。",
+			"以上摘要是缓存，原文是证据；需要历史细节时可运行 `h8o hebi8 expand <nodeId>` 查看下层节点或原文，重要节点可运行 `h8o hebi8 pin <nodeId>` 钉住。",
 		now.Format(time.RFC3339),
 	)
 

@@ -29,23 +29,26 @@ var (
 //go:embed setup.html
 var setupHTML []byte
 
+//go:embed appicon.png
+var appIconPNG []byte
+
 func main() {
 	var (
 		urlFlag     = flag.String("url", "", "Hub URL override (e.g. https://orbit.example.ts.net)")
-		configDir   = flag.String("config-dir", "", "Orbit config directory (default ~/.config/hebi8-orbit)")
+		configDir   = flag.String("config-dir", "", "hebi8/orbit config directory (default ~/.config/hebi8-orbit)")
 		forceSetup  = flag.Bool("setup", false, "open the Hub connection setup screen")
-		showVersion = flag.Bool("version", false, "print orbit-client version and exit")
+		showVersion = flag.Bool("version", false, "print h8o-client version and exit")
 	)
 	flag.Parse()
 
 	if *showVersion {
-		fmt.Printf("orbit-client %s (commit=%s built=%s)\n", Version, Commit, BuildDate)
+		fmt.Printf("h8o-client %s (commit=%s built=%s)\n", Version, Commit, BuildDate)
 		return
 	}
 
 	cfg, err := LoadClientConfig(*configDir, *urlFlag)
 	if err != nil {
-		log.Printf("orbit-client: warning loading config: %v", err)
+		log.Printf("h8o-client: warning loading config: %v", err)
 	}
 
 	runtimeMgr := NewRuntimeManager()
@@ -78,7 +81,7 @@ func main() {
 		cfg.Mode = mode
 	})
 	if err != nil {
-		log.Fatalf("orbit-client: start setup server: %v", err)
+		log.Fatalf("h8o-client: start setup server: %v", err)
 	}
 	defer closeSetupSrv()
 
@@ -103,7 +106,7 @@ func main() {
 					cfg.Mode = "local"
 					initialURL = runtimeMgr.BuildDesktopOpenURL(context.Background(), *configDir, getHubURL(), "")
 				} else if sErr != nil {
-					log.Printf("orbit-client: auto-start local hub unavailable (%v); showing setup screen", sErr)
+					log.Printf("h8o-client: auto-start local hub unavailable (%v); showing setup screen", sErr)
 				}
 			}
 		} else {
@@ -118,7 +121,7 @@ func main() {
 				// Restore managed remote Runner if user opted in ("让这台机器执行任务") during join.
 				if cfg.RunLocalRunner {
 					if rErr := runtimeMgr.EnsureRemoteRunner(*configDir); rErr != nil {
-						log.Printf("orbit-client: warning restoring remote runner: %v", rErr)
+						log.Printf("h8o-client: warning restoring remote runner: %v", rErr)
 					}
 				}
 			}
@@ -126,7 +129,7 @@ func main() {
 		}
 	}
 
-	mygo.App.SetName("hebi8-Orbit")
+	mygo.App.SetName("hebi8/orbit")
 	mygo.App.SetVersion(Version)
 
 	var mainWin *mygo.Window
@@ -141,7 +144,7 @@ func main() {
 			return
 		}
 		w := mygo.NewWindow(mygo.WindowOptions{
-			Title:           "hebi8-Orbit",
+			Title:           "hebi8/orbit",
 			URL:             targetURL,
 			Width:           1360,
 			Height:          860,
@@ -149,6 +152,7 @@ func main() {
 			MinHeight:       620,
 			BackgroundColor: "light-dark(#fcfcfb, #0f0f11)",
 		})
+		_ = w.SetIcon(appIconPNG)
 		mainWin = w
 
 		page := w.Page()
@@ -168,7 +172,7 @@ func main() {
 				e.PreventDefault()
 				go func(target string) {
 					if err := mygo.Shell.OpenExternal(target); err != nil {
-						log.Printf("orbit-client: open external %s: %v", target, err)
+						log.Printf("h8o-client: open external %s: %v", target, err)
 					}
 				}(e.URL)
 			}
@@ -177,7 +181,7 @@ func main() {
 			if strings.TrimSpace(req.URL) != "" {
 				go func(target string) {
 					if err := mygo.Shell.OpenExternal(target); err != nil {
-						log.Printf("orbit-client: open external popup %s: %v", target, err)
+						log.Printf("h8o-client: open external popup %s: %v", target, err)
 					}
 				}(req.URL)
 			}
@@ -186,7 +190,7 @@ func main() {
 		page.OnDidFailLoad(func(loadErr *mygo.LoadError) {
 			// If the configured Hub is unreachable on startup, gracefully offer the setup screen.
 			if loadErr != nil && !strings.HasPrefix(page.URL(), setupOrigin) {
-				log.Printf("orbit-client: load failed (%v); falling back to setup screen", loadErr)
+				log.Printf("h8o-client: load failed (%v); falling back to setup screen", loadErr)
 				_ = page.LoadURL(setupOrigin + "/")
 			}
 		})
@@ -210,7 +214,7 @@ func main() {
 				mygo.App.Focus()
 				openMainWindow(target)
 			}); err != nil {
-				log.Printf("orbit-client: global shortcut %q unavailable: %v", sc, err)
+				log.Printf("h8o-client: global shortcut %q unavailable: %v", sc, err)
 			}
 		}
 	})
@@ -227,7 +231,7 @@ func main() {
 	})
 
 	if err := mygo.App.Run(); err != nil {
-		log.Fatalf("orbit-client: %v", err)
+		log.Fatalf("h8o-client: %v", err)
 	}
 }
 
@@ -250,7 +254,7 @@ func buildAppMenu(
 
 	return mygo.NewMenu([]*mygo.MenuItem{
 		{
-			Label: "hebi8-Orbit",
+			Label: "hebi8/orbit",
 			Submenu: []*mygo.MenuItem{
 				{
 					Label: "切换网络或重新连接…",

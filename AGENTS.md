@@ -1,18 +1,19 @@
-# hebi8-Orbit
+# hebi8/orbit (`hebi8-Orbit`)
 
-Single-user, multi-machine agent project delivery and review workbench. Pure Go (`CGO_ENABLED=0`) core (`orbit-hub`, `orbit-runner`, `orbit`), embedded React SPA (`web/`), and thin pure-Go `egoist/mygo` desktop client (`desktop/`). Apache-2.0 public repository (`github.com/Hebi8/hebi8-Orbit`, default branch `main`).
+Single-user, multi-machine agent project delivery and review workbench. Pure Go (`CGO_ENABLED=0`) core (`h8o-hub`, `h8o-runner`, `h8o`), embedded React SPA (`web/`), and thin pure-Go `egoist/mygo` desktop client (`desktop/` -> `h8o-client`). Apache-2.0 public repository (`github.com/Hebi8/hebi8-Orbit`, default branch `main`).
 
 Read [docs/README.md](docs/README.md) before changing architecture, protocol contracts, or UI/UX behavior.
 
 ## Code Map
 
-- `cmd/orbit-hub/`: Central Hub binary (single-writer SQLite WAL, Git Smart HTTP mirror + `pre-receive`, Ryugi sidecar bridge, Hebi8/PA runtime, embedded `web/dist`).
-- `cmd/orbit-runner/`: Thin ACP Runner (`agy`, `claude-agent-acp`, `codex-acp`), per-session serialization, SQLite Outbox, worktree/folder execution, Unix socket delegate proxy.
-- `cmd/orbit/`: Terminal CLI (`up`, `pair`, `join`, `discover`, `tasks`, `child`, `mcp-serve`, `deliver`, `approvals`, `hebi8`/`pa`, `agents`, `machines`, `projects`, `service`, `init`, `doctor`, `open`).
+- `cmd/h8o-hub/`: Central Hub binary (single-writer SQLite WAL, Git Smart HTTP mirror + `pre-receive`, Ryugi sidecar bridge, Hebi8/PA runtime, embedded `web/dist`).
+- `cmd/h8o-runner/`: Thin ACP Runner (`agy`, `claude-agent-acp`, `codex-acp`), per-session serialization, SQLite Outbox, worktree/folder execution, Unix socket delegate proxy.
+- `cmd/h8o/`: Terminal CLI (`up`, `pair`, `join`, `discover`, `tasks`, `child`, `mcp-serve`, `deliver`, `approvals`, `hebi8`/`pa`, `agents`, `machines`, `projects`, `service`, `init`, `doctor`, `open`).
 - `cmd/gen-ts/`: Generates `web/src/generated/protocol.ts` from `internal/protocol`.
 - `internal/`: `protocol/` (single source of truth for enums/DTOs/WS frames), `store/` (`ncruces/go-sqlite3` WAL), `hub/` (HTTP/WS/scheduler/child wakeup/hebi8-line/pairing/Ryugi), `runner/` (ACP driver/Swarm tracker/Outbox), `mcpserver/` (built-in 5-tool stdio MCP), `gitops/`, `discovery/`, `sshcfg/`.
 - `web/`: React 19 + Vite 6 + TypeScript + Tailwind v4 SPA (`web/src/generated/protocol.ts` is generated — never edit by hand).
-- `desktop/`: Separate Go module (`desktop/go.mod`) for `orbit-client` (`egoist/mygo` WebView shell, managed local Hub/Runner, SSH config IDE launcher, `setup.html`).
+- `desktop/`: Separate Go module (`desktop/go.mod`) for `h8o-client` (`egoist/mygo` WebView shell, managed local Hub/Runner, SSH config IDE launcher, `setup.html`).
+- `assets/icons/`: Brand SVG marks (`h8o-app-icon.svg`, `h8o-mark.svg`) and macOS `AppIcon.icns`.
 - `docs/`: All architecture specs, UX specs, and historical archives (indexed in [docs/README.md](docs/README.md)).
 
 ## Commands
@@ -22,14 +23,14 @@ make gen-types          # REQUIRED after editing internal/protocol; updates web/
 make test               # go vet + go test -race ./... (core + CLI)
 make test-desktop       # go vet + go test -race ./... inside desktop/
 pnpm --dir web build    # tsc -b && vite build (TypeScript check + SPA bundle)
-make build              # gen-types + build-web + CGO_ENABLED=0 orbit-hub / orbit-runner / orbit
-make build-desktop      # CGO_ENABLED=0 orbit-client
+make build              # gen-types + build-web + CGO_ENABLED=0 h8o-hub / h8o-runner / h8o
+make build-desktop      # CGO_ENABLED=0 h8o-client
 make check-privacy      # REQUIRED before commit; scans index blobs & untracked files
 ```
 
 ## Engineering & Privacy Rules
 
-- **Pure Go, zero CGO**: All Go targets (including `ncruces/go-sqlite3` and `desktop/` `mygo`) build with `CGO_ENABLED=0`. Keep `orbit-hub` SQLite strictly single-writer WAL with `BEGIN IMMEDIATE` (`_txlock=immediate`) for multi-table writes.
+- **Pure Go, zero CGO**: All Go targets (including `ncruces/go-sqlite3` and `desktop/` `mygo`) build with `CGO_ENABLED=0`. Keep `h8o-hub` SQLite strictly single-writer WAL with `BEGIN IMMEDIATE` (`_txlock=immediate`) for multi-table writes.
 - **Single protocol source**: Edit enums/DTOs only in `internal/protocol/` and run `make gen-types` immediately so `web/src/generated/protocol.ts` stays in sync.
 - **Runtime config & data stay outside Git**: `~/.config/hebi8-orbit/` and `~/.local/share/hebi8-orbit/` never enter this repository; only sanitized `configs/*.example.yaml` templates belong in Git.
 - **Public repo hygiene (Apache-2.0)**: Every commit MUST pass `make check-privacy`. Never commit real usernames, personal paths, Tailscale CGNAT IPs or real `*.ts.net` domains, personal hostnames, emails, or secrets. Use sanitized placeholders (`hub-node`, `mac-node`, `aux-node`, `deploy-vps`, `orbit.example.ts.net`, `user@example.com`, `/home/orbit`, RFC 5737 IPs) in all docs and tests.

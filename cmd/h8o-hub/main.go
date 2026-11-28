@@ -41,12 +41,12 @@ func main() {
 		ryugiPublicOrigin = flag.String("ryugi-public-origin", "", "override public origin for ryugi Open URLs")
 		ryugiPollSec      = flag.Int("ryugi-poll-seconds", -1, "override ryugi polling interval seconds (0 disables background poller)")
 		parentPID         = flag.Int("parent-pid", 0, "optional parent PID to watch; exits cleanly if parent disappears")
-		showVersion       = flag.Bool("version", false, "print orbit-hub version and exit")
+		showVersion       = flag.Bool("version", false, "print h8o-hub version and exit")
 	)
 	flag.Parse()
 
 	if *showVersion {
-		fmt.Printf("orbit-hub %s (commit=%s built=%s)\n", Version, Commit, BuildDate)
+		fmt.Printf("h8o-hub %s (commit=%s built=%s)\n", Version, Commit, BuildDate)
 		return
 	}
 
@@ -105,19 +105,19 @@ func main() {
 
 	if *parentPID > 0 {
 		protocol.StartParentWatchdog(ctx, *parentPID, func() {
-			log.Printf("orbit-hub: parent pid %d exited; shutting down", *parentPID)
+			log.Printf("h8o-hub: parent pid %d exited; shutting down", *parentPID)
 			stop()
 		})
 	}
 
 	hubLock, err := protocol.AcquireFileLock(filepath.Join(cfg.DataDir, "hub.lock"))
 	if err != nil {
-		log.Fatalf("orbit-hub single-instance lock: %v", err)
+		log.Fatalf("h8o-hub single-instance lock: %v", err)
 	}
 	defer hubLock.Release()
 
 	if cfg.DevOpen {
-		log.Printf("WARNING: orbit-hub running with --dev-open (development only)")
+		log.Printf("WARNING: h8o-hub running with --dev-open (development only)")
 	}
 
 	dbPath := filepath.Join(cfg.DataDir, "orbit.sqlite")
@@ -161,7 +161,7 @@ func main() {
 
 	errCh := make(chan error, 1)
 	go func() {
-		log.Printf("orbit-hub listening on http://%s (data=%s, devOpen=%v)", cfg.ListenAddr, cfg.DataDir, cfg.DevOpen)
+		log.Printf("h8o-hub listening on http://%s (data=%s, devOpen=%v)", cfg.ListenAddr, cfg.DataDir, cfg.DevOpen)
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			errCh <- err
 		}
@@ -170,7 +170,7 @@ func main() {
 
 	select {
 	case <-ctx.Done():
-		log.Printf("orbit-hub shutting down...")
+		log.Printf("h8o-hub shutting down...")
 	case err := <-errCh:
 		if err != nil {
 			cancelPoller()

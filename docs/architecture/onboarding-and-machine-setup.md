@@ -34,7 +34,7 @@
 
 ## 二、核心现状约束与兼容性红线
 
-1. **Loopback 不可直接当信任依据**：`orbit-hub` 强绑定 loopback（`ValidateListenAddr`），Tailscale Serve 反代进来的远程请求 `RemoteAddr` 同样是 `127.0.0.1`。认证逻辑必须以显式凭据（Bearer client token / `Tailscale-User-Login` / `X-Orbit-Dev-Token`）为准，不靠 `RemoteAddr` 跳过校验。
+1. **Loopback 不可直接当信任依据**：`h8o-hub` 强绑定 loopback（`ValidateListenAddr`），Tailscale Serve 反代进来的远程请求 `RemoteAddr` 同样是 `127.0.0.1`。认证逻辑必须以显式凭据（Bearer client token / `Tailscale-User-Login` / `X-Orbit-Dev-Token`）为准，不靠 `RemoteAddr` 跳过校验。
 2. **YAML 与 DB 和平共存，Hub / UI 绝不回写 YAML**：
    - `machines.yaml` 与 `projects.yaml` 继续完整兼容；
    - 新增 SQLite 动态表存放：配对码、动态注册机器、机器多凭据（支持为 `machines.yaml` 中已有但尚缺 `tokenHash` 的节点补发凭据）、客户端 Token、每机 Agent 稀疏覆盖配置、UI 添加的动态项目、全局 `hub_settings`；
@@ -54,11 +54,11 @@
 - **Desktop 首启（`desktop/setup.html`）两张卡**：
   1. **就在这台机器用（默认推荐）**：
      - 附着优先：先探 `127.0.0.1:<port>/api/health` 与单实例文件锁 `hub.lock`，若本机已有 Orbit Hub 运行（如用户级 systemd 服务）则直接附着不另起进程；
-     - 否则自动执行幂等初始化（生成 `hub.yaml` + 本机 `local_ws` 机器与 `runner.token`）并托管拉起本机 `orbit-hub` + `orbit-runner`（`Setpgid` 进程组 + `--parent-pid` 看门狗 + `flock` 防双开）；
+     - 否则自动执行幂等初始化（生成 `hub.yaml` + 本机 `local_ws` 机器与 `runner.token`）并托管拉起本机 `h8o-hub` + `h8o-runner`（`Setpgid` 进程组 + `--parent-pid` 看门狗 + `flock` 防双开）；
      - Desktop 用 `devToken` 调用 `POST /api/auth/handoff` 换取 30 秒一次性 `code`，加载 `http://127.0.0.1:<port>/#/auth/<code>`；SPA 换取 `ock_` 客户端 Token 存入 `localStorage` 并 `replaceState` 抹掉 hash 中的 `code`，全程免填 URL 与 Token。
-  2. **连到已有的 Orbit**：
-     - 单个输入框智能识别三种输入：`orbit join https://<hub> K7QM-2XPA` 整行、`https://<hub>/#/join/K7QM-2XPA` 链接、或纯 Hub 地址；
-     - 勾选「也让这台机器执行任务」（默认勾选）：调用 `POST /api/pairing/claim` 一次同时签发 `clientToken`（写进 `client.yaml`）与 `runnerToken`（写进 `runner.yaml` + `runner.token`），随即拉起本机 `orbit-runner` 并等待上线后自动通过 handoff 进入主工作台；
+  2. **配对加入其他网络**：
+     - 单个输入框智能识别三种输入：`h8o join https://<hub> K7QM-2XPA` 整行、`https://<hub>/#/join/K7QM-2XPA` 链接、或纯 Hub 地址；
+     - 勾选「同时把本机加入对方网络作为执行节点」：调用 `POST /api/pairing/claim` 一次同时签发 `clientToken`（写进 `client.yaml`）与 `runnerToken`（写进 `runner.yaml` + `runner.token`），随即拉起本机 `h8o-runner` 并等待上线后自动通过 handoff 进入主工作台；
      - 若只填纯 Hub 地址（无配对码）：沿用原 Tailscale Serve 直连行为。
 - **平滑升级为多机共享**：在设置页「网络与机器」点击「开启多机共享」，探测本机 `tailscale` CLI 与 `tailscale serve status --json`（不覆盖已有非 Orbit 443 映射），确认后执行 `tailscale serve --bg` 并将新 Origin / 当前 Tailscale Login 写入 DB `hub_settings`（与 `hub.yaml` 取并集生效，不改 YAML）。
 
@@ -108,15 +108,15 @@
 ## 四、CLI 与桌面端收口
 
 - **CLI 子命令**（与 Web 共用同一套配对与配置 API）：
-  - `orbit up [--no-runner] [--managed|--service]`：本机幂等初始化并启动 Hub + Runner
-  - `orbit pair [--runner|--client|--both] [--machine <id>] [--no-wait]`：生成配对码并实时等待节点上线
-  - `orbit join <hub> <code>` / `orbit join '<整行或链接>' [--no-runner] [--name <id>] [--service]`：零手动配置入网
-  - `orbit discover`：手动扫描 Tailscale / 局域网可用 Orbit 实例
-  - `orbit agents [list|check|test|install|enable|disable] ...`
-  - `orbit machines [ls|rename|rm]`
-  - `orbit projects add [dir] [--machine <id>] [--name <name>]`
-  - `orbit service [install|uninstall|status] [hub|runner]`（支持 Linux systemd user 与 macOS LaunchAgent，自动识别已有 `orbit-hub.service`/`orbit-runner.service`）
-  - `orbit init`：向后保留所有旧 flag，交互菜单收敛为 `[1] 本机起跑` / `[2] 加入已有网络` / `[3] 添加项目`
+  - `h8o up [--no-runner] [--managed|--service]`：本机幂等初始化并启动 Hub + Runner
+  - `h8o pair [--runner|--client|--both] [--machine <id>] [--no-wait]`：生成配对码并实时等待节点上线
+  - `h8o join <hub> <code>` / `h8o join '<整行或链接>' [--no-runner] [--name <id>] [--service]`：零手动配置入网
+  - `h8o discover`：手动扫描 Tailscale / 局域网可用 hebi8/orbit 实例
+  - `h8o agents [list|check|test|install|enable|disable] ...`
+  - `h8o machines [ls|rename|rm]`
+  - `h8o projects add [dir] [--machine <id>] [--name <name>]`
+  - `h8o service [install|uninstall|status] [hub|runner]`（支持 Linux systemd user `h8o-hub.service`/`h8o-runner.service` 与 macOS LaunchAgent `io.github.hebi8.h8o-hub`/`io.github.hebi8.h8o-runner`）
+  - `h8o init`：向后保留所有旧 flag，交互菜单收敛为 `[1] 本机起跑` / `[2] 加入已有网络` / `[3] 添加项目`
 - **Desktop (`desktop/`)**：
-  - `scripts/package-mac-app.sh` 同时打包 `orbit-hub`、`orbit-runner`、`orbit` 到 `Orbit.app/Contents/Resources/bin/`，令 `Orbit.app` 开箱即用无外置依赖；
-  - `desktop/setup.html` 采用干净两卡（就在这台机器用 / 连到已有的 Orbit），全流程人话文案，无内部术语泄漏。
+  - `scripts/package-mac-app.sh` 同时打包 `h8o-hub`、`h8o-runner`、`h8o` 到 `hebi8-Orbit.app/Contents/Resources/bin/`，并内置 `assets/icons/AppIcon.icns`，令 `hebi8-Orbit.app` 开箱即用无外置依赖；
+  - `desktop/setup.html` 采用干净两卡（使用本机工作区 / 配对加入其他网络），全流程人话文案，无内部术语泄漏。

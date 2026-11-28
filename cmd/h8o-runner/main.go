@@ -32,19 +32,19 @@ func main() {
 		dataDir     = flag.String("data-dir", "", "orbit data directory (default ~/.local/share/hebi8-orbit)")
 		tokenFlag   = flag.String("token", "", "optional runner bearer token (overrides --token-file)")
 		tokenFile   = flag.String("token-file", "", "path to runner bearer token file (default <config-dir>/runner.token)")
-		sockPath    = flag.String("sock", "", "local Unix domain socket path for `orbit deliver`")
+		sockPath    = flag.String("sock", "", "local Unix domain socket path for h8o deliver")
 		agyBin      = flag.String("agy-bin", "", "override agy executable path")
 		claudeBin   = flag.String("claude-bin", "", "override claude-agent-acp executable path")
 		codexBin    = flag.String("codex-bin", "", "override codex-acp executable path")
-		orbitBinDir = flag.String("orbit-bin-dir", "", "directory containing `orbit` CLI to prepend to child PATH")
+		h8oBinDir   = flag.String("h8o-bin-dir", "", "directory containing h8o CLI to prepend to child PATH")
 		idleClose   = flag.Int("idle-close-seconds", -1, "idle ACP session close timeout in seconds (0 disables)")
 		parentPID   = flag.Int("parent-pid", 0, "optional parent PID to watch; exits cleanly if parent disappears")
-		showVersion = flag.Bool("version", false, "print orbit-runner version and exit")
+		showVersion = flag.Bool("version", false, "print h8o-runner version and exit")
 	)
 	flag.Parse()
 
 	if *showVersion {
-		fmt.Printf("orbit-runner %s (commit=%s built=%s)\n", Version, Commit, BuildDate)
+		fmt.Printf("h8o-runner %s (commit=%s built=%s)\n", Version, Commit, BuildDate)
 		return
 	}
 
@@ -141,7 +141,7 @@ func main() {
 	}
 	sock = protocol.ExpandPath(sock)
 
-	binDir := strings.TrimSpace(*orbitBinDir)
+	binDir := strings.TrimSpace(*h8oBinDir)
 	if binDir == "" {
 		if exe, err := os.Executable(); err == nil {
 			binDir = filepath.Dir(exe)
@@ -181,14 +181,14 @@ func main() {
 
 	if *parentPID > 0 {
 		protocol.StartParentWatchdog(ctx, *parentPID, func() {
-			log.Printf("orbit-runner: parent pid %d exited; shutting down", *parentPID)
+			log.Printf("h8o-runner: parent pid %d exited; shutting down", *parentPID)
 			stop()
 		})
 	}
 
 	runnerLock, err := protocol.AcquireFileLock(filepath.Join(expDataDir, "runner-"+mid+".lock"))
 	if err != nil {
-		log.Fatalf("orbit-runner single-instance lock: %v", err)
+		log.Fatalf("h8o-runner single-instance lock: %v", err)
 	}
 	defer runnerLock.Release()
 
@@ -214,25 +214,25 @@ func main() {
 		IdleCloseSeconds: idleSec,
 	})
 	if err != nil {
-		log.Fatalf("init orbit-runner: %v", err)
+		log.Fatalf("init h8o-runner: %v", err)
 	}
 
 	if err := r.Start(ctx); err != nil {
-		log.Fatalf("start orbit-runner: %v", err)
+		log.Fatalf("start h8o-runner: %v", err)
 	}
 	probes := agentMgr.SnapshotProbes()
 	var probeDesc []string
 	for _, p := range probes {
 		probeDesc = append(probeDesc, fmt.Sprintf("%s=%s", p.Adapter, p.State))
 	}
-	log.Printf("orbit-runner started (version=%s machine=%s instance=%s hub=%s sock=%s agents=[%s])",
+	log.Printf("h8o-runner started (version=%s machine=%s instance=%s hub=%s sock=%s agents=[%s])",
 		Version, mid, r.InstanceID(), wsURL, r.SocketPath(), strings.Join(probeDesc, ", "))
 
 	<-ctx.Done()
-	log.Printf("orbit-runner shutting down...")
+	log.Printf("h8o-runner shutting down...")
 	shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := r.Close(shutCtx); err != nil {
-		log.Printf("orbit-runner shutdown error: %v", err)
+		log.Printf("h8o-runner shutdown error: %v", err)
 	}
 }

@@ -136,7 +136,7 @@ type mcpToolDef struct {
 	InputSchema map[string]any `json:"inputSchema"`
 }
 
-// ToolDefinitions returns the strict 5-tool catalog exposed by orbit mcp-serve.
+// ToolDefinitions returns the strict 5-tool catalog exposed by h8o mcp-serve.
 func ToolDefinitions() []mcpToolDef {
 	return []mcpToolDef{
 		{
@@ -247,7 +247,7 @@ func (s *Server) ServeStdio(ctx context.Context, r io.Reader, w io.Writer) error
 			return nil
 		}
 		if err != nil {
-			fmt.Fprintf(s.stderr, "orbit mcp-serve: read frame error: %v\n", err)
+			fmt.Fprintf(s.stderr, "h8o mcp-serve: read frame error: %v\n", err)
 			return err
 		}
 		if len(bytes.TrimSpace(payload)) == 0 {
@@ -499,7 +499,7 @@ func (s *Server) executeTool(ctx context.Context, name string, args map[string]a
 
 	raw, err := s.backend.CallDelegate(ctx, action, payload)
 	if err != nil {
-		fmt.Fprintf(s.stderr, "orbit mcp-serve: tool %s error: %v\n", name, err)
+		fmt.Fprintf(s.stderr, "h8o mcp-serve: tool %s error: %v\n", name, err)
 		return err.Error(), true
 	}
 	return string(bytes.TrimSpace(raw)), false

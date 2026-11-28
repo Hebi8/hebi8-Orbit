@@ -31,7 +31,7 @@ type managedProc struct {
 	done chan struct{}
 }
 
-// RuntimeManager manages optional local orbit-hub / orbit-runner child processes
+// RuntimeManager manages optional local h8o-hub / h8o-runner child processes
 // for the desktop shell, always preferring to attach to an already-running service.
 type RuntimeManager struct {
 	mu                sync.Mutex
@@ -67,7 +67,7 @@ func (m *RuntimeManager) Shutdown() {
 	m.mu.Unlock()
 	for i := len(procs) - 1; i >= 0; i-- {
 		p := procs[i]
-		log.Printf("orbit-client: stopping managed %s", p.name)
+		log.Printf("h8o-client: stopping managed %s", p.name)
 		stopChildProcess(p.cmd, p.done)
 	}
 }
@@ -103,7 +103,7 @@ func (m *RuntimeManager) stopManaged(name string) {
 	m.procs = keep
 	m.mu.Unlock()
 	for _, p := range toStop {
-		log.Printf("orbit-client: stopping managed %s", p.name)
+		log.Printf("h8o-client: stopping managed %s", p.name)
 		stopChildProcess(p.cmd, p.done)
 	}
 }
@@ -146,7 +146,7 @@ func (m *RuntimeManager) startManaged(name, binPath string, args []string, logPa
 	return nil
 }
 
-// LocateBinary searches bundled Orbit.app/Contents/Resources/bin, sibling dir, ~/.local/bin, Homebrew, and PATH.
+// LocateBinary searches bundled hebi8-Orbit.app/Contents/Resources/bin, sibling dir, ~/.local/bin, Homebrew, and PATH.
 func LocateBinary(name string) (string, error) {
 	if runtime.GOOS == "windows" && !strings.HasSuffix(strings.ToLower(name), ".exe") {
 		name += ".exe"
@@ -175,7 +175,7 @@ func LocateBinary(name string) (string, error) {
 	if found, err := exec.LookPath(name); err == nil {
 		return found, nil
 	}
-	return "", fmt.Errorf("未找到 %s 可执行文件，请重新安装 Orbit", name)
+	return "", fmt.Errorf("未找到 %s 可执行文件，请重新安装 hebi8/orbit", name)
 }
 
 func buildDesktopChildEnv(binDir string) []string {
@@ -222,7 +222,7 @@ func buildDesktopChildEnv(binDir string) []string {
 }
 
 // StartOrAttachLocal initializes local Orbit files if needed, attaches to an existing Hub if healthy,
-// or starts managed orbit-hub + orbit-runner child processes.
+// or starts managed h8o-hub + h8o-runner child processes.
 func (m *RuntimeManager) StartOrAttachLocal(ctx context.Context, configDir string) (hubURL, machineID string, attached bool, err error) {
 	m.switchMu.Lock()
 	defer m.switchMu.Unlock()
@@ -278,12 +278,12 @@ func (m *RuntimeManager) startOrAttachLocalLocked(ctx context.Context, configDir
 			}
 		}
 
-		if !m.hasManaged("orbit-hub") {
-			hubBin, bErr := LocateBinary("orbit-hub")
+		if !m.hasManaged("h8o-hub") {
+			hubBin, bErr := LocateBinary("h8o-hub")
 			if bErr != nil {
 				return "", "", false, bErr
 			}
-			if err := m.startManaged("orbit-hub", hubBin, []string{"--config-dir", expCfgDir}, filepath.Join(dataDir, "logs", "hub.log")); err != nil {
+			if err := m.startManaged("h8o-hub", hubBin, []string{"--config-dir", expCfgDir}, filepath.Join(dataDir, "logs", "hub.log")); err != nil {
 				return "", "", false, fmt.Errorf("启动本机服务失败: %w", err)
 			}
 		}
@@ -313,22 +313,22 @@ func (m *RuntimeManager) startOrAttachLocalLocked(ctx context.Context, configDir
 	}
 
 	// Start local runner if not already managed and no local socket is active
-	m.stopManaged("orbit-runner-remote")
+	m.stopManaged("h8o-runner-remote")
 	if err := m.ensureLocalRunner(expCfgDir, dataDir, machineID); err != nil {
-		log.Printf("orbit-client: warning starting local runner: %v", err)
+		log.Printf("h8o-client: warning starting local runner: %v", err)
 	}
 	return hubURL, machineID, attached, nil
 }
 
 func (m *RuntimeManager) ensureLocalRunner(expCfgDir, dataDir, machineID string) error {
-	if m.hasManaged("orbit-runner-local") || isSocketAlive(filepath.Join(dataDir, "runner-"+machineID+".sock")) {
+	if m.hasManaged("h8o-runner-local") || isSocketAlive(filepath.Join(dataDir, "runner-"+machineID+".sock")) {
 		return nil
 	}
-	runnerBin, bErr := LocateBinary("orbit-runner")
+	runnerBin, bErr := LocateBinary("h8o-runner")
 	if bErr != nil {
 		return bErr
 	}
-	return m.startManaged("orbit-runner-local", runnerBin, []string{"--machine-id", machineID, "--config-dir", expCfgDir}, filepath.Join(dataDir, "logs", "runner.log"))
+	return m.startManaged("h8o-runner-local", runnerBin, []string{"--machine-id", machineID, "--config-dir", expCfgDir}, filepath.Join(dataDir, "logs", "runner.log"))
 }
 
 // EnsureRemoteRunner starts a managed orbit-runner for the active remote profile
@@ -364,14 +364,14 @@ func (m *RuntimeManager) EnsureRemoteRunnerDir(runnerDir string) error {
 	if dataDir == "" {
 		dataDir = expandHome("~/.local/share/hebi8-orbit")
 	}
-	if m.hasManaged("orbit-runner-remote") || (rc.MachineID != "" && isSocketAlive(filepath.Join(dataDir, "runner-"+rc.MachineID+".sock"))) {
+	if m.hasManaged("h8o-runner-remote") || (rc.MachineID != "" && isSocketAlive(filepath.Join(dataDir, "runner-"+rc.MachineID+".sock"))) {
 		return nil
 	}
-	runnerBin, bErr := LocateBinary("orbit-runner")
+	runnerBin, bErr := LocateBinary("h8o-runner")
 	if bErr != nil {
 		return bErr
 	}
-	return m.startManaged("orbit-runner-remote", runnerBin, []string{"--config-dir", runnerDir}, filepath.Join(dataDir, "logs", "runner.log"))
+	return m.startManaged("h8o-runner-remote", runnerBin, []string{"--config-dir", runnerDir}, filepath.Join(dataDir, "logs", "runner.log"))
 }
 
 // SwitchNetwork activates a previously saved network profile (or starts local workspace for "local").
@@ -418,14 +418,14 @@ func (m *RuntimeManager) switchNetworkLocked(ctx context.Context, configDir, net
 	if err := SaveClientConfig(expCfgDir, cfg); err != nil {
 		return NetworkProfile{}, err
 	}
-	m.stopManaged("orbit-runner-remote")
+	m.stopManaged("h8o-runner-remote")
 	if prof.RunLocalRunner {
 		rDir := prof.RunnerConfigDir
 		if rDir == "" {
 			rDir = expCfgDir
 		}
 		if rErr := m.EnsureRemoteRunnerDir(rDir); rErr != nil {
-			log.Printf("orbit-client: warning starting remote runner for %s: %v", prof.ID, rErr)
+			log.Printf("h8o-client: warning starting remote runner for %s: %v", prof.ID, rErr)
 		}
 	}
 	return prof, nil
@@ -449,10 +449,10 @@ func (m *RuntimeManager) RemoveNetwork(configDir, networkID string) (ClientConfi
 		return cfg, err
 	}
 	if wasActive {
-		m.stopManaged("orbit-runner-remote")
+		m.stopManaged("h8o-runner-remote")
 		if cfg.Mode == "remote" && cfg.RunLocalRunner && cfg.ActiveNetworkID != "" {
 			if rErr := m.EnsureRemoteRunner(expCfgDir); rErr != nil {
-				log.Printf("orbit-client: warning restoring remote runner after network removal: %v", rErr)
+				log.Printf("h8o-client: warning restoring remote runner after network removal: %v", rErr)
 			}
 		}
 	}
@@ -520,7 +520,7 @@ func (m *RuntimeManager) joinRemote(ctx context.Context, configDir, rawInput str
 		if err := SaveClientConfig(expCfgDir, existingCfg); err != nil {
 			return JoinResult{}, err
 		}
-		m.stopManaged("orbit-runner-remote")
+		m.stopManaged("h8o-runner-remote")
 		return JoinResult{HubURL: hubURL, ClientConnected: true}, nil
 	}
 
@@ -610,7 +610,7 @@ func (m *RuntimeManager) joinRemote(ctx context.Context, configDir, rawInput str
 
 	// Always stop any previous remote runner when switching/joining a new remote network,
 	// even if the new network is client-only (runRunner == false).
-	m.stopManaged("orbit-runner-remote")
+	m.stopManaged("h8o-runner-remote")
 
 	if runRunner {
 		// Isolate remote runner credentials/config so local workspace runner.token is never overwritten!
@@ -640,18 +640,18 @@ func (m *RuntimeManager) joinRemote(ctx context.Context, configDir, rawInput str
 			res.RunnerError = fmt.Sprintf("写入 runner.yaml 失败: %v", wErr)
 			return res, nil
 		}
-		runnerBin, bErr := LocateBinary("orbit-runner")
+		runnerBin, bErr := LocateBinary("h8o-runner")
 		if bErr != nil {
 			res.RunnerError = bErr.Error()
 			return res, nil
 		}
-		if sErr := m.startManaged("orbit-runner-remote", runnerBin, []string{"--config-dir", remoteRunnerDir}, filepath.Join(dataDir, "logs", "runner.log")); sErr != nil {
+		if sErr := m.startManaged("h8o-runner-remote", runnerBin, []string{"--config-dir", remoteRunnerDir}, filepath.Join(dataDir, "logs", "runner.log")); sErr != nil {
 			res.RunnerError = fmt.Sprintf("启动本机执行节点失败: %v", sErr)
 			return res, nil
 		}
 		if m.waitForRunnerOnline(ctx, hubURL, claimed.ClientToken, claimed.MachineID, 5*time.Second) {
 			res.RunnerStarted = true
-		} else if !m.hasManaged("orbit-runner-remote") {
+		} else if !m.hasManaged("h8o-runner-remote") {
 			res.RunnerError = "执行节点启动后已退出，请检查日志 " + filepath.Join(dataDir, "logs", "runner.log")
 		} else {
 			res.RunnerStarted = false
@@ -668,7 +668,7 @@ func (m *RuntimeManager) waitForRunnerOnline(ctx context.Context, hubURL, client
 	client := originBoundHTTPClient(hubURL, 2*time.Second)
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if !m.hasManaged("orbit-runner-remote") {
+		if !m.hasManaged("h8o-runner-remote") {
 			return false
 		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(hubURL, "/")+"/api/machines", nil)

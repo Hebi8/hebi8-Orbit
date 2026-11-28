@@ -22,6 +22,35 @@ function Svg({ size = 14, children, ...rest }: P & { children: ReactNode }) {
   );
 }
 
+export const BrandMark = ({ size = 18 }: { size?: number }) => (
+  <svg
+    width={size}
+    height={size}
+    viewBox="0 0 24 24"
+    fill="none"
+    aria-hidden="true"
+    className="brand-mark-svg"
+  >
+    <path d="M5.6 7.8a8.2 8.2 0 0 1 12.8 0" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" />
+    <path
+      d="M18.4 16.2a8.2 8.2 0 0 1-12.8 0"
+      stroke="currentColor"
+      strokeOpacity="0.42"
+      strokeWidth="1.7"
+      strokeLinecap="round"
+    />
+    <path d="M7.8 12A4.2 4.2 0 1 1 12 16.2" stroke="var(--accent)" strokeWidth="1.7" strokeLinecap="round" />
+    <circle cx="12" cy="12" r="1.7" fill="currentColor" />
+    <circle cx="18.4" cy="7.8" r="1.5" fill="var(--accent)" />
+  </svg>
+);
+
+export const BrandWordmark = () => (
+  <b className="brand-name">
+    hebi8<span className="brand-slash">/</span>orbit
+  </b>
+);
+
 export const PAIcon = (p: P) => (
   <Svg {...p}>
     <circle cx="12" cy="12" r="3.2" />

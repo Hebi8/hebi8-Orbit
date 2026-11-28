@@ -199,11 +199,11 @@ select.field {
 .side { background: var(--side); border-right: 1px solid var(--line); display: flex; flex-direction: column; min-height: 0; min-width: 0; overflow: hidden; }
 .app.side-collapsed .side { border-right-color: transparent; }
 .side-in { width: 248px; display: flex; flex-direction: column; height: 100%; min-height: 0; }
-.brand { height: 46px; display: flex; align-items: center; gap: 9px; padding: 0 8px 0 14px; flex: none; }
-.brand-mark { width: 18px; height: 18px; border-radius: 50%; border: 1.5px solid var(--fg2); position: relative; flex: none; }
-.brand-mark::after { content: ""; position: absolute; width: 5px; height: 5px; border-radius: 50%; background: var(--fg); top: -3px; right: 1px; }
-.brand b { font-weight: 600; letter-spacing: -0.01em; font-size: 13px; }
-.brand-acts { margin-left: auto; display: flex; align-items: center; gap: 2px; }
+.brand { height: 46px; display: flex; align-items: center; gap: 8px; padding: 0 8px 0 14px; flex: none; min-width: 0; }
+.brand-mark-svg { flex: none; display: block; color: var(--fg); }
+.brand b, .brand-name { font-weight: 600; letter-spacing: -0.015em; font-size: 13px; white-space: nowrap; flex: none; }
+.brand-slash { color: var(--faint); font-weight: 400; margin: 0 1px; }
+.brand-acts { margin-left: auto; display: flex; align-items: center; gap: 2px; flex: none; }
 .quick { padding: 2px 8px 8px; display: flex; flex-direction: column; gap: 1px; flex: none; }
 .qi { display: flex; align-items: center; gap: 9px; height: 30px; padding: 0 8px; border-radius: 7px; color: var(--fg2); text-align: left; width: 100%; }
 .qi:hover { background: var(--hover); color: var(--fg); }

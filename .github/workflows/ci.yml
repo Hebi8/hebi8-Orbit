@@ -59,6 +59,6 @@ jobs:
           cd desktop
           go vet ./...
           go test -race -count=1 ./...
-          CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 go build -trimpath -o ../bin/linux-amd64/orbit-client .
-          CGO_ENABLED=0 GOOS=darwin  GOARCH=arm64 go build -trimpath -o ../bin/darwin-arm64/orbit-client .
-          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -o ../bin/windows-amd64/orbit-client.exe .
+          CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 go build -trimpath -o ../bin/linux-amd64/h8o-client .
+          CGO_ENABLED=0 GOOS=darwin  GOARCH=arm64 go build -trimpath -o ../bin/darwin-arm64/h8o-client .
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -o ../bin/windows-amd64/h8o-client.exe .

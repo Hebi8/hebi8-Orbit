@@ -61,7 +61,7 @@ var (
 
 func main() {
 	if err := run(context.Background(), os.Args[1:], os.Stdout, os.Stderr); err != nil {
-		fmt.Fprintf(os.Stderr, "orbit: %v\n", err)
+		fmt.Fprintf(os.Stderr, "h8o: %v\n", err)
 		os.Exit(1)
 	}
 }
@@ -92,7 +92,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	case "init":
 		return runInit(ctx, args[1:], os.Stdin, stdout, stderr)
 	case "version", "--version", "-v":
-		fmt.Fprintf(stdout, "orbit %s (commit=%s built=%s)\n", Version, Commit, BuildDate)
+		fmt.Fprintf(stdout, "h8o %s (commit=%s built=%s)\n", Version, Commit, BuildDate)
 		return nil
 	case "deliver":
 		return runDeliver(ctx, args[1:], stdout, stderr)
@@ -124,30 +124,30 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 
 func printUsage(w io.Writer) {
 	fmt.Fprintln(w, `Usage:
-  orbit up [--no-runner] [--service] [--json]               Start or attach to local Orbit on this machine
-  orbit pair [--runner|--client|--both] [--machine <id>]    Generate a one-time pairing code & wait for node
-  orbit join <hub-url> <pair-code> [--no-runner] [--service] Join an existing Orbit network
-  orbit discover [--json]                                   Scan Tailscale & local ports for Orbit Hubs
-  orbit agents [list|check|test|install|enable|disable] ... Inspect and configure machine Agents
-  orbit machines [ls|rename|rm] ...                         Manage connected machines
-  orbit projects [ls|add|rm] ...                            Manage registered projects
-  orbit service [install|uninstall|status] [hub|runner|all] Manage background user services
-  orbit init [--connect <url> | --hub | --runner --hub-url <url> | --project [dir]]
-  orbit status [--hub <url>] [--json]
-  orbit tasks [list|new|show|followup|cancel|retry] ...
-  orbit child [spawn|ls|show|send|cancel] ...               Manage delegated child sessions
-  orbit mcp-serve                                           Run Orbit stdio MCP server (5 sub-session tools)
-  orbit approvals [list|allow|reject] ...
-  orbit hebi8 "<message>"                                   Send a turn to the single Hebi8 main conversation (alias: orbit pa)
-  orbit hebi8 [fold|line|expand <nodeId>|pin <nodeId>]      Manage Hebi8 Fold-Rollover context tree
-  orbit artifacts [--project <id>] [--kind <type>] [--json]
-  orbit brief [--since-hours 24] [--project <id>] [--json]
-  orbit deliver --summary "..." [--final] [--attach <file>...]                               (inside runner worktree via ORBIT_RUNNER_SOCK)
-  orbit deliver --project <id> [--repo <dir>] [--base <sha>] [--task <id>] [--title "..."] [--summary "..."] [--attach <file>...]
-  orbit deliver --resume <deliveryId> [--hub <url>] [--mirror <path>]
-  orbit doctor [--hub <url>] [--json]
-  orbit open [--hub <url>]
-  orbit version
+  h8o up [--no-runner] [--service] [--json]               Start or attach to local hebi8/orbit on this machine
+  h8o pair [--runner|--client|--both] [--machine <id>]    Generate a one-time pairing code & wait for node
+  h8o join <hub-url> <pair-code> [--no-runner] [--service] Join an existing hebi8/orbit network
+  h8o discover [--json]                                   Scan Tailscale & local ports for hebi8/orbit Hubs
+  h8o agents [list|check|test|install|enable|disable] ... Inspect and configure machine Agents
+  h8o machines [ls|rename|rm] ...                         Manage connected machines
+  h8o projects [ls|add|rm] ...                            Manage registered projects
+  h8o service [install|uninstall|status] [hub|runner|all] Manage background user services
+  h8o init [--connect <url> | --hub | --runner --hub-url <url> | --project [dir]]
+  h8o status [--hub <url>] [--json]
+  h8o tasks [list|new|show|followup|cancel|retry] ...
+  h8o child [spawn|ls|show|send|cancel] ...               Manage delegated child sessions
+  h8o mcp-serve                                           Run hebi8/orbit stdio MCP server (5 sub-session tools)
+  h8o approvals [list|allow|reject] ...
+  h8o hebi8 "<message>"                                   Send a turn to the single Hebi8 main conversation (alias: h8o pa)
+  h8o hebi8 [fold|line|expand <nodeId>|pin <nodeId>]      Manage Hebi8 Fold-Rollover context tree
+  h8o artifacts [--project <id>] [--kind <type>] [--json]
+  h8o brief [--since-hours 24] [--project <id>] [--json]
+  h8o deliver --summary "..." [--final] [--attach <file>...]                               (inside runner worktree via ORBIT_RUNNER_SOCK)
+  h8o deliver --project <id> [--repo <dir>] [--base <sha>] [--task <id>] [--title "..."] [--summary "..."] [--attach <file>...]
+  h8o deliver --resume <deliveryId> [--hub <url>] [--mirror <path>]
+  h8o doctor [--hub <url>] [--json]
+  h8o open [--hub <url>]
+  h8o version
 
 Environment variables:
   ORBIT_RUNNER_SOCK Local runner Unix domain socket (auto-injected for ACP agent deliveries)
@@ -383,7 +383,7 @@ func runDeliver(ctx context.Context, args []string, stdout, stderr io.Writer) er
 		taskID     = fs.String("task", "", "existing task ID to attach this delivery to")
 		title      = fs.String("title", "", "optional task title when creating a new manual task")
 		summary    = fs.String("summary", "", "human-readable delivery summary")
-		hubURLFlag = fs.String("hub", "", "orbit-hub base URL")
+		hubURLFlag = fs.String("hub", "", "h8o-hub base URL")
 		mirrorFlag = fs.String("mirror", "", "explicit local bare mirror path")
 		tokenFlag  = fs.String("token", "", "optional X-Orbit-Dev-Token")
 		machineID  = fs.String("machine", "", "optional source machine ID")
@@ -461,7 +461,7 @@ func runDeliver(ctx context.Context, args []string, stdout, stderr io.Writer) er
 		// Protect any existing pending delivery record from being overwritten or re-committed
 		pendingPath = pendingRecordPath(dataDir, dlvID)
 		if _, err := os.Stat(pendingPath); err == nil {
-			return fmt.Errorf("pending delivery %s already exists at %s; use `orbit deliver --resume %s` instead of re-packaging", dlvID, pendingPath, dlvID)
+			return fmt.Errorf("pending delivery %s already exists at %s; use `h8o deliver --resume %s` instead of re-packaging", dlvID, pendingPath, dlvID)
 		}
 
 		cliCWD, _ := os.Getwd()
@@ -537,7 +537,7 @@ func runDeliver(ctx context.Context, args []string, stdout, stderr io.Writer) er
 	}
 
 	failWithResumeHint := func(step string, err error) error {
-		fmt.Fprintf(stderr, "hint: delivery %s saved at %s; retry with: orbit deliver --resume %s\n", rec.DeliveryID, pendingPath, rec.DeliveryID)
+		fmt.Fprintf(stderr, "hint: delivery %s saved at %s; retry with: h8o deliver --resume %s\n", rec.DeliveryID, pendingPath, rec.DeliveryID)
 		return fmt.Errorf("%s: %w", step, err)
 	}
 
@@ -672,7 +672,7 @@ func runStatus(ctx context.Context, args []string, stdout, stderr io.Writer) err
 	fs.SetOutput(stderr)
 
 	var (
-		hubURLFlag = fs.String("hub", "", "orbit-hub base URL")
+		hubURLFlag = fs.String("hub", "", "h8o-hub base URL")
 		tokenFlag  = fs.String("token", "", "optional X-Orbit-Dev-Token")
 		configDir  = fs.String("config-dir", "", "orbit config directory")
 		dataDirFlg = fs.String("data-dir", "", "orbit data directory")
@@ -719,7 +719,7 @@ func runStatus(ctx context.Context, args []string, stdout, stderr io.Writer) err
 		return err
 	}
 
-	fmt.Fprintf(stdout, "hebi8-Orbit Hub (%s) · snapshotSeq=%d\n", hubURL, boot.SnapshotSeq)
+	fmt.Fprintf(stdout, "hebi8/orbit Hub (%s) · snapshotSeq=%d\n", hubURL, boot.SnapshotSeq)
 	fmt.Fprintf(stdout, "\nInbox (%d open):\n", len(boot.OpenInboxItems))
 	if len(boot.OpenInboxItems) == 0 {
 		fmt.Fprintln(stdout, "  (clear)")
@@ -896,7 +896,7 @@ func runBrief(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	fs.SetOutput(stderr)
 
 	var (
-		hubURLFlag = fs.String("hub", "", "orbit-hub base URL")
+		hubURLFlag = fs.String("hub", "", "h8o-hub base URL")
 		tokenFlag  = fs.String("token", "", "optional X-Orbit-Dev-Token")
 		configDir  = fs.String("config-dir", "", "orbit config directory")
 		dataDirFlg = fs.String("data-dir", "", "orbit data directory")

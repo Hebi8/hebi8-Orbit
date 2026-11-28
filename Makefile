@@ -21,25 +21,25 @@ build-web: gen-types
 
 build: build-web
 	@mkdir -p $(BIN_DIR)
-	CGO_ENABLED=0 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/orbit-hub ./cmd/orbit-hub
-	CGO_ENABLED=0 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/orbit-runner ./cmd/orbit-runner
-	CGO_ENABLED=0 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/orbit ./cmd/orbit
+	CGO_ENABLED=0 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/h8o-hub ./cmd/h8o-hub
+	CGO_ENABLED=0 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/h8o-runner ./cmd/h8o-runner
+	CGO_ENABLED=0 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/h8o ./cmd/h8o
 
 build-desktop:
 	@mkdir -p $(BIN_DIR)
-	cd desktop && CGO_ENABLED=0 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o ../$(BIN_DIR)/orbit-client .
+	cd desktop && CGO_ENABLED=0 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o ../$(BIN_DIR)/h8o-client .
 
 build-all: build-web
 	@mkdir -p $(BIN_DIR)/linux-amd64 $(BIN_DIR)/darwin-arm64 $(BIN_DIR)/windows-amd64
-	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/linux-amd64/orbit-hub ./cmd/orbit-hub
-	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/linux-amd64/orbit-runner ./cmd/orbit-runner
-	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/linux-amd64/orbit ./cmd/orbit
-	CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/darwin-arm64/orbit-hub ./cmd/orbit-hub
-	CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/darwin-arm64/orbit-runner ./cmd/orbit-runner
-	CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/darwin-arm64/orbit ./cmd/orbit
-	cd desktop && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o ../$(BIN_DIR)/linux-amd64/orbit-client .
-	cd desktop && CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o ../$(BIN_DIR)/darwin-arm64/orbit-client .
-	cd desktop && CGO_ENABLED=0 GOOS=windows GOARCH=amd64 $(GO) build -trimpath -ldflags "$(LDFLAGS) -H=windowsgui" -o ../$(BIN_DIR)/windows-amd64/orbit-client.exe .
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/linux-amd64/h8o-hub ./cmd/h8o-hub
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/linux-amd64/h8o-runner ./cmd/h8o-runner
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/linux-amd64/h8o ./cmd/h8o
+	CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/darwin-arm64/h8o-hub ./cmd/h8o-hub
+	CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/darwin-arm64/h8o-runner ./cmd/h8o-runner
+	CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/darwin-arm64/h8o ./cmd/h8o
+	cd desktop && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o ../$(BIN_DIR)/linux-amd64/h8o-client .
+	cd desktop && CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o ../$(BIN_DIR)/darwin-arm64/h8o-client .
+	cd desktop && CGO_ENABLED=0 GOOS=windows GOARCH=amd64 $(GO) build -trimpath -ldflags "$(LDFLAGS) -H=windowsgui" -o ../$(BIN_DIR)/windows-amd64/h8o-client.exe .
 
 test:
 	$(GO) vet ./...

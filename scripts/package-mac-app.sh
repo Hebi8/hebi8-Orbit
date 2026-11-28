@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Package hebi8-Orbit macOS Desktop Client (Orbit.app + DMG + ZIP).
+# Package hebi8/orbit macOS Desktop Client (hebi8-Orbit.app + DMG + ZIP).
 # Works both on GitHub Actions (macos-latest) and locally on a Mac.
 # Optional Apple Developer signing & notarization activates automatically when
 # APPLE_CERTIFICATE_P12 / APPLE_SIGNING_IDENTITY / APPLE_NOTARY_* are provided.
@@ -14,7 +14,7 @@ CLEAN_VER="${VERSION#v}"
 LDFLAGS="-s -w -X main.Version=${VERSION} -X main.Commit=${COMMIT} -X main.BuildDate=${BUILT}"
 
 mkdir -p "$OUT_DIR"
-APP_DIR="${OUT_DIR}/Orbit.app"
+APP_DIR="${OUT_DIR}/hebi8-Orbit.app"
 rm -rf "$APP_DIR"
 mkdir -p "${APP_DIR}/Contents/MacOS" "${APP_DIR}/Contents/Resources/bin"
 
@@ -23,7 +23,7 @@ if [[ ! -f "web/dist/index.html" ]] || [[ ! -d "web/dist/assets" ]]; then
     echo "==> web/dist missing; building embedded Web workbench first"
     make build-web
   else
-    echo "ERROR: web/dist/index.html (and assets) missing; run 'make build-web' before packaging Orbit.app" >&2
+    echo "ERROR: web/dist/index.html (and assets) missing; run 'make build-web' before packaging hebi8-Orbit.app" >&2
     exit 1
   fi
 fi
@@ -31,15 +31,20 @@ if [[ ! -f "web/dist/index.html" ]]; then
   echo "ERROR: web/dist/index.html still missing after build-web; aborting packaging" >&2
   exit 1
 fi
+if [[ ! -f "assets/icons/AppIcon.icns" ]]; then
+  echo "ERROR: assets/icons/AppIcon.icns missing; aborting packaging" >&2
+  exit 1
+fi
 
 echo "==> Building pure-Go desktop client + bundled runtime (darwin/arm64, version=${VERSION})"
 (
   cd desktop
-  CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags "$LDFLAGS" -o "../${APP_DIR}/Contents/MacOS/orbit-client" .
+  CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags "$LDFLAGS" -o "../${APP_DIR}/Contents/MacOS/h8o-client" .
 )
-CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags "$LDFLAGS" -o "${APP_DIR}/Contents/Resources/bin/orbit-hub" ./cmd/orbit-hub
-CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags "$LDFLAGS" -o "${APP_DIR}/Contents/Resources/bin/orbit-runner" ./cmd/orbit-runner
-CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags "$LDFLAGS" -o "${APP_DIR}/Contents/Resources/bin/orbit" ./cmd/orbit
+CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags "$LDFLAGS" -o "${APP_DIR}/Contents/Resources/bin/h8o-hub" ./cmd/h8o-hub
+CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags "$LDFLAGS" -o "${APP_DIR}/Contents/Resources/bin/h8o-runner" ./cmd/h8o-runner
+CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags "$LDFLAGS" -o "${APP_DIR}/Contents/Resources/bin/h8o" ./cmd/h8o
+cp "assets/icons/AppIcon.icns" "${APP_DIR}/Contents/Resources/AppIcon.icns"
 
 cat > "${APP_DIR}/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -49,15 +54,17 @@ cat > "${APP_DIR}/Contents/Info.plist" <<EOF
   <key>CFBundleDevelopmentRegion</key>
   <string>en</string>
   <key>CFBundleDisplayName</key>
-  <string>hebi8-Orbit</string>
+  <string>hebi8/orbit</string>
   <key>CFBundleExecutable</key>
-  <string>orbit-client</string>
+  <string>h8o-client</string>
+  <key>CFBundleIconFile</key>
+  <string>AppIcon</string>
   <key>CFBundleIdentifier</key>
-  <string>io.github.hebi8.orbit-client</string>
+  <string>io.github.hebi8.h8o-client</string>
   <key>CFBundleInfoDictionaryVersion</key>
   <string>6.0</string>
   <key>CFBundleName</key>
-  <string>Orbit</string>
+  <string>hebi8/orbit</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
@@ -97,17 +104,17 @@ if [[ -n "${APPLE_CERTIFICATE_P12:-}" && -n "${APPLE_SIGNING_IDENTITY:-}" ]]; th
   codesign --force --deep --options runtime --timestamp --keychain "$KEYCHAIN" --sign "$APPLE_SIGNING_IDENTITY" "$APP_DIR"
   codesign --verify --deep --strict "$APP_DIR"
 else
-  echo "==> Ad-hoc signing Orbit.app (no Developer ID secrets configured)"
+  echo "==> Ad-hoc signing hebi8-Orbit.app (no Developer ID secrets configured)"
   codesign --force --deep --sign - "$APP_DIR"
 fi
 
-ZIP_PATH="${OUT_DIR}/orbit-client-${VERSION}-darwin-arm64.zip"
-DMG_PATH="${OUT_DIR}/orbit-client-${VERSION}-darwin-arm64.dmg"
+ZIP_PATH="${OUT_DIR}/h8o-client-${VERSION}-darwin-arm64.zip"
+DMG_PATH="${OUT_DIR}/h8o-client-${VERSION}-darwin-arm64.dmg"
 
 ditto -c -k --keepParent "$APP_DIR" "$ZIP_PATH"
 
 DMG_STAGE="$(mktemp -d)"
-cp -R "$APP_DIR" "${DMG_STAGE}/Orbit.app"
+cp -R "$APP_DIR" "${DMG_STAGE}/hebi8-Orbit.app"
 ln -s /Applications "${DMG_STAGE}/Applications"
 hdiutil create -volname "hebi8-Orbit" -srcfolder "$DMG_STAGE" -ov -format UDZO "$DMG_PATH"
 rm -rf "$DMG_STAGE"
