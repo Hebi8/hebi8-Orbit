@@ -3,11 +3,13 @@ import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { ArrowRight, GitBranch, Sparkles, X, Zap } from 'lucide-react';
 import type { BootstrapResponse, Hebi8MainResponse } from '../generated/protocol';
 import { Hebi8LineDrawer } from '../components/Hebi8LineDrawer';
+import { MdLinkProvider } from '../components/Md';
 import { PageHeader } from '../components/PageHeader';
 import { StatusMark } from '../components/StatusMark';
-import { useAllTasks, useHebi8Main, useTimeline } from '../hooks/queries';
+import { useAllTasks, useHebi8Main, useMdLinkRecommendedSshHost, useTimeline } from '../hooks/queries';
 import { api, errMsg } from '../lib/api';
 import { PA_PROJECT_ID, effectiveReadyWatermark, indexInboxByTask, isTaskBusy, sessionMark } from '../lib/format';
+import { resolveSessionFileContext } from '../lib/ide';
 import { navigate, paths } from '../lib/router';
 import { SessionConversation } from '../session/SessionConversation';
 import { SessionPage } from '../session/SessionPage';
@@ -83,6 +85,25 @@ function Hebi8MainView({
   }, [drawerOpen]);
 
   const inboxByTask = useMemo(() => indexInboxByTask(boot.openInboxItems), [boot.openInboxItems]);
+
+  const hebi8FileCtx = useMemo(() => {
+    const tl = tlq.data;
+    const lastAtt = tl?.attempts?.[tl.attempts.length - 1];
+    return resolveSessionFileContext({
+      task: tl?.task ?? mainTask,
+      attempt: lastAtt,
+      deliveries: tl?.deliveries,
+      machines: boot.machines,
+      runtimeConfig: tl?.runtimeConfig,
+      activeDutyMachineId: boot.setup?.activeDutyMachineId,
+    });
+  }, [tlq.data, mainTask, boot.machines, boot.setup?.activeDutyMachineId]);
+  const hebi8SshHost = useMdLinkRecommendedSshHost(
+    hebi8FileCtx.machineId,
+    boot.machines,
+    boot.setup?.currentMachineId,
+    drawerOpen && !!hebi8FileCtx.machineId,
+  );
 
   const hasReadyAgent = useMemo(() => {
     for (const m of boot.machines) {
@@ -315,17 +336,26 @@ function Hebi8MainView({
                 if (e.target === e.currentTarget) setDrawerOpen(false);
               }}
             >
-              <Hebi8LineDrawer
-                nodes={nodes}
-                summary={lineSummary}
-                pendingTurns={pendingTurns}
-                busy={busy}
-                folding={foldMut.isPending}
-                selectedNodeId={selectedNodeId}
-                onSelectNode={setSelectedNodeId}
-                onFold={() => foldMut.mutate()}
-                onClose={() => setDrawerOpen(false)}
-              />
+              <MdLinkProvider
+                machineId={hebi8FileCtx.machineId}
+                worktreePath={hebi8FileCtx.worktreePath}
+                machines={boot.machines}
+                localMachineId={boot.setup?.currentMachineId}
+                ideScheme={hebi8FileCtx.ideScheme}
+                recommendedSshHost={hebi8SshHost}
+              >
+                <Hebi8LineDrawer
+                  nodes={nodes}
+                  summary={lineSummary}
+                  pendingTurns={pendingTurns}
+                  busy={busy}
+                  folding={foldMut.isPending}
+                  selectedNodeId={selectedNodeId}
+                  onSelectNode={setSelectedNodeId}
+                  onFold={() => foldMut.mutate()}
+                  onClose={() => setDrawerOpen(false)}
+                />
+              </MdLinkProvider>
             </div>
           )}
         </div>

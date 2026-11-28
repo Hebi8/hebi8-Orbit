@@ -8,6 +8,7 @@ import {
   type AttemptRawSyncController,
   type BoundAttemptRawSync,
 } from '../lib/attemptStream';
+import { resolveEffectiveLocalMachineId } from '../lib/ide';
 import { useWorkbenchStore } from '../store/useWorkbenchStore';
 
 export function useBootstrap(enabled = true) {
@@ -118,6 +119,25 @@ export function useMachineSSHCandidates(machine?: MachineView | null, enabled = 
     staleTime: 60_000,
     retry: false,
   });
+}
+
+/**
+ * Reuses the exact `useMachineSSHCandidates` cache key as `IdeOpenButton` to resolve the recommended
+ * `~/.ssh/config` host alias for remote `<Md />` file links without issuing duplicate network requests.
+ */
+export function useMdLinkRecommendedSshHost(
+  machineId: string | undefined,
+  machines: MachineView[] | undefined,
+  localMachineId?: string,
+  enabled = true,
+): string | undefined {
+  const storedLocalId = useWorkbenchStore((s) => s.localMachineId);
+  const list = machines ?? [];
+  const effectiveLocalId = resolveEffectiveLocalMachineId(list, localMachineId || storedLocalId);
+  const targetMachine = machineId ? (list.find((m) => m.machineId === machineId) ?? null) : null;
+  const isRemote = !!targetMachine && effectiveLocalId !== targetMachine.machineId;
+  const sshQ = useMachineSSHCandidates(targetMachine, enabled && isRemote);
+  return sshQ.data?.recommended || undefined;
 }
 
 export function useRyugiArtifactContent(

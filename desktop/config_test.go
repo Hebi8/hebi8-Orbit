@@ -44,8 +44,13 @@ func TestShouldOpenExternally(t *testing.T) {
 		{"vscode://file/tmp/repo/main.go:10", true},
 		{"zed://ssh/hub-node/tmp/repo", true},
 		{"antigravity://file/tmp/repo", true},
+		{"mailto:user@example.com", true},
+		{"mailto:user@example.com?subject=Orbit", true},
+		{"http://example.com/docs", true},
 		{"https://orbit.example.ts.net:8443/art/demo", true},
 		{"https://github.com/Hebi8/hebi8-Orbit", true},
+		{"javascript:alert(1)", false},
+		{"data:text/html,hi", false},
 	}
 	for _, tc := range cases {
 		if got := ShouldOpenExternally(tc.url, hub, setup); got != tc.want {

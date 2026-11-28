@@ -23,7 +23,7 @@ import {
   shortSha,
   taskTitle,
 } from '../lib/format';
-import { resolveMachineSshAlias } from '../lib/ide';
+import { resolveMachineSshAlias, resolveSessionFileContext } from '../lib/ide';
 import { navigate, paths, replaceHash } from '../lib/router';
 import { toast, useWorkbenchStore } from '../store/useWorkbenchStore';
 import { BoardPanel } from './BoardPanel';
@@ -523,6 +523,15 @@ export function SessionPage({
 
   const mark = sessionMark(task, inboxByTask.get(task.taskId) ?? [], seenTasks);
   const lastAttempt = tl.attempts[tl.attempts.length - 1];
+  const boardFileCtx = resolveSessionFileContext({
+    task,
+    attempt: lastAttempt,
+    deliveries: tl.deliveries,
+    project,
+    machines: boot.machines,
+    runtimeConfig: tl.runtimeConfig,
+    activeDutyMachineId: boot.setup?.activeDutyMachineId,
+  });
   const machineId =
     latestCode?.sourceMachineId ||
     lastAttempt?.machineId ||
@@ -987,6 +996,10 @@ export function SessionPage({
                   fallbackMembers={members}
                   childrenList={childrenList}
                   machines={boot.machines}
+                  machineId={boardFileCtx.machineId}
+                  worktreePath={boardFileCtx.worktreePath}
+                  localMachineId={boot.setup?.currentMachineId}
+                  ideScheme={boardFileCtx.ideScheme}
                   inboxByTask={inboxByTask}
                   worker={effectiveWorker}
                   onOpenChild={openChildDrawer}

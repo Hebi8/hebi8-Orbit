@@ -10,8 +10,11 @@ import type {
   TaskSummary,
   TaskTimelineResponse,
 } from '../generated/protocol';
+import { MdLinkProvider } from '../components/Md';
+import { useMdLinkRecommendedSshHost } from '../hooks/queries';
 import { api, errMsg } from '../lib/api';
 import { indexInboxByTask, taskTitle } from '../lib/format';
+import { resolveSessionFileContext } from '../lib/ide';
 import { navigate, paths } from '../lib/router';
 import { toast, useWorkbenchStore } from '../store/useWorkbenchStore';
 import { Composer } from './Composer';
@@ -193,6 +196,39 @@ export function SessionConversation({
     (boot?.setup?.activeDutyMachineId && boot?.machines?.some((m) => m.machineId === boot.setup?.activeDutyMachineId)
       ? boot.setup.activeDutyMachineId
       : undefined);
+
+  const sessionFileCtx = useMemo(() => {
+    const resolved = resolveSessionFileContext({
+      task,
+      attempt: lastAttempt,
+      deliveries: tl.deliveries,
+      project,
+      machines: boot?.machines,
+      runtimeConfig: tl.runtimeConfig,
+      activeDutyMachineId: boot?.setup?.activeDutyMachineId,
+    });
+    const effectiveMachineId = (worker && drilledMember?.machineId) || resolved.machineId;
+    return {
+      machineId: effectiveMachineId,
+      worktreePath: worker && drilledMember?.machineId && drilledMember.machineId !== resolved.machineId ? undefined : resolved.worktreePath,
+      ideScheme: resolved.ideScheme,
+    };
+  }, [
+    task,
+    lastAttempt,
+    tl.deliveries,
+    tl.runtimeConfig,
+    project,
+    boot?.machines,
+    boot?.setup?.activeDutyMachineId,
+    worker,
+    drilledMember?.machineId,
+  ]);
+  const recommendedSshHost = useMdLinkRecommendedSshHost(
+    sessionFileCtx.machineId,
+    boot?.machines,
+    boot?.setup?.currentMachineId,
+  );
   const needsVerifyAttemptId = !task.activeAttemptId && lastAttempt?.state === 'needs_verification' ? lastAttempt.attemptId : undefined;
   const pendingInputs = [...tl.pendingInputs].sort((a, b) => a.position - b.position || a.createdAt - b.createdAt);
   const openAnnotations = useMemo(() => tl.annotations.filter((a) => a.status === 'open'), [tl.annotations]);
@@ -257,6 +293,14 @@ export function SessionConversation({
   }, [tl.events, tl.attempts]);
 
   return (
+    <MdLinkProvider
+      machineId={sessionFileCtx.machineId}
+      worktreePath={sessionFileCtx.worktreePath}
+      machines={boot?.machines}
+      localMachineId={boot?.setup?.currentMachineId}
+      ideScheme={sessionFileCtx.ideScheme}
+      recommendedSshHost={recommendedSshHost}
+    >
     <div className={`sess-body ${compact ? 'compact' : ''} ${inDrawer ? 'in-drawer' : ''}`}>
       <div className="stage" ref={stageRef} onScroll={onScroll}>
         {worker ? (
@@ -362,5 +406,6 @@ export function SessionConversation({
         />
       )}
     </div>
+    </MdLinkProvider>
   );
 }

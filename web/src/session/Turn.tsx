@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useContext, useEffect, useMemo, useState } from 'react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   ArrowUpRight,
@@ -23,10 +23,10 @@ import type {
 } from '../generated/protocol';
 import { ApprovalNotice } from '../components/ApprovalNotice';
 import { FolderChangesCard } from '../components/FolderChangesCard';
-import { Md } from '../components/Md';
+import { Md, MdLinkContext, MdLinkProvider } from '../components/Md';
 import { CrossDirSessionCards, type CrossDirSessionItem } from '../components/PAViews';
 import { StatusMark } from '../components/StatusMark';
-import { useAttemptRaw } from '../hooks/queries';
+import { useAttemptRaw, useMdLinkRecommendedSshHost } from '../hooks/queries';
 import { ADAPTER_LABELS } from '../lib/agentCaps';
 import { api, errMsg } from '../lib/api';
 import { deliveryInlineImages, deliveryReusableArtifacts } from '../lib/artifacts';
@@ -47,6 +47,7 @@ import {
   type SeenTaskMap,
   type SessionMark,
 } from '../lib/format';
+import { resolveSessionFileContext } from '../lib/ide';
 import { navigate, paths } from '../lib/router';
 import { buildSegments, lastLiveStep } from '../lib/segments';
 import { toast, useWorkbenchStore } from '../store/useWorkbenchStore';
@@ -743,24 +744,85 @@ export function Turn({
     return stripSystemWakeupBoilerplate(attempt.promptText ?? '');
   }, [isChildResult, attempt.childResult, attempt.promptText]);
 
-  return (
+  const parentLinkCtx = useContext(MdLinkContext);
+  const turnProject = useMemo(
+    () => projects?.find((p) => p.projectId === tl.task.projectId),
+    [projects, tl.task.projectId],
+  );
+  const turnFileCtx = useMemo(
+    () =>
+      resolveSessionFileContext({
+        task: tl.task,
+        attempt,
+        deliveries: tl.deliveries,
+        project: turnProject,
+        machines: machines ?? parentLinkCtx.machines,
+        runtimeConfig: tl.runtimeConfig,
+      }),
+    [tl.task, attempt, tl.deliveries, turnProject, machines, parentLinkCtx.machines, tl.runtimeConfig],
+  );
+  const turnMachineId = turnFileCtx.machineId ?? parentLinkCtx.machineId;
+  const turnWorktreePath =
+    turnFileCtx.worktreePath ?? (turnMachineId === parentLinkCtx.machineId ? parentLinkCtx.worktreePath : undefined);
+  const turnMachineDiffers = !!turnMachineId && turnMachineId !== parentLinkCtx.machineId;
+  const turnRecommendedSsh = useMdLinkRecommendedSshHost(
+    turnMachineId,
+    machines ?? parentLinkCtx.machines,
+    parentLinkCtx.localMachineId,
+    turnMachineDiffers,
+  );
+
+  const childResultMachineId = useMemo(() => {
+    if (!isChildResult || !attempt.childResult?.childTaskId) return undefined;
+    const pool = childrenList ?? tl.children ?? [];
+    return pool.find((c) => c.taskId === attempt.childResult?.childTaskId)?.machineId || undefined;
+  }, [isChildResult, attempt.childResult?.childTaskId, childrenList, tl.children]);
+  const childResultMachineDiffers = !!childResultMachineId && childResultMachineId !== turnMachineId;
+  const childResultRecommendedSsh = useMdLinkRecommendedSshHost(
+    childResultMachineId,
+    machines ?? parentLinkCtx.machines,
+    parentLinkCtx.localMachineId,
+    childResultMachineDiffers,
+  );
+
+  const turnContent = (
     <div className="turn" id={`turn-${attempt.attemptId}`} data-turn={index}>
       {!isPA && isChildResult ? (
-        <InboundCommRail
-          title={attempt.childResult?.childTitle || attempt.childResult?.childTaskId || '子会话'}
-          bodyMd={childResultMd}
-          time={hhmm(attempt.startedAt)}
-          isFailed={
-            attempt.childResult?.childState === 'failed' ||
-            attempt.childResult?.childState === 'expired' ||
-            attempt.childResult?.childState === 'cancelled'
-          }
-          insertions={attempt.childResult?.insertions ?? 0}
-          deletions={attempt.childResult?.deletions ?? 0}
-          targetTaskId={attempt.childResult?.childTaskId}
-          openLinkLabel={onOpenChild ? '分屏查看' : '打开会话'}
-          onOpenTarget={onOpenChild}
-        />
+        childResultMachineDiffers ? (
+          <MdLinkProvider machineId={childResultMachineId} recommendedSshHost={childResultRecommendedSsh}>
+            <InboundCommRail
+              title={attempt.childResult?.childTitle || attempt.childResult?.childTaskId || '子会话'}
+              bodyMd={childResultMd}
+              time={hhmm(attempt.startedAt)}
+              isFailed={
+                attempt.childResult?.childState === 'failed' ||
+                attempt.childResult?.childState === 'expired' ||
+                attempt.childResult?.childState === 'cancelled'
+              }
+              insertions={attempt.childResult?.insertions ?? 0}
+              deletions={attempt.childResult?.deletions ?? 0}
+              targetTaskId={attempt.childResult?.childTaskId}
+              openLinkLabel={onOpenChild ? '分屏查看' : '打开会话'}
+              onOpenTarget={onOpenChild}
+            />
+          </MdLinkProvider>
+        ) : (
+          <InboundCommRail
+            title={attempt.childResult?.childTitle || attempt.childResult?.childTaskId || '子会话'}
+            bodyMd={childResultMd}
+            time={hhmm(attempt.startedAt)}
+            isFailed={
+              attempt.childResult?.childState === 'failed' ||
+              attempt.childResult?.childState === 'expired' ||
+              attempt.childResult?.childState === 'cancelled'
+            }
+            insertions={attempt.childResult?.insertions ?? 0}
+            deletions={attempt.childResult?.deletions ?? 0}
+            targetTaskId={attempt.childResult?.childTaskId}
+            openLinkLabel={onOpenChild ? '分屏查看' : '打开会话'}
+            onOpenTarget={onOpenChild}
+          />
+        )
       ) : !isPA && delegatedInbound ? (
         <InboundCommRail
           title={delegatedInbound.senderTitle}
@@ -965,4 +1027,20 @@ export function Turn({
       )}
     </div>
   );
+
+  if (turnMachineDiffers || turnWorktreePath !== parentLinkCtx.worktreePath) {
+    return (
+      <MdLinkProvider
+        machineId={turnMachineId}
+        worktreePath={turnWorktreePath}
+        machines={machines ?? parentLinkCtx.machines}
+        ideScheme={turnFileCtx.ideScheme ?? parentLinkCtx.ideScheme}
+        recommendedSshHost={turnMachineDiffers ? turnRecommendedSsh : parentLinkCtx.recommendedSshHost}
+      >
+        {turnContent}
+      </MdLinkProvider>
+    );
+  }
+
+  return turnContent;
 }

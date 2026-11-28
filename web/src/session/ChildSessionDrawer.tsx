@@ -2,8 +2,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { Check, ChevronDown, Maximize2, X } from 'lucide-react';
 import type { BoardMemberCursor, BootstrapResponse, ChildTaskView, InboxItemView } from '../generated/protocol';
+import { MdLinkProvider } from '../components/Md';
 import { StatusMark } from '../components/StatusMark';
-import { useTimeline } from '../hooks/queries';
+import { useMdLinkRecommendedSshHost, useTimeline } from '../hooks/queries';
 import { ADAPTER_LABELS } from '../lib/agentCaps';
 import { errMsg } from '../lib/api';
 import { collectSessionArtifacts } from '../lib/artifacts';
@@ -262,6 +263,12 @@ export function ChildSessionDrawer({
   }, [childTaskId, childReadyWatermark, markTaskSeen]);
 
   const childArtifacts = useMemo(() => collectSessionArtifacts(childTl), [childTl]);
+  const nativeSshHost = useMdLinkRecommendedSshHost(
+    nativeMember?.machineId,
+    boot.machines,
+    boot.setup?.currentMachineId,
+    !childTaskId && !!nativeMember?.machineId,
+  );
 
   // Native subagent / swarm member read-only inspection view
   if (!childTaskId && nativeMember) {
@@ -309,7 +316,14 @@ export function ChildSessionDrawer({
             </div>
           )}
           <div className="csd-native-stream">
-            <WorkerStream taskId={parentTaskId} worker={nativeMember.memberName} member={nativeMember} inDrawer />
+            <MdLinkProvider
+              machineId={nativeMember.machineId}
+              machines={boot.machines}
+              localMachineId={boot.setup?.currentMachineId}
+              recommendedSshHost={nativeSshHost}
+            >
+              <WorkerStream taskId={parentTaskId} worker={nativeMember.memberName} member={nativeMember} inDrawer />
+            </MdLinkProvider>
           </div>
         </div>
       </aside>

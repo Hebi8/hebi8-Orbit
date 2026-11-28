@@ -308,6 +308,160 @@ export function buildProjectIDEJump(params: {
   };
 }
 
+/**
+ * Computes a local or SSH-remote IDE URI for opening a single file (optionally anchored at a line/column),
+ * reusing the exact same local-machine detection and SSH alias precedence as `IdeOpenButton`.
+ * Returns `null` for empty, relative, or `~/` home-relative paths that cannot be launched via IDE URI directly.
+ */
+export function buildFileIDEJump(params: {
+  scheme?: IDEScheme;
+  path: string;
+  line?: number;
+  column?: number;
+  machineId?: string;
+  localMachineId?: string;
+  machines?: MachineView[];
+  recommendedSshHost?: string;
+  customSshHost?: string;
+}): IDEJumpResult | null {
+  const {
+    scheme,
+    path,
+    line,
+    column,
+    machineId,
+    localMachineId = '',
+    machines = [],
+    recommendedSshHost,
+    customSshHost,
+  } = params;
+
+  const trimmed = (path ?? '').trim();
+  if (!trimmed || !trimmed.startsWith('/')) {
+    return null;
+  }
+
+  const fullPath = trimmed.length > 1 ? trimmed.replace(/\/+$/, '') : trimmed;
+  const encodedPath = encodeURIPathSegments(fullPath);
+  const validLine = typeof line === 'number' && Number.isInteger(line) && line > 0 ? line : undefined;
+  const validCol =
+    validLine && typeof column === 'number' && Number.isInteger(column) && column > 0 ? column : undefined;
+  const lineSuffix = validLine ? (validCol ? `:${validLine}:${validCol}` : `:${validLine}`) : '';
+
+  const targetMachine = (machineId ?? '').trim();
+  const effectiveLocal = resolveEffectiveLocalMachineId(machines, localMachineId);
+  const proto: IDEScheme = scheme || 'cursor';
+  const isLocal = !targetMachine || (effectiveLocal !== '' && effectiveLocal === targetMachine);
+
+  if (isLocal) {
+    return {
+      uri: `${proto}://file${encodedPath}${lineSuffix}`,
+      mode: 'local',
+      targetMachine,
+      targetLabel: '工作目录',
+      resolvedPath: fullPath,
+      line: validLine,
+    };
+  }
+
+  const machineObj = machines.find((m) => m.machineId === targetMachine);
+  const resolved = resolveEffectiveSshHost({
+    machine: machineObj,
+    fallbackId: targetMachine,
+    recommendedSshHost,
+    customSshHost,
+  });
+
+  return {
+    uri: buildRemoteUri(proto, resolved.host, encodedPath, lineSuffix),
+    mode: 'ssh',
+    targetMachine,
+    sshHost: resolved.host,
+    sshSource: resolved.source,
+    targetLabel: '工作目录',
+    resolvedPath: fullPath,
+    line: validLine,
+  };
+}
+
+/** Resolves the effective execution machine, working directory, and project IDE scheme for a session or turn. */
+export function resolveSessionFileContext(params: {
+  task?: { requiredCapability?: string; latestDeliveryId?: string };
+  attempt?: { machineId?: string; worktreePath?: string; partId?: string; locationId?: string; outputDeliveryId?: string };
+  deliveries?: DeliveryView[];
+  project?: ProjectView;
+  machines?: MachineView[];
+  runtimeConfig?: Record<string, string>;
+  activeDutyMachineId?: string;
+}): { machineId?: string; worktreePath?: string; ideScheme?: IDEScheme } {
+  const { task, attempt, deliveries = [], project, machines = [], runtimeConfig, activeDutyMachineId } = params;
+
+  const matchedDelivery =
+    (attempt?.outputDeliveryId
+      ? deliveries.find((d) => d.deliveryId === attempt.outputDeliveryId)
+      : undefined) ??
+    (task?.latestDeliveryId ? deliveries.find((d) => d.deliveryId === task.latestDeliveryId) : undefined) ??
+    [...deliveries].reverse().find((d) => !!d.manifest?.worktreePath) ??
+    deliveries[deliveries.length - 1];
+
+  const matchedPart = attempt?.partId
+    ? project?.parts?.find((p) => p.partId === attempt.partId)
+    : project?.parts?.[0];
+  const matchedLoc = attempt?.locationId
+    ? matchedPart?.locations?.find((l) => l.locationId === attempt.locationId)
+    : undefined;
+  const defaultLoc = matchedPart?.locations?.find((l) => l.isDefault) ?? matchedPart?.locations?.[0];
+
+  const anchor = project
+    ? project.anchors[task?.requiredCapability || project.defaultCapability] ??
+      Object.values(project.anchors).find((a) => a.repoPath || a.machine)
+    : undefined;
+
+  const runtimeMachine = runtimeConfig?.machineId?.trim() || runtimeConfig?.preferredMachine?.trim() || undefined;
+  const dutyMachine =
+    activeDutyMachineId && machines.some((m) => m.machineId === activeDutyMachineId)
+      ? activeDutyMachineId
+      : undefined;
+
+  const machineId =
+    attempt?.machineId ||
+    runtimeMachine ||
+    matchedDelivery?.sourceMachineId ||
+    matchedLoc?.machineId ||
+    defaultLoc?.machineId ||
+    anchor?.machine ||
+    dutyMachine ||
+    undefined;
+
+  const machineLoc = machineId ? matchedPart?.locations?.find((l) => l.machineId === machineId) : undefined;
+  const deliveryWorktree =
+    matchedDelivery?.manifest?.worktreePath &&
+    (!machineId || !matchedDelivery.sourceMachineId || matchedDelivery.sourceMachineId === machineId)
+      ? matchedDelivery.manifest.worktreePath
+      : '';
+  const matchedLocPath =
+    matchedLoc?.absPath && (!machineId || !matchedLoc.machineId || matchedLoc.machineId === machineId)
+      ? matchedLoc.absPath
+      : '';
+  const defaultLocPath =
+    defaultLoc?.absPath && (!machineId || !defaultLoc.machineId || defaultLoc.machineId === machineId)
+      ? defaultLoc.absPath
+      : '';
+  const anchorRepoPath =
+    anchor?.repoPath && (!machineId || !anchor.machine || anchor.machine === machineId) ? anchor.repoPath : '';
+  const rawWorktree =
+    attempt?.worktreePath || deliveryWorktree || matchedLocPath || machineLoc?.absPath || defaultLocPath || anchorRepoPath || '';
+
+  const trimmedDir = rawWorktree.trim();
+  const worktreePath = trimmedDir.startsWith('/') || trimmedDir.startsWith('~/') ? trimmedDir : undefined;
+
+  return {
+    machineId,
+    worktreePath,
+    ideScheme: project?.ideScheme,
+  };
+}
+
 /** Hands a custom-scheme IDE URI to the OS without leaving the SPA. */
 export function launchIDE(uri: string) {
   const a = document.createElement('a');

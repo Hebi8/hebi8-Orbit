@@ -5,7 +5,15 @@ import React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import Markdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import type { ChildTaskView, EventRecord, InboxItemView, TaskSummary } from '../src/generated/protocol.ts';
+import type {
+  ChildTaskView,
+  DeliveryView,
+  EventRecord,
+  InboxItemView,
+  MachineView,
+  ProjectView,
+  TaskSummary,
+} from '../src/generated/protocol.ts';
 import {
   bindAttemptRawSyncToQueryClient,
   createAttemptRawSyncController,
@@ -24,10 +32,12 @@ import {
   sessionMark,
   type SeenTaskMap,
 } from '../src/lib/format.ts';
+import { buildFileIDEJump, resolveSessionFileContext } from '../src/lib/ide.ts';
 import {
   classifyMdHref,
   findFootnoteTargetInContainer,
   isFootnoteHref,
+  parseMdFileHref,
   resolveFootnoteTargetIds,
   safeMdUrlTransform,
 } from '../src/lib/markdown.ts';
@@ -612,4 +622,408 @@ test('GFM Markdown pipeline renders tables, adjacent heading+list, h4, quotes, h
   assert.match(html, /<pre><code class="language-ts">const streaming = true;\n?<\/code><\/pre>/);
   assert.doesNotMatch(html, /<script>/i);
   assert.match(html, /&lt;script&gt;alert\(&quot;xss&quot;\)&lt;\/script&gt;/);
+});
+
+test('Markdown link classification & file path parsing support file://, absolute/relative paths, CJK decoding, mailto:, and strictly block XSS', () => {
+  // 1. file:// URLs (with #L range, :line:col, localhost, CJK/spaces, and encoded #)
+  assert.equal(classifyMdHref('file:///Users/orbit/now.md'), 'file');
+  assert.equal(classifyMdHref('file:///Users/orbit/now.md#L105-L126'), 'file');
+  assert.equal(classifyMdHref('file:///Users/orbit/now.md:105:12'), 'file');
+  assert.equal(classifyMdHref('file://localhost/Users/orbit/now.md#L7'), 'file');
+  assert.deepEqual(parseMdFileHref('file:///Users/orbit/now.md#L105-L126'), {
+    path: '/Users/orbit/now.md',
+    line: 105,
+    endLine: 126,
+    rawHref: 'file:///Users/orbit/now.md#L105-L126',
+    isRelative: false,
+  });
+  assert.deepEqual(parseMdFileHref('file:///Users/orbit/now.md:105:12'), {
+    path: '/Users/orbit/now.md',
+    line: 105,
+    column: 12,
+    rawHref: 'file:///Users/orbit/now.md:105:12',
+    isRelative: false,
+  });
+  assert.deepEqual(parseMdFileHref('file:///Users/orbit/%E6%96%87%E6%A1%A3/my%20notes.md#L8'), {
+    path: '/Users/orbit/文档/my notes.md',
+    line: 8,
+    rawHref: 'file:///Users/orbit/%E6%96%87%E6%A1%A3/my%20notes.md#L8',
+    isRelative: false,
+  });
+  assert.deepEqual(parseMdFileHref('file:///Users/orbit/c%23.md#L4'), {
+    path: '/Users/orbit/c#.md',
+    line: 4,
+    rawHref: 'file:///Users/orbit/c%23.md#L4',
+    isRelative: false,
+  });
+
+  // 2. Absolute POSIX & ~/ home-relative paths
+  assert.equal(classifyMdHref('/home/orbit/repo/main.go:42'), 'file');
+  assert.equal(classifyMdHref('~/notes/now.md#L12'), 'file');
+  assert.deepEqual(parseMdFileHref('/home/orbit/repo/main.go:42'), {
+    path: '/home/orbit/repo/main.go',
+    line: 42,
+    rawHref: '/home/orbit/repo/main.go:42',
+    isRelative: false,
+  });
+  assert.deepEqual(parseMdFileHref('~/notes/now.md#L12'), {
+    path: '~/notes/now.md',
+    line: 12,
+    rawHref: '~/notes/now.md#L12',
+    isRelative: false,
+  });
+
+  // 3. Relative paths with and without baseDir normalization
+  assert.equal(classifyMdHref('web/src/App.tsx'), 'file');
+  assert.equal(classifyMdHref('web/src/App.tsx#L10-L20'), 'file');
+  assert.equal(classifyMdHref('./foo.go#L12'), 'file');
+  assert.equal(classifyMdHref('docs/README.md'), 'file');
+  assert.equal(classifyMdHref('Segments.tsx'), 'file');
+  assert.equal(classifyMdHref('now.md:105'), 'file');
+  assert.equal(classifyMdHref('ux_polish.test.ts:105'), 'file');
+  assert.equal(classifyMdHref('.env.local:5'), 'file');
+  assert.deepEqual(parseMdFileHref('ux_polish.test.ts:105', '/home/orbit/repo/web/tests'), {
+    path: '/home/orbit/repo/web/tests/ux_polish.test.ts',
+    line: 105,
+    rawHref: 'ux_polish.test.ts:105',
+    isRelative: false,
+  });
+
+  assert.deepEqual(parseMdFileHref('web/src/App.tsx#L10-L20'), {
+    path: 'web/src/App.tsx',
+    line: 10,
+    endLine: 20,
+    rawHref: 'web/src/App.tsx#L10-L20',
+    isRelative: true,
+  });
+  assert.deepEqual(parseMdFileHref('web/src/App.tsx#L10-L20', '/home/orbit/repo/'), {
+    path: '/home/orbit/repo/web/src/App.tsx',
+    line: 10,
+    endLine: 20,
+    rawHref: 'web/src/App.tsx#L10-L20',
+    isRelative: false,
+  });
+  assert.deepEqual(parseMdFileHref('./foo.go#L12', '/home/orbit/repo'), {
+    path: '/home/orbit/repo/foo.go',
+    line: 12,
+    rawHref: './foo.go#L12',
+    isRelative: false,
+  });
+  assert.deepEqual(parseMdFileHref('../docs/README.md#overview', '/home/orbit/repo/web'), {
+    path: '/home/orbit/repo/docs/README.md',
+    rawHref: '../docs/README.md#overview',
+    isRelative: false,
+  });
+
+  // 4. mailto: external links
+  assert.equal(classifyMdHref('mailto:user@example.com'), 'external');
+  assert.equal(classifyMdHref('mailto:user@example.com?subject=Orbit'), 'external');
+  assert.equal(classifyMdHref('mailto:'), 'unsafe');
+  assert.equal(classifyMdHref('mailto:javascript:alert(1)'), 'unsafe');
+  assert.equal(parseMdFileHref('mailto:user@example.com'), null);
+  assert.equal(parseMdFileHref('https://example.com/docs'), null);
+
+  // 5. Strict XSS & unknown-scheme blocking
+  for (const bad of [
+    'javascript:alert(1)',
+    'JAVASCRIPT:alert(1)',
+    'java\tscript:alert(1)',
+    'vbscript:msgbox(1)',
+    'data:text/html,<script>alert(1)</script>',
+    'blob:https://example.com/123',
+    'ftp://example.com/file.txt',
+    'tel:123456',
+    'javascript:123',
+    '//evil.example/payload.js',
+    'file://evil.example/share/secret.txt',
+    'file://',
+    'file:///',
+    'file:///tmp/bad%00.txt',
+    'file:///tmp/bad%0a.txt',
+  ]) {
+    assert.equal(classifyMdHref(bad), 'unsafe', `expected ${JSON.stringify(bad)} to be unsafe`);
+    assert.equal(parseMdFileHref(bad), null, `expected parseMdFileHref(${JSON.stringify(bad)}) to be null`);
+    assert.equal(safeMdUrlTransform(bad, 'href'), '', `expected safeMdUrlTransform(${JSON.stringify(bad)}, 'href') to be empty`);
+  }
+
+  // 6. safeMdUrlTransform allows safe hrefs (file://, paths, mailto:) while restricting src strictly to https?://
+  assert.equal(safeMdUrlTransform('file:///Users/orbit/now.md#L105-L126', 'href'), 'file:///Users/orbit/now.md#L105-L126');
+  assert.equal(safeMdUrlTransform('web/src/App.tsx#L10-L20', 'href'), 'web/src/App.tsx#L10-L20');
+  assert.equal(safeMdUrlTransform('mailto:user@example.com', 'href'), 'mailto:user@example.com');
+  assert.equal(safeMdUrlTransform('https://example.com/pic.png', 'src'), 'https://example.com/pic.png');
+  assert.equal(safeMdUrlTransform('file:///etc/passwd', 'src'), '');
+  assert.equal(safeMdUrlTransform('mailto:user@example.com', 'src'), '');
+  assert.equal(safeMdUrlTransform('web/src/pic.png', 'src'), '');
+  assert.equal(safeMdUrlTransform('data:image/svg+xml,<svg/>', 'src'), '');
+
+  // 7. End-to-end react-markdown output preserves file://, relative paths, mailto: and strips javascript:
+  const mdLinks = [
+    '[now.md](file:///Users/orbit/now.md#L105-L126)',
+    '[`Md.tsx`](web/src/components/Md.tsx#L12)',
+    '[Email](mailto:user@example.com)',
+    '[XSS](javascript:alert(1))',
+    '![Blocked](file:///etc/passwd)',
+  ].join(' · ');
+  const html = renderToStaticMarkup(
+    React.createElement(
+      Markdown,
+      {
+        remarkPlugins: [remarkGfm],
+        urlTransform: safeMdUrlTransform,
+        components: {
+          img({ src, alt }) {
+            return src ? React.createElement('img', { src, alt }) : null;
+          },
+        },
+      },
+      mdLinks,
+    ),
+  );
+  assert.match(html, /href="file:\/\/\/Users\/orbit\/now\.md#L105-L126"/);
+  assert.match(html, /href="web\/src\/components\/Md\.tsx#L12".*<code>Md\.tsx<\/code>/);
+  assert.match(html, /href="mailto:user@example\.com"/);
+  assert.doesNotMatch(html, /javascript:/i);
+  assert.doesNotMatch(html, /src="file:/i);
+});
+
+test('buildFileIDEJump generates local and Remote-SSH URIs for Cursor, VS Code, Antigravity, and Zed with exact SSH alias precedence', () => {
+  const machines: MachineView[] = [
+    {
+      machineId: 'mac-node',
+      displayName: 'Mac Node',
+      transportMode: 'remote_ws',
+      status: 'online',
+      capabilities: ['primary-dev'],
+      resources: {},
+      updatedAt: 1000,
+    },
+    {
+      machineId: 'hub-node',
+      displayName: 'Hub Node',
+      transportMode: 'local_ws',
+      sshAlias: 'hub-ssh',
+      tailscaleHost: 'hub-node.example.ts.net',
+      status: 'online',
+      capabilities: ['primary-dev'],
+      resources: {},
+      updatedAt: 1000,
+    },
+    {
+      machineId: 'aux-node',
+      displayName: 'Aux Node',
+      transportMode: 'remote_ws',
+      sshAlias: 'AuxBox',
+      tailscaleHost: 'aux-node.example.ts.net',
+      status: 'online',
+      capabilities: ['gpu'],
+      resources: {},
+      updatedAt: 1000,
+    },
+  ];
+
+  // 1. Local file URIs across all 4 IDEs (including line:col and CJK/space encoding)
+  for (const scheme of ['cursor', 'vscode', 'antigravity', 'zed'] as const) {
+    const j = buildFileIDEJump({
+      scheme,
+      path: '/Users/orbit/now.md',
+      line: 105,
+      machineId: 'mac-node',
+      localMachineId: 'mac-node',
+      machines,
+    });
+    assert.ok(j);
+    assert.equal(j.mode, 'local');
+    assert.equal(j.uri, `${scheme}://file/Users/orbit/now.md:105`);
+    assert.equal(j.line, 105);
+  }
+  const cjkLocal = buildFileIDEJump({
+    scheme: 'cursor',
+    path: '/Users/orbit/文档/my notes.md',
+    line: 8,
+    column: 4,
+    machineId: 'mac-node',
+    localMachineId: 'mac-node',
+    machines,
+  });
+  assert.equal(cjkLocal?.uri, 'cursor://file/Users/orbit/%E6%96%87%E6%A1%A3/my%20notes.md:8:4');
+
+  // 2. Remote SSH URIs across all 4 IDEs (lowercase host vs uppercase host hex-encoding)
+  const remoteCursor = buildFileIDEJump({
+    scheme: 'cursor',
+    path: '/home/orbit/repo/web/src/App.tsx',
+    line: 10,
+    machineId: 'hub-node',
+    localMachineId: 'mac-node',
+    machines,
+    customSshHost: '',
+  });
+  assert.equal(remoteCursor?.mode, 'ssh');
+  assert.equal(remoteCursor?.sshHost, 'hub-ssh');
+  assert.equal(remoteCursor?.sshSource, 'machine');
+  assert.equal(remoteCursor?.uri, 'cursor://vscode-remote/ssh-remote+hub-ssh/home/orbit/repo/web/src/App.tsx:10');
+
+  const remoteVscode = buildFileIDEJump({
+    scheme: 'vscode',
+    path: '/home/orbit/repo/web/src/App.tsx',
+    line: 10,
+    machineId: 'hub-node',
+    localMachineId: 'mac-node',
+    machines,
+    customSshHost: '',
+  });
+  assert.equal(remoteVscode?.uri, 'vscode://vscode-remote/ssh-remote+hub-ssh/home/orbit/repo/web/src/App.tsx:10');
+
+  const remoteAgy = buildFileIDEJump({
+    scheme: 'antigravity',
+    path: '/home/orbit/repo/web/src/App.tsx',
+    line: 10,
+    machineId: 'hub-node',
+    localMachineId: 'mac-node',
+    machines,
+    customSshHost: '',
+  });
+  assert.equal(remoteAgy?.uri, 'antigravity://vscode-remote/ssh-remote+hub-ssh/home/orbit/repo/web/src/App.tsx:10');
+
+  const remoteZed = buildFileIDEJump({
+    scheme: 'zed',
+    path: '/home/orbit/repo/web/src/App.tsx',
+    line: 10,
+    machineId: 'hub-node',
+    localMachineId: 'mac-node',
+    machines,
+    customSshHost: '',
+  });
+  assert.equal(remoteZed?.uri, 'zed://ssh/hub-ssh/home/orbit/repo/web/src/App.tsx:10');
+
+  // Uppercase SSH alias (`AuxBox`) MUST hex-encode JSON {"hostName":"AuxBox"} for VS Code-family IDEs, plain for Zed
+  const expectedHex = Buffer.from(JSON.stringify({ hostName: 'AuxBox' }), 'utf8').toString('hex');
+  const upperCursor = buildFileIDEJump({
+    scheme: 'cursor',
+    path: '/home/orbit/repo/main.go',
+    line: 42,
+    machineId: 'aux-node',
+    localMachineId: 'mac-node',
+    machines,
+    customSshHost: '',
+  });
+  assert.equal(upperCursor?.uri, `cursor://vscode-remote/ssh-remote+${expectedHex}/home/orbit/repo/main.go:42`);
+
+  const upperZed = buildFileIDEJump({
+    scheme: 'zed',
+    path: '/home/orbit/repo/main.go',
+    line: 42,
+    machineId: 'aux-node',
+    localMachineId: 'mac-node',
+    machines,
+    customSshHost: '',
+  });
+  assert.equal(upperZed?.uri, 'zed://ssh/AuxBox/home/orbit/repo/main.go:42');
+
+  // 3. SSH alias priority: customSshHost > recommendedSshHost > machine.sshAlias > tailscaleHost > machineId
+  const customWins = buildFileIDEJump({
+    scheme: 'cursor',
+    path: '/home/orbit/a.go',
+    machineId: 'hub-node',
+    localMachineId: 'mac-node',
+    machines,
+    recommendedSshHost: 'from-ssh-config',
+    customSshHost: 'my-custom-alias',
+  });
+  assert.equal(customWins?.sshHost, 'my-custom-alias');
+  assert.equal(customWins?.sshSource, 'custom');
+
+  const recWins = buildFileIDEJump({
+    scheme: 'cursor',
+    path: '/home/orbit/a.go',
+    machineId: 'hub-node',
+    localMachineId: 'mac-node',
+    machines,
+    recommendedSshHost: 'from-ssh-config',
+    customSshHost: '',
+  });
+  assert.equal(recWins?.sshHost, 'from-ssh-config');
+  assert.equal(recWins?.sshSource, 'ssh_config');
+
+  // 4. Relative and ~/ paths return null (MdFileLink falls back to clipboard copy + toast)
+  assert.equal(
+    buildFileIDEJump({ scheme: 'cursor', path: 'web/src/App.tsx', machineId: 'hub-node', localMachineId: 'mac-node', machines }),
+    null,
+  );
+  assert.equal(
+    buildFileIDEJump({ scheme: 'cursor', path: '~/notes/now.md', machineId: 'mac-node', localMachineId: 'mac-node', machines }),
+    null,
+  );
+
+  // 5. resolveSessionFileContext respects attempt > delivery > project anchor precedence
+  const project: ProjectView = {
+    projectId: 'proj-1',
+    displayName: 'Demo',
+    repoIdentity: 'git:demo',
+    defaultBranch: 'main',
+    mirrorBarePath: '/home/orbit/mirrors/demo.git',
+    defaultCapability: 'primary-dev',
+    defaultAdapter: 'agy',
+    ideScheme: 'zed',
+    anchors: { 'primary-dev': { machine: 'hub-node', repoPath: '/home/orbit/demo' } },
+    activeTaskCount: 1,
+    blockedTaskCount: 0,
+    archived: false,
+    updatedAt: 1000,
+  };
+  const delivery: DeliveryView = {
+    deliveryId: 'dlv_1',
+    projectId: 'proj-1',
+    taskId: 'tsk_1',
+    attemptId: 'att_1',
+    sourceMachineId: 'aux-node',
+    repoIdentity: 'git:demo',
+    baseSha: 'aaa',
+    headSha: 'bbb',
+    gitRef: 'refs/heads/main',
+    kind: 'code_diff',
+    summary: 'diff',
+    manifest: { filesChanged: 1, insertions: 2, deletions: 0, worktreePath: '/home/orbit/wt/dlv' },
+    ryugiSyncState: 'none',
+    lateArrival: false,
+    pinned: false,
+    createdAt: 1000,
+    openAnnotations: 0,
+  };
+  assert.deepEqual(
+    resolveSessionFileContext({
+      attempt: { machineId: 'mac-node', worktreePath: '/Users/orbit/wt/att', outputDeliveryId: 'dlv_1' },
+      deliveries: [delivery],
+      project,
+      machines,
+    }),
+    { machineId: 'mac-node', worktreePath: '/Users/orbit/wt/att', ideScheme: 'zed' },
+  );
+  assert.deepEqual(
+    resolveSessionFileContext({
+      task: { requiredCapability: 'primary-dev', latestDeliveryId: 'dlv_1' },
+      deliveries: [delivery],
+      project,
+      machines,
+    }),
+    { machineId: 'aux-node', worktreePath: '/home/orbit/wt/dlv', ideScheme: 'zed' },
+  );
+  assert.deepEqual(
+    resolveSessionFileContext({
+      task: { requiredCapability: 'primary-dev' },
+      deliveries: [],
+      project,
+      machines,
+    }),
+    { machineId: 'hub-node', worktreePath: '/home/orbit/demo', ideScheme: 'zed' },
+  );
+  // Cross-machine guard: an attempt on mac-node without its own worktreePath MUST NOT borrow aux-node's or hub-node's path
+  assert.deepEqual(
+    resolveSessionFileContext({
+      attempt: { machineId: 'mac-node' },
+      deliveries: [delivery],
+      project,
+      machines,
+    }),
+    { machineId: 'mac-node', worktreePath: undefined, ideScheme: 'zed' },
+  );
 });

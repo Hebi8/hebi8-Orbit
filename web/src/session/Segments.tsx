@@ -142,12 +142,14 @@ export function Segments({ segs, live = false }: { segs: Segment[]; live?: boole
             return (
               <div className="it bm" key={s.key} style={{ padding: '4px 0' }}>
                 <span className="seq mono">#{s.seq}</span>
-                <div>
+                <div style={{ minWidth: 0 }}>
                   <span className={`who ${s.author === 'human' || s.author === 'user' ? 'you' : ''}`}>
                     {s.author === 'human' ? '你' : s.author}
                   </span>
                   {s.mention && <span className="men">@{s.mention}</span>}
-                  <span className="body2">{s.body}</span>
+                  <div className="body2 bm-body">
+                    <Md text={s.body} />
+                  </div>
                 </div>
               </div>
             );

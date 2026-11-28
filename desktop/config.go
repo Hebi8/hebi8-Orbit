@@ -424,7 +424,7 @@ func ShouldOpenExternally(targetURL, hubURL, setupOrigin string) bool {
 	}
 	scheme := strings.ToLower(u.Scheme)
 	switch scheme {
-	case "about", "data", "blob":
+	case "about", "data", "blob", "javascript", "vbscript":
 		return false
 	case "cursor", "vscode", "zed", "antigravity", "mailto":
 		return true

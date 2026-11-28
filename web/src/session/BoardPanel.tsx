@@ -4,12 +4,15 @@ import { X } from 'lucide-react';
 import type {
   BoardMemberCursor,
   ChildTaskView,
+  IDEScheme,
   InboxItemView,
   MachineView,
   TaskBoardResponse,
 } from '../generated/protocol';
 import { SendUpIcon } from '../components/Icons';
+import { Md, MdLinkProvider } from '../components/Md';
 import { StatusMark } from '../components/StatusMark';
+import { useMdLinkRecommendedSshHost } from '../hooks/queries';
 import { ADAPTER_LABELS } from '../lib/agentCaps';
 import { api, errMsg } from '../lib/api';
 import {
@@ -62,6 +65,10 @@ export function BoardPanel({
   fallbackMembers,
   childrenList = [],
   machines = [],
+  machineId,
+  worktreePath,
+  localMachineId,
+  ideScheme,
   inboxByTask,
   worker,
   onClose,
@@ -73,6 +80,10 @@ export function BoardPanel({
   fallbackMembers: BoardMemberCursor[];
   childrenList?: ChildTaskView[];
   machines?: MachineView[];
+  machineId?: string;
+  worktreePath?: string;
+  localMachineId?: string;
+  ideScheme?: IDEScheme;
   inboxByTask?: ReadonlyMap<string, InboxItemView[]>;
   worker?: string;
   onClose: () => void;
@@ -82,6 +93,7 @@ export function BoardPanel({
   const qc = useQueryClient();
   const seenTasks = useWorkbenchStore((s) => s.seenTasks);
   const ime = useImeGuard();
+  const recommendedSshHost = useMdLinkRecommendedSshHost(machineId, machines, localMachineId);
   const members = board?.members ?? fallbackMembers;
   const [olderMessages, setOlderMessages] = useState<TaskBoardResponse['messages']>([]);
   const [olderHasMore, setOlderHasMore] = useState<boolean | null>(null);
@@ -268,7 +280,15 @@ export function BoardPanel({
       : participants.find((p) => p.mentionValue === target)?.label.replace(/^@/, '') || formatActorOrMention(target);
 
   return (
-    <aside className="board" aria-label="共享消息板">
+    <MdLinkProvider
+      machineId={machineId}
+      worktreePath={worktreePath}
+      machines={machines}
+      localMachineId={localMachineId}
+      ideScheme={ideScheme}
+      recommendedSshHost={recommendedSshHost}
+    >
+      <aside className="board" aria-label="共享消息板">
       <div className="bh">
         <span className="t">共享消息板</span>
         <span className="s mono">#{latest}</span>
@@ -345,7 +365,9 @@ export function BoardPanel({
                       @{formatActorOrMention(msg.targetMention)}
                     </span>
                   )}
-                  <span className="body2">{msg.body}</span>
+                  <div className="body2 bm-body">
+                    <Md text={msg.body} />
+                  </div>
                   <div className="bell">
                     <span>{hhmm(msg.createdAt)}</span>
                     <span>{msg.status === 'consumed' ? '已消费' : '待消费'}</span>
@@ -417,5 +439,6 @@ export function BoardPanel({
         </div>
       </div>
     </aside>
+    </MdLinkProvider>
   );
 }

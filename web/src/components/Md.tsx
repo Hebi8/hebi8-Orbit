@@ -1,11 +1,190 @@
-import { isValidElement, memo, useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
+import {
+  createContext,
+  isValidElement,
+  memo,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from 'react';
 import { AlertCircle, Check, Copy } from 'lucide-react';
 import Markdown, { type Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { classifyMdHref, findFootnoteTargetInContainer, safeMdUrlTransform } from '../lib/markdown';
+import type { IDEScheme, MachineView } from '../generated/protocol';
+import {
+  buildFileIDEJump,
+  getCustomSshAlias,
+  ideLabel,
+  launchIDE,
+  resolveEffectiveLocalMachineId,
+} from '../lib/ide';
+import {
+  classifyMdHref,
+  findFootnoteTargetInContainer,
+  parseMdFileHref,
+  safeMdUrlTransform,
+} from '../lib/markdown';
 import { navigate } from '../lib/router';
+import { toast, useWorkbenchStore } from '../store/useWorkbenchStore';
 
-export { classifyMdHref, isFootnoteHref, type MdHrefKind } from '../lib/markdown';
+export {
+  classifyMdHref,
+  isFootnoteHref,
+  parseMdFileHref,
+  type MdHrefKind,
+  type ParsedMdFileHref,
+} from '../lib/markdown';
+
+export interface MdLinkContextValue {
+  machineId?: string;
+  worktreePath?: string;
+  machines?: MachineView[];
+  localMachineId?: string;
+  ideScheme?: IDEScheme;
+  recommendedSshHost?: string;
+}
+
+export const MdLinkContext = createContext<MdLinkContextValue>({});
+
+const EMPTY_MACHINES: MachineView[] = [];
+
+/**
+ * Provides execution-machine and working-directory context so `<Md />` file links
+ * can resolve relative paths and jump straight into the user's preferred IDE (local or Remote-SSH).
+ */
+export function MdLinkProvider({
+  machineId,
+  worktreePath,
+  machines,
+  localMachineId,
+  ideScheme,
+  recommendedSshHost,
+  children,
+}: MdLinkContextValue & { children: ReactNode }) {
+  const parent = useContext(MdLinkContext);
+  const value = useMemo<MdLinkContextValue>(() => {
+    const resolvedMachineId = machineId !== undefined ? machineId : parent.machineId;
+    const machineChanged = resolvedMachineId !== parent.machineId;
+    return {
+      machineId: resolvedMachineId,
+      worktreePath:
+        worktreePath !== undefined ? worktreePath : machineChanged ? undefined : parent.worktreePath,
+      machines: machines !== undefined ? machines : parent.machines,
+      localMachineId: localMachineId !== undefined ? localMachineId : parent.localMachineId,
+      ideScheme: ideScheme !== undefined ? ideScheme : parent.ideScheme,
+      recommendedSshHost:
+        recommendedSshHost !== undefined
+          ? recommendedSshHost
+          : machineChanged
+            ? undefined
+            : parent.recommendedSshHost,
+    };
+  }, [
+    machineId,
+    worktreePath,
+    machines,
+    localMachineId,
+    ideScheme,
+    recommendedSshHost,
+    parent.machineId,
+    parent.worktreePath,
+    parent.machines,
+    parent.localMachineId,
+    parent.ideScheme,
+    parent.recommendedSshHost,
+  ]);
+
+  return <MdLinkContext.Provider value={value}>{children}</MdLinkContext.Provider>;
+}
+
+function fileBaseName(path: string): string {
+  const parts = path.split('/').filter(Boolean);
+  return parts[parts.length - 1] || path;
+}
+
+function formatParsedLineSuffix(line?: number, endLine?: number, column?: number): string {
+  if (!line) return '';
+  if (column) return `:${line}:${column}`;
+  if (endLine && endLine !== line) return `:${line}-${endLine}`;
+  return `:${line}`;
+}
+
+function MdFileLink({ id, rawHref, children }: { id?: string; rawHref: string; children?: ReactNode }) {
+  const ctx = useContext(MdLinkContext);
+  const preferredIDE = useWorkbenchStore((s) => s.preferredIDE);
+  const storedLocalId = useWorkbenchStore((s) => s.localMachineId);
+  const sshAliasRev = useWorkbenchStore((s) => s.sshAliasRev);
+
+  const parsed = useMemo(() => parseMdFileHref(rawHref, ctx.worktreePath), [rawHref, ctx.worktreePath]);
+  const machines = ctx.machines ?? EMPTY_MACHINES;
+  const scheme: IDEScheme = preferredIDE || ctx.ideScheme || 'cursor';
+  const effectiveLocalId = resolveEffectiveLocalMachineId(machines, ctx.localMachineId || storedLocalId);
+
+  const customAlias = useMemo(() => {
+    void sshAliasRev;
+    return ctx.machineId ? getCustomSshAlias(ctx.machineId) : '';
+  }, [ctx.machineId, sshAliasRev]);
+
+  const jump = useMemo(() => {
+    if (!parsed || parsed.isRelative) return null;
+    return buildFileIDEJump({
+      scheme,
+      path: parsed.path,
+      line: parsed.line,
+      column: parsed.column,
+      machineId: ctx.machineId,
+      localMachineId: effectiveLocalId,
+      machines,
+      recommendedSshHost: ctx.recommendedSshHost,
+      customSshHost: customAlias,
+    });
+  }, [parsed, scheme, ctx.machineId, effectiveLocalId, machines, ctx.recommendedSshHost, customAlias]);
+
+  if (!parsed) {
+    return <>{children}</>;
+  }
+
+  const lineSuffix = formatParsedLineSuffix(parsed.line, parsed.endLine, parsed.column);
+  const copyTarget = `${parsed.path}${lineSuffix}`;
+  const shortName = fileBaseName(parsed.path);
+  const ideName = ideLabel(scheme);
+  const title = jump
+    ? jump.mode === 'ssh'
+      ? `在 ${ideName} 打开 ${jump.resolvedPath}${lineSuffix} · SSH · ${jump.sshHost || jump.targetMachine} · Option+点击复制路径`
+      : `在 ${ideName} 打开 ${jump.resolvedPath}${lineSuffix} · Option+点击复制路径`
+    : `点击复制路径 ${copyTarget}`;
+
+  return (
+    <a
+      id={id}
+      href={jump?.uri ?? rawHref}
+      className="md-link md-file-link"
+      title={title}
+      onClick={(e) => {
+        e.preventDefault();
+        if (e.altKey || !jump) {
+          void copyTextToClipboard(copyTarget).then((ok) => {
+            if (ok) toast(`已复制路径：${copyTarget}`);
+            else toast('复制路径失败', 'err');
+          });
+          return;
+        }
+        launchIDE(jump.uri);
+        const shortLoc = parsed.line ? `${shortName}:${parsed.line}` : shortName;
+        toast(
+          jump.mode === 'ssh'
+            ? `已在 ${ideName} 打开 ${shortLoc}（SSH · ${jump.sshHost || jump.targetMachine}）`
+            : `已在 ${ideName} 打开 ${shortLoc}`,
+        );
+      }}
+    >
+      {children}
+    </a>
+  );
+}
 
 function extractNodeText(node: ReactNode): string {
   if (typeof node === 'string') return node;
@@ -158,13 +337,30 @@ const MD_COMPONENTS: Components = {
       );
     }
     if (kind === 'external') {
+      const isMailto = /^mailto:/i.test(safeHref);
       return (
-        <a id={id} href={safeHref} className="md-link" target="_blank" rel="noopener noreferrer">
+        <a
+          id={id}
+          href={safeHref}
+          className="md-link"
+          {...(isMailto ? { rel: 'noopener noreferrer' } : { target: '_blank', rel: 'noopener noreferrer' })}
+        >
           {children}
         </a>
       );
     }
+    if (kind === 'file') {
+      return (
+        <MdFileLink id={id} rawHref={safeHref}>
+          {children}
+        </MdFileLink>
+      );
+    }
     return <>{children}</>;
+  },
+  img({ src, alt, title }) {
+    if (!src) return alt ? <span>{alt}</span> : null;
+    return <img src={src} alt={alt ?? ''} title={title} loading="lazy" />;
   },
   pre({ children }) {
     return <MdCodeBlock>{children}</MdCodeBlock>;

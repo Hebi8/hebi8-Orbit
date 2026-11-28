@@ -3,10 +3,12 @@ import { createPortal } from 'react-dom';
 import { ChevronDown, Layers, MessageSquare, X } from 'lucide-react';
 import type { BootstrapResponse } from '../generated/protocol';
 import { DiffIcon } from '../components/Icons';
+import { MdLinkProvider } from '../components/Md';
 import { StatusMark } from '../components/StatusMark';
-import { useTimeline } from '../hooks/queries';
+import { useMdLinkRecommendedSshHost, useTimeline } from '../hooks/queries';
 import { collectSessionArtifacts } from '../lib/artifacts';
 import { artifactShortLabel, effectiveReadyWatermark, indexInboxByTask, sessionMark, taskTitle } from '../lib/format';
+import { resolveSessionFileContext } from '../lib/ide';
 import { useAnchoredPopover } from '../lib/popover';
 import { SessionConversation } from '../session/SessionConversation';
 import { useWorkbenchStore } from '../store/useWorkbenchStore';
@@ -59,6 +61,28 @@ export function ReviewOverlay({ boot }: { boot: BootstrapResponse }) {
   });
 
   const reviewTask = tl?.task;
+  const reviewProject = useMemo(
+    () => (reviewTask ? boot.projects.find((p) => p.projectId === reviewTask.projectId) : undefined),
+    [boot.projects, reviewTask],
+  );
+  const reviewFileCtx = useMemo(() => {
+    const lastAtt = tl?.attempts?.[tl.attempts.length - 1];
+    return resolveSessionFileContext({
+      task: reviewTask,
+      attempt: lastAtt,
+      deliveries: tl?.deliveries,
+      project: reviewProject,
+      machines: boot.machines,
+      runtimeConfig: tl?.runtimeConfig,
+      activeDutyMachineId: boot.setup?.activeDutyMachineId,
+    });
+  }, [reviewTask, tl?.attempts, tl?.deliveries, tl?.runtimeConfig, reviewProject, boot.machines, boot.setup?.activeDutyMachineId]);
+  const reviewSshHost = useMdLinkRecommendedSshHost(
+    reviewFileCtx.machineId,
+    boot.machines,
+    boot.setup?.currentMachineId,
+    !!review && review.tab === 'art' && !!reviewFileCtx.machineId,
+  );
   const reviewTaskId = review && reviewTask ? reviewTask.taskId : '';
   const reviewReadyWatermark =
     review && reviewTask ? effectiveReadyWatermark(reviewTask, inboxByTask.get(reviewTask.taskId)) : 0;
@@ -226,15 +250,24 @@ export function ReviewOverlay({ boot }: { boot: BootstrapResponse }) {
                 headerEnd={leftHeaderEnd}
               />
             ) : (
-              <ArtifactsPane
-                taskId={review.taskId}
-                deliveryId={review.deliveryId}
-                artifactId={activeArtifact?.artifactId ?? review.artifactId}
-                artifacts={sessionArtifacts}
-                tl={tl}
-                titleSwitcher={titleSwitcher}
-                headerEnd={leftHeaderEnd}
-              />
+              <MdLinkProvider
+                machineId={reviewFileCtx.machineId}
+                worktreePath={reviewFileCtx.worktreePath}
+                machines={boot.machines}
+                localMachineId={boot.setup?.currentMachineId}
+                ideScheme={reviewFileCtx.ideScheme}
+                recommendedSshHost={reviewSshHost}
+              >
+                <ArtifactsPane
+                  taskId={review.taskId}
+                  deliveryId={review.deliveryId}
+                  artifactId={activeArtifact?.artifactId ?? review.artifactId}
+                  artifacts={sessionArtifacts}
+                  tl={tl}
+                  titleSwitcher={titleSwitcher}
+                  headerEnd={leftHeaderEnd}
+                />
+              </MdLinkProvider>
             )}
           </div>
 
